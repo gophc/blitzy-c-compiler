@@ -1,0 +1,2 @@
+// BCC - Blitzy's C Compiler
+// Library root - module declarations will be added by implementation agents
