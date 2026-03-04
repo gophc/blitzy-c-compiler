@@ -1,0 +1,6 @@
+# Cargo configuration for BCC (Blitzy's C Compiler)
+# Sets the minimum stack size to 64 MiB for worker threads
+# Required for deeply nested kernel macro expansions
+
+[env]
+RUST_MIN_STACK = "67108864"

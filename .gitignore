@@ -1,0 +1,23 @@
+# Rust/Cargo build directory
+/target/
+
+# Compilation artifacts produced by BCC
+*.o
+*.so
+*.elf
+*.a
+
+# Temporary files from BCC compilation
+*.tmp
+
+# Editor and IDE files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+*.iml
+
+# OS-specific
+.DS_Store
+Thumbs.db
