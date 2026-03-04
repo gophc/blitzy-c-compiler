@@ -4,6 +4,7 @@
 //! of the compiler: frontend, IR, optimization passes, and backend.
 //! It has no dependencies on other BCC modules.
 
+pub mod encoding;
 pub mod fx_hash;
 pub mod long_double;
 pub mod temp_files;
