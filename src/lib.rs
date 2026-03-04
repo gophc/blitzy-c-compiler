@@ -2,3 +2,4 @@
 // Library root - module declarations will be added by implementation agents
 
 pub mod common;
+pub mod frontend;
