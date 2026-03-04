@@ -7,5 +7,6 @@
 pub mod encoding;
 pub mod fx_hash;
 pub mod long_double;
+pub mod source_map;
 pub mod target;
 pub mod temp_files;
