@@ -5,3 +5,4 @@
 //! shared linker infrastructure, and four architecture-specific backends.
 
 pub mod dwarf;
+pub mod x86_64;
