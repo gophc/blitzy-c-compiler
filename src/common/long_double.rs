@@ -246,7 +246,11 @@ impl LongDouble {
 
         // Overflow → ±infinity.
         if biased >= Self::MAX_EXPONENT as i32 {
-            return if sign { Self::NEG_INFINITY } else { Self::INFINITY };
+            return if sign {
+                Self::NEG_INFINITY
+            } else {
+                Self::INFINITY
+            };
         }
 
         // Underflow → denormal or zero.
@@ -572,7 +576,11 @@ impl PartialOrd for LongDouble {
         };
 
         // For negative numbers the larger magnitude is the *smaller* value.
-        Some(if self.sign { mag_cmp.reverse() } else { mag_cmp })
+        Some(if self.sign {
+            mag_cmp.reverse()
+        } else {
+            mag_cmp
+        })
     }
 }
 
@@ -632,20 +640,16 @@ impl LongDouble {
             // value = ±fraction × 2^(−1074)
             let lz = fraction.leading_zeros(); // ≥ 12 since fraction fits in 52 bits
             let significand = fraction << lz; // leading 1 now at bit 63
-            // Derive biased exponent:
-            //   value = significand × 2^(−1074 − lz)
-            //   LD form: 2^(biased − 16383) × significand × 2^(−63)
-            //   ⇒ biased = 16446 − 1074 − lz = 15372 − lz
+                                              // Derive biased exponent:
+                                              //   value = significand × 2^(−1074 − lz)
+                                              //   LD form: 2^(biased − 16383) × significand × 2^(−63)
+                                              //   ⇒ biased = 16446 − 1074 − lz = 15372 − lz
             let biased = 15372i32 - lz as i32;
             if biased < 1 {
                 // Extremely small — still denormal in long double format.
                 // Shouldn't happen for valid f64 denormals but handle gracefully.
                 let shift = (1 - biased) as u32;
-                let sig = if shift < 64 {
-                    significand >> shift
-                } else {
-                    0
-                };
+                let sig = if shift < 64 { significand >> shift } else { 0 };
                 return LongDouble {
                     sign,
                     exponent: 0,
@@ -766,14 +770,12 @@ impl LongDouble {
                         f64::INFINITY
                     };
                 }
-                let bits =
-                    ((self.sign as u64) << 63) | ((new_biased as u64) << 52) | fraction;
+                let bits = ((self.sign as u64) << 63) | ((new_biased as u64) << 52) | fraction;
                 return f64::from_bits(bits);
             }
         }
 
-        let bits =
-            ((self.sign as u64) << 63) | ((f64_biased as u64) << 52) | fraction;
+        let bits = ((self.sign as u64) << 63) | ((f64_biased as u64) << 52) | fraction;
         f64::from_bits(bits)
     }
 }
@@ -809,14 +811,14 @@ impl LongDouble {
         }
         let lz = val.leading_zeros();
         let significand = val << lz; // leading 1 at bit 63
-        // Unbiased exponent: the leading 1 was at bit position (63 − lz).
-        // That means the value is significand × 2^(−lz) × ... let's derive:
-        //   val = significand >> lz   (undo the shift we applied)
-        //   LD value = 2^(biased − 16383) × significand / 2^63
-        //            = significand × 2^(biased − 16446)
-        //   We need significand × 2^(biased − 16446) = val = significand >> lz
-        //                                              = significand × 2^(−lz)
-        //   ⇒ biased − 16446 = −lz  ⇒  biased = 16446 − lz
+                                     // Unbiased exponent: the leading 1 was at bit position (63 − lz).
+                                     // That means the value is significand × 2^(−lz) × ... let's derive:
+                                     //   val = significand >> lz   (undo the shift we applied)
+                                     //   LD value = 2^(biased − 16383) × significand / 2^63
+                                     //            = significand × 2^(biased − 16446)
+                                     //   We need significand × 2^(biased − 16446) = val = significand >> lz
+                                     //                                              = significand × 2^(−lz)
+                                     //   ⇒ biased − 16446 = −lz  ⇒  biased = 16446 − lz
         let biased = 16446u32 - lz;
         LongDouble {
             sign: false,
@@ -849,9 +851,7 @@ impl LongDouble {
             // Value is larger than 2^63 — overflow.
             if self.sign {
                 // Check for exactly −2^63 = i64::MIN.
-                if true_exp == 63
-                    && self.significand == Self::INTEGER_BIT
-                {
+                if true_exp == 63 && self.significand == Self::INTEGER_BIT {
                     return i64::MIN;
                 }
                 return i64::MIN;
