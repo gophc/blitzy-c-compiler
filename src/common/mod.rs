@@ -5,3 +5,4 @@
 //! It has no dependencies on other BCC modules.
 
 pub mod fx_hash;
+pub mod temp_files;
