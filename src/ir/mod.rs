@@ -11,6 +11,7 @@
 
 // Core IR definitions
 pub mod basic_block;
+pub mod builder;
 pub mod function;
 pub mod instructions;
 pub mod module;
@@ -18,6 +19,7 @@ pub mod types;
 
 // Re-export core IR types for convenient access
 pub use basic_block::BasicBlock;
+pub use builder::IrBuilder;
 pub use function::{CallingConvention, FunctionParam, IrFunction, Linkage, Visibility};
 pub use instructions::{BinOp, BlockId, FCmpOp, ICmpOp, Instruction, Value};
 pub use module::IrModule;
