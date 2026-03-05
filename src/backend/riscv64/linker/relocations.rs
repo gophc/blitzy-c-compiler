@@ -137,14 +137,16 @@ pub const R_RISCV_RVC_JUMP: u32 = 45;
 pub const R_RISCV_RVC_LUI: u32 = 46;
 /// Relaxation hint — paired with another relocation to indicate it can be relaxed.
 pub const R_RISCV_RELAX: u32 = 51;
+/// V - (S + A) — 6-bit subtraction (DWARF/CIE/FDE tables).
+pub const R_RISCV_SUB6: u32 = 52;
 /// Set lower 6 bits of byte to S + A.
-pub const R_RISCV_SET6: u32 = 52;
+pub const R_RISCV_SET6: u32 = 53;
 /// Set byte to S + A (truncated to 8 bits).
-pub const R_RISCV_SET8: u32 = 53;
+pub const R_RISCV_SET8: u32 = 54;
 /// Set 16-bit value to S + A (truncated to 16 bits).
-pub const R_RISCV_SET16: u32 = 54;
+pub const R_RISCV_SET16: u32 = 55;
 /// Set 32-bit value to S + A (truncated to 32 bits).
-pub const R_RISCV_SET32: u32 = 55;
+pub const R_RISCV_SET32: u32 = 56;
 /// S + A - P — 32-bit PC-relative.
 pub const R_RISCV_32_PCREL: u32 = 57;
 
@@ -506,9 +508,9 @@ impl RelocationHandler for RiscV64RelocationHandler {
             | R_RISCV_TLS_GD_HI20 | R_RISCV_TPREL_HI20 | R_RISCV_TPREL_LO12_I
             | R_RISCV_TPREL_LO12_S | R_RISCV_TPREL_ADD => RelocCategory::Tls,
             R_RISCV_NONE | R_RISCV_RELAX | R_RISCV_ALIGN => RelocCategory::Other,
-            R_RISCV_ADD8 | R_RISCV_ADD16 | R_RISCV_ADD32 | R_RISCV_ADD64 | R_RISCV_SUB8
-            | R_RISCV_SUB16 | R_RISCV_SUB32 | R_RISCV_SUB64 | R_RISCV_SET6 | R_RISCV_SET8
-            | R_RISCV_SET16 | R_RISCV_SET32 => RelocCategory::SectionRelative,
+            R_RISCV_ADD8 | R_RISCV_ADD16 | R_RISCV_ADD32 | R_RISCV_ADD64 | R_RISCV_SUB6
+            | R_RISCV_SUB8 | R_RISCV_SUB16 | R_RISCV_SUB32 | R_RISCV_SUB64 | R_RISCV_SET6
+            | R_RISCV_SET8 | R_RISCV_SET16 | R_RISCV_SET32 => RelocCategory::SectionRelative,
             R_RISCV_RELATIVE | R_RISCV_COPY => RelocCategory::Absolute,
             R_RISCV_GNU_VTINHERIT | R_RISCV_GNU_VTENTRY | R_RISCV_RVC_LUI => RelocCategory::Other,
             _ => RelocCategory::Other,
@@ -561,6 +563,7 @@ impl RelocationHandler for RiscV64RelocationHandler {
             R_RISCV_RVC_JUMP => "R_RISCV_RVC_JUMP",
             R_RISCV_RVC_LUI => "R_RISCV_RVC_LUI",
             R_RISCV_RELAX => "R_RISCV_RELAX",
+            R_RISCV_SUB6 => "R_RISCV_SUB6",
             R_RISCV_SET6 => "R_RISCV_SET6",
             R_RISCV_SET8 => "R_RISCV_SET8",
             R_RISCV_SET16 => "R_RISCV_SET16",
@@ -583,7 +586,7 @@ impl RelocationHandler for RiscV64RelocationHandler {
             R_RISCV_RVC_BRANCH | R_RISCV_RVC_JUMP | R_RISCV_RVC_LUI => 2, // compressed
             R_RISCV_ADD16 | R_RISCV_SUB16 | R_RISCV_SET16 => 2,
             R_RISCV_ADD8 | R_RISCV_SUB8 | R_RISCV_SET8 => 1,
-            R_RISCV_SET6 => 1,
+            R_RISCV_SUB6 | R_RISCV_SET6 => 1,
             R_RISCV_RELATIVE | R_RISCV_JUMP_SLOT | R_RISCV_TLS_DTPMOD64 | R_RISCV_TLS_DTPREL64
             | R_RISCV_TLS_TPREL64 => 8,
             R_RISCV_TLS_DTPMOD32 | R_RISCV_TLS_DTPREL32 | R_RISCV_TLS_TPREL32 | R_RISCV_COPY => 4,
@@ -933,6 +936,16 @@ impl RelocationHandler for RiscV64RelocationHandler {
                 let existing = read_le(section_data, offset, 8);
                 let sa = compute_absolute(s, a);
                 write_le(section_data, offset, 8, existing.wrapping_sub(sa));
+                Ok(())
+            }
+
+            // R_RISCV_SUB6: V - (S + A) — subtract lower 6 bits
+            R_RISCV_SUB6 => {
+                let existing = section_data[offset];
+                let sa = compute_absolute(s, a) as u8;
+                // Subtract from the lower 6 bits, preserving the upper 2 bits.
+                let low6 = (existing & 0x3F).wrapping_sub(sa & 0x3F) & 0x3F;
+                section_data[offset] = (existing & 0xC0) | low6;
                 Ok(())
             }
 

@@ -582,6 +582,8 @@ pub fn is_integer_type(ty: &CType) -> bool {
         resolve_and_strip(ty),
         CType::Bool
             | CType::Char
+            | CType::SChar
+            | CType::UChar
             | CType::Short
             | CType::UShort
             | CType::Int
@@ -655,7 +657,7 @@ pub fn integer_rank(ty: &CType) -> u8 {
     let resolved = resolve_and_strip(ty);
     match resolved {
         CType::Bool => 1,
-        CType::Char => 2,
+        CType::Char | CType::SChar | CType::UChar => 2,
         CType::Short | CType::UShort => 3,
         CType::Int | CType::UInt => 4,
         CType::Long | CType::ULong => 5,
@@ -762,9 +764,10 @@ pub fn usual_arithmetic_conversion(lhs: &CType, rhs: &CType) -> CType {
 /// are returned unchanged.
 fn integer_promote(ty: &CType) -> CType {
     match ty {
-        CType::Bool | CType::Char | CType::Short => CType::Int,
-        CType::UShort => {
-            // unsigned short fits in int on all targets (int is always 32-bit).
+        CType::Bool | CType::Char | CType::SChar | CType::Short => CType::Int,
+        CType::UChar | CType::UShort => {
+            // unsigned char and unsigned short fit in int on all targets
+            // (int is always 32-bit).
             CType::Int
         }
         CType::Enum {
@@ -811,6 +814,8 @@ fn is_integer_type_inner(ty: &CType) -> bool {
         ty,
         CType::Bool
             | CType::Char
+            | CType::SChar
+            | CType::UChar
             | CType::Short
             | CType::UShort
             | CType::Int
