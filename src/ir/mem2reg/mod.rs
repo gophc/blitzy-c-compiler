@@ -62,10 +62,10 @@
 // Submodule declarations — all public for crate-wide access
 // ============================================================================
 
-pub mod dominator_tree;
 pub mod dominance_frontier;
-pub mod ssa_builder;
+pub mod dominator_tree;
 pub mod phi_eliminate;
+pub mod ssa_builder;
 
 // ============================================================================
 // Re-export Phase 9 entry point for convenient crate-wide access
@@ -766,7 +766,7 @@ mod tests {
         // call @foo(%1)  — address escapes via function argument
         let call = Instruction::Call {
             result: Value(2),
-            callee: Value(10), // some function
+            callee: Value(10),    // some function
             args: vec![Value(1)], // alloca passed as argument
             return_type: IrType::Void,
             span: Span::dummy(),
@@ -1044,8 +1044,7 @@ mod tests {
         module.functions.push(func);
 
         // Add a declaration (should be skipped).
-        let mut decl_func =
-            IrFunction::new("extern_fn".to_string(), vec![], IrType::Void);
+        let mut decl_func = IrFunction::new("extern_fn".to_string(), vec![], IrType::Void);
         decl_func.is_definition = false;
         decl_func.blocks.clear();
         module.functions.push(decl_func);
@@ -1088,9 +1087,11 @@ mod tests {
         // After mem2reg, bb3 should have a phi node merging the values
         // from bb1 and bb2.
 
-        let params = vec![
-            FunctionParam::new("param".to_string(), IrType::I32, Value(0)),
-        ];
+        let params = vec![FunctionParam::new(
+            "param".to_string(),
+            IrType::I32,
+            Value(0),
+        )];
         let mut func = IrFunction::new("ifelse".to_string(), params, IrType::I32);
         func.value_count = 1;
 
