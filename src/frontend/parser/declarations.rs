@@ -133,8 +133,8 @@ pub fn parse_declaration_specifiers(parser: &mut Parser<'_>) -> Result<Declarati
             }
             // __attribute__ — parse and collect
             TokenKind::Attribute => {
-                let attr = attributes::parse_attribute_specifier(parser)?;
-                attrs.push(attr);
+                let attr_list = attributes::parse_attribute_specifier(parser)?;
+                attrs.extend(attr_list);
             }
             // Identifier that is a typedef name
             TokenKind::Identifier(sym) => {
@@ -181,7 +181,7 @@ pub fn parse_declarator(parser: &mut Parser<'_>) -> Result<Declarator, ()> {
     // Parse trailing attributes.
     let mut attrs = Vec::new();
     while parser.check(&TokenKind::Attribute) {
-        attrs.push(attributes::parse_attribute_specifier(parser)?);
+        attrs.extend(attributes::parse_attribute_specifier(parser)?);
     }
 
     let span = parser.make_span(start_span);
@@ -388,7 +388,7 @@ fn parse_struct_or_union_specifier(parser: &mut Parser<'_>) -> Result<TypeSpecif
     // Optional attributes before tag.
     let mut pre_attrs = Vec::new();
     while parser.check(&TokenKind::Attribute) {
-        pre_attrs.push(attributes::parse_attribute_specifier(parser)?);
+        pre_attrs.extend(attributes::parse_attribute_specifier(parser)?);
     }
 
     // Optional tag name.
@@ -418,7 +418,7 @@ fn parse_struct_or_union_specifier(parser: &mut Parser<'_>) -> Result<TypeSpecif
 
     // Optional attributes after body.
     while parser.check(&TokenKind::Attribute) {
-        pre_attrs.push(attributes::parse_attribute_specifier(parser)?);
+        pre_attrs.extend(attributes::parse_attribute_specifier(parser)?);
     }
 
     let span = parser.make_span(start_span);
@@ -500,7 +500,7 @@ fn parse_struct_member(parser: &mut Parser<'_>) -> Result<StructMember, ()> {
     // Optional attributes after declarators.
     let mut member_attrs = Vec::new();
     while parser.check(&TokenKind::Attribute) {
-        member_attrs.push(attributes::parse_attribute_specifier(parser)?);
+        member_attrs.extend(attributes::parse_attribute_specifier(parser)?);
     }
 
     parser.expect(TokenKind::Semicolon)?;
@@ -592,7 +592,7 @@ fn parse_specifier_qualifier_list(parser: &mut Parser<'_>) -> Result<SpecifierQu
                 type_specifiers.push(spec);
             }
             TokenKind::Attribute => {
-                attrs.push(attributes::parse_attribute_specifier(parser)?);
+                attrs.extend(attributes::parse_attribute_specifier(parser)?);
             }
             TokenKind::Extension => {
                 parser.advance();
@@ -631,7 +631,7 @@ fn parse_enum_specifier(parser: &mut Parser<'_>) -> Result<TypeSpecifier, ()> {
     // Optional attributes.
     let mut attrs = Vec::new();
     while parser.check(&TokenKind::Attribute) {
-        attrs.push(attributes::parse_attribute_specifier(parser)?);
+        attrs.extend(attributes::parse_attribute_specifier(parser)?);
     }
 
     // Optional tag name.
