@@ -11,3 +11,4 @@
 pub mod dominance_frontier;
 pub mod dominator_tree;
 pub mod phi_eliminate;
+pub mod ssa_builder;
