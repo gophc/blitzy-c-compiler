@@ -2,3 +2,4 @@
 
 pub mod attribute_handler;
 pub mod constant_eval;
+pub mod initializer;
