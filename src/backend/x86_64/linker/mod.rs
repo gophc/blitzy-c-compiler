@@ -30,36 +30,24 @@ pub mod relocations;
 // Imports — crate-internal only (zero external crate dependencies)
 // ---------------------------------------------------------------------------
 
-use crate::common::target::Target;
-use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::diagnostics::{DiagnosticEngine, Span};
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use crate::common::target::Target;
 
-use crate::backend::linker_common::{
-    LinkerConfig, LinkerInput, LinkerOutput, OutputType,
-};
-use crate::backend::linker_common::symbol_resolver::{
-    SymbolResolver, ResolvedSymbol, SHN_UNDEF,
-};
-use crate::backend::linker_common::section_merger::{
-    SectionMerger, OutputSection,
-};
-use crate::backend::linker_common::relocation::{
-    RelocationCollector, RelocationHandler,
-    resolve_relocations, apply_all_relocations, annotate_relocations,
-    build_input_to_output_map,
+use crate::backend::elf_writer_common::{
+    Elf64ProgramHeader, ElfSymbol, ElfWriter, Section, ET_DYN, ET_EXEC, PT_DYNAMIC, PT_GNU_STACK,
+    PT_INTERP, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHT_DYNAMIC, SHT_DYNSYM, SHT_GNU_HASH,
+    SHT_NOBITS, SHT_PROGBITS, SHT_RELA, SHT_STRTAB,
 };
 use crate::backend::linker_common::dynamic::DynamicLinkContext;
-use crate::backend::linker_common::linker_script::{
-    DefaultLinkerScript, InputSectionInfo,
+use crate::backend::linker_common::linker_script::{DefaultLinkerScript, InputSectionInfo};
+use crate::backend::linker_common::relocation::{
+    annotate_relocations, apply_all_relocations, build_input_to_output_map, resolve_relocations,
+    RelocationCollector, RelocationHandler,
 };
-use crate::backend::elf_writer_common::{
-    ElfWriter, ElfSymbol, Section, Elf64ProgramHeader,
-    ET_EXEC, ET_DYN,
-    SHT_PROGBITS, SHT_NOBITS, SHT_RELA, SHT_DYNAMIC, SHT_DYNSYM, SHT_STRTAB,
-    SHT_GNU_HASH,
-    SHF_ALLOC, SHF_WRITE, SHF_EXECINSTR,
-    PT_DYNAMIC, PT_INTERP, PT_GNU_STACK,
-};
+use crate::backend::linker_common::section_merger::{OutputSection, SectionMerger};
+use crate::backend::linker_common::symbol_resolver::{ResolvedSymbol, SymbolResolver, SHN_UNDEF};
+use crate::backend::linker_common::{LinkerConfig, LinkerInput, LinkerOutput, OutputType};
 
 // Re-export the x86-64 relocation handler for consumers of this module.
 pub use self::relocations::X86_64RelocationHandler;
@@ -253,10 +241,7 @@ impl X86_64Linker {
     ///
     /// On success, returns a [`LinkerOutput`] containing the serialized ELF
     /// bytes, the resolved entry point, and the output type.
-    pub fn link(
-        &mut self,
-        diagnostics: &mut DiagnosticEngine,
-    ) -> Result<LinkerOutput, String> {
+    pub fn link(&mut self, diagnostics: &mut DiagnosticEngine) -> Result<LinkerOutput, String> {
         // ===================================================================
         // Phase 1: Symbol Resolution
         // ===================================================================
@@ -273,8 +258,9 @@ impl X86_64Linker {
         }
 
         // Check for undefined symbols (fatal for executables).
-        if let Err(undef_errors) =
-            self.symbol_resolver.check_undefined(self.config.allow_undefined)
+        if let Err(undef_errors) = self
+            .symbol_resolver
+            .check_undefined(self.config.allow_undefined)
         {
             for err_msg in &undef_errors {
                 diagnostics.emit_error(Span::dummy(), err_msg.clone());
@@ -297,11 +283,16 @@ impl X86_64Linker {
         // ===================================================================
         // Phase 2: Section Merging
         // ===================================================================
-        let base_address = if self.is_shared { 0u64 } else { DEFAULT_BASE_ADDRESS };
+        let base_address = if self.is_shared {
+            0u64
+        } else {
+            DEFAULT_BASE_ADDRESS
+        };
         let page_alignment = PAGE_SIZE;
 
-        let address_map =
-            self.section_merger.assign_addresses(base_address, page_alignment);
+        let address_map = self
+            .section_merger
+            .assign_addresses(base_address, page_alignment);
         self.section_merger.resolve_fragment_addresses();
 
         // ===================================================================
@@ -309,10 +300,7 @@ impl X86_64Linker {
         // ===================================================================
         let mut section_addr_map: FxHashMap<String, (u64, u64)> = FxHashMap::default();
         for (name, addr_info) in &address_map.section_addresses {
-            section_addr_map.insert(
-                name.clone(),
-                (addr_info.virtual_address, addr_info.size),
-            );
+            section_addr_map.insert(name.clone(), (addr_info.virtual_address, addr_info.size));
         }
         self.symbol_resolver
             .define_linker_symbols(&section_addr_map);
@@ -321,35 +309,29 @@ impl X86_64Linker {
         // Phase 4: Relocation Collection & GOT/PLT Scanning
         // ===================================================================
         let output_sections = self.section_merger.get_ordered_sections();
-        let output_section_vec: Vec<OutputSection> =
-            output_sections.into_iter().cloned().collect();
+        let output_section_vec: Vec<OutputSection> = output_sections.into_iter().cloned().collect();
         let input_to_output_map = build_input_to_output_map(&output_section_vec);
 
         // Collect all relocations from input objects.
         let mut reloc_collector = RelocationCollector::new();
         for input in &self.inputs {
             for (sec_idx, section) in input.sections.iter().enumerate() {
-                let relocs: Vec<crate::backend::linker_common::relocation::Relocation> =
-                    section
-                        .relocations
-                        .iter()
-                        .map(|sr| crate::backend::linker_common::relocation::Relocation {
-                            offset: sr.offset,
-                            symbol_name: String::new(), // resolved below
-                            sym_index: sr.sym_index,
-                            rel_type: sr.rel_type,
-                            addend: sr.addend,
-                            object_id: input.object_id,
-                            section_index: sec_idx as u32,
-                            output_section_name: None,
-                        })
-                        .collect();
+                let relocs: Vec<crate::backend::linker_common::relocation::Relocation> = section
+                    .relocations
+                    .iter()
+                    .map(|sr| crate::backend::linker_common::relocation::Relocation {
+                        offset: sr.offset,
+                        symbol_name: String::new(), // resolved below
+                        sym_index: sr.sym_index,
+                        rel_type: sr.rel_type,
+                        addend: sr.addend,
+                        object_id: input.object_id,
+                        section_index: sec_idx as u32,
+                        output_section_name: None,
+                    })
+                    .collect();
                 if !relocs.is_empty() {
-                    reloc_collector.add_relocations(
-                        input.object_id,
-                        sec_idx as u32,
-                        relocs,
-                    );
+                    reloc_collector.add_relocations(input.object_id, sec_idx as u32, relocs);
                 }
             }
             // Also process top-level relocations from the input.
@@ -358,11 +340,7 @@ impl X86_64Linker {
                 for r in &mut relocs {
                     r.object_id = input.object_id;
                 }
-                reloc_collector.add_relocations(
-                    input.object_id,
-                    0,
-                    relocs,
-                );
+                reloc_collector.add_relocations(input.object_id, 0, relocs);
             }
         }
 
@@ -529,7 +507,10 @@ impl X86_64Linker {
                 Err(e) => {
                     diagnostics.emit_error(Span::dummy(), e);
                     // Fall back to .text start if available.
-                    section_vaddr_map.get(".text").copied().unwrap_or(DEFAULT_BASE_ADDRESS)
+                    section_vaddr_map
+                        .get(".text")
+                        .copied()
+                        .unwrap_or(DEFAULT_BASE_ADDRESS)
                 }
             }
         };
@@ -677,7 +658,11 @@ impl X86_64Linker {
                 .remove(&sec.name)
                 .unwrap_or_else(|| self.section_merger.build_section_data(&sec.name));
 
-            let sh_type = if sec.name == ".bss" { SHT_NOBITS } else { sec.section_type };
+            let sh_type = if sec.name == ".bss" {
+                SHT_NOBITS
+            } else {
+                sec.section_type
+            };
 
             writer.add_section(Section {
                 name: sec.name.clone(),
@@ -1092,7 +1077,10 @@ mod tests {
         assert_eq!(entry[0], 0xff);
         assert_eq!(entry[1], 0x25);
         assert_eq!(entry[6], 0x68);
-        assert_eq!(u32::from_le_bytes([entry[7], entry[8], entry[9], entry[10]]), 42);
+        assert_eq!(
+            u32::from_le_bytes([entry[7], entry[8], entry[9], entry[10]]),
+            42
+        );
         assert_eq!(entry[11], 0xe9);
     }
 

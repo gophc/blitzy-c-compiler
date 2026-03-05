@@ -516,7 +516,6 @@ impl DominatorTree {
 
             // Process all blocks in RPO, skipping the entry.
             for &b in rpo.iter().skip(1) {
-
                 let preds = func.predecessors(b);
                 let mut new_idom = SENTINEL;
 
@@ -561,12 +560,7 @@ impl DominatorTree {
     ///
     /// Builds the children lists from the idom relationships and
     /// packages all data into a [`DominatorTree`].
-    fn finalize(
-        idom_arr: Vec<usize>,
-        n: usize,
-        dfnum: Vec<usize>,
-        rpo: Vec<usize>,
-    ) -> Self {
+    fn finalize(idom_arr: Vec<usize>, n: usize, dfnum: Vec<usize>, rpo: Vec<usize>) -> Self {
         // Build children lists from the idom array.
         let mut children = vec![Vec::new(); n];
         for (block, &dom) in idom_arr.iter().enumerate() {
@@ -803,10 +797,7 @@ impl DominatorTree {
         let mut output = String::with_capacity(self.block_count * 40);
         output.push_str("DominatorTree {\n");
         output.push_str(&format!("  block_count: {}\n", self.block_count));
-        output.push_str(&format!(
-            "  reachable: {}\n",
-            self.dfs_order.len()
-        ));
+        output.push_str(&format!("  reachable: {}\n", self.dfs_order.len()));
 
         // Print idom relationships.
         output.push_str("  idom: [");
@@ -1048,12 +1039,7 @@ impl DominatorTree {
 /// # Returns
 ///
 /// The nearest common dominator of `a` and `b`.
-fn intersect_blocks(
-    idom: &[usize],
-    rpo_pos: &[usize],
-    mut a: usize,
-    mut b: usize,
-) -> usize {
+fn intersect_blocks(idom: &[usize], rpo_pos: &[usize], mut a: usize, mut b: usize) -> usize {
     while a != b {
         // Walk up the chain of the block with the larger RPO position
         // (i.e., the block that appears later in RPO).
@@ -1234,8 +1220,14 @@ mod tests {
     fn test_build_simple_matches_lt() {
         // Complex CFG: 0→1, 0→2, 1→3, 2→3, 3→4, 3→5, 4→6, 5→6
         let edges = &[
-            (0, 1), (0, 2), (1, 3), (2, 3),
-            (3, 4), (3, 5), (4, 6), (5, 6),
+            (0, 1),
+            (0, 2),
+            (1, 3),
+            (2, 3),
+            (3, 4),
+            (3, 5),
+            (4, 6),
+            (5, 6),
         ];
         let func = build_test_function(7, edges);
         let dt_lt = DominatorTree::build(&func);
@@ -1243,8 +1235,12 @@ mod tests {
 
         // Both algorithms should agree on all idom values.
         for i in 0..7 {
-            assert_eq!(dt_lt.idom(i), dt_chk.idom(i),
-                "idom mismatch for block {}", i);
+            assert_eq!(
+                dt_lt.idom(i),
+                dt_chk.idom(i),
+                "idom mismatch for block {}",
+                i
+            );
         }
 
         assert!(dt_lt.validate(&func));
@@ -1301,11 +1297,7 @@ mod tests {
         // Outer loop: 0→1, 1→2, 2→1 (back), 2→3
         // Inner loop in 1: 1→4, 4→1 (back)
         // Exit: 3→5
-        let edges = &[
-            (0, 1), (1, 2), (2, 1), (2, 3),
-            (1, 4), (4, 1),
-            (3, 5),
-        ];
+        let edges = &[(0, 1), (1, 2), (2, 1), (2, 3), (1, 4), (4, 1), (3, 5)];
         let func = build_test_function(6, edges);
         let dt = DominatorTree::build(&func);
 

@@ -117,9 +117,7 @@ fn replace_block_reference_in_terminator(
                 *else_block = new_block;
             }
         }
-        Instruction::Switch {
-            default, cases, ..
-        } => {
+        Instruction::Switch { default, cases, .. } => {
             if *default == old_block {
                 *default = new_block;
             }
@@ -193,10 +191,7 @@ fn replace_value_in_function(func: &mut IrFunction, old_value: Value, new_value:
 /// [`Branch`](Instruction::Branch), [`CondBranch`](Instruction::CondBranch),
 /// [`Switch`](Instruction::Switch), [`Phi`](Instruction::Phi), and
 /// [`InlineAsm`](Instruction::InlineAsm) (goto targets).
-fn update_block_ids_in_instruction(
-    inst: &mut Instruction,
-    index_map: &FxHashMap<usize, usize>,
-) {
+fn update_block_ids_in_instruction(inst: &mut Instruction, index_map: &FxHashMap<usize, usize>) {
     match inst {
         Instruction::Branch { target, .. } => {
             if let Some(&new_idx) = index_map.get(&target.index()) {
@@ -215,9 +210,7 @@ fn update_block_ids_in_instruction(
                 *else_block = BlockId(new_idx as u32);
             }
         }
-        Instruction::Switch {
-            default, cases, ..
-        } => {
+        Instruction::Switch { default, cases, .. } => {
             if let Some(&new_idx) = index_map.get(&default.index()) {
                 *default = BlockId(new_idx as u32);
             }
@@ -406,10 +399,8 @@ fn simplify_trivial_phis(func: &mut IrFunction) -> bool {
         }
 
         // Remove the now-dead phi instructions.
-        let trivial_results: FxHashSet<Value> = trivial_phis
-            .iter()
-            .map(|&(result, _)| result)
-            .collect();
+        let trivial_results: FxHashSet<Value> =
+            trivial_phis.iter().map(|&(result, _)| result).collect();
         for block in func.blocks_mut() {
             block.instructions.retain(|inst| {
                 if let Some(result) = inst.result() {
@@ -543,11 +534,7 @@ fn merge_blocks(func: &mut IrFunction) -> bool {
             for &s_idx in &b_succs {
                 if s_idx < num_blocks && !removed.contains(&s_idx) {
                     for inst in func.blocks[s_idx].instructions_mut().iter_mut() {
-                        replace_phi_predecessor(
-                            inst,
-                            BlockId(b_idx as u32),
-                            BlockId(a_idx as u32),
-                        );
+                        replace_phi_predecessor(inst, BlockId(b_idx as u32), BlockId(a_idx as u32));
                     }
                 }
             }
@@ -687,9 +674,7 @@ fn eliminate_empty_blocks(func: &mut IrFunction) -> bool {
                         if block_ref == BlockId(e_idx as u32) {
                             // Expand the single E-entry into per-predecessor entries.
                             for &p_idx in &e_preds {
-                                let resolved = if let Some(pred_map) =
-                                    phi_resolution.get(&val)
-                                {
+                                let resolved = if let Some(pred_map) = phi_resolution.get(&val) {
                                     // val is a phi result in E — look up what E's phi
                                     // would produce when coming from P.
                                     pred_map.get(&p_idx).copied().unwrap_or(val)
@@ -925,7 +910,8 @@ fn propagate_phi_for_chain(
 
     // Apply additions.
     for (inst_idx, val, block_ref) in additions {
-        if let Instruction::Phi { incoming, .. } = &mut func.blocks[final_target].instructions[inst_idx]
+        if let Instruction::Phi { incoming, .. } =
+            &mut func.blocks[final_target].instructions[inst_idx]
         {
             // Only add if not already present from this predecessor.
             if !incoming.iter().any(|&(_, b)| b == block_ref) {

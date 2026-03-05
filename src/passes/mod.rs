@@ -6,5 +6,6 @@
 // Individual optimization passes — declared for module compilation.
 // Full module documentation and re-exports will be provided by the mod.rs agent.
 
+pub mod constant_folding;
 pub mod dead_code_elimination;
 pub mod simplify_cfg;
