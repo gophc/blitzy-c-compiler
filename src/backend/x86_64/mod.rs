@@ -3,4 +3,5 @@
 //!
 //! This is the PRIMARY validation target in the BCC backend validation order.
 
+pub mod assembler;
 pub mod registers;
