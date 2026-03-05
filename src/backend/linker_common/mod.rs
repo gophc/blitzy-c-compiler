@@ -10,10 +10,13 @@
 //! ## Submodules
 //! - [`dynamic`] — Dynamic linking section generation (.dynamic, .dynsym, .dynstr,
 //!   .gnu.hash, .got, .got.plt, .plt, .rela.dyn, .rela.plt, PT_INTERP, PT_DYNAMIC).
+//! - [`relocation`] — Architecture-agnostic relocation processing framework — collection,
+//!   resolution, and dispatched application of relocations (GOT/PLT, PC-relative, absolute).
 //! - [`section_merger`] — Input section aggregation from multiple object files into output
 //!   sections, with alignment padding, COMDAT group deduplication, and standard section ordering.
 
 pub mod dynamic;
 pub mod linker_script;
+pub mod relocation;
 pub mod section_merger;
 pub mod symbol_resolver;
