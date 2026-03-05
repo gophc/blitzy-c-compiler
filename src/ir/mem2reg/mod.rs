@@ -8,5 +8,6 @@
 //! 3. **SSA builder** — Insert phi nodes and rename variables.
 //! 4. **Phi elimination** — Convert SSA back to register assignments.
 
+pub mod dominance_frontier;
 pub mod dominator_tree;
 pub mod phi_eliminate;
