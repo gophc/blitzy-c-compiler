@@ -9,6 +9,7 @@ pub mod traits;
 pub mod aarch64;
 pub mod dwarf;
 pub mod elf_writer_common;
+pub mod i686;
 pub mod linker_common;
 pub mod register_allocator;
 pub mod riscv64;
