@@ -9,3 +9,4 @@
 //! 4. **Phi elimination** — Convert SSA back to register assignments.
 
 pub mod dominator_tree;
+pub mod phi_eliminate;
