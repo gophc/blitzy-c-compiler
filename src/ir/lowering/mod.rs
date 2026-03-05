@@ -4,4 +4,5 @@
 //! semantically-validated, type-annotated AST into BCC's intermediate representation (IR).
 
 pub mod asm_lowering;
+pub mod decl_lowering;
 pub mod expr_lowering;
