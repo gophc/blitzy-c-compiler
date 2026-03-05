@@ -5,4 +5,5 @@
 //! shared linker infrastructure, and four architecture-specific backends.
 
 pub mod dwarf;
+pub mod elf_writer_common;
 pub mod x86_64;
