@@ -422,11 +422,7 @@ impl SectionMerger {
     ///
     /// Returns an [`AddressMap`] containing the assigned addresses for every
     /// output section.
-    pub fn assign_addresses(
-        &mut self,
-        base_address: u64,
-        page_alignment: u64,
-    ) -> AddressMap {
+    pub fn assign_addresses(&mut self, base_address: u64, page_alignment: u64) -> AddressMap {
         let ordered = self.get_ordered_sections();
         let ordered_names: Vec<String> = ordered.iter().map(|s| s.name.clone()).collect();
 
@@ -558,11 +554,7 @@ impl SectionMerger {
     /// `(output_section_virtual_address, offset_within_output_section)`,
     /// or `None` if the input section was not included (e.g., due to COMDAT
     /// deduplication).
-    pub fn lookup_input_section(
-        &self,
-        object_id: u32,
-        section_index: u32,
-    ) -> Option<(u64, u64)> {
+    pub fn lookup_input_section(&self, object_id: u32, section_index: u32) -> Option<(u64, u64)> {
         for out_sec in self.output_sections.values() {
             for frag in &out_sec.fragments {
                 if frag.input_section_ref.object_id == object_id
@@ -713,10 +705,7 @@ fn segment_class(flags: u64) -> u8 {
 /// 2. Feeds all input sections through COMDAT deduplication and merging.
 /// 3. Returns a [`MergeResult`] with the merged output sections in standard
 ///    ELF ordering and the set of COMDAT groups that were kept.
-pub fn merge_all_sections(
-    target: &Target,
-    input_sections: Vec<InputSection>,
-) -> MergeResult {
+pub fn merge_all_sections(target: &Target, input_sections: Vec<InputSection>) -> MergeResult {
     let mut merger = SectionMerger::new(*target);
 
     for section in input_sections {
@@ -924,10 +913,7 @@ mod tests {
         merger.add_input_section(s2);
 
         // Only one fragment should exist (second COMDAT is deduplicated).
-        let out = merger
-            .output_sections
-            .get(".text._ZN3fooEv")
-            .unwrap();
+        let out = merger.output_sections.get(".text._ZN3fooEv").unwrap();
         assert_eq!(out.fragments.len(), 1);
         assert_eq!(out.fragments[0].input_section_ref.object_id, 0);
     }
@@ -1161,15 +1147,7 @@ mod tests {
         let mut merger = SectionMerger::new(Target::X86_64);
 
         // First: only SHF_ALLOC.
-        let s1 = make_input_section(
-            ".custom",
-            SHT_PROGBITS,
-            SHF_ALLOC,
-            vec![0; 4],
-            4,
-            0,
-            1,
-        );
+        let s1 = make_input_section(".custom", SHT_PROGBITS, SHF_ALLOC, vec![0; 4], 4, 0, 1);
         // Second: SHF_ALLOC | SHF_WRITE.
         let s2 = make_input_section(
             ".custom",

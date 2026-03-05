@@ -731,10 +731,7 @@ impl StringTable {
         let mut map = FxHashMap::default();
         // The empty string maps to offset 0 (the initial null byte).
         map.insert(String::new(), 0);
-        Self {
-            data: vec![0],
-            map,
-        }
+        Self { data: vec![0], map }
     }
 
     /// Add a string to the table, returning its byte offset.
@@ -870,7 +867,9 @@ impl SymbolTable {
     ///
     /// This value is stored in `sh_info` of the `.symtab` section header.
     pub fn first_global_index(&self) -> u32 {
-        let num_locals = self.symbols.iter()
+        let num_locals = self
+            .symbols
+            .iter()
             .filter(|s| s.binding == STB_LOCAL)
             .count();
         // +1 for the null symbol at index 0
@@ -1200,8 +1199,7 @@ impl ElfWriter {
         let mut shstrtab = StringTable::new();
 
         // Reserve name offsets for all sections (including null at index 0).
-        let mut section_name_offsets: Vec<u32> =
-            Vec::with_capacity(self.sections.len() + 4);
+        let mut section_name_offsets: Vec<u32> = Vec::with_capacity(self.sections.len() + 4);
         section_name_offsets.push(shstrtab.add_string("")); // null section
 
         for sec in &self.sections {
@@ -1241,8 +1239,7 @@ impl ElfWriter {
         }
 
         // Track (file_offset, logical_size) for every section.
-        let mut section_file_offsets: Vec<(u64, u64)> =
-            Vec::with_capacity(total_sections);
+        let mut section_file_offsets: Vec<(u64, u64)> = Vec::with_capacity(total_sections);
         section_file_offsets.push((0, 0)); // null section
 
         for sec in &self.sections {
@@ -1259,26 +1256,22 @@ impl ElfWriter {
         // .symtab — aligned to pointer width
         let ptr_align = ptr_width;
         current_offset = align_up(current_offset, ptr_align);
-        section_file_offsets
-            .push((current_offset as u64, sym_bytes.len() as u64));
+        section_file_offsets.push((current_offset as u64, sym_bytes.len() as u64));
         current_offset += sym_bytes.len();
 
         // .strtab — alignment 1
-        section_file_offsets
-            .push((current_offset as u64, strtab_bytes.len() as u64));
+        section_file_offsets.push((current_offset as u64, strtab_bytes.len() as u64));
         current_offset += strtab_bytes.len();
 
         // .shstrtab — alignment 1
-        section_file_offsets
-            .push((current_offset as u64, shstrtab_bytes.len() as u64));
+        section_file_offsets.push((current_offset as u64, shstrtab_bytes.len() as u64));
         current_offset += shstrtab_bytes.len();
 
         // Section header table — aligned to pointer width
         current_offset = align_up(current_offset, ptr_align);
         let shdr_table_offset = current_offset;
 
-        let total_file_size =
-            shdr_table_offset + total_sections * shdr_entry_size;
+        let total_file_size = shdr_table_offset + total_sections * shdr_entry_size;
 
         // -----------------------------------------------------------------
         // Phase 4: Write ELF header
@@ -1351,11 +1344,17 @@ impl ElfWriter {
         }
 
         // Write .symtab data
-        pad_to(&mut buf, section_file_offsets[symtab_section_idx].0 as usize);
+        pad_to(
+            &mut buf,
+            section_file_offsets[symtab_section_idx].0 as usize,
+        );
         buf.extend_from_slice(&sym_bytes);
 
         // Write .strtab data
-        pad_to(&mut buf, section_file_offsets[strtab_section_idx].0 as usize);
+        pad_to(
+            &mut buf,
+            section_file_offsets[strtab_section_idx].0 as usize,
+        );
         buf.extend_from_slice(&strtab_bytes);
 
         // Write .shstrtab data
@@ -1453,12 +1452,7 @@ impl ElfWriter {
 
     /// Internal helper: write a section header entry, dispatching between
     /// 64-bit and 32-bit formats based on target.
-    fn write_shdr(
-        &self,
-        buf: &mut Vec<u8>,
-        is_64: bool,
-        shdr: &Elf64SectionHeader,
-    ) {
+    fn write_shdr(&self, buf: &mut Vec<u8>, is_64: bool, shdr: &Elf64SectionHeader) {
         if is_64 {
             buf.extend_from_slice(&shdr.to_bytes());
         } else {

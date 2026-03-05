@@ -98,7 +98,11 @@ impl Span {
     /// Create a new span covering `[start, end)` in file `file_id`.
     #[inline]
     pub fn new(file_id: u32, start: u32, end: u32) -> Self {
-        Span { file_id, start, end }
+        Span {
+            file_id,
+            start,
+            end,
+        }
     }
 
     /// Create a **dummy span** — all fields zero — for compiler-generated
@@ -488,7 +492,10 @@ impl DiagnosticEngine {
         // Print fix suggestion if present.
         if let Some(ref fix) = diag.fix_suggestion {
             if fix.span.is_dummy() {
-                eprintln!("  fix: {} (replace with '{}')", fix.message, fix.replacement);
+                eprintln!(
+                    "  fix: {} (replace with '{}')",
+                    fix.message, fix.replacement
+                );
             } else {
                 let location_str =
                     source_map.format_span(fix.span.file_id, fix.span.start, fix.span.end);
@@ -686,8 +693,11 @@ mod tests {
 
     #[test]
     fn test_diagnostic_with_fix() {
-        let d = Diagnostic::error(Span::new(0, 0, 3), "typo")
-            .with_fix(Span::new(0, 0, 3), "foo", "replace with 'foo'");
+        let d = Diagnostic::error(Span::new(0, 0, 3), "typo").with_fix(
+            Span::new(0, 0, 3),
+            "foo",
+            "replace with 'foo'",
+        );
         assert!(d.fix_suggestion.is_some());
         let fix = d.fix_suggestion.unwrap();
         assert_eq!(fix.replacement, "foo");
@@ -889,8 +899,11 @@ mod tests {
 
         let mut engine = DiagnosticEngine::new();
         engine.emit(
-            Diagnostic::error(Span::new(fid, 8, 9), "expected expression")
-                .with_fix(Span::new(fid, 8, 8), "0", "insert '0'"),
+            Diagnostic::error(Span::new(fid, 8, 9), "expected expression").with_fix(
+                Span::new(fid, 8, 8),
+                "0",
+                "insert '0'",
+            ),
         );
         engine.print_all(&sm);
         assert_eq!(engine.error_count(), 1);

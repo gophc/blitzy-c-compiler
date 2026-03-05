@@ -251,10 +251,7 @@ fn assert_wall_clock_ceiling(target_name: &str, bcc_time: Duration, gcc_time: Op
 
 /// Performs a `make clean` in the given directory, ignoring errors.
 fn make_clean(dir: &Path) {
-    let _ = Command::new("make")
-        .arg("clean")
-        .current_dir(dir)
-        .output();
+    let _ = Command::new("make").arg("clean").current_dir(dir).output();
 }
 
 /// Creates a temporary build directory and returns its path.
@@ -405,9 +402,7 @@ fn test_sqlite_basic_operations() {
     let shell_c = src_dir.join("shell.c");
 
     if !sqlite3_c.exists() || !shell_c.exists() {
-        eprintln!(
-            "[checkpoint7] SQLite amalgamation (sqlite3.c + shell.c) not found. Skipping."
-        );
+        eprintln!("[checkpoint7] SQLite amalgamation (sqlite3.c + shell.c) not found. Skipping.");
         return;
     }
 
@@ -585,10 +580,7 @@ fn test_redis_build() {
 
     if !build_result.status.success() {
         let stderr = String::from_utf8_lossy(&build_result.stderr);
-        panic!(
-            "[checkpoint7] Redis BCC build failed:\nstderr: {}",
-            stderr
-        );
+        panic!("[checkpoint7] Redis BCC build failed:\nstderr: {}", stderr);
     }
 
     eprintln!(
@@ -642,9 +634,7 @@ fn test_redis_basic_operations() {
     let redis_cli = src_dir.join("src").join("redis-cli");
 
     if !redis_server.exists() {
-        eprintln!(
-            "[checkpoint7] redis-server not found. Run test_redis_build first. Skipping."
-        );
+        eprintln!("[checkpoint7] redis-server not found. Run test_redis_build first. Skipping.");
         return;
     }
 
@@ -781,10 +771,7 @@ fn test_postgresql_build() {
 
     if !configure_result.status.success() {
         let stderr = String::from_utf8_lossy(&configure_result.stderr);
-        eprintln!(
-            "[checkpoint7] PostgreSQL configure failed:\n{}",
-            stderr
-        );
+        eprintln!("[checkpoint7] PostgreSQL configure failed:\n{}", stderr);
         panic!("PostgreSQL configure with BCC failed");
     }
 
@@ -860,7 +847,11 @@ fn test_postgresql_basic_operations() {
 
     // Check if postgres binary was built
     let postgres_bin = src_dir.join("src").join("backend").join("postgres");
-    let initdb_bin = src_dir.join("src").join("bin").join("initdb").join("initdb");
+    let initdb_bin = src_dir
+        .join("src")
+        .join("bin")
+        .join("initdb")
+        .join("initdb");
 
     if !postgres_bin.exists() {
         eprintln!(
@@ -880,16 +871,12 @@ fn test_postgresql_basic_operations() {
             .output();
 
         if init_result.is_err() || !init_result.as_ref().unwrap().status.success() {
-            eprintln!(
-                "[checkpoint7] PostgreSQL initdb failed. Skipping operations test."
-            );
+            eprintln!("[checkpoint7] PostgreSQL initdb failed. Skipping operations test.");
             let _ = fs::remove_dir_all(&data_dir);
             return;
         }
     } else {
-        eprintln!(
-            "[checkpoint7] initdb binary not found. Skipping PostgreSQL operations."
-        );
+        eprintln!("[checkpoint7] initdb binary not found. Skipping PostgreSQL operations.");
         let _ = fs::remove_dir_all(&data_dir);
         return;
     }
@@ -901,10 +888,7 @@ fn test_postgresql_basic_operations() {
     {
         Ok(child) => child,
         Err(e) => {
-            eprintln!(
-                "[checkpoint7] Failed to start PostgreSQL: {}. Skipping.",
-                e
-            );
+            eprintln!("[checkpoint7] Failed to start PostgreSQL: {}. Skipping.", e);
             let _ = fs::remove_dir_all(&data_dir);
             return;
         }
@@ -959,16 +943,10 @@ fn test_postgresql_basic_operations() {
         }
         Ok(ref output) => {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            eprintln!(
-                "[checkpoint7] PostgreSQL query failed: {}",
-                stderr
-            );
+            eprintln!("[checkpoint7] PostgreSQL query failed: {}", stderr);
         }
         Err(e) => {
-            eprintln!(
-                "[checkpoint7] Failed to run psql: {}. Skipping.",
-                e
-            );
+            eprintln!("[checkpoint7] Failed to run psql: {}. Skipping.", e);
         }
     }
 
@@ -1083,10 +1061,7 @@ fn test_ffmpeg_build() {
 
     if !build_result.status.success() {
         let stderr = String::from_utf8_lossy(&build_result.stderr);
-        panic!(
-            "[checkpoint7] FFmpeg BCC build failed:\nstderr: {}",
-            stderr
-        );
+        panic!("[checkpoint7] FFmpeg BCC build failed:\nstderr: {}", stderr);
     }
 
     eprintln!(
@@ -1163,10 +1138,7 @@ fn test_ffmpeg_basic_operations() {
     let ffmpeg_path = if ffmpeg_bin.exists() {
         ffmpeg_bin.to_string_lossy().into_owned()
     } else {
-        src_dir
-            .join("ffmpeg_g")
-            .to_string_lossy()
-            .into_owned()
+        src_dir.join("ffmpeg_g").to_string_lossy().into_owned()
     };
 
     // Generate a simple test audio file (silence) and transcode it
@@ -1200,29 +1172,17 @@ fn test_ffmpeg_basic_operations() {
                 Ok(ref out) if out.status.success() => {
                     // Verify output file exists and has non-zero size
                     let metadata_result = fs::metadata(output_str);
-                    assert!(
-                        metadata_result.is_ok(),
-                        "FFmpeg output file should exist"
-                    );
+                    assert!(metadata_result.is_ok(), "FFmpeg output file should exist");
                     let meta = metadata_result.unwrap();
-                    assert!(
-                        meta.len() > 0,
-                        "FFmpeg output file should be non-empty"
-                    );
+                    assert!(meta.len() > 0, "FFmpeg output file should be non-empty");
                     eprintln!("[checkpoint7] FFmpeg basic operations: PASS");
                 }
                 Ok(ref out) => {
                     let stderr = String::from_utf8_lossy(&out.stderr);
-                    eprintln!(
-                        "[checkpoint7] FFmpeg transcode failed: {}",
-                        stderr
-                    );
+                    eprintln!("[checkpoint7] FFmpeg transcode failed: {}", stderr);
                 }
                 Err(e) => {
-                    eprintln!(
-                        "[checkpoint7] Failed to run ffmpeg transcode: {}",
-                        e
-                    );
+                    eprintln!("[checkpoint7] Failed to run ffmpeg transcode: {}", e);
                 }
             }
         }
@@ -1235,10 +1195,7 @@ fn test_ffmpeg_basic_operations() {
             );
         }
         Err(e) => {
-            eprintln!(
-                "[checkpoint7] Failed to run ffmpeg: {}. Skipping.",
-                e
-            );
+            eprintln!("[checkpoint7] Failed to run ffmpeg: {}. Skipping.", e);
         }
     }
 
@@ -1261,9 +1218,7 @@ fn test_sqlite_cross_compile_aarch64() {
     let src_dir = match locate_sqlite_source() {
         Some(d) => d,
         None => {
-            eprintln!(
-                "[checkpoint7] SQLite source not found. Skipping cross-arch test."
-            );
+            eprintln!("[checkpoint7] SQLite source not found. Skipping cross-arch test.");
             return;
         }
     };
@@ -1317,9 +1272,7 @@ fn test_sqlite_cross_compile_riscv64() {
     let src_dir = match locate_sqlite_source() {
         Some(d) => d,
         None => {
-            eprintln!(
-                "[checkpoint7] SQLite source not found. Skipping cross-arch test."
-            );
+            eprintln!("[checkpoint7] SQLite source not found. Skipping cross-arch test.");
             return;
         }
     };
@@ -1545,9 +1498,7 @@ fn test_stretch_performance_summary() {
     eprintln!("--------------------------------------------------------");
 
     if measurements.is_empty() {
-        eprintln!(
-            "\n  No stretch targets available for performance measurement."
-        );
+        eprintln!("\n  No stretch targets available for performance measurement.");
         eprintln!(
             "  Set environment variables (SQLITE_SRC_DIR, REDIS_SRC_DIR, etc.)\n  \
              to enable performance testing."
