@@ -203,12 +203,7 @@ impl SsaRenamer {
     /// 4. Fill phi-node operands in successor blocks.
     /// 5. Recursively rename dominator tree children.
     /// 6. Pop definitions to restore stacks to pre-block state.
-    fn rename_block(
-        &mut self,
-        func: &mut IrFunction,
-        block_idx: usize,
-        dom_tree: &DominatorTree,
-    ) {
+    fn rename_block(&mut self, func: &mut IrFunction, block_idx: usize, dom_tree: &DominatorTree) {
         // Guard against out-of-bounds (should not happen with a valid
         // dominator tree, but defensive coding costs nothing).
         if block_idx >= func.block_count() {
@@ -685,8 +680,7 @@ mod tests {
         // No phi nodes needed for a single-block function.
         let phi_locations: FxHashSet<(usize, Value)> = FxHashSet::default();
         let vc = func.value_count;
-        let (phi_map, next_val) =
-            insert_phi_nodes(&mut func, &phi_locations, &alloca_types, vc);
+        let (phi_map, next_val) = insert_phi_nodes(&mut func, &phi_locations, &alloca_types, vc);
 
         assert!(phi_map.is_empty());
         assert_eq!(next_val, 3);
@@ -737,8 +731,7 @@ mod tests {
         let mut phi_locations: FxHashSet<(usize, Value)> = FxHashSet::default();
         phi_locations.insert((1, Value(1)));
 
-        let (phi_map, next_val) =
-            insert_phi_nodes(&mut func, &phi_locations, &alloca_types, 2);
+        let (phi_map, next_val) = insert_phi_nodes(&mut func, &phi_locations, &alloca_types, 2);
 
         assert_eq!(phi_map.len(), 1);
         assert!(phi_map.contains_key(&(1, Value(1))));

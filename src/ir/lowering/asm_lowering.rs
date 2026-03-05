@@ -253,8 +253,27 @@ fn validate_constraint(
         // Architecture-specific validation
         let valid = match target {
             Target::X86_64 | Target::I686 => {
-                matches!(ch, 'a' | 'b' | 'c' | 'd' | 'S' | 'D' | 'A' | 'q' | 'Q'
-                    | 'R' | 'l' | 'f' | 't' | 'u' | 'y' | 'x' | 'Y' | 'e' | 'Z')
+                matches!(
+                    ch,
+                    'a' | 'b'
+                        | 'c'
+                        | 'd'
+                        | 'S'
+                        | 'D'
+                        | 'A'
+                        | 'q'
+                        | 'Q'
+                        | 'R'
+                        | 'l'
+                        | 'f'
+                        | 't'
+                        | 'u'
+                        | 'y'
+                        | 'x'
+                        | 'Y'
+                        | 'e'
+                        | 'Z'
+                )
             }
             Target::AArch64 => {
                 matches!(ch, 'w' | 'x' | 'z' | 'Q' | 'U')
@@ -480,10 +499,7 @@ pub fn lower_inline_asm(
     }
 
     // ---- 7. Build named operand map and resolve template ----------------
-    let named_map = build_named_operand_map_from_strs(
-        named_operand_strs,
-        asm_stmt.outputs.len(),
-    );
+    let named_map = build_named_operand_map_from_strs(named_operand_strs, asm_stmt.outputs.len());
     let processed_template = analyze_template(&template_raw, &named_map);
 
     // ---- 8. Handle read-write ('+') outputs — load current value --------
@@ -524,10 +540,7 @@ pub fn lower_inline_asm(
     all_operand_values.extend_from_slice(&read_write_input_values);
 
     // ---- 9. Build the concatenated constraint string --------------------
-    let constraints_string = build_constraints_string(
-        &output_constraints,
-        &input_constraints,
-    );
+    let constraints_string = build_constraints_string(&output_constraints, &input_constraints);
 
     // ---- 10. Determine side-effect flags --------------------------------
     let has_memory_clobber = clobbers.iter().any(|c| c == "memory");
@@ -683,24 +696,23 @@ fn validate_clobber_register(name: &str, target: &Target) -> bool {
 fn is_valid_x86_64_register(name: &str) -> bool {
     // 64-bit GPRs
     let gpr64 = [
-        "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
-        "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+        "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "r8", "r9", "r10", "r11", "r12",
+        "r13", "r14", "r15",
     ];
     // 32-bit GPR aliases
     let gpr32 = [
-        "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp",
-        "r8d", "r9d", "r10d", "r11d", "r12d", "r13d", "r14d", "r15d",
+        "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp", "r8d", "r9d", "r10d", "r11d",
+        "r12d", "r13d", "r14d", "r15d",
     ];
     // 16-bit GPR aliases
     let gpr16 = [
-        "ax", "bx", "cx", "dx", "si", "di", "bp", "sp",
-        "r8w", "r9w", "r10w", "r11w", "r12w", "r13w", "r14w", "r15w",
+        "ax", "bx", "cx", "dx", "si", "di", "bp", "sp", "r8w", "r9w", "r10w", "r11w", "r12w",
+        "r13w", "r14w", "r15w",
     ];
     // 8-bit GPR aliases
     let gpr8 = [
-        "al", "bl", "cl", "dl", "sil", "dil", "bpl", "spl",
-        "ah", "bh", "ch", "dh",
-        "r8b", "r9b", "r10b", "r11b", "r12b", "r13b", "r14b", "r15b",
+        "al", "bl", "cl", "dl", "sil", "dil", "bpl", "spl", "ah", "bh", "ch", "dh", "r8b", "r9b",
+        "r10b", "r11b", "r12b", "r13b", "r14b", "r15b",
     ];
     // SSE/AVX registers
     let sse: Vec<String> = (0..16).map(|i| format!("xmm{}", i)).collect();
@@ -712,8 +724,11 @@ fn is_valid_x86_64_register(name: &str) -> bool {
         || gpr8.contains(&name)
         || sse.iter().any(|r| r == name)
         || avx.iter().any(|r| r == name)
-        || name == "st" || name.starts_with("st(")
-        || name == "flags" || name == "fpsr" || name == "fpcr"
+        || name == "st"
+        || name.starts_with("st(")
+        || name == "flags"
+        || name == "fpsr"
+        || name == "fpcr"
         || name == "dirflag"
 }
 
@@ -728,8 +743,11 @@ fn is_valid_i686_register(name: &str) -> bool {
         || gpr16.contains(&name)
         || gpr8.contains(&name)
         || sse.iter().any(|r| r == name)
-        || name == "st" || name.starts_with("st(")
-        || name == "flags" || name == "fpsr" || name == "fpcr"
+        || name == "st"
+        || name.starts_with("st(")
+        || name == "flags"
+        || name == "fpsr"
+        || name == "fpcr"
         || name == "dirflag"
 }
 
@@ -776,17 +794,14 @@ fn is_valid_riscv64_register(name: &str) -> bool {
     }
     // ABI names for integer registers
     let abi_int = [
-        "zero", "ra", "sp", "gp", "tp",
-        "t0", "t1", "t2", "t3", "t4", "t5", "t6",
-        "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11",
-        "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7",
+        "zero", "ra", "sp", "gp", "tp", "t0", "t1", "t2", "t3", "t4", "t5", "t6", "s0", "s1", "s2",
+        "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11", "a0", "a1", "a2", "a3", "a4", "a5",
+        "a6", "a7",
     ];
     // ABI names for FP registers
     let abi_fp = [
-        "ft0", "ft1", "ft2", "ft3", "ft4", "ft5", "ft6", "ft7",
-        "ft8", "ft9", "ft10", "ft11",
-        "fs0", "fs1", "fs2", "fs3", "fs4", "fs5", "fs6", "fs7",
-        "fs8", "fs9", "fs10", "fs11",
+        "ft0", "ft1", "ft2", "ft3", "ft4", "ft5", "ft6", "ft7", "ft8", "ft9", "ft10", "ft11",
+        "fs0", "fs1", "fs2", "fs3", "fs4", "fs5", "fs6", "fs7", "fs8", "fs9", "fs10", "fs11",
         "fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7",
     ];
 
@@ -855,10 +870,7 @@ fn wire_asm_goto_targets(
 /// `.pushsection`/`.popsection` directives within the template are
 /// preserved as-is — they are processed by the built-in assembler during
 /// code generation, not during IR lowering.
-fn analyze_template(
-    template: &str,
-    named_operands: &FxHashMap<String, usize>,
-) -> String {
+fn analyze_template(template: &str, named_operands: &FxHashMap<String, usize>) -> String {
     let mut result = String::with_capacity(template.len());
     let mut chars = template.chars().peekable();
 
@@ -1010,10 +1022,7 @@ pub fn build_named_operand_map(
 /// Output constraints come first, then input constraints, comma-separated:
 /// `"=r,=m,r,i"` for two outputs (register and memory) and two inputs
 /// (register and immediate).
-fn build_constraints_string(
-    outputs: &[AsmConstraint],
-    inputs: &[AsmConstraint],
-) -> String {
+fn build_constraints_string(outputs: &[AsmConstraint], inputs: &[AsmConstraint]) -> String {
     let mut parts: Vec<String> = Vec::with_capacity(outputs.len() + inputs.len());
 
     for c in outputs {
@@ -1071,7 +1080,11 @@ fn infer_ir_type_for_constraint(constraint: &AsmConstraint, target: &Target) -> 
     let code = &constraint.constraint_code;
 
     if code.is_empty() {
-        return if target.is_64bit() { IrType::I64 } else { IrType::I32 };
+        return if target.is_64bit() {
+            IrType::I64
+        } else {
+            IrType::I32
+        };
     }
 
     let first_char = code.chars().next().unwrap_or('r');
@@ -1238,7 +1251,13 @@ mod tests {
     fn test_validate_x86_specific_constraint() {
         let c = parse_constraint("a").unwrap();
         let mut diag = DiagnosticEngine::new();
-        assert!(validate_constraint(&c, &Target::X86_64, None, &mut diag, Span::dummy()));
+        assert!(validate_constraint(
+            &c,
+            &Target::X86_64,
+            None,
+            &mut diag,
+            Span::dummy()
+        ));
         assert!(!diag.has_errors());
     }
 
@@ -1246,7 +1265,13 @@ mod tests {
     fn test_validate_x86_invalid_on_aarch64() {
         let c = parse_constraint("a").unwrap();
         let mut diag = DiagnosticEngine::new();
-        assert!(!validate_constraint(&c, &Target::AArch64, None, &mut diag, Span::dummy()));
+        assert!(!validate_constraint(
+            &c,
+            &Target::AArch64,
+            None,
+            &mut diag,
+            Span::dummy()
+        ));
         assert!(diag.has_errors());
     }
 
@@ -1254,7 +1279,13 @@ mod tests {
     fn test_validate_aarch64_simd_constraint() {
         let c = parse_constraint("w").unwrap();
         let mut diag = DiagnosticEngine::new();
-        assert!(validate_constraint(&c, &Target::AArch64, None, &mut diag, Span::dummy()));
+        assert!(validate_constraint(
+            &c,
+            &Target::AArch64,
+            None,
+            &mut diag,
+            Span::dummy()
+        ));
         assert!(!diag.has_errors());
     }
 
@@ -1262,26 +1293,54 @@ mod tests {
     fn test_validate_riscv_fp_constraint() {
         let c = parse_constraint("f").unwrap();
         let mut diag = DiagnosticEngine::new();
-        assert!(validate_constraint(&c, &Target::RiscV64, None, &mut diag, Span::dummy()));
+        assert!(validate_constraint(
+            &c,
+            &Target::RiscV64,
+            None,
+            &mut diag,
+            Span::dummy()
+        ));
         assert!(!diag.has_errors());
     }
 
     #[test]
     fn test_validate_universal_constraint_all_targets() {
-        for target in &[Target::X86_64, Target::I686, Target::AArch64, Target::RiscV64] {
+        for target in &[
+            Target::X86_64,
+            Target::I686,
+            Target::AArch64,
+            Target::RiscV64,
+        ] {
             let c = parse_constraint("r").unwrap();
             let mut diag = DiagnosticEngine::new();
-            assert!(validate_constraint(&c, target, None, &mut diag, Span::dummy()));
+            assert!(validate_constraint(
+                &c,
+                target,
+                None,
+                &mut diag,
+                Span::dummy()
+            ));
             assert!(!diag.has_errors());
         }
     }
 
     #[test]
     fn test_validate_memory_constraint_all_targets() {
-        for target in &[Target::X86_64, Target::I686, Target::AArch64, Target::RiscV64] {
+        for target in &[
+            Target::X86_64,
+            Target::I686,
+            Target::AArch64,
+            Target::RiscV64,
+        ] {
             let c = parse_constraint("m").unwrap();
             let mut diag = DiagnosticEngine::new();
-            assert!(validate_constraint(&c, target, None, &mut diag, Span::dummy()));
+            assert!(validate_constraint(
+                &c,
+                target,
+                None,
+                &mut diag,
+                Span::dummy()
+            ));
             assert!(!diag.has_errors());
         }
     }
@@ -1383,11 +1442,7 @@ mod tests {
 
     #[test]
     fn test_named_operand_map_from_strs() {
-        let names = vec![
-            Some("out".to_string()),
-            None,
-            Some("in1".to_string()),
-        ];
+        let names = vec![Some("out".to_string()), None, Some("in1".to_string())];
         let map = build_named_operand_map_from_strs(&names, 2);
         assert_eq!(map.get("out"), Some(&0));
         assert_eq!(map.get("in1"), Some(&2));
@@ -1467,15 +1522,13 @@ mod tests {
 
     #[test]
     fn test_build_constraints_string() {
-        let outputs = vec![
-            AsmConstraint {
-                raw: "=r".to_string(),
-                is_output: true,
-                is_read_write: false,
-                is_early_clobber: false,
-                constraint_code: "r".to_string(),
-            },
-        ];
+        let outputs = vec![AsmConstraint {
+            raw: "=r".to_string(),
+            is_output: true,
+            is_read_write: false,
+            is_early_clobber: false,
+            constraint_code: "r".to_string(),
+        }];
         let inputs = vec![
             AsmConstraint {
                 raw: "r".to_string(),
@@ -1515,7 +1568,10 @@ mod tests {
             is_early_clobber: false,
             constraint_code: "r".to_string(),
         };
-        assert_eq!(infer_ir_type_for_constraint(&c, &Target::X86_64), IrType::I64);
+        assert_eq!(
+            infer_ir_type_for_constraint(&c, &Target::X86_64),
+            IrType::I64
+        );
         assert_eq!(infer_ir_type_for_constraint(&c, &Target::I686), IrType::I32);
     }
 
@@ -1528,7 +1584,10 @@ mod tests {
             is_early_clobber: false,
             constraint_code: "m".to_string(),
         };
-        assert_eq!(infer_ir_type_for_constraint(&c, &Target::X86_64), IrType::Ptr);
+        assert_eq!(
+            infer_ir_type_for_constraint(&c, &Target::X86_64),
+            IrType::Ptr
+        );
     }
 
     #[test]
@@ -1540,7 +1599,10 @@ mod tests {
             is_early_clobber: false,
             constraint_code: "i".to_string(),
         };
-        assert_eq!(infer_ir_type_for_constraint(&c, &Target::X86_64), IrType::I32);
+        assert_eq!(
+            infer_ir_type_for_constraint(&c, &Target::X86_64),
+            IrType::I32
+        );
     }
 
     #[test]
@@ -1552,7 +1614,10 @@ mod tests {
             is_early_clobber: false,
             constraint_code: "f".to_string(),
         };
-        assert_eq!(infer_ir_type_for_constraint(&c, &Target::RiscV64), IrType::F64);
+        assert_eq!(
+            infer_ir_type_for_constraint(&c, &Target::RiscV64),
+            IrType::F64
+        );
     }
 
     // -- Register validation tests ----------------------------------------
@@ -1600,4 +1665,3 @@ mod tests {
         assert!(!is_valid_riscv64_register("rax"));
     }
 }
-

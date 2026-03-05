@@ -37,9 +37,9 @@
 //!
 //! Uses the dominator tree from [`super::dominator_tree::DominatorTree`].
 
+use super::dominator_tree::DominatorTree;
 use crate::common::fx_hash::FxHashSet;
 use crate::ir::function::IrFunction;
-use super::dominator_tree::DominatorTree;
 
 // ===========================================================================
 // DominanceFrontiers — the per-block frontier data structure
@@ -206,7 +206,6 @@ pub fn compute_dominance_frontiers(
     // and add B to the frontier of every block along the way.
     let blocks = func.blocks();
     for (b_idx, block) in blocks.iter().enumerate() {
-
         // Only process join points — blocks with 2 or more predecessors.
         // Blocks with 0 or 1 predecessors cannot contribute to any
         // dominance frontier through this algorithm.
@@ -367,10 +366,7 @@ pub fn compute_iterated_dominance_frontier(
 /// - `func`: Mutable reference to the function whose blocks will be updated.
 /// - `frontiers`: Pre-computed dominance frontiers from
 ///   [`compute_dominance_frontiers`].
-pub fn store_frontiers_in_blocks(
-    func: &mut IrFunction,
-    frontiers: &DominanceFrontiers,
-) {
+pub fn store_frontiers_in_blocks(func: &mut IrFunction, frontiers: &DominanceFrontiers) {
     let block_count = func.block_count();
     let frontier_count = frontiers.block_count();
     let count = block_count.min(frontier_count);
@@ -424,8 +420,8 @@ mod tests {
     use crate::ir::basic_block::BasicBlock;
     use crate::ir::function::IrFunction;
     use crate::ir::instructions::{BlockId, Instruction, Value};
-    use crate::ir::types::IrType;
     use crate::ir::mem2reg::dominator_tree::DominatorTree;
+    use crate::ir::types::IrType;
 
     /// Helper: build a function with the specified number of blocks and
     /// the given CFG edges. Each block gets a simple return terminator
@@ -531,9 +527,17 @@ mod tests {
         assert_eq!(df.block_count(), 4);
         assert!(df.frontier(0).is_empty(), "DF(0) should be empty");
         assert!(df.contains(1, 3), "3 should be in DF(1)");
-        assert_eq!(df.frontier(1).len(), 1, "DF(1) should have exactly 1 element");
+        assert_eq!(
+            df.frontier(1).len(),
+            1,
+            "DF(1) should have exactly 1 element"
+        );
         assert!(df.contains(2, 3), "3 should be in DF(2)");
-        assert_eq!(df.frontier(2).len(), 1, "DF(2) should have exactly 1 element");
+        assert_eq!(
+            df.frontier(2).len(),
+            1,
+            "DF(2) should have exactly 1 element"
+        );
         assert!(df.frontier(3).is_empty(), "DF(3) should be empty");
     }
 
@@ -593,7 +597,10 @@ mod tests {
 
         assert_eq!(df.block_count(), 3);
         assert!(df.frontier(0).is_empty(), "DF(0) should be empty");
-        assert!(df.contains(1, 1), "1 should be in DF(1) (self-loop back edge)");
+        assert!(
+            df.contains(1, 1),
+            "1 should be in DF(1) (self-loop back edge)"
+        );
         assert!(df.contains(2, 1), "1 should be in DF(2)");
     }
 
@@ -637,9 +644,19 @@ mod tests {
         //   - Process 3: DF(3)={} (3 is a join point but no further frontier)
         //   - Process 6: DF(6)={} (similar)
         //   → IDF = {3, 6}
-        let func = build_cfg(7, &[
-            (0, 1), (0, 2), (1, 3), (2, 3), (3, 4), (3, 5), (4, 6), (5, 6),
-        ]);
+        let func = build_cfg(
+            7,
+            &[
+                (0, 1),
+                (0, 2),
+                (1, 3),
+                (2, 3),
+                (3, 4),
+                (3, 5),
+                (4, 6),
+                (5, 6),
+            ],
+        );
         let dom_tree = DominatorTree::build(&func);
         let df = compute_dominance_frontiers(&func, &dom_tree);
 
@@ -733,7 +750,10 @@ mod tests {
         let dom_tree = DominatorTree::build(&func);
         let df = compute_dominance_frontiers(&func, &dom_tree);
 
-        assert!(df.contains(1, 1), "Block 1 should be in its own DF (self-loop)");
+        assert!(
+            df.contains(1, 1),
+            "Block 1 should be in its own DF (self-loop)"
+        );
     }
 
     #[test]

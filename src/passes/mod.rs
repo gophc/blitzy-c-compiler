@@ -8,4 +8,5 @@
 
 pub mod constant_folding;
 pub mod dead_code_elimination;
+pub mod pass_manager;
 pub mod simplify_cfg;

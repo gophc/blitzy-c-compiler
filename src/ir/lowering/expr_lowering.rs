@@ -33,17 +33,17 @@
 //! - `crate::frontend::parser::ast` — AST expression nodes
 //! - `crate::common::*` — Types, diagnostics, target
 
-use crate::ir::types::IrType;
-use crate::ir::instructions::{Value, BlockId, BinOp as IrBinOp, ICmpOp, FCmpOp, Instruction};
+use crate::common::diagnostics::{DiagnosticEngine, Span};
+use crate::common::fx_hash::FxHashMap;
+use crate::common::target::Target;
+use crate::common::type_builder::{self, TypeBuilder};
+use crate::common::types::{self, CType, TypeQualifiers};
+use crate::frontend::parser::ast;
 use crate::ir::builder::IrBuilder;
 use crate::ir::function::IrFunction;
-use crate::ir::module::{self as ir_module, IrModule, Constant, GlobalVariable};
-use crate::frontend::parser::ast;
-use crate::common::types::{self, CType, TypeQualifiers};
-use crate::common::type_builder::{self, TypeBuilder};
-use crate::common::target::Target;
-use crate::common::diagnostics::{Span, DiagnosticEngine};
-use crate::common::fx_hash::FxHashMap;
+use crate::ir::instructions::{BinOp as IrBinOp, BlockId, FCmpOp, ICmpOp, Instruction, Value};
+use crate::ir::module::{self as ir_module, Constant, GlobalVariable, IrModule};
+use crate::ir::types::IrType;
 
 // ---------------------------------------------------------------------------
 // Expression Lowering Context
@@ -103,7 +103,10 @@ impl TypedValue {
 
     #[inline]
     fn void() -> Self {
-        Self { value: Value::UNDEF, ty: CType::Void }
+        Self {
+            value: Value::UNDEF,
+            ty: CType::Void,
+        }
     }
 }
 
@@ -140,15 +143,16 @@ fn new_block(ctx: &mut ExprLoweringContext<'_>) -> BlockId {
 /// so that the backend can resolve the `Value` to an immediate.  The
 /// in-function instruction is a `BinOp::Add` with `Value::UNDEF` operand
 /// that serves as a placeholder defining the SSA value.
-fn emit_int_const(ctx: &mut ExprLoweringContext<'_>, value: i128, ir_ty: IrType, span: Span) -> Value {
+fn emit_int_const(
+    ctx: &mut ExprLoweringContext<'_>,
+    value: i128,
+    ir_ty: IrType,
+    span: Span,
+) -> Value {
     // Register the constant in the module's global pool for the backend.
     let const_id = ctx.module.globals().len();
     let gname = format!(".Lconst.i.{}", const_id);
-    let mut gv = GlobalVariable::new(
-        gname,
-        ir_ty.clone(),
-        Some(Constant::Integer(value)),
-    );
+    let mut gv = GlobalVariable::new(gname, ir_ty.clone(), Some(Constant::Integer(value)));
     gv.linkage = ir_module::Linkage::Internal;
     gv.is_constant = true;
     ctx.module.add_global(gv);
@@ -168,14 +172,15 @@ fn emit_int_const(ctx: &mut ExprLoweringContext<'_>, value: i128, ir_ty: IrType,
 }
 
 /// Emit a compile-time floating-point constant.
-fn emit_float_const(ctx: &mut ExprLoweringContext<'_>, value: f64, ir_ty: IrType, span: Span) -> Value {
+fn emit_float_const(
+    ctx: &mut ExprLoweringContext<'_>,
+    value: f64,
+    ir_ty: IrType,
+    span: Span,
+) -> Value {
     let const_id = ctx.module.globals().len();
     let gname = format!(".Lconst.f.{}", const_id);
-    let mut gv = GlobalVariable::new(
-        gname,
-        ir_ty.clone(),
-        Some(Constant::Float(value)),
-    );
+    let mut gv = GlobalVariable::new(gname, ir_ty.clone(), Some(Constant::Float(value)));
     gv.linkage = ir_module::Linkage::Internal;
     gv.is_constant = true;
     ctx.module.add_global(gv);
@@ -233,24 +238,27 @@ fn emit_one(ctx: &mut ExprLoweringContext<'_>, ir_ty: IrType, span: Span) -> Val
 fn ctype_to_ir(ctype: &CType, target: &Target) -> IrType {
     let resolved = types::resolve_typedef(ctype);
     match resolved {
-        CType::Void        => IrType::Void,
-        CType::Bool        => IrType::I1,
-        CType::Char
-        | CType::UChar
-        | CType::SChar     => IrType::I8,
-        CType::Short
-        | CType::UShort    => IrType::I16,
-        CType::Int
-        | CType::UInt      => IrType::I32,
+        CType::Void => IrType::Void,
+        CType::Bool => IrType::I1,
+        CType::Char | CType::UChar | CType::SChar => IrType::I8,
+        CType::Short | CType::UShort => IrType::I16,
+        CType::Int | CType::UInt => IrType::I32,
         CType::Long | CType::ULong => {
-            if target.long_size() == 8 { IrType::I64 } else { IrType::I32 }
+            if target.long_size() == 8 {
+                IrType::I64
+            } else {
+                IrType::I32
+            }
         }
-        CType::LongLong
-        | CType::ULongLong => IrType::I64,
-        CType::Float       => IrType::F32,
-        CType::Double      => IrType::F64,
-        CType::LongDouble  => {
-            if target.long_double_size() == 16 { IrType::F80 } else { IrType::F80 }
+        CType::LongLong | CType::ULongLong => IrType::I64,
+        CType::Float => IrType::F32,
+        CType::Double => IrType::F64,
+        CType::LongDouble => {
+            if target.long_double_size() == 16 {
+                IrType::F80
+            } else {
+                IrType::F80
+            }
         }
         CType::Pointer(..) => IrType::Ptr,
         CType::Array(elem, count) => {
@@ -258,18 +266,23 @@ fn ctype_to_ir(ctype: &CType, target: &Target) -> IrType {
             IrType::Array(Box::new(elem_ir), count.unwrap_or(0))
         }
         CType::Struct { fields, packed, .. } => {
-            let member_irs: Vec<IrType> = fields.iter()
-                .map(|f| ctype_to_ir(&f.ty, target))
-                .collect();
+            let member_irs: Vec<IrType> =
+                fields.iter().map(|f| ctype_to_ir(&f.ty, target)).collect();
             IrType::Struct(crate::ir::types::StructType::new(member_irs, *packed))
         }
-        CType::Union { fields: _fields, .. } => {
+        CType::Union {
+            fields: _fields, ..
+        } => {
             // Union IR type: represented as a byte array of the union size.
             let sz = target.pointer_width(); // fallback, real size from type_builder
             let _ = sz;
             IrType::from_ctype(resolved, target)
         }
-        CType::Function { return_type, params, variadic: _ } => {
+        CType::Function {
+            return_type,
+            params,
+            variadic: _,
+        } => {
             let ret = ctype_to_ir(return_type, target);
             let ps: Vec<IrType> = params.iter().map(|p| ctype_to_ir(p, target)).collect();
             IrType::Function(Box::new(ret), ps)
@@ -284,12 +297,20 @@ fn ctype_to_ir(ctype: &CType, target: &Target) -> IrType {
 
 /// Return the IR type corresponding to `size_t` for the current target.
 fn size_ir_type(target: &Target) -> IrType {
-    if target.is_64bit() { IrType::I64 } else { IrType::I32 }
+    if target.is_64bit() {
+        IrType::I64
+    } else {
+        IrType::I32
+    }
 }
 
 /// Return the C type corresponding to `size_t` for the current target.
 fn size_ctype(target: &Target) -> CType {
-    if target.is_64bit() { CType::ULong } else { CType::UInt }
+    if target.is_64bit() {
+        CType::ULong
+    } else {
+        CType::UInt
+    }
 }
 
 /// Check if a C type is unsigned.
@@ -360,29 +381,46 @@ fn pointee_of(ctype: &CType) -> CType {
 /// Compute the byte size of the pointee for pointer arithmetic scaling.
 fn pointee_size(ctype: &CType, tb: &TypeBuilder) -> usize {
     let pt = pointee_of(ctype);
-    if matches!(pt, CType::Void) { 1 } else { tb.sizeof_type(&pt) }
+    if matches!(pt, CType::Void) {
+        1
+    } else {
+        tb.sizeof_type(&pt)
+    }
 }
 
 /// Determine the C type of an integer literal from its value and suffix.
 fn integer_literal_ctype(value: u128, suffix: &ast::IntegerSuffix) -> CType {
     match suffix {
         ast::IntegerSuffix::None => {
-            if value <= i32::MAX as u128 { CType::Int }
-            else if value <= i64::MAX as u128 { CType::Long }
-            else { CType::ULongLong }
+            if value <= i32::MAX as u128 {
+                CType::Int
+            } else if value <= i64::MAX as u128 {
+                CType::Long
+            } else {
+                CType::ULongLong
+            }
         }
         ast::IntegerSuffix::U => {
-            if value <= u32::MAX as u128 { CType::UInt }
-            else { CType::ULongLong }
+            if value <= u32::MAX as u128 {
+                CType::UInt
+            } else {
+                CType::ULongLong
+            }
         }
         ast::IntegerSuffix::L => {
-            if value <= i64::MAX as u128 { CType::Long }
-            else { CType::ULongLong }
+            if value <= i64::MAX as u128 {
+                CType::Long
+            } else {
+                CType::ULongLong
+            }
         }
         ast::IntegerSuffix::UL => CType::ULong,
         ast::IntegerSuffix::LL => {
-            if value <= i64::MAX as u128 { CType::LongLong }
-            else { CType::ULongLong }
+            if value <= i64::MAX as u128 {
+                CType::LongLong
+            } else {
+                CType::ULongLong
+            }
         }
         ast::IntegerSuffix::ULL => CType::ULongLong,
     }
@@ -421,10 +459,7 @@ fn lookup_var(ctx: &ExprLoweringContext<'_>, name: &str) -> Option<(Value, bool)
 
 /// Look up the declared C type of a variable.
 fn lookup_var_type<'a>(ctx: &'a ExprLoweringContext<'_>, name: &str) -> CType {
-    ctx.local_types
-        .get(name)
-        .cloned()
-        .unwrap_or(CType::Int)
+    ctx.local_types.get(name).cloned().unwrap_or(CType::Int)
 }
 
 // =========================================================================
@@ -471,48 +506,59 @@ pub fn lower_lvalue(ctx: &mut ExprLoweringContext<'_>, expr: &ast::Expression) -
 fn lower_expr_inner(ctx: &mut ExprLoweringContext<'_>, expr: &ast::Expression) -> TypedValue {
     match expr {
         // ---- Literals ----
-        ast::Expression::IntegerLiteral { value, suffix, span } => {
-            lower_integer_literal(ctx, *value, suffix, *span)
-        }
-        ast::Expression::FloatLiteral { value, suffix, span } => {
-            lower_float_literal(ctx, *value, suffix, *span)
-        }
-        ast::Expression::StringLiteral { segments, prefix, span } => {
-            lower_string_literal(ctx, segments, prefix, *span)
-        }
-        ast::Expression::CharLiteral { value, prefix, span } => {
-            lower_char_literal(ctx, *value, prefix, *span)
-        }
+        ast::Expression::IntegerLiteral {
+            value,
+            suffix,
+            span,
+        } => lower_integer_literal(ctx, *value, suffix, *span),
+        ast::Expression::FloatLiteral {
+            value,
+            suffix,
+            span,
+        } => lower_float_literal(ctx, *value, suffix, *span),
+        ast::Expression::StringLiteral {
+            segments,
+            prefix,
+            span,
+        } => lower_string_literal(ctx, segments, prefix, *span),
+        ast::Expression::CharLiteral {
+            value,
+            prefix,
+            span,
+        } => lower_char_literal(ctx, *value, prefix, *span),
 
         // ---- Identifier ----
-        ast::Expression::Identifier { name, span } => {
-            lower_identifier(ctx, name.as_u32(), *span)
-        }
+        ast::Expression::Identifier { name, span } => lower_identifier(ctx, name.as_u32(), *span),
 
         // ---- Parenthesised (transparent) ----
-        ast::Expression::Parenthesized { inner, .. } => {
-            lower_expr_inner(ctx, inner)
-        }
+        ast::Expression::Parenthesized { inner, .. } => lower_expr_inner(ctx, inner),
 
         // ---- Binary / Logical ----
-        ast::Expression::Binary { op, left, right, span } => {
-            lower_binary(ctx, op, left, right, *span)
-        }
+        ast::Expression::Binary {
+            op,
+            left,
+            right,
+            span,
+        } => lower_binary(ctx, op, left, right, *span),
 
         // ---- Unary ----
-        ast::Expression::UnaryOp { op, operand, span } => {
-            lower_unary(ctx, op, operand, *span)
-        }
+        ast::Expression::UnaryOp { op, operand, span } => lower_unary(ctx, op, operand, *span),
 
         // ---- Assignment / Compound assignment ----
-        ast::Expression::Assignment { op, target, value, span } => {
-            lower_assignment(ctx, op, target, value, *span)
-        }
+        ast::Expression::Assignment {
+            op,
+            target,
+            value,
+            span,
+        } => lower_assignment(ctx, op, target, value, *span),
 
         // ---- Conditional (ternary) ----
-        ast::Expression::Conditional { condition, then_expr, else_expr, span } => {
-            lower_conditional(ctx, condition, then_expr.as_deref(), else_expr, *span)
-        }
+        ast::Expression::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+            span,
+        } => lower_conditional(ctx, condition, then_expr.as_deref(), else_expr, *span),
 
         // ---- Function call ----
         ast::Expression::FunctionCall { callee, args, span } => {
@@ -520,28 +566,30 @@ fn lower_expr_inner(ctx: &mut ExprLoweringContext<'_>, expr: &ast::Expression) -
         }
 
         // ---- Cast ----
-        ast::Expression::Cast { type_name, operand, span } => {
-            lower_cast_expr(ctx, type_name, operand, *span)
-        }
+        ast::Expression::Cast {
+            type_name,
+            operand,
+            span,
+        } => lower_cast_expr(ctx, type_name, operand, *span),
 
         // ---- sizeof / alignof ----
-        ast::Expression::SizeofExpr { operand, span } => {
-            lower_sizeof_expr(ctx, operand, *span)
-        }
-        ast::Expression::SizeofType { type_name, span } => {
-            lower_sizeof_type(ctx, type_name, *span)
-        }
+        ast::Expression::SizeofExpr { operand, span } => lower_sizeof_expr(ctx, operand, *span),
+        ast::Expression::SizeofType { type_name, span } => lower_sizeof_type(ctx, type_name, *span),
         ast::Expression::AlignofType { type_name, span } => {
             lower_alignof_type(ctx, type_name, *span)
         }
 
         // ---- Member access ----
-        ast::Expression::MemberAccess { object, member, span } => {
-            lower_member_access(ctx, object, member.as_u32(), false, *span)
-        }
-        ast::Expression::PointerMemberAccess { object, member, span } => {
-            lower_member_access(ctx, object, member.as_u32(), true, *span)
-        }
+        ast::Expression::MemberAccess {
+            object,
+            member,
+            span,
+        } => lower_member_access(ctx, object, member.as_u32(), false, *span),
+        ast::Expression::PointerMemberAccess {
+            object,
+            member,
+            span,
+        } => lower_member_access(ctx, object, member.as_u32(), true, *span),
 
         // ---- Array subscript ----
         ast::Expression::ArraySubscript { base, index, span } => {
@@ -565,14 +613,14 @@ fn lower_expr_inner(ctx: &mut ExprLoweringContext<'_>, expr: &ast::Expression) -
         }
 
         // ---- Comma ----
-        ast::Expression::Comma { exprs, span } => {
-            lower_comma(ctx, exprs, *span)
-        }
+        ast::Expression::Comma { exprs, span } => lower_comma(ctx, exprs, *span),
 
         // ---- Compound literal ----
-        ast::Expression::CompoundLiteral { type_name, initializer, span } => {
-            lower_compound_literal(ctx, type_name, initializer, *span)
-        }
+        ast::Expression::CompoundLiteral {
+            type_name,
+            initializer,
+            span,
+        } => lower_compound_literal(ctx, type_name, initializer, *span),
 
         // ---- GCC statement expression ----
         ast::Expression::StatementExpression { compound, span } => {
@@ -580,14 +628,18 @@ fn lower_expr_inner(ctx: &mut ExprLoweringContext<'_>, expr: &ast::Expression) -
         }
 
         // ---- GCC builtin call ----
-        ast::Expression::BuiltinCall { builtin, args, span } => {
-            lower_builtin(ctx, builtin, args, *span)
-        }
+        ast::Expression::BuiltinCall {
+            builtin,
+            args,
+            span,
+        } => lower_builtin(ctx, builtin, args, *span),
 
         // ---- C11 _Generic ----
-        ast::Expression::Generic { controlling, associations, span } => {
-            lower_generic(ctx, controlling, associations, *span)
-        }
+        ast::Expression::Generic {
+            controlling,
+            associations,
+            span,
+        } => lower_generic(ctx, controlling, associations, *span),
 
         // ---- GCC address-of-label (&&label) ----
         ast::Expression::AddressOfLabel { label, span } => {
@@ -602,7 +654,11 @@ fn lower_lvalue_inner(ctx: &mut ExprLoweringContext<'_>, expr: &ast::Expression)
         ast::Expression::Identifier { name, span } => {
             lower_identifier_lvalue(ctx, name.as_u32(), *span)
         }
-        ast::Expression::UnaryOp { op: ast::UnaryOp::Deref, operand, span: _ } => {
+        ast::Expression::UnaryOp {
+            op: ast::UnaryOp::Deref,
+            operand,
+            span: _,
+        } => {
             // *ptr as lvalue → evaluate ptr, the pointer IS the lvalue
             let ptr = lower_expr_inner(ctx, operand);
             let pt = pointee_of(&ptr.ty);
@@ -611,21 +667,26 @@ fn lower_lvalue_inner(ctx: &mut ExprLoweringContext<'_>, expr: &ast::Expression)
         ast::Expression::ArraySubscript { base, index, span } => {
             lower_array_subscript_lvalue(ctx, base, index, *span)
         }
-        ast::Expression::MemberAccess { object, member, span } => {
-            lower_member_access_lvalue(ctx, object, member.as_u32(), false, *span)
-        }
-        ast::Expression::PointerMemberAccess { object, member, span } => {
-            lower_member_access_lvalue(ctx, object, member.as_u32(), true, *span)
-        }
-        ast::Expression::Parenthesized { inner, .. } => {
-            lower_lvalue_inner(ctx, inner)
-        }
-        ast::Expression::CompoundLiteral { type_name, initializer, span } => {
-            lower_compound_literal(ctx, type_name, initializer, *span)
-        }
+        ast::Expression::MemberAccess {
+            object,
+            member,
+            span,
+        } => lower_member_access_lvalue(ctx, object, member.as_u32(), false, *span),
+        ast::Expression::PointerMemberAccess {
+            object,
+            member,
+            span,
+        } => lower_member_access_lvalue(ctx, object, member.as_u32(), true, *span),
+        ast::Expression::Parenthesized { inner, .. } => lower_lvalue_inner(ctx, inner),
+        ast::Expression::CompoundLiteral {
+            type_name,
+            initializer,
+            span,
+        } => lower_compound_literal(ctx, type_name, initializer, *span),
         other => {
             let sp = expr_span(other);
-            ctx.diagnostics.emit_error(sp, "expression is not an lvalue".to_string());
+            ctx.diagnostics
+                .emit_error(sp, "expression is not an lvalue".to_string());
             TypedValue::void()
         }
     }
@@ -727,11 +788,7 @@ fn lower_string_literal(
     // Register a global for the string literal with Constant::String initializer.
     let str_global_name = format!(".str.{}", str_id);
     let str_arr_ty = IrType::Array(Box::new(IrType::I8), bytes.len());
-    let gv = GlobalVariable::new(
-        str_global_name,
-        str_arr_ty,
-        Some(Constant::String(bytes)),
-    );
+    let gv = GlobalVariable::new(str_global_name, str_arr_ty, Some(Constant::String(bytes)));
     ctx.module.add_global(gv);
 
     let result = ctx.builder.fresh_value();
@@ -739,9 +796,15 @@ fn lower_string_literal(
     let (val, gep_inst) = ctx.builder.build_gep(result, vec![zero], IrType::Ptr, span);
     emit_inst(ctx, gep_inst);
     let cty = CType::Pointer(
-        Box::new(CType::Qualified(Box::new(CType::Char), TypeQualifiers {
-            is_const: true, is_volatile: false, is_restrict: false, is_atomic: false,
-        })),
+        Box::new(CType::Qualified(
+            Box::new(CType::Char),
+            TypeQualifiers {
+                is_const: true,
+                is_volatile: false,
+                is_restrict: false,
+                is_atomic: false,
+            },
+        )),
         TypeQualifiers::default(),
     );
     TypedValue::new(val, cty)
@@ -790,14 +853,22 @@ fn lower_identifier(ctx: &mut ExprLoweringContext<'_>, sym_idx: u32, span: Span)
     // Function references (decay to function pointer).
     if ctx.module.get_function(name).is_some() {
         let fptr = ctx.builder.fresh_value();
-        return TypedValue::new(fptr, CType::Pointer(Box::new(CType::Void), TypeQualifiers::default()));
+        return TypedValue::new(
+            fptr,
+            CType::Pointer(Box::new(CType::Void), TypeQualifiers::default()),
+        );
     }
 
-    ctx.diagnostics.emit_error(span, format!("undeclared identifier '{}'", name));
+    ctx.diagnostics
+        .emit_error(span, format!("undeclared identifier '{}'", name));
     TypedValue::new(Value::UNDEF, CType::Int)
 }
 
-fn lower_identifier_lvalue(ctx: &mut ExprLoweringContext<'_>, sym_idx: u32, span: Span) -> TypedValue {
+fn lower_identifier_lvalue(
+    ctx: &mut ExprLoweringContext<'_>,
+    sym_idx: u32,
+    span: Span,
+) -> TypedValue {
     let name = resolve_sym(ctx, sym_idx);
     let var_cty = lookup_var_type(ctx, name);
     if let Some((ptr_val, _)) = lookup_var(ctx, name) {
@@ -806,7 +877,8 @@ fn lower_identifier_lvalue(ctx: &mut ExprLoweringContext<'_>, sym_idx: u32, span
     if ctx.module.get_global(name).is_some() {
         return TypedValue::new(ctx.builder.fresh_value(), var_cty);
     }
-    ctx.diagnostics.emit_error(span, format!("undeclared identifier '{}'", name));
+    ctx.diagnostics
+        .emit_error(span, format!("undeclared identifier '{}'", name));
     TypedValue::new(Value::UNDEF, CType::Int)
 }
 
@@ -823,7 +895,7 @@ fn lower_binary(
 ) -> TypedValue {
     match op {
         ast::BinaryOp::LogicalAnd => return lower_logical_and(ctx, lhs_expr, rhs_expr, span),
-        ast::BinaryOp::LogicalOr  => return lower_logical_or(ctx, lhs_expr, rhs_expr, span),
+        ast::BinaryOp::LogicalOr => return lower_logical_or(ctx, lhs_expr, rhs_expr, span),
         _ => {}
     }
     let lhs = lower_expr_inner(ctx, lhs_expr);
@@ -851,108 +923,259 @@ fn lower_binary(
     let uns = is_unsigned(&common);
 
     match op {
-        ast::BinaryOp::Add    => { let (v,i) = ctx.builder.build_add(lv,rv,ci,span); emit_inst(ctx,i); TypedValue::new(v,common) }
-        ast::BinaryOp::Sub    => { let (v,i) = ctx.builder.build_sub(lv,rv,ci,span); emit_inst(ctx,i); TypedValue::new(v,common) }
-        ast::BinaryOp::Mul    => { let (v,i) = ctx.builder.build_mul(lv,rv,ci,span); emit_inst(ctx,i); TypedValue::new(v,common) }
-        ast::BinaryOp::Div    => { let (v,i) = ctx.builder.build_div(lv,rv,ci,!uns,span); emit_inst(ctx,i); TypedValue::new(v,common) }
-        ast::BinaryOp::Mod    => { let (v,i) = ctx.builder.build_rem(lv,rv,ci,!uns,span); emit_inst(ctx,i); TypedValue::new(v,common) }
-        ast::BinaryOp::BitwiseAnd => { let (v,i) = ctx.builder.build_and(lv,rv,ci,span); emit_inst(ctx,i); TypedValue::new(v,common) }
-        ast::BinaryOp::BitwiseOr  => { let (v,i) = ctx.builder.build_or(lv,rv,ci,span); emit_inst(ctx,i); TypedValue::new(v,common) }
-        ast::BinaryOp::BitwiseXor => { let (v,i) = ctx.builder.build_xor(lv,rv,ci,span); emit_inst(ctx,i); TypedValue::new(v,common) }
-        ast::BinaryOp::ShiftLeft  => { let (v,i) = ctx.builder.build_shl(lv,rv,ci,span); emit_inst(ctx,i); TypedValue::new(v,common) }
-        ast::BinaryOp::ShiftRight => { let (v,i) = ctx.builder.build_shr(lv,rv,ci,!uns,span); emit_inst(ctx,i); TypedValue::new(v,common) }
-        ast::BinaryOp::Equal        => { TypedValue::new(emit_cmp(ctx,lv,rv,&common,ICmpOp::Eq,FCmpOp::Oeq,span), CType::Bool) }
-        ast::BinaryOp::NotEqual     => { TypedValue::new(emit_cmp(ctx,lv,rv,&common,ICmpOp::Ne,FCmpOp::One,span), CType::Bool) }
-        ast::BinaryOp::Less         => { let ic=if uns{ICmpOp::Ult}else{ICmpOp::Slt}; TypedValue::new(emit_cmp(ctx,lv,rv,&common,ic,FCmpOp::Olt,span), CType::Bool) }
-        ast::BinaryOp::LessEqual    => { let ic=if uns{ICmpOp::Ule}else{ICmpOp::Sle}; TypedValue::new(emit_cmp(ctx,lv,rv,&common,ic,FCmpOp::Ole,span), CType::Bool) }
-        ast::BinaryOp::Greater      => { let ic=if uns{ICmpOp::Ugt}else{ICmpOp::Sgt}; TypedValue::new(emit_cmp(ctx,lv,rv,&common,ic,FCmpOp::Ogt,span), CType::Bool) }
-        ast::BinaryOp::GreaterEqual => { let ic=if uns{ICmpOp::Uge}else{ICmpOp::Sge}; TypedValue::new(emit_cmp(ctx,lv,rv,&common,ic,FCmpOp::Oge,span), CType::Bool) }
+        ast::BinaryOp::Add => {
+            let (v, i) = ctx.builder.build_add(lv, rv, ci, span);
+            emit_inst(ctx, i);
+            TypedValue::new(v, common)
+        }
+        ast::BinaryOp::Sub => {
+            let (v, i) = ctx.builder.build_sub(lv, rv, ci, span);
+            emit_inst(ctx, i);
+            TypedValue::new(v, common)
+        }
+        ast::BinaryOp::Mul => {
+            let (v, i) = ctx.builder.build_mul(lv, rv, ci, span);
+            emit_inst(ctx, i);
+            TypedValue::new(v, common)
+        }
+        ast::BinaryOp::Div => {
+            let (v, i) = ctx.builder.build_div(lv, rv, ci, !uns, span);
+            emit_inst(ctx, i);
+            TypedValue::new(v, common)
+        }
+        ast::BinaryOp::Mod => {
+            let (v, i) = ctx.builder.build_rem(lv, rv, ci, !uns, span);
+            emit_inst(ctx, i);
+            TypedValue::new(v, common)
+        }
+        ast::BinaryOp::BitwiseAnd => {
+            let (v, i) = ctx.builder.build_and(lv, rv, ci, span);
+            emit_inst(ctx, i);
+            TypedValue::new(v, common)
+        }
+        ast::BinaryOp::BitwiseOr => {
+            let (v, i) = ctx.builder.build_or(lv, rv, ci, span);
+            emit_inst(ctx, i);
+            TypedValue::new(v, common)
+        }
+        ast::BinaryOp::BitwiseXor => {
+            let (v, i) = ctx.builder.build_xor(lv, rv, ci, span);
+            emit_inst(ctx, i);
+            TypedValue::new(v, common)
+        }
+        ast::BinaryOp::ShiftLeft => {
+            let (v, i) = ctx.builder.build_shl(lv, rv, ci, span);
+            emit_inst(ctx, i);
+            TypedValue::new(v, common)
+        }
+        ast::BinaryOp::ShiftRight => {
+            let (v, i) = ctx.builder.build_shr(lv, rv, ci, !uns, span);
+            emit_inst(ctx, i);
+            TypedValue::new(v, common)
+        }
+        ast::BinaryOp::Equal => TypedValue::new(
+            emit_cmp(ctx, lv, rv, &common, ICmpOp::Eq, FCmpOp::Oeq, span),
+            CType::Bool,
+        ),
+        ast::BinaryOp::NotEqual => TypedValue::new(
+            emit_cmp(ctx, lv, rv, &common, ICmpOp::Ne, FCmpOp::One, span),
+            CType::Bool,
+        ),
+        ast::BinaryOp::Less => {
+            let ic = if uns { ICmpOp::Ult } else { ICmpOp::Slt };
+            TypedValue::new(
+                emit_cmp(ctx, lv, rv, &common, ic, FCmpOp::Olt, span),
+                CType::Bool,
+            )
+        }
+        ast::BinaryOp::LessEqual => {
+            let ic = if uns { ICmpOp::Ule } else { ICmpOp::Sle };
+            TypedValue::new(
+                emit_cmp(ctx, lv, rv, &common, ic, FCmpOp::Ole, span),
+                CType::Bool,
+            )
+        }
+        ast::BinaryOp::Greater => {
+            let ic = if uns { ICmpOp::Ugt } else { ICmpOp::Sgt };
+            TypedValue::new(
+                emit_cmp(ctx, lv, rv, &common, ic, FCmpOp::Ogt, span),
+                CType::Bool,
+            )
+        }
+        ast::BinaryOp::GreaterEqual => {
+            let ic = if uns { ICmpOp::Uge } else { ICmpOp::Sge };
+            TypedValue::new(
+                emit_cmp(ctx, lv, rv, &common, ic, FCmpOp::Oge, span),
+                CType::Bool,
+            )
+        }
         ast::BinaryOp::LogicalAnd | ast::BinaryOp::LogicalOr => unreachable!(),
     }
 }
 
-fn emit_cmp(ctx: &mut ExprLoweringContext<'_>, l: Value, r: Value, ty: &CType, ic: ICmpOp, fc: FCmpOp, span: Span) -> Value {
-    if is_floating(ty) { let (v,i)=ctx.builder.build_fcmp(fc,l,r,span); emit_inst(ctx,i); v }
-    else { let (v,i)=ctx.builder.build_icmp(ic,l,r,span); emit_inst(ctx,i); v }
+fn emit_cmp(
+    ctx: &mut ExprLoweringContext<'_>,
+    l: Value,
+    r: Value,
+    ty: &CType,
+    ic: ICmpOp,
+    fc: FCmpOp,
+    span: Span,
+) -> Value {
+    if is_floating(ty) {
+        let (v, i) = ctx.builder.build_fcmp(fc, l, r, span);
+        emit_inst(ctx, i);
+        v
+    } else {
+        let (v, i) = ctx.builder.build_icmp(ic, l, r, span);
+        emit_inst(ctx, i);
+        v
+    }
 }
 
-fn lower_logical_and(ctx: &mut ExprLoweringContext<'_>, le: &ast::Expression, re: &ast::Expression, span: Span) -> TypedValue {
-    let rb = new_block(ctx); let mb = new_block(ctx);
+fn lower_logical_and(
+    ctx: &mut ExprLoweringContext<'_>,
+    le: &ast::Expression,
+    re: &ast::Expression,
+    span: Span,
+) -> TypedValue {
+    let rb = new_block(ctx);
+    let mb = new_block(ctx);
     let lhs = lower_expr_inner(ctx, le);
     let lb = lower_to_bool(ctx, lhs.value, &lhs.ty, span);
-    let ci = ctx.builder.build_cond_branch(lb, rb, mb, span); emit_inst(ctx, ci);
+    let ci = ctx.builder.build_cond_branch(lb, rb, mb, span);
+    emit_inst(ctx, ci);
     let le_blk = ctx.builder.get_insert_block().unwrap();
     ctx.builder.set_insert_point(rb);
     let rhs = lower_expr_inner(ctx, re);
     let rbv = lower_to_bool(ctx, rhs.value, &rhs.ty, span);
-    let bi = ctx.builder.build_branch(mb, span); emit_inst(ctx, bi);
+    let bi = ctx.builder.build_branch(mb, span);
+    emit_inst(ctx, bi);
     let re_blk = ctx.builder.get_insert_block().unwrap();
     ctx.builder.set_insert_point(mb);
     let fv = emit_int_const(ctx, 0, IrType::I1, span);
-    let (pv,pi)=ctx.builder.build_phi(IrType::I1,vec![(fv,le_blk),(rbv,re_blk)],span); emit_inst(ctx,pi);
+    let (pv, pi) = ctx
+        .builder
+        .build_phi(IrType::I1, vec![(fv, le_blk), (rbv, re_blk)], span);
+    emit_inst(ctx, pi);
     TypedValue::new(pv, CType::Bool)
 }
 
-fn lower_logical_or(ctx: &mut ExprLoweringContext<'_>, le: &ast::Expression, re: &ast::Expression, span: Span) -> TypedValue {
-    let rb = new_block(ctx); let mb = new_block(ctx);
+fn lower_logical_or(
+    ctx: &mut ExprLoweringContext<'_>,
+    le: &ast::Expression,
+    re: &ast::Expression,
+    span: Span,
+) -> TypedValue {
+    let rb = new_block(ctx);
+    let mb = new_block(ctx);
     let lhs = lower_expr_inner(ctx, le);
     let lb = lower_to_bool(ctx, lhs.value, &lhs.ty, span);
-    let ci = ctx.builder.build_cond_branch(lb, mb, rb, span); emit_inst(ctx, ci);
+    let ci = ctx.builder.build_cond_branch(lb, mb, rb, span);
+    emit_inst(ctx, ci);
     let le_blk = ctx.builder.get_insert_block().unwrap();
     ctx.builder.set_insert_point(rb);
     let rhs = lower_expr_inner(ctx, re);
     let rbv = lower_to_bool(ctx, rhs.value, &rhs.ty, span);
-    let bi = ctx.builder.build_branch(mb, span); emit_inst(ctx, bi);
+    let bi = ctx.builder.build_branch(mb, span);
+    emit_inst(ctx, bi);
     let re_blk = ctx.builder.get_insert_block().unwrap();
     ctx.builder.set_insert_point(mb);
     let tv = emit_int_const(ctx, 1, IrType::I1, span);
-    let (pv,pi)=ctx.builder.build_phi(IrType::I1,vec![(tv,le_blk),(rbv,re_blk)],span); emit_inst(ctx,pi);
+    let (pv, pi) = ctx
+        .builder
+        .build_phi(IrType::I1, vec![(tv, le_blk), (rbv, re_blk)], span);
+    emit_inst(ctx, pi);
     TypedValue::new(pv, CType::Bool)
 }
 
-fn lower_ptr_arith(ctx: &mut ExprLoweringContext<'_>, op: &ast::BinaryOp, ptr: &TypedValue, idx: &TypedValue, span: Span) -> TypedValue {
+fn lower_ptr_arith(
+    ctx: &mut ExprLoweringContext<'_>,
+    op: &ast::BinaryOp,
+    ptr: &TypedValue,
+    idx: &TypedValue,
+    span: Span,
+) -> TypedValue {
     let es = pointee_size(&ptr.ty, ctx.type_builder) as i128;
     let si = size_ir_type(ctx.target);
     let sc = emit_int_const(ctx, es, si.clone(), span);
     let iv = insert_implicit_conversion(ctx, idx.value, &idx.ty, &size_ctype(ctx.target), span);
-    let (bo, mi) = ctx.builder.build_mul(iv, sc, si.clone(), span); emit_inst(ctx, mi);
+    let (bo, mi) = ctx.builder.build_mul(iv, sc, si.clone(), span);
+    emit_inst(ctx, mi);
     match op {
-        ast::BinaryOp::Add => { let (r,g)=ctx.builder.build_gep(ptr.value,vec![bo],IrType::Ptr,span); emit_inst(ctx,g); TypedValue::new(r,ptr.ty.clone()) }
-        ast::BinaryOp::Sub => {
-            let (n,ni)=ctx.builder.build_neg(bo,si,span); emit_inst(ctx,ni);
-            let (r,g)=ctx.builder.build_gep(ptr.value,vec![n],IrType::Ptr,span); emit_inst(ctx,g);
-            TypedValue::new(r,ptr.ty.clone())
+        ast::BinaryOp::Add => {
+            let (r, g) = ctx
+                .builder
+                .build_gep(ptr.value, vec![bo], IrType::Ptr, span);
+            emit_inst(ctx, g);
+            TypedValue::new(r, ptr.ty.clone())
         }
-        _ => { ctx.diagnostics.emit_error(span, "invalid pointer arithmetic"); TypedValue::void() }
+        ast::BinaryOp::Sub => {
+            let (n, ni) = ctx.builder.build_neg(bo, si, span);
+            emit_inst(ctx, ni);
+            let (r, g) = ctx.builder.build_gep(ptr.value, vec![n], IrType::Ptr, span);
+            emit_inst(ctx, g);
+            TypedValue::new(r, ptr.ty.clone())
+        }
+        _ => {
+            ctx.diagnostics
+                .emit_error(span, "invalid pointer arithmetic");
+            TypedValue::void()
+        }
     }
 }
 
-fn lower_ptr_diff(ctx: &mut ExprLoweringContext<'_>, l: &TypedValue, r: &TypedValue, span: Span) -> TypedValue {
+fn lower_ptr_diff(
+    ctx: &mut ExprLoweringContext<'_>,
+    l: &TypedValue,
+    r: &TypedValue,
+    span: Span,
+) -> TypedValue {
     let pi = size_ir_type(ctx.target);
-    let (li,lic)=ctx.builder.build_ptr_to_int(l.value,pi.clone(),span); emit_inst(ctx,lic);
-    let (ri,ric)=ctx.builder.build_ptr_to_int(r.value,pi.clone(),span); emit_inst(ctx,ric);
-    let (d,di)=ctx.builder.build_sub(li,ri,pi.clone(),span); emit_inst(ctx,di);
+    let (li, lic) = ctx.builder.build_ptr_to_int(l.value, pi.clone(), span);
+    emit_inst(ctx, lic);
+    let (ri, ric) = ctx.builder.build_ptr_to_int(r.value, pi.clone(), span);
+    emit_inst(ctx, ric);
+    let (d, di) = ctx.builder.build_sub(li, ri, pi.clone(), span);
+    emit_inst(ctx, di);
     let es = pointee_size(&l.ty, ctx.type_builder) as i128;
     let dv = emit_int_const(ctx, es, pi.clone(), span);
-    let (res,rdi)=ctx.builder.build_div(d,dv,pi,true,span); emit_inst(ctx,rdi);
-    TypedValue::new(res, if ctx.target.is_64bit(){CType::Long}else{CType::Int})
+    let (res, rdi) = ctx.builder.build_div(d, dv, pi, true, span);
+    emit_inst(ctx, rdi);
+    TypedValue::new(
+        res,
+        if ctx.target.is_64bit() {
+            CType::Long
+        } else {
+            CType::Int
+        },
+    )
 }
 
 // =========================================================================
 // UNARY OPERATIONS
 // =========================================================================
 
-fn lower_unary(ctx: &mut ExprLoweringContext<'_>, op: &ast::UnaryOp, operand: &ast::Expression, span: Span) -> TypedValue {
+fn lower_unary(
+    ctx: &mut ExprLoweringContext<'_>,
+    op: &ast::UnaryOp,
+    operand: &ast::Expression,
+    span: Span,
+) -> TypedValue {
     match op {
         ast::UnaryOp::AddressOf => {
             let lv = lower_lvalue_inner(ctx, operand);
-            TypedValue::new(lv.value, CType::Pointer(Box::new(lv.ty), TypeQualifiers::default()))
+            TypedValue::new(
+                lv.value,
+                CType::Pointer(Box::new(lv.ty), TypeQualifiers::default()),
+            )
         }
         ast::UnaryOp::Deref => {
             let p = lower_expr_inner(ctx, operand);
             let pt = pointee_of(&p.ty);
             let it = ctype_to_ir(&pt, ctx.target);
-            let (v,li) = ctx.builder.build_load(p.value, it, span); emit_inst(ctx, li);
+            let (v, li) = ctx.builder.build_load(p.value, it, span);
+            emit_inst(ctx, li);
             TypedValue::new(v, pt)
         }
         ast::UnaryOp::Plus => {
@@ -966,7 +1189,8 @@ fn lower_unary(ctx: &mut ExprLoweringContext<'_>, op: &ast::UnaryOp, operand: &a
             let prom = types::integer_promotion(&inner.ty);
             let it = ctype_to_ir(&prom, ctx.target);
             let v = insert_implicit_conversion(ctx, inner.value, &inner.ty, &prom, span);
-            let (r,i) = ctx.builder.build_neg(v, it, span); emit_inst(ctx, i);
+            let (r, i) = ctx.builder.build_neg(v, it, span);
+            emit_inst(ctx, i);
             TypedValue::new(r, prom)
         }
         ast::UnaryOp::BitwiseNot => {
@@ -974,14 +1198,16 @@ fn lower_unary(ctx: &mut ExprLoweringContext<'_>, op: &ast::UnaryOp, operand: &a
             let prom = types::integer_promotion(&inner.ty);
             let it = ctype_to_ir(&prom, ctx.target);
             let v = insert_implicit_conversion(ctx, inner.value, &inner.ty, &prom, span);
-            let (r,i) = ctx.builder.build_not(v, it, span); emit_inst(ctx, i);
+            let (r, i) = ctx.builder.build_not(v, it, span);
+            emit_inst(ctx, i);
             TypedValue::new(r, prom)
         }
         ast::UnaryOp::LogicalNot => {
             let inner = lower_expr_inner(ctx, operand);
             let bv = lower_to_bool(ctx, inner.value, &inner.ty, span);
             let one = emit_int_const(ctx, 1, IrType::I1, span);
-            let (r,i) = ctx.builder.build_xor(bv, one, IrType::I1, span); emit_inst(ctx, i);
+            let (r, i) = ctx.builder.build_xor(bv, one, IrType::I1, span);
+            emit_inst(ctx, i);
             TypedValue::new(r, CType::Bool)
         }
     }
@@ -1023,40 +1249,88 @@ fn lower_assignment(
                         let es = pointee_size(&lhs_ptr.ty, ctx.type_builder) as i128;
                         let si = size_ir_type(ctx.target);
                         let sc = emit_int_const(ctx, es, si.clone(), span);
-                        let iv = insert_implicit_conversion(ctx, rhs.value, &rhs.ty, &size_ctype(ctx.target), span);
-                        let (bo,mi)=ctx.builder.build_mul(iv,sc,si,span); emit_inst(ctx,mi);
-                        let (r,g)=ctx.builder.build_gep(cur_val,vec![bo],IrType::Ptr,span); emit_inst(ctx,g);
+                        let iv = insert_implicit_conversion(
+                            ctx,
+                            rhs.value,
+                            &rhs.ty,
+                            &size_ctype(ctx.target),
+                            span,
+                        );
+                        let (bo, mi) = ctx.builder.build_mul(iv, sc, si, span);
+                        emit_inst(ctx, mi);
+                        let (r, g) = ctx.builder.build_gep(cur_val, vec![bo], IrType::Ptr, span);
+                        emit_inst(ctx, g);
                         r
                     } else {
-                        let (v,i) = ctx.builder.build_add(cur_val, rhs_conv, lhs_ir.clone(), span); emit_inst(ctx,i); v
+                        let (v, i) = ctx
+                            .builder
+                            .build_add(cur_val, rhs_conv, lhs_ir.clone(), span);
+                        emit_inst(ctx, i);
+                        v
                     }
                 }
                 ast::AssignOp::SubAssign => {
-                    let (v,i) = ctx.builder.build_sub(cur_val, rhs_conv, lhs_ir.clone(), span); emit_inst(ctx,i); v
+                    let (v, i) = ctx
+                        .builder
+                        .build_sub(cur_val, rhs_conv, lhs_ir.clone(), span);
+                    emit_inst(ctx, i);
+                    v
                 }
                 ast::AssignOp::MulAssign => {
-                    let (v,i) = ctx.builder.build_mul(cur_val, rhs_conv, lhs_ir.clone(), span); emit_inst(ctx,i); v
+                    let (v, i) = ctx
+                        .builder
+                        .build_mul(cur_val, rhs_conv, lhs_ir.clone(), span);
+                    emit_inst(ctx, i);
+                    v
                 }
                 ast::AssignOp::DivAssign => {
-                    let (v,i) = ctx.builder.build_div(cur_val, rhs_conv, lhs_ir.clone(), !uns, span); emit_inst(ctx,i); v
+                    let (v, i) =
+                        ctx.builder
+                            .build_div(cur_val, rhs_conv, lhs_ir.clone(), !uns, span);
+                    emit_inst(ctx, i);
+                    v
                 }
                 ast::AssignOp::ModAssign => {
-                    let (v,i) = ctx.builder.build_rem(cur_val, rhs_conv, lhs_ir.clone(), !uns, span); emit_inst(ctx,i); v
+                    let (v, i) =
+                        ctx.builder
+                            .build_rem(cur_val, rhs_conv, lhs_ir.clone(), !uns, span);
+                    emit_inst(ctx, i);
+                    v
                 }
                 ast::AssignOp::AndAssign => {
-                    let (v,i) = ctx.builder.build_and(cur_val, rhs_conv, lhs_ir.clone(), span); emit_inst(ctx,i); v
+                    let (v, i) = ctx
+                        .builder
+                        .build_and(cur_val, rhs_conv, lhs_ir.clone(), span);
+                    emit_inst(ctx, i);
+                    v
                 }
                 ast::AssignOp::OrAssign => {
-                    let (v,i) = ctx.builder.build_or(cur_val, rhs_conv, lhs_ir.clone(), span); emit_inst(ctx,i); v
+                    let (v, i) = ctx
+                        .builder
+                        .build_or(cur_val, rhs_conv, lhs_ir.clone(), span);
+                    emit_inst(ctx, i);
+                    v
                 }
                 ast::AssignOp::XorAssign => {
-                    let (v,i) = ctx.builder.build_xor(cur_val, rhs_conv, lhs_ir.clone(), span); emit_inst(ctx,i); v
+                    let (v, i) = ctx
+                        .builder
+                        .build_xor(cur_val, rhs_conv, lhs_ir.clone(), span);
+                    emit_inst(ctx, i);
+                    v
                 }
                 ast::AssignOp::ShlAssign => {
-                    let (v,i) = ctx.builder.build_shl(cur_val, rhs_conv, lhs_ir.clone(), span); emit_inst(ctx,i); v
+                    let (v, i) = ctx
+                        .builder
+                        .build_shl(cur_val, rhs_conv, lhs_ir.clone(), span);
+                    emit_inst(ctx, i);
+                    v
                 }
                 ast::AssignOp::ShrAssign => {
-                    let (v,i) = ctx.builder.build_shr(cur_val, rhs_conv, lhs_ir.clone(), !uns, span); emit_inst(ctx,i); v
+                    let (v, i) =
+                        ctx.builder
+                            .build_shr(cur_val, rhs_conv, lhs_ir.clone(), !uns, span);
+                    emit_inst(ctx, i);
+                    v
                 }
                 ast::AssignOp::Assign => unreachable!(),
             };
@@ -1084,7 +1358,9 @@ fn lower_conditional(
 
     let cond_tv = lower_expr_inner(ctx, cond);
     let cond_bool = lower_to_bool(ctx, cond_tv.value, &cond_tv.ty, span);
-    let ci = ctx.builder.build_cond_branch(cond_bool, then_blk, else_blk, span);
+    let ci = ctx
+        .builder
+        .build_cond_branch(cond_bool, then_blk, else_blk, span);
     emit_inst(ctx, ci);
 
     // Then branch.
@@ -1112,9 +1388,9 @@ fn lower_conditional(
     let result_ir = ctype_to_ir(&result_ty, ctx.target);
     let tv = insert_implicit_conversion(ctx, then_tv.value, &then_tv.ty, &result_ty, span);
     let ev = insert_implicit_conversion(ctx, else_tv.value, &else_tv.ty, &result_ty, span);
-    let (pv, pi) = ctx.builder.build_phi(
-        result_ir, vec![(tv, then_end), (ev, else_end)], span,
-    );
+    let (pv, pi) = ctx
+        .builder
+        .build_phi(result_ir, vec![(tv, then_end), (ev, else_end)], span);
     emit_inst(ctx, pi);
     TypedValue::new(pv, result_ty)
 }
@@ -1146,7 +1422,9 @@ fn lower_function_call(
         arg_vals.push(v);
     }
 
-    let (result, ci) = ctx.builder.build_call(callee_tv.value, arg_vals, ret_ir.clone(), span);
+    let (result, ci) = ctx
+        .builder
+        .build_call(callee_tv.value, arg_vals, ret_ir.clone(), span);
     emit_inst(ctx, ci);
 
     if matches!(ret_cty, CType::Void) {
@@ -1160,15 +1438,19 @@ fn lower_function_call(
 fn extract_function_return_type(ctype: &CType) -> (CType, bool) {
     let resolved = types::resolve_typedef(ctype);
     match resolved {
-        CType::Function { return_type, variadic, .. } => {
-            (*return_type.clone(), *variadic)
-        }
+        CType::Function {
+            return_type,
+            variadic,
+            ..
+        } => (*return_type.clone(), *variadic),
         CType::Pointer(inner, _) => {
             let inner_resolved = types::resolve_typedef(inner);
             match inner_resolved {
-                CType::Function { return_type, variadic, .. } => {
-                    (*return_type.clone(), *variadic)
-                }
+                CType::Function {
+                    return_type,
+                    variadic,
+                    ..
+                } => (*return_type.clone(), *variadic),
                 _ => (CType::Int, false),
             }
         }
@@ -1221,11 +1503,17 @@ fn lower_cast(
         let fw = from_ir.int_width();
         let tw = to_ir.int_width();
         if tw < fw {
-            let (v,i) = ctx.builder.build_trunc(value, to_ir, span); emit_inst(ctx, i); return v;
+            let (v, i) = ctx.builder.build_trunc(value, to_ir, span);
+            emit_inst(ctx, i);
+            return v;
         } else if is_unsigned(from) {
-            let (v,i) = ctx.builder.build_zext(value, to_ir, span); emit_inst(ctx, i); return v;
+            let (v, i) = ctx.builder.build_zext(value, to_ir, span);
+            emit_inst(ctx, i);
+            return v;
         } else {
-            let (v,i) = ctx.builder.build_sext(value, to_ir, span); emit_inst(ctx, i); return v;
+            let (v, i) = ctx.builder.build_sext(value, to_ir, span);
+            emit_inst(ctx, i);
+            return v;
         }
     }
 
@@ -1233,42 +1521,49 @@ fn lower_cast(
     if from_ir.is_float() && to_ir.is_float() {
         // Use bitcast as a placeholder; proper FPTrunc/FPExt would be added
         // to the instruction set in a follow-up.  For now, identity via bitcast.
-        let (v,i) = ctx.builder.build_bitcast(value, to_ir, span); emit_inst(ctx, i);
+        let (v, i) = ctx.builder.build_bitcast(value, to_ir, span);
+        emit_inst(ctx, i);
         return v;
     }
 
     // Integer → Float.
     if from_ir.is_integer() && to_ir.is_float() {
-        let (v,i) = ctx.builder.build_bitcast(value, to_ir, span); emit_inst(ctx, i);
+        let (v, i) = ctx.builder.build_bitcast(value, to_ir, span);
+        emit_inst(ctx, i);
         return v;
     }
 
     // Float → Integer.
     if from_ir.is_float() && to_ir.is_integer() {
-        let (v,i) = ctx.builder.build_bitcast(value, to_ir, span); emit_inst(ctx, i);
+        let (v, i) = ctx.builder.build_bitcast(value, to_ir, span);
+        emit_inst(ctx, i);
         return v;
     }
 
     // Integer → Pointer.
     if from_ir.is_integer() && to_ir.is_pointer() {
-        let (v,i) = ctx.builder.build_int_to_ptr(value, span); emit_inst(ctx, i);
+        let (v, i) = ctx.builder.build_int_to_ptr(value, span);
+        emit_inst(ctx, i);
         return v;
     }
 
     // Pointer → Integer.
     if from_ir.is_pointer() && to_ir.is_integer() {
-        let (v,i) = ctx.builder.build_ptr_to_int(value, to_ir, span); emit_inst(ctx, i);
+        let (v, i) = ctx.builder.build_ptr_to_int(value, to_ir, span);
+        emit_inst(ctx, i);
         return v;
     }
 
     // Pointer → Pointer.
     if from_ir.is_pointer() && to_ir.is_pointer() {
-        let (v,i) = ctx.builder.build_bitcast(value, to_ir, span); emit_inst(ctx, i);
+        let (v, i) = ctx.builder.build_bitcast(value, to_ir, span);
+        emit_inst(ctx, i);
         return v;
     }
 
     // Fallback: bitcast.
-    let (v,i) = ctx.builder.build_bitcast(value, to_ir, span); emit_inst(ctx, i);
+    let (v, i) = ctx.builder.build_bitcast(value, to_ir, span);
+    emit_inst(ctx, i);
     v
 }
 
@@ -1316,9 +1611,17 @@ fn lower_sizeof_type(
     let _bw = ir_repr.int_width();
 
     // For struct types, also verify via compute_struct_layout for consistency.
-    if let CType::Struct { fields, packed, aligned, .. } = &cty {
+    if let CType::Struct {
+        fields,
+        packed,
+        aligned,
+        ..
+    } = &cty
+    {
         let field_types: Vec<CType> = fields.iter().map(|f| f.ty.clone()).collect();
-        let _layout = ctx.type_builder.compute_struct_layout(&field_types, *packed, *aligned);
+        let _layout = ctx
+            .type_builder
+            .compute_struct_layout(&field_types, *packed, *aligned);
     }
 
     let ir_ty = if ptr_w == 8 { IrType::I64 } else { IrType::I32 };
@@ -1379,13 +1682,14 @@ fn lower_member_access_lvalue(
     };
 
     // Look up the member in the struct fields.
-    let (member_offset, member_ty) = find_struct_member(&obj_ty, &member_name_owned, ctx.type_builder);
+    let (member_offset, member_ty) =
+        find_struct_member(&obj_ty, &member_name_owned, ctx.type_builder);
 
     // Compute GEP to the member.
     let offset_val = emit_int_const(ctx, member_offset as i128, size_ir_type(ctx.target), span);
-    let (gep_val, gep_inst) = ctx.builder.build_gep(
-        base_ptr, vec![offset_val], IrType::Ptr, span,
-    );
+    let (gep_val, gep_inst) = ctx
+        .builder
+        .build_gep(base_ptr, vec![offset_val], IrType::Ptr, span);
     emit_inst(ctx, gep_inst);
 
     TypedValue::new(gep_val, member_ty)
@@ -1395,10 +1699,13 @@ fn lower_member_access_lvalue(
 fn find_struct_member(ctype: &CType, name: &str, tb: &TypeBuilder) -> (usize, CType) {
     let resolved = types::resolve_typedef(ctype);
     match resolved {
-        CType::Struct { fields, packed, aligned, .. } => {
-            let layout = tb.compute_struct_layout_with_fields(
-                fields, *packed, *aligned,
-            );
+        CType::Struct {
+            fields,
+            packed,
+            aligned,
+            ..
+        } => {
+            let layout = tb.compute_struct_layout_with_fields(fields, *packed, *aligned);
             // Access overall layout properties for completeness checks.
             let _total_size = layout.size;
             let _total_align = layout.alignment;
@@ -1426,7 +1733,12 @@ fn find_struct_member(ctype: &CType, name: &str, tb: &TypeBuilder) -> (usize, CT
             }
             (0, CType::Void)
         }
-        CType::Union { fields, packed, aligned, .. } => {
+        CType::Union {
+            fields,
+            packed,
+            aligned,
+            ..
+        } => {
             // Use compute_union_layout for consistent field information.
             let field_types: Vec<CType> = fields.iter().map(|f| f.ty.clone()).collect();
             let _union_layout = tb.compute_union_layout(&field_types, *packed, *aligned);
@@ -1482,12 +1794,15 @@ fn lower_array_subscript_lvalue(
     let si = size_ir_type(ctx.target);
 
     // Scale index by element size.
-    let idx_val = insert_implicit_conversion(ctx, idx_tv.value, &idx_tv.ty, &size_ctype(ctx.target), span);
+    let idx_val =
+        insert_implicit_conversion(ctx, idx_tv.value, &idx_tv.ty, &size_ctype(ctx.target), span);
     let sc = emit_int_const(ctx, elem_size, si.clone(), span);
     let (byte_off, mi) = ctx.builder.build_mul(idx_val, sc, si, span);
     emit_inst(ctx, mi);
 
-    let (ptr, gi) = ctx.builder.build_gep(base_tv.value, vec![byte_off], IrType::Ptr, span);
+    let (ptr, gi) = ctx
+        .builder
+        .build_gep(base_tv.value, vec![byte_off], IrType::Ptr, span);
     emit_inst(ctx, gi);
 
     TypedValue::new(ptr, elem_ty)
@@ -1510,15 +1825,27 @@ fn lower_post_inc_dec(
 
     let new_val = if is_pointer_type(&lv.ty) {
         let es = pointee_size(&lv.ty, ctx.type_builder) as i128;
-        let step = emit_int_const(ctx, if is_inc { es } else { -(es as i128) }, size_ir_type(ctx.target), span);
-        let (r,g) = ctx.builder.build_gep(old_val, vec![step], IrType::Ptr, span); emit_inst(ctx, g);
+        let step = emit_int_const(
+            ctx,
+            if is_inc { es } else { -(es as i128) },
+            size_ir_type(ctx.target),
+            span,
+        );
+        let (r, g) = ctx
+            .builder
+            .build_gep(old_val, vec![step], IrType::Ptr, span);
+        emit_inst(ctx, g);
         r
     } else {
         let one = emit_one(ctx, ir_ty.clone(), span);
         if is_inc {
-            let (v,i) = ctx.builder.build_add(old_val, one, ir_ty, span); emit_inst(ctx,i); v
+            let (v, i) = ctx.builder.build_add(old_val, one, ir_ty, span);
+            emit_inst(ctx, i);
+            v
         } else {
-            let (v,i) = ctx.builder.build_sub(old_val, one, ir_ty, span); emit_inst(ctx,i); v
+            let (v, i) = ctx.builder.build_sub(old_val, one, ir_ty, span);
+            emit_inst(ctx, i);
+            v
         }
     };
     let si = ctx.builder.build_store(new_val, lv.value, span);
@@ -1540,15 +1867,27 @@ fn lower_pre_inc_dec(
 
     let new_val = if is_pointer_type(&lv.ty) {
         let es = pointee_size(&lv.ty, ctx.type_builder) as i128;
-        let step = emit_int_const(ctx, if is_inc { es } else { -(es as i128) }, size_ir_type(ctx.target), span);
-        let (r,g) = ctx.builder.build_gep(old_val, vec![step], IrType::Ptr, span); emit_inst(ctx, g);
+        let step = emit_int_const(
+            ctx,
+            if is_inc { es } else { -(es as i128) },
+            size_ir_type(ctx.target),
+            span,
+        );
+        let (r, g) = ctx
+            .builder
+            .build_gep(old_val, vec![step], IrType::Ptr, span);
+        emit_inst(ctx, g);
         r
     } else {
         let one = emit_one(ctx, ir_ty.clone(), span);
         if is_inc {
-            let (v,i) = ctx.builder.build_add(old_val, one, ir_ty, span); emit_inst(ctx,i); v
+            let (v, i) = ctx.builder.build_add(old_val, one, ir_ty, span);
+            emit_inst(ctx, i);
+            v
         } else {
-            let (v,i) = ctx.builder.build_sub(old_val, one, ir_ty, span); emit_inst(ctx,i); v
+            let (v, i) = ctx.builder.build_sub(old_val, one, ir_ty, span);
+            emit_inst(ctx, i);
+            v
         }
     };
     let si = ctx.builder.build_store(new_val, lv.value, span);
@@ -1590,7 +1929,8 @@ fn lower_compound_literal(
 
     // Validate completeness of the type for diagnostic reporting.
     if !type_builder::is_complete_type(&cty) {
-        ctx.diagnostics.emit_warning(span, "compound literal of incomplete type");
+        ctx.diagnostics
+            .emit_warning(span, "compound literal of incomplete type");
     }
 
     let ir_ty = ctype_to_ir(&cty, ctx.target);
@@ -1760,7 +2100,10 @@ fn lower_builtin(
                 let _ = lower_expr_inner(ctx, arg);
             }
             let v = emit_int_const(ctx, 0, IrType::Ptr, span);
-            TypedValue::new(v, CType::Pointer(Box::new(CType::Void), TypeQualifiers::default()))
+            TypedValue::new(
+                v,
+                CType::Pointer(Box::new(CType::Void), TypeQualifiers::default()),
+            )
         }
 
         ast::BuiltinKind::ReturnAddress => {
@@ -1768,7 +2111,10 @@ fn lower_builtin(
                 let _ = lower_expr_inner(ctx, arg);
             }
             let v = emit_int_const(ctx, 0, IrType::Ptr, span);
-            TypedValue::new(v, CType::Pointer(Box::new(CType::Void), TypeQualifiers::default()))
+            TypedValue::new(
+                v,
+                CType::Pointer(Box::new(CType::Void), TypeQualifiers::default()),
+            )
         }
 
         // ----- Alignment hint -----
@@ -1814,7 +2160,9 @@ fn lower_bit_builtin(
     // Create a pseudo-global for the intrinsic and emit a call.
     let intrinsic_name = format!("__builtin_{}", name);
     let callee = emit_global_ref(ctx, &intrinsic_name, span);
-    let (result, ci) = ctx.builder.build_call(callee, vec![arg.value], IrType::I32, span);
+    let (result, ci) = ctx
+        .builder
+        .build_call(callee, vec![arg.value], IrType::I32, span);
     emit_inst(ctx, ci);
     TypedValue::new(result, CType::Int)
 }
@@ -1846,7 +2194,9 @@ fn lower_bswap(
         _ => CType::UInt,
     };
     let callee = emit_global_ref(ctx, &intrinsic_name, span);
-    let (result, ci) = ctx.builder.build_call(callee, vec![arg.value], ret_ty, span);
+    let (result, ci) = ctx
+        .builder
+        .build_call(callee, vec![arg.value], ret_ty, span);
     emit_inst(ctx, ci);
     TypedValue::new(result, ret_cty)
 }
@@ -1886,7 +2236,8 @@ fn lower_overflow_arith(
     span: Span,
 ) -> TypedValue {
     if args.len() < 3 {
-        ctx.diagnostics.emit_error(span, "overflow builtin requires 3 arguments");
+        ctx.diagnostics
+            .emit_error(span, "overflow builtin requires 3 arguments");
         return TypedValue::void();
     }
     let a = lower_expr_inner(ctx, &args[0]);
@@ -1918,11 +2269,7 @@ fn lower_overflow_arith(
 }
 
 /// Emit a reference to a global function/symbol by name.
-fn emit_global_ref(
-    ctx: &mut ExprLoweringContext<'_>,
-    name: &str,
-    span: Span,
-) -> Value {
+fn emit_global_ref(ctx: &mut ExprLoweringContext<'_>, name: &str, span: Span) -> Value {
     // Look up in module globals / functions.
     if let Some(func) = ctx.module.get_function(name) {
         // Function declarations provide a callable Value.
@@ -1982,7 +2329,8 @@ fn lower_generic(
     }
 
     // No matching association — emit a diagnostic.
-    ctx.diagnostics.emit_error(span, "_Generic: no matching association");
+    ctx.diagnostics
+        .emit_error(span, "_Generic: no matching association");
     TypedValue::void()
 }
 
@@ -2001,7 +2349,10 @@ fn lower_address_of_label(
     // converts it to a pointer Value using BlockAddress.
     // For now, emit a null pointer as a placeholder.
     let null = emit_int_const(ctx, 0, IrType::Ptr, span);
-    TypedValue::new(null, CType::Pointer(Box::new(CType::Void), TypeQualifiers::default()))
+    TypedValue::new(
+        null,
+        CType::Pointer(Box::new(CType::Void), TypeQualifiers::default()),
+    )
 }
 
 // =========================================================================
@@ -2064,58 +2415,71 @@ fn insert_implicit_conversion(
             return value;
         }
         if tw < fw {
-            let (v, i) = ctx.builder.build_trunc(value, to_ir, span); emit_inst(ctx, i); return v;
+            let (v, i) = ctx.builder.build_trunc(value, to_ir, span);
+            emit_inst(ctx, i);
+            return v;
         }
         if is_unsigned(from) {
-            let (v, i) = ctx.builder.build_zext(value, to_ir, span); emit_inst(ctx, i); return v;
+            let (v, i) = ctx.builder.build_zext(value, to_ir, span);
+            emit_inst(ctx, i);
+            return v;
         } else {
-            let (v, i) = ctx.builder.build_sext(value, to_ir, span); emit_inst(ctx, i); return v;
+            let (v, i) = ctx.builder.build_sext(value, to_ir, span);
+            emit_inst(ctx, i);
+            return v;
         }
     }
 
     // Bool (I1) to integer.
     if matches!(from, CType::Bool) && types::is_integer(to) {
         let to_ir = ctype_to_ir(to, ctx.target);
-        let (v, i) = ctx.builder.build_zext(value, to_ir, span); emit_inst(ctx, i);
+        let (v, i) = ctx.builder.build_zext(value, to_ir, span);
+        emit_inst(ctx, i);
         return v;
     }
 
     // Integer to bool.
     if types::is_integer(from) && matches!(to, CType::Bool) {
         let zero = emit_zero(ctx, ctype_to_ir(from, ctx.target), span);
-        let (v, i) = ctx.builder.build_icmp(ICmpOp::Ne, value, zero, span); emit_inst(ctx, i);
+        let (v, i) = ctx.builder.build_icmp(ICmpOp::Ne, value, zero, span);
+        emit_inst(ctx, i);
         return v;
     }
 
     // Integer ↔ Float.
     if types::is_integer(from) && types::is_floating(to) {
         let to_ir = ctype_to_ir(to, ctx.target);
-        let (v, i) = ctx.builder.build_bitcast(value, to_ir, span); emit_inst(ctx, i);
+        let (v, i) = ctx.builder.build_bitcast(value, to_ir, span);
+        emit_inst(ctx, i);
         return v;
     }
     if types::is_floating(from) && types::is_integer(to) {
         let to_ir = ctype_to_ir(to, ctx.target);
-        let (v, i) = ctx.builder.build_bitcast(value, to_ir, span); emit_inst(ctx, i);
+        let (v, i) = ctx.builder.build_bitcast(value, to_ir, span);
+        emit_inst(ctx, i);
         return v;
     }
 
     // Float ↔ Float (different widths).
     if types::is_floating(from) && types::is_floating(to) {
         let to_ir = ctype_to_ir(to, ctx.target);
-        let (v, i) = ctx.builder.build_bitcast(value, to_ir, span); emit_inst(ctx, i);
+        let (v, i) = ctx.builder.build_bitcast(value, to_ir, span);
+        emit_inst(ctx, i);
         return v;
     }
 
     // Integer → Pointer.
     if types::is_integer(from) && types::is_pointer(to) {
-        let (v, i) = ctx.builder.build_int_to_ptr(value, span); emit_inst(ctx, i);
+        let (v, i) = ctx.builder.build_int_to_ptr(value, span);
+        emit_inst(ctx, i);
         return v;
     }
 
     // Pointer → Integer.
     if types::is_pointer(from) && types::is_integer(to) {
         let to_ir = ctype_to_ir(to, ctx.target);
-        let (v, i) = ctx.builder.build_ptr_to_int(value, to_ir, span); emit_inst(ctx, i);
+        let (v, i) = ctx.builder.build_ptr_to_int(value, to_ir, span);
+        emit_inst(ctx, i);
         return v;
     }
 
@@ -2129,13 +2493,18 @@ fn insert_implicit_conversion(
     if matches!(from, CType::Enum { .. }) && types::is_integer(to) {
         let to_ir = ctype_to_ir(to, ctx.target);
         let from_ir = ctype_to_ir(from, ctx.target);
-        if from_ir == to_ir { return value; }
+        if from_ir == to_ir {
+            return value;
+        }
         let fw = from_ir.int_width();
         let tw = to_ir.int_width();
         if tw < fw {
-            let (v, i) = ctx.builder.build_trunc(value, to_ir, span); emit_inst(ctx, i); return v;
+            let (v, i) = ctx.builder.build_trunc(value, to_ir, span);
+            emit_inst(ctx, i);
+            return v;
         }
-        let (v, i) = ctx.builder.build_sext(value, to_ir, span); emit_inst(ctx, i);
+        let (v, i) = ctx.builder.build_sext(value, to_ir, span);
+        emit_inst(ctx, i);
         return v;
     }
 
@@ -2196,7 +2565,9 @@ fn lower_to_bool(
     // Pointer types.
     if types::is_pointer(stripped) {
         let ptr_int_ty = size_ir_type(ctx.target);
-        let (int_val, pti) = ctx.builder.build_ptr_to_int(value, ptr_int_ty.clone(), span);
+        let (int_val, pti) = ctx
+            .builder
+            .build_ptr_to_int(value, ptr_int_ty.clone(), span);
         emit_inst(ctx, pti);
         let zero = emit_zero(ctx, ptr_int_ty, span);
         let (v, i) = ctx.builder.build_icmp(ICmpOp::Ne, int_val, zero, span);
