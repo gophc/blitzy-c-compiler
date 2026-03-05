@@ -531,9 +531,9 @@ pub fn classify_arguments(params: &[IrType], target: &Target) -> Vec<ArgLocation
         let param_size = param.size_bytes(target);
 
         // MEMORY / X87 → always on stack.
-        let is_memory = classes.iter().any(|c| {
-            *c == AbiClass::Memory || *c == AbiClass::X87 || *c == AbiClass::X87Up
-        });
+        let is_memory = classes
+            .iter()
+            .any(|c| *c == AbiClass::Memory || *c == AbiClass::X87 || *c == AbiClass::X87Up);
 
         if is_memory || param.is_void() {
             let aligned_size = align_to(param_size.max(8), 8) as i32;
@@ -622,9 +622,9 @@ pub fn classify_return(ret_type: &IrType, target: &Target) -> RetLocation {
     let classes = classify_ir_type_eightbytes(ret_type, target);
 
     // MEMORY or X87 → indirect return via hidden pointer.
-    let is_memory = classes.iter().any(|c| {
-        *c == AbiClass::Memory || *c == AbiClass::X87 || *c == AbiClass::X87Up
-    });
+    let is_memory = classes
+        .iter()
+        .any(|c| *c == AbiClass::Memory || *c == AbiClass::X87 || *c == AbiClass::X87Up);
     if is_memory {
         return RetLocation::Indirect;
     }
@@ -835,8 +835,7 @@ fn classify_ir_struct_eightbytes(st: &StructType, target: &Target) -> Vec<AbiCla
             IrType::F80 if start_eb < num_eb => {
                 classes[start_eb] = merge_abi_class(classes[start_eb], AbiClass::X87);
                 if start_eb + 1 < num_eb {
-                    classes[start_eb + 1] =
-                        merge_abi_class(classes[start_eb + 1], AbiClass::X87Up);
+                    classes[start_eb + 1] = merge_abi_class(classes[start_eb + 1], AbiClass::X87Up);
                 }
             }
             IrType::I128 if start_eb < num_eb => {
@@ -989,11 +988,7 @@ fn aggregate_class_summary(classes: &[AbiClass]) -> AbiClass {
 }
 
 /// Allocate a register for a single eightbyte classification.
-fn alloc_eightbyte_reg(
-    class: AbiClass,
-    gpr_idx: &mut usize,
-    sse_idx: &mut usize,
-) -> Option<u16> {
+fn alloc_eightbyte_reg(class: AbiClass, gpr_idx: &mut usize, sse_idx: &mut usize) -> Option<u16> {
     match class {
         AbiClass::Integer => {
             if *gpr_idx < INTEGER_ARG_REGS.len() {
@@ -1125,13 +1120,22 @@ mod tests {
     fn test_classify_arguments_overflow_to_stack() {
         let t = Target::X86_64;
         let params = vec![
-            IrType::I64, IrType::I64, IrType::I64, IrType::I64,
-            IrType::I64, IrType::I64, IrType::I64,
+            IrType::I64,
+            IrType::I64,
+            IrType::I64,
+            IrType::I64,
+            IrType::I64,
+            IrType::I64,
+            IrType::I64,
         ];
         let locs = classify_arguments(&params, &t);
         assert_eq!(locs.len(), 7);
         for i in 0..6 {
-            assert!(matches!(locs[i], ArgLocation::Register(_)), "Arg {} in reg", i);
+            assert!(
+                matches!(locs[i], ArgLocation::Register(_)),
+                "Arg {} in reg",
+                i
+            );
         }
         assert!(matches!(locs[6], ArgLocation::Stack(_)), "7th on stack");
     }
@@ -1151,7 +1155,10 @@ mod tests {
     #[test]
     fn test_classify_return_void() {
         let t = Target::X86_64;
-        assert!(matches!(classify_return(&IrType::Void, &t), RetLocation::Void));
+        assert!(matches!(
+            classify_return(&IrType::Void, &t),
+            RetLocation::Void
+        ));
     }
 
     #[test]
@@ -1185,7 +1192,10 @@ mod tests {
     #[test]
     fn test_classify_return_f80_indirect() {
         let t = Target::X86_64;
-        assert!(matches!(classify_return(&IrType::F80, &t), RetLocation::Indirect));
+        assert!(matches!(
+            classify_return(&IrType::F80, &t),
+            RetLocation::Indirect
+        ));
     }
 
     #[test]
@@ -1239,19 +1249,43 @@ mod tests {
 
     #[test]
     fn test_merge_abi_class() {
-        assert_eq!(merge_abi_class(AbiClass::NoClass, AbiClass::Integer), AbiClass::Integer);
-        assert_eq!(merge_abi_class(AbiClass::Integer, AbiClass::NoClass), AbiClass::Integer);
-        assert_eq!(merge_abi_class(AbiClass::Integer, AbiClass::Integer), AbiClass::Integer);
+        assert_eq!(
+            merge_abi_class(AbiClass::NoClass, AbiClass::Integer),
+            AbiClass::Integer
+        );
+        assert_eq!(
+            merge_abi_class(AbiClass::Integer, AbiClass::NoClass),
+            AbiClass::Integer
+        );
+        assert_eq!(
+            merge_abi_class(AbiClass::Integer, AbiClass::Integer),
+            AbiClass::Integer
+        );
         assert_eq!(merge_abi_class(AbiClass::Sse, AbiClass::Sse), AbiClass::Sse);
-        assert_eq!(merge_abi_class(AbiClass::Memory, AbiClass::Integer), AbiClass::Memory);
-        assert_eq!(merge_abi_class(AbiClass::Integer, AbiClass::Sse), AbiClass::Integer);
+        assert_eq!(
+            merge_abi_class(AbiClass::Memory, AbiClass::Integer),
+            AbiClass::Memory
+        );
+        assert_eq!(
+            merge_abi_class(AbiClass::Integer, AbiClass::Sse),
+            AbiClass::Integer
+        );
         // Per System V AMD64 ABI §3.2.3, INTEGER (step d) takes precedence
         // over X87 (step e), so INTEGER + X87 = INTEGER.
-        assert_eq!(merge_abi_class(AbiClass::X87, AbiClass::Integer), AbiClass::Integer);
+        assert_eq!(
+            merge_abi_class(AbiClass::X87, AbiClass::Integer),
+            AbiClass::Integer
+        );
         // But X87 + SSE (both checked after INTEGER) → MEMORY (step e).
-        assert_eq!(merge_abi_class(AbiClass::X87, AbiClass::Sse), AbiClass::Memory);
+        assert_eq!(
+            merge_abi_class(AbiClass::X87, AbiClass::Sse),
+            AbiClass::Memory
+        );
         // SseUp + Sse → Sse (neither is Memory/Integer/X87-vs-non-X87).
-        assert_eq!(merge_abi_class(AbiClass::Sse, AbiClass::SseUp), AbiClass::Memory);
+        assert_eq!(
+            merge_abi_class(AbiClass::Sse, AbiClass::SseUp),
+            AbiClass::Memory
+        );
     }
 
     #[test]
@@ -1269,8 +1303,16 @@ mod tests {
         let ty = CType::Struct {
             name: None,
             fields: vec![
-                StructField { name: Some("a".into()), ty: CType::Int, bit_width: None },
-                StructField { name: Some("b".into()), ty: CType::Int, bit_width: None },
+                StructField {
+                    name: Some("a".into()),
+                    ty: CType::Int,
+                    bit_width: None,
+                },
+                StructField {
+                    name: Some("b".into()),
+                    ty: CType::Int,
+                    bit_width: None,
+                },
             ],
             packed: false,
             aligned: None,
@@ -1287,8 +1329,16 @@ mod tests {
         let ty = CType::Struct {
             name: None,
             fields: vec![
-                StructField { name: Some("a".into()), ty: CType::Int, bit_width: None },
-                StructField { name: Some("b".into()), ty: CType::Double, bit_width: None },
+                StructField {
+                    name: Some("a".into()),
+                    ty: CType::Int,
+                    bit_width: None,
+                },
+                StructField {
+                    name: Some("b".into()),
+                    ty: CType::Double,
+                    bit_width: None,
+                },
             ],
             packed: false,
             aligned: None,
@@ -1306,9 +1356,21 @@ mod tests {
         let ty = CType::Struct {
             name: None,
             fields: vec![
-                StructField { name: Some("a".into()), ty: CType::Long, bit_width: None },
-                StructField { name: Some("b".into()), ty: CType::Long, bit_width: None },
-                StructField { name: Some("c".into()), ty: CType::Long, bit_width: None },
+                StructField {
+                    name: Some("a".into()),
+                    ty: CType::Long,
+                    bit_width: None,
+                },
+                StructField {
+                    name: Some("b".into()),
+                    ty: CType::Long,
+                    bit_width: None,
+                },
+                StructField {
+                    name: Some("c".into()),
+                    ty: CType::Long,
+                    bit_width: None,
+                },
             ],
             packed: false,
             aligned: None,
