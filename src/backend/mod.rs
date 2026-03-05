@@ -6,4 +6,5 @@
 
 pub mod dwarf;
 pub mod elf_writer_common;
+pub mod linker_common;
 pub mod x86_64;
