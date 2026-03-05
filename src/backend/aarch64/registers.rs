@@ -264,10 +264,10 @@ pub const NUM_ALLOCATABLE_GPRS: usize = 29;
 pub const ALLOCATABLE_GPRS: &[u8] = &[
     // Caller-saved temporaries (preferred for allocation — no save overhead)
     X0, X1, X2, X3, X4, X5, X6, X7, // argument registers, scratch after use
-    X8,                                // indirect result location register
+    X8, // indirect result location register
     X9, X10, X11, X12, X13, X14, X15, // scratch temporaries
-    X16, X17,                          // IP0, IP1 — intra-procedure scratch
-    X18,                               // platform register (usable on Linux)
+    X16, X17, // IP0, IP1 — intra-procedure scratch
+    X18, // platform register (usable on Linux)
     // Callee-saved (allocator will prefer caller-saved first)
     X19, X20, X21, X22, X23, X24, X25, X26, X27, X28,
 ];
@@ -279,9 +279,9 @@ pub const ALLOCATABLE_GPRS: &[u8] = &[
 /// only the lower 64 bits D8–D15 are preserved by the callee).
 pub const ALLOCATABLE_FPRS: &[u8] = &[
     // Caller-saved (argument + scratch — no save overhead)
-    V0, V1, V2, V3, V4, V5, V6, V7,         // FP argument/return registers
-    V16, V17, V18, V19, V20, V21, V22, V23,  // scratch temporaries
-    V24, V25, V26, V27, V28, V29, V30, V31,  // scratch temporaries
+    V0, V1, V2, V3, V4, V5, V6, V7, // FP argument/return registers
+    V16, V17, V18, V19, V20, V21, V22, V23, // scratch temporaries
+    V24, V25, V26, V27, V28, V29, V30, V31, // scratch temporaries
     // Callee-saved (lower 64 bits D8–D15 preserved by callee)
     V8, V9, V10, V11, V12, V13, V14, V15,
 ];
@@ -295,17 +295,13 @@ pub const ALLOCATABLE_FPRS: &[u8] = &[
 /// These registers must be preserved across function calls. If a function
 /// uses any of these registers, it must save them in the prologue and
 /// restore them in the epilogue.
-pub const CALLEE_SAVED_GPRS: &[u8] = &[
-    X19, X20, X21, X22, X23, X24, X25, X26, X27, X28,
-];
+pub const CALLEE_SAVED_GPRS: &[u8] = &[X19, X20, X21, X22, X23, X24, X25, X26, X27, X28];
 
 /// Callee-saved FP registers per AAPCS64: V8–V15 (8 registers).
 ///
 /// Only the lower 64 bits (D8–D15) are preserved by the callee.
 /// The upper 64 bits of V8–V15 are NOT preserved across calls.
-pub const CALLEE_SAVED_FPRS: &[u8] = &[
-    V8, V9, V10, V11, V12, V13, V14, V15,
-];
+pub const CALLEE_SAVED_FPRS: &[u8] = &[V8, V9, V10, V11, V12, V13, V14, V15];
 
 /// Caller-saved GPRs per AAPCS64: X0–X18, X30 (LR) — 20 registers.
 ///
@@ -318,18 +314,15 @@ pub const CALLEE_SAVED_FPRS: &[u8] = &[
 /// X30 (LR) is caller-saved because the callee may use BL which
 /// overwrites LR.
 pub const CALLER_SAVED_GPRS: &[u8] = &[
-    X0, X1, X2, X3, X4, X5, X6, X7, X8,
-    X9, X10, X11, X12, X13, X14, X15,
-    X16, X17, X18, X30,
+    X0, X1, X2, X3, X4, X5, X6, X7, X8, X9, X10, X11, X12, X13, X14, X15, X16, X17, X18, X30,
 ];
 
 /// Caller-saved FP registers per AAPCS64: V0–V7, V16–V31 — 24 registers.
 ///
 /// These registers may be clobbered by any function call.
 pub const CALLER_SAVED_FPRS: &[u8] = &[
-    V0, V1, V2, V3, V4, V5, V6, V7,
-    V16, V17, V18, V19, V20, V21, V22, V23,
-    V24, V25, V26, V27, V28, V29, V30, V31,
+    V0, V1, V2, V3, V4, V5, V6, V7, V16, V17, V18, V19, V20, V21, V22, V23, V24, V25, V26, V27,
+    V28, V29, V30, V31,
 ];
 
 /// Reserved registers that are never available for general allocation.
@@ -347,43 +340,38 @@ pub const RESERVED_REGS: &[u8] = &[SP_REG];
 /// 64-bit GPR names (X-register view). Index 31 maps to "sp" (stack pointer
 /// context).
 const GPR_NAMES_X: [&str; 32] = [
-    "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
-    "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
-    "x16", "x17", "x18", "x19", "x20", "x21", "x22", "x23",
-    "x24", "x25", "x26", "x27", "x28", "x29", "x30", "sp",
+    "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14",
+    "x15", "x16", "x17", "x18", "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27",
+    "x28", "x29", "x30", "sp",
 ];
 
 /// 64-bit GPR names with zero register context. Index 31 maps to "xzr"
 /// instead of "sp".
 const GPR_NAMES_X_ZR: [&str; 32] = [
-    "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
-    "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
-    "x16", "x17", "x18", "x19", "x20", "x21", "x22", "x23",
-    "x24", "x25", "x26", "x27", "x28", "x29", "x30", "xzr",
+    "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14",
+    "x15", "x16", "x17", "x18", "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27",
+    "x28", "x29", "x30", "xzr",
 ];
 
 /// SIMD/FP register names (V-register 128-bit view). Indexed 0–31.
 const FPR_NAMES_V: [&str; 32] = [
-    "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
-    "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15",
-    "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23",
-    "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31",
+    "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14",
+    "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27",
+    "v28", "v29", "v30", "v31",
 ];
 
 /// SIMD/FP register names (D-register 64-bit double view). Indexed 0–31.
 const FPR_NAMES_D: [&str; 32] = [
-    "d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7",
-    "d8", "d9", "d10", "d11", "d12", "d13", "d14", "d15",
-    "d16", "d17", "d18", "d19", "d20", "d21", "d22", "d23",
-    "d24", "d25", "d26", "d27", "d28", "d29", "d30", "d31",
+    "d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7", "d8", "d9", "d10", "d11", "d12", "d13", "d14",
+    "d15", "d16", "d17", "d18", "d19", "d20", "d21", "d22", "d23", "d24", "d25", "d26", "d27",
+    "d28", "d29", "d30", "d31",
 ];
 
 /// SIMD/FP register names (S-register 32-bit float view). Indexed 0–31.
 const FPR_NAMES_S: [&str; 32] = [
-    "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
-    "s8", "s9", "s10", "s11", "s12", "s13", "s14", "s15",
-    "s16", "s17", "s18", "s19", "s20", "s21", "s22", "s23",
-    "s24", "s25", "s26", "s27", "s28", "s29", "s30", "s31",
+    "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11", "s12", "s13", "s14",
+    "s15", "s16", "s17", "s18", "s19", "s20", "s21", "s22", "s23", "s24", "s25", "s26", "s27",
+    "s28", "s29", "s30", "s31",
 ];
 
 // ===========================================================================
@@ -725,9 +713,8 @@ impl AArch64RegisterInfo {
             allocatable_gpr: ALLOCATABLE_GPRS.iter().map(|&r| r as u16).collect(),
             allocatable_fpr: ALLOCATABLE_FPRS.iter().map(|&r| r as u16).collect(),
             callee_saved: {
-                let mut saved = Vec::with_capacity(
-                    CALLEE_SAVED_GPRS.len() + CALLEE_SAVED_FPRS.len(),
-                );
+                let mut saved =
+                    Vec::with_capacity(CALLEE_SAVED_GPRS.len() + CALLEE_SAVED_FPRS.len());
                 for &r in CALLEE_SAVED_GPRS {
                     saved.push(r as u16);
                 }
@@ -737,9 +724,8 @@ impl AArch64RegisterInfo {
                 saved
             },
             caller_saved: {
-                let mut saved = Vec::with_capacity(
-                    CALLER_SAVED_GPRS.len() + CALLER_SAVED_FPRS.len(),
-                );
+                let mut saved =
+                    Vec::with_capacity(CALLER_SAVED_GPRS.len() + CALLER_SAVED_FPRS.len());
                 for &r in CALLER_SAVED_GPRS {
                     saved.push(r as u16);
                 }

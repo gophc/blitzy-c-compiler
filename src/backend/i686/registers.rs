@@ -551,13 +551,25 @@ mod tests {
             assert!(reg <= 7, "GPR index {} exceeds 3-bit limit", reg);
         }
         for &reg in CALLEE_SAVED {
-            assert!(reg <= 7, "Callee-saved register index {} exceeds 3-bit limit", reg);
+            assert!(
+                reg <= 7,
+                "Callee-saved register index {} exceeds 3-bit limit",
+                reg
+            );
         }
         for &reg in CALLER_SAVED {
-            assert!(reg <= 7, "Caller-saved register index {} exceeds 3-bit limit", reg);
+            assert!(
+                reg <= 7,
+                "Caller-saved register index {} exceeds 3-bit limit",
+                reg
+            );
         }
         for &reg in RESERVED {
-            assert!(reg <= 7, "Reserved register index {} exceeds 3-bit limit", reg);
+            assert!(
+                reg <= 7,
+                "Reserved register index {} exceeds 3-bit limit",
+                reg
+            );
         }
     }
 

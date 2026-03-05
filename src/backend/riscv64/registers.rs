@@ -357,11 +357,11 @@ pub enum RegClass {
 /// values) and callee-saved registers last (preferred for long-lived values
 /// since they require save/restore in prologue/epilogue).
 pub const ALLOCATABLE_GPRS: &[u8] = &[
-    X5, X6, X7,                                                     // t0–t2 (caller-saved)
-    X10, X11, X12, X13, X14, X15, X16, X17,                         // a0–a7 (caller-saved)
-    X28, X29, X30, X31,                                              // t3–t6 (caller-saved)
-    X8, X9,                                                          // s0–s1 (callee-saved)
-    X18, X19, X20, X21, X22, X23, X24, X25, X26, X27,               // s2–s11 (callee-saved)
+    X5, X6, X7, // t0–t2 (caller-saved)
+    X10, X11, X12, X13, X14, X15, X16, X17, // a0–a7 (caller-saved)
+    X28, X29, X30, X31, // t3–t6 (caller-saved)
+    X8, X9, // s0–s1 (callee-saved)
+    X18, X19, X20, X21, X22, X23, X24, X25, X26, X27, // s2–s11 (callee-saved)
 ];
 
 /// Allocatable floating-point registers — all f0–f31 are allocatable.
@@ -369,11 +369,11 @@ pub const ALLOCATABLE_GPRS: &[u8] = &[
 /// Ordered with caller-saved registers first (temporaries and arguments)
 /// and callee-saved registers last.
 pub const ALLOCATABLE_FPRS: &[u8] = &[
-    F0, F1, F2, F3, F4, F5, F6, F7,                                 // ft0–ft7 (caller-saved)
-    F10, F11, F12, F13, F14, F15, F16, F17,                          // fa0–fa7 (caller-saved)
-    F28, F29, F30, F31,                                              // ft8–ft11 (caller-saved)
-    F8, F9,                                                          // fs0–fs1 (callee-saved)
-    F18, F19, F20, F21, F22, F23, F24, F25, F26, F27,                // fs2–fs11 (callee-saved)
+    F0, F1, F2, F3, F4, F5, F6, F7, // ft0–ft7 (caller-saved)
+    F10, F11, F12, F13, F14, F15, F16, F17, // fa0–fa7 (caller-saved)
+    F28, F29, F30, F31, // ft8–ft11 (caller-saved)
+    F8, F9, // fs0–fs1 (callee-saved)
+    F18, F19, F20, F21, F22, F23, F24, F25, F26, F27, // fs2–fs11 (callee-saved)
 ];
 
 // ===========================================================================
@@ -384,33 +384,26 @@ pub const ALLOCATABLE_FPRS: &[u8] = &[
 ///
 /// The callee must save and restore these registers if it modifies them.
 /// 12 registers total.
-pub const CALLEE_SAVED_GPRS: &[u8] = &[
-    X8, X9, X18, X19, X20, X21, X22, X23, X24, X25, X26, X27,
-];
+pub const CALLEE_SAVED_GPRS: &[u8] = &[X8, X9, X18, X19, X20, X21, X22, X23, X24, X25, X26, X27];
 
 /// Callee-saved floating-point registers: fs0–fs11 (f8–f9, f18–f27).
 ///
 /// 12 registers total.
-pub const CALLEE_SAVED_FPRS: &[u8] = &[
-    F8, F9, F18, F19, F20, F21, F22, F23, F24, F25, F26, F27,
-];
+pub const CALLEE_SAVED_FPRS: &[u8] = &[F8, F9, F18, F19, F20, F21, F22, F23, F24, F25, F26, F27];
 
 /// Caller-saved integer registers: ra, t0–t6, a0–a7.
 ///
 /// The caller must save these registers before a call if their values
 /// are needed after the call. 16 registers total.
 pub const CALLER_SAVED_GPRS: &[u8] = &[
-    X1, X5, X6, X7, X10, X11, X12, X13, X14, X15, X16, X17,
-    X28, X29, X30, X31,
+    X1, X5, X6, X7, X10, X11, X12, X13, X14, X15, X16, X17, X28, X29, X30, X31,
 ];
 
 /// Caller-saved floating-point registers: ft0–ft7, fa0–fa7, ft8–ft11.
 ///
 /// 20 registers total.
 pub const CALLER_SAVED_FPRS: &[u8] = &[
-    F0, F1, F2, F3, F4, F5, F6, F7,
-    F10, F11, F12, F13, F14, F15, F16, F17,
-    F28, F29, F30, F31,
+    F0, F1, F2, F3, F4, F5, F6, F7, F10, F11, F12, F13, F14, F15, F16, F17, F28, F29, F30, F31,
 ];
 
 /// Reserved integer registers that are never allocated by the register
@@ -442,22 +435,17 @@ pub const RETURN_FPRS: &[u8] = &[F10, F11];
 
 /// ABI names for integer registers x0–x31, indexed by register number.
 const GPR_NAMES: [&str; 32] = [
-    "zero", "ra", "sp", "gp", "tp",
-    "t0", "t1", "t2",
-    "s0", "s1",
-    "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7",
-    "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11",
-    "t3", "t4", "t5", "t6",
+    "zero", "ra", "sp", "gp", "tp", "t0", "t1", "t2", "s0", "s1", "a0", "a1", "a2", "a3", "a4",
+    "a5", "a6", "a7", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11", "t3", "t4",
+    "t5", "t6",
 ];
 
 /// ABI names for floating-point registers f0–f31, indexed by f-register number
 /// (0–31, NOT the full register ID 32–63).
 const FPR_NAMES: [&str; 32] = [
-    "ft0", "ft1", "ft2", "ft3", "ft4", "ft5", "ft6", "ft7",
-    "fs0", "fs1",
-    "fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7",
-    "fs2", "fs3", "fs4", "fs5", "fs6", "fs7", "fs8", "fs9", "fs10", "fs11",
-    "ft8", "ft9", "ft10", "ft11",
+    "ft0", "ft1", "ft2", "ft3", "ft4", "ft5", "ft6", "ft7", "fs0", "fs1", "fa0", "fa1", "fa2",
+    "fa3", "fa4", "fa5", "fa6", "fa7", "fs2", "fs3", "fs4", "fs5", "fs6", "fs7", "fs8", "fs9",
+    "fs10", "fs11", "ft8", "ft9", "ft10", "ft11",
 ];
 
 // ===========================================================================

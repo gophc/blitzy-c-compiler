@@ -13,4 +13,5 @@
 //! ## Submodules
 //! - [`registers`] — Register definitions (GPRs, x87 FPU stack)
 
+pub mod linker;
 pub mod registers;
