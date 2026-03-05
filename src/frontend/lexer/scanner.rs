@@ -493,3 +493,457 @@ impl<'src> Scanner<'src> {
         }
     }
 }
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ===================================================================
+    // Construction and empty input
+    // ===================================================================
+
+    #[test]
+    fn test_new_scanner_empty_input() {
+        let mut sc = Scanner::new("");
+        assert!(sc.is_eof());
+        assert_eq!(sc.advance(), None);
+        assert_eq!(sc.peek(), None);
+    }
+
+    #[test]
+    fn test_new_scanner_initial_position() {
+        let sc = Scanner::new("abc");
+        assert_eq!(sc.line(), 1);
+        assert_eq!(sc.column(), 1);
+        assert_eq!(sc.offset(), 0);
+    }
+
+    // ===================================================================
+    // Advance through ASCII characters
+    // ===================================================================
+
+    #[test]
+    fn test_advance_ascii_single_char() {
+        let mut sc = Scanner::new("A");
+        assert_eq!(sc.advance(), Some('A'));
+        assert_eq!(sc.advance(), None);
+    }
+
+    #[test]
+    fn test_advance_ascii_multiple_chars() {
+        let mut sc = Scanner::new("abc");
+        assert_eq!(sc.advance(), Some('a'));
+        assert_eq!(sc.advance(), Some('b'));
+        assert_eq!(sc.advance(), Some('c'));
+        assert_eq!(sc.advance(), None);
+    }
+
+    #[test]
+    fn test_advance_updates_column() {
+        let mut sc = Scanner::new("xyz");
+        assert_eq!(sc.column(), 1);
+        sc.advance(); // 'x'
+        assert_eq!(sc.column(), 2);
+        sc.advance(); // 'y'
+        assert_eq!(sc.column(), 3);
+        sc.advance(); // 'z'
+        assert_eq!(sc.column(), 4);
+    }
+
+    #[test]
+    fn test_advance_updates_offset() {
+        let mut sc = Scanner::new("ab");
+        assert_eq!(sc.offset(), 0);
+        sc.advance(); // 'a' (1 byte)
+        assert_eq!(sc.offset(), 1);
+        sc.advance(); // 'b' (1 byte)
+        assert_eq!(sc.offset(), 2);
+    }
+
+    // ===================================================================
+    // Line-ending normalization
+    // ===================================================================
+
+    #[test]
+    fn test_lf_normalization() {
+        let mut sc = Scanner::new("a\nb");
+        assert_eq!(sc.advance(), Some('a'));
+        assert_eq!(sc.advance(), Some('\n'));
+        assert_eq!(sc.line(), 2);
+        assert_eq!(sc.column(), 1);
+        assert_eq!(sc.advance(), Some('b'));
+    }
+
+    #[test]
+    fn test_cr_normalization() {
+        let mut sc = Scanner::new("a\rb");
+        assert_eq!(sc.advance(), Some('a'));
+        assert_eq!(sc.advance(), Some('\n')); // \r → \n
+        assert_eq!(sc.line(), 2);
+        assert_eq!(sc.column(), 1);
+        assert_eq!(sc.advance(), Some('b'));
+    }
+
+    #[test]
+    fn test_crlf_normalization() {
+        let mut sc = Scanner::new("a\r\nb");
+        assert_eq!(sc.advance(), Some('a'));
+        assert_eq!(sc.advance(), Some('\n')); // \r\n → \n (2 bytes consumed)
+        assert_eq!(sc.line(), 2);
+        assert_eq!(sc.column(), 1);
+        assert_eq!(sc.advance(), Some('b'));
+    }
+
+    #[test]
+    fn test_crlf_offset_accounts_for_two_bytes() {
+        let mut sc = Scanner::new("x\r\ny");
+        sc.advance(); // 'x'
+        sc.advance(); // '\r\n' → '\n'
+                      // After consuming 'x' (1 byte) and '\r\n' (2 bytes), offset should be 3.
+        assert_eq!(sc.offset(), 3);
+    }
+
+    #[test]
+    fn test_multiple_line_endings() {
+        let mut sc = Scanner::new("a\n\n\nb");
+        sc.advance(); // 'a'
+        sc.advance(); // '\n'
+        assert_eq!(sc.line(), 2);
+        sc.advance(); // '\n'
+        assert_eq!(sc.line(), 3);
+        sc.advance(); // '\n'
+        assert_eq!(sc.line(), 4);
+        assert_eq!(sc.advance(), Some('b'));
+    }
+
+    // ===================================================================
+    // Peek — non-consuming lookahead
+    // ===================================================================
+
+    #[test]
+    fn test_peek_returns_next_without_consuming() {
+        let mut sc = Scanner::new("ab");
+        assert_eq!(sc.peek(), Some('a'));
+        assert_eq!(sc.peek(), Some('a')); // still 'a'
+        assert_eq!(sc.advance(), Some('a'));
+        assert_eq!(sc.peek(), Some('b'));
+    }
+
+    #[test]
+    fn test_peek_at_eof() {
+        let mut sc = Scanner::new("");
+        assert_eq!(sc.peek(), None);
+    }
+
+    #[test]
+    fn test_peek_normalizes_cr() {
+        let mut sc = Scanner::new("\r");
+        assert_eq!(sc.peek(), Some('\n')); // \r normalized to \n
+    }
+
+    // ===================================================================
+    // peek_nth — multi-character lookahead
+    // ===================================================================
+
+    #[test]
+    fn test_peek_nth_zero_same_as_peek() {
+        let mut sc = Scanner::new("abc");
+        assert_eq!(sc.peek_nth(0), sc.peek());
+    }
+
+    #[test]
+    fn test_peek_nth_lookahead() {
+        let mut sc = Scanner::new("abcd");
+        assert_eq!(sc.peek_nth(0), Some('a'));
+        assert_eq!(sc.peek_nth(1), Some('b'));
+        assert_eq!(sc.peek_nth(2), Some('c'));
+        assert_eq!(sc.peek_nth(3), Some('d'));
+        assert_eq!(sc.peek_nth(4), None);
+    }
+
+    #[test]
+    fn test_peek_nth_does_not_consume() {
+        let mut sc = Scanner::new("xyz");
+        sc.peek_nth(2);
+        // First advance should still return 'x'
+        assert_eq!(sc.advance(), Some('x'));
+    }
+
+    #[test]
+    fn test_peek_nth_beyond_eof() {
+        let mut sc = Scanner::new("a");
+        assert_eq!(sc.peek_nth(0), Some('a'));
+        assert_eq!(sc.peek_nth(1), None);
+    }
+
+    // ===================================================================
+    // unget — push character back
+    // ===================================================================
+
+    #[test]
+    fn test_unget_restores_character() {
+        let mut sc = Scanner::new("ab");
+        let pos = sc.position();
+        let ch = sc.advance().unwrap();
+        assert_eq!(ch, 'a');
+        sc.unget(ch, pos);
+        // After unget, the next advance should return 'a' again.
+        assert_eq!(sc.advance(), Some('a'));
+        assert_eq!(sc.advance(), Some('b'));
+        assert_eq!(sc.advance(), None);
+    }
+
+    #[test]
+    fn test_unget_restores_position() {
+        let mut sc = Scanner::new("xy");
+        let pos_before = sc.position();
+        sc.advance(); // 'x'
+        sc.unget('x', pos_before);
+        assert_eq!(sc.position(), pos_before);
+    }
+
+    // ===================================================================
+    // Position tracking — multi-line
+    // ===================================================================
+
+    #[test]
+    fn test_position_tracking_multiline() {
+        let mut sc = Scanner::new("ab\ncd\ne");
+        // Line 1: a, b, \n
+        sc.advance(); // 'a' → line 1, col 2
+        sc.advance(); // 'b' → line 1, col 3
+        sc.advance(); // '\n' → line 2, col 1
+        assert_eq!(sc.line(), 2);
+        assert_eq!(sc.column(), 1);
+
+        // Line 2: c, d, \n
+        sc.advance(); // 'c' → line 2, col 2
+        assert_eq!(sc.column(), 2);
+        sc.advance(); // 'd' → line 2, col 3
+        sc.advance(); // '\n' → line 3, col 1
+        assert_eq!(sc.line(), 3);
+
+        // Line 3: e
+        assert_eq!(sc.advance(), Some('e'));
+    }
+
+    #[test]
+    fn test_position_method_returns_current() {
+        let mut sc = Scanner::new("a\nb");
+        let pos = sc.position();
+        assert_eq!(pos.offset, 0);
+        assert_eq!(pos.line, 1);
+        assert_eq!(pos.column, 1);
+
+        sc.advance(); // 'a'
+        let pos = sc.position();
+        assert_eq!(pos.offset, 1);
+        assert_eq!(pos.line, 1);
+        assert_eq!(pos.column, 2);
+    }
+
+    // ===================================================================
+    // EOF detection
+    // ===================================================================
+
+    #[test]
+    fn test_is_eof_empty_input() {
+        let mut sc = Scanner::new("");
+        assert!(sc.is_eof());
+    }
+
+    #[test]
+    fn test_is_eof_after_consuming_all() {
+        let mut sc = Scanner::new("x");
+        assert!(!sc.is_eof());
+        sc.advance();
+        assert!(sc.is_eof());
+    }
+
+    // ===================================================================
+    // Multi-byte UTF-8 handling
+    // ===================================================================
+
+    #[test]
+    fn test_advance_multibyte_utf8() {
+        let mut sc = Scanner::new("é"); // 2-byte UTF-8 (U+00E9)
+        assert_eq!(sc.advance(), Some('é'));
+        assert_eq!(sc.offset(), 2); // 2 bytes consumed
+        assert!(sc.is_eof());
+    }
+
+    #[test]
+    fn test_advance_three_byte_utf8() {
+        let mut sc = Scanner::new("€"); // 3-byte UTF-8 (U+20AC)
+        assert_eq!(sc.advance(), Some('€'));
+        assert_eq!(sc.offset(), 3);
+    }
+
+    #[test]
+    fn test_advance_four_byte_utf8() {
+        let mut sc = Scanner::new("🦀"); // 4-byte UTF-8 (U+1F980)
+        assert_eq!(sc.advance(), Some('🦀'));
+        assert_eq!(sc.offset(), 4);
+    }
+
+    #[test]
+    fn test_column_counts_bytes_not_chars() {
+        let mut sc = Scanner::new("aé"); // 'a' (1 byte) + 'é' (2 bytes)
+        sc.advance(); // 'a'
+        assert_eq!(sc.column(), 2); // column 2 (after 1 byte)
+        sc.advance(); // 'é'
+        assert_eq!(sc.column(), 4); // column 4 (after 1 + 2 = 3 bytes)
+    }
+
+    // ===================================================================
+    // PUA character handling
+    // ===================================================================
+
+    #[test]
+    fn test_advance_pua_encoded_character() {
+        // U+E080 is PUA-encoded byte 0x80, encoded in UTF-8 as 3 bytes: EE 82 80
+        let pua_char = char::from_u32(0xE080).unwrap();
+        let input = String::from(pua_char);
+        let mut sc = Scanner::new(&input);
+        assert_eq!(sc.advance(), Some(pua_char));
+        assert_eq!(sc.offset(), 3); // 3 UTF-8 bytes
+    }
+
+    #[test]
+    fn test_is_pua_char_true() {
+        let pua = char::from_u32(0xE080).unwrap();
+        assert!(Scanner::is_pua_char(pua));
+    }
+
+    #[test]
+    fn test_is_pua_char_false_for_ascii() {
+        assert!(!Scanner::is_pua_char('a'));
+        assert!(!Scanner::is_pua_char('\n'));
+    }
+
+    #[test]
+    fn test_is_pua_char_boundary() {
+        let low = char::from_u32(0xE080).unwrap();
+        let high = char::from_u32(0xE0FF).unwrap();
+        assert!(Scanner::is_pua_char(low));
+        assert!(Scanner::is_pua_char(high));
+
+        // Just below and above the range
+        let below = char::from_u32(0xE07F).unwrap();
+        let above = char::from_u32(0xE100).unwrap();
+        assert!(!Scanner::is_pua_char(below));
+        assert!(!Scanner::is_pua_char(above));
+    }
+
+    // ===================================================================
+    // Utility methods — skip_while, consume_if, consume_if_pred
+    // ===================================================================
+
+    #[test]
+    fn test_skip_while_digits() {
+        let mut sc = Scanner::new("123abc");
+        sc.skip_while(|c| c.is_ascii_digit());
+        assert_eq!(sc.advance(), Some('a'));
+    }
+
+    #[test]
+    fn test_skip_while_no_match() {
+        let mut sc = Scanner::new("abc");
+        sc.skip_while(|c| c.is_ascii_digit());
+        assert_eq!(sc.advance(), Some('a')); // nothing skipped
+    }
+
+    #[test]
+    fn test_skip_while_all_match() {
+        let mut sc = Scanner::new("999");
+        sc.skip_while(|c| c.is_ascii_digit());
+        assert!(sc.is_eof());
+    }
+
+    #[test]
+    fn test_consume_if_matching() {
+        let mut sc = Scanner::new("+=");
+        assert!(sc.consume_if('+'));
+        assert_eq!(sc.advance(), Some('='));
+    }
+
+    #[test]
+    fn test_consume_if_not_matching() {
+        let mut sc = Scanner::new("ab");
+        assert!(!sc.consume_if('x'));
+        assert_eq!(sc.advance(), Some('a')); // 'a' not consumed
+    }
+
+    #[test]
+    fn test_consume_if_pred_matching() {
+        let mut sc = Scanner::new("abc");
+        let result = sc.consume_if_pred(|c| c == 'a');
+        assert_eq!(result, Some('a'));
+        assert_eq!(sc.advance(), Some('b'));
+    }
+
+    #[test]
+    fn test_consume_if_pred_not_matching() {
+        let mut sc = Scanner::new("abc");
+        let result = sc.consume_if_pred(|c| c == 'z');
+        assert_eq!(result, None);
+        assert_eq!(sc.advance(), Some('a')); // not consumed
+    }
+
+    // ===================================================================
+    // source() and slice()
+    // ===================================================================
+
+    #[test]
+    fn test_source_returns_full_input() {
+        let sc = Scanner::new("hello world");
+        assert_eq!(sc.source(), "hello world");
+    }
+
+    #[test]
+    fn test_slice_extracts_substring() {
+        let sc = Scanner::new("hello world");
+        assert_eq!(sc.slice(0, 5), "hello");
+        assert_eq!(sc.slice(6, 11), "world");
+    }
+
+    // ===================================================================
+    // Position::new
+    // ===================================================================
+
+    #[test]
+    fn test_position_new() {
+        let pos = Position::new(10, 2, 5);
+        assert_eq!(pos.offset, 10);
+        assert_eq!(pos.line, 2);
+        assert_eq!(pos.column, 5);
+    }
+
+    #[test]
+    fn test_position_default() {
+        let pos = Position::default();
+        assert_eq!(pos.offset, 0);
+        assert_eq!(pos.line, 0);
+        assert_eq!(pos.column, 0);
+    }
+
+    #[test]
+    fn test_position_equality() {
+        let a = Position::new(0, 1, 1);
+        let b = Position::new(0, 1, 1);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_position_clone_copy() {
+        let pos = Position::new(5, 3, 2);
+        let copied = pos;
+        let cloned = pos.clone();
+        assert_eq!(pos, copied);
+        assert_eq!(pos, cloned);
+    }
+}

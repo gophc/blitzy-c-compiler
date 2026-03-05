@@ -1036,3 +1036,889 @@ impl std::ops::Neg for LongDouble {
         LongDouble::neg(self)
     }
 }
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ====================================================================
+    // Constants and Classification
+    // ====================================================================
+
+    #[test]
+    fn test_zero_constant_is_zero() {
+        assert!(LongDouble::ZERO.is_zero());
+        assert!(!LongDouble::ZERO.is_negative());
+    }
+
+    #[test]
+    fn test_neg_zero_constant_is_zero_and_negative() {
+        assert!(LongDouble::NEG_ZERO.is_zero());
+        assert!(LongDouble::NEG_ZERO.is_negative());
+    }
+
+    #[test]
+    fn test_one_constant_is_finite_and_positive() {
+        let one = LongDouble::ONE;
+        assert!(!one.is_zero());
+        assert!(!one.is_infinity());
+        assert!(!one.is_nan());
+        assert!(!one.is_negative());
+        assert!(!one.is_denormal());
+    }
+
+    #[test]
+    fn test_infinity_constant_classification() {
+        assert!(LongDouble::INFINITY.is_infinity());
+        assert!(!LongDouble::INFINITY.is_nan());
+        assert!(!LongDouble::INFINITY.is_zero());
+        assert!(!LongDouble::INFINITY.is_negative());
+    }
+
+    #[test]
+    fn test_neg_infinity_constant_classification() {
+        assert!(LongDouble::NEG_INFINITY.is_infinity());
+        assert!(LongDouble::NEG_INFINITY.is_negative());
+        assert!(!LongDouble::NEG_INFINITY.is_nan());
+    }
+
+    #[test]
+    fn test_nan_constant_classification() {
+        assert!(LongDouble::NAN.is_nan());
+        assert!(!LongDouble::NAN.is_infinity());
+        assert!(!LongDouble::NAN.is_zero());
+    }
+
+    #[test]
+    fn test_exponent_bias_is_16383() {
+        assert_eq!(LongDouble::EXPONENT_BIAS, 16383);
+    }
+
+    #[test]
+    fn test_default_is_zero() {
+        let d: LongDouble = Default::default();
+        assert!(d.is_zero());
+        assert!(!d.is_negative());
+    }
+
+    // ====================================================================
+    // f64 Conversion — from_f64
+    // ====================================================================
+
+    #[test]
+    fn test_from_f64_positive_zero() {
+        let ld = LongDouble::from_f64(0.0);
+        assert!(ld.is_zero());
+        assert!(!ld.is_negative());
+    }
+
+    #[test]
+    fn test_from_f64_negative_zero() {
+        let ld = LongDouble::from_f64(-0.0);
+        assert!(ld.is_zero());
+        assert!(ld.is_negative());
+    }
+
+    #[test]
+    fn test_from_f64_positive_infinity() {
+        let ld = LongDouble::from_f64(f64::INFINITY);
+        assert!(ld.is_infinity());
+        assert!(!ld.is_negative());
+    }
+
+    #[test]
+    fn test_from_f64_negative_infinity() {
+        let ld = LongDouble::from_f64(f64::NEG_INFINITY);
+        assert!(ld.is_infinity());
+        assert!(ld.is_negative());
+    }
+
+    #[test]
+    fn test_from_f64_nan() {
+        let ld = LongDouble::from_f64(f64::NAN);
+        assert!(ld.is_nan());
+    }
+
+    #[test]
+    fn test_from_f64_one() {
+        let ld = LongDouble::from_f64(1.0);
+        // Should produce exponent = 16383 (bias + 0) and integer bit set
+        assert_eq!(ld.to_f64(), 1.0);
+    }
+
+    #[test]
+    fn test_from_f64_negative_one() {
+        let ld = LongDouble::from_f64(-1.0);
+        assert!(ld.is_negative());
+        assert_eq!(ld.to_f64(), -1.0);
+    }
+
+    #[test]
+    fn test_from_f64_small_positive() {
+        let ld = LongDouble::from_f64(0.5);
+        assert_eq!(ld.to_f64(), 0.5);
+    }
+
+    #[test]
+    fn test_from_f64_large_value() {
+        let ld = LongDouble::from_f64(1.0e18);
+        assert_eq!(ld.to_f64(), 1.0e18);
+    }
+
+    #[test]
+    fn test_from_f64_subnormal() {
+        // f64 minimum positive subnormal: 5e-324
+        let val = f64::from_bits(1); // smallest positive subnormal
+        let ld = LongDouble::from_f64(val);
+        assert!(!ld.is_zero());
+        // The round-trip should recover the same f64 (exact conversion)
+        assert_eq!(ld.to_f64(), val);
+    }
+
+    // ====================================================================
+    // f64 Conversion — to_f64
+    // ====================================================================
+
+    #[test]
+    fn test_to_f64_zero() {
+        assert_eq!(LongDouble::ZERO.to_f64(), 0.0);
+        // Check negative zero using bit pattern
+        let neg_z = LongDouble::NEG_ZERO.to_f64();
+        assert_eq!(neg_z.to_bits(), (-0.0_f64).to_bits());
+    }
+
+    #[test]
+    fn test_to_f64_infinity() {
+        assert_eq!(LongDouble::INFINITY.to_f64(), f64::INFINITY);
+        assert_eq!(LongDouble::NEG_INFINITY.to_f64(), f64::NEG_INFINITY);
+    }
+
+    #[test]
+    fn test_to_f64_nan() {
+        assert!(LongDouble::NAN.to_f64().is_nan());
+    }
+
+    #[test]
+    fn test_f64_roundtrip_various_values() {
+        let values = [
+            1.0,
+            -1.0,
+            0.5,
+            -0.5,
+            2.0,
+            100.0,
+            -100.0,
+            1.23456789,
+            -9.876543e10,
+            1.0e-100,
+            1.0e100,
+            core::f64::consts::PI,
+            core::f64::consts::E,
+        ];
+        for &v in &values {
+            let ld = LongDouble::from_f64(v);
+            let back = ld.to_f64();
+            assert_eq!(
+                back.to_bits(),
+                v.to_bits(),
+                "Round-trip failed for f64 value {}",
+                v
+            );
+        }
+    }
+
+    // ====================================================================
+    // Integer Conversion — from_u64 / from_i64 / to_u64 / to_i64
+    // ====================================================================
+
+    #[test]
+    fn test_from_u64_zero() {
+        let ld = LongDouble::from_u64(0);
+        assert!(ld.is_zero());
+    }
+
+    #[test]
+    fn test_from_u64_one() {
+        let ld = LongDouble::from_u64(1);
+        assert_eq!(ld.to_f64(), 1.0);
+    }
+
+    #[test]
+    fn test_from_u64_large() {
+        let ld = LongDouble::from_u64(1_000_000);
+        assert_eq!(ld.to_f64(), 1_000_000.0);
+    }
+
+    #[test]
+    fn test_from_u64_max() {
+        let ld = LongDouble::from_u64(u64::MAX);
+        assert!(!ld.is_zero());
+        assert!(!ld.is_infinity());
+        // u64::MAX = 2^64 - 1, to_u64 should recover it
+        assert_eq!(ld.to_u64(), u64::MAX);
+    }
+
+    #[test]
+    fn test_from_i64_zero() {
+        let ld = LongDouble::from_i64(0);
+        assert!(ld.is_zero());
+    }
+
+    #[test]
+    fn test_from_i64_positive() {
+        let ld = LongDouble::from_i64(42);
+        assert_eq!(ld.to_i64(), 42);
+    }
+
+    #[test]
+    fn test_from_i64_negative() {
+        let ld = LongDouble::from_i64(-42);
+        assert!(ld.is_negative());
+        assert_eq!(ld.to_i64(), -42);
+    }
+
+    #[test]
+    fn test_from_i64_min() {
+        let ld = LongDouble::from_i64(i64::MIN);
+        assert!(ld.is_negative());
+        assert_eq!(ld.to_i64(), i64::MIN);
+    }
+
+    #[test]
+    fn test_from_i64_max() {
+        let ld = LongDouble::from_i64(i64::MAX);
+        assert_eq!(ld.to_i64(), i64::MAX);
+    }
+
+    #[test]
+    fn test_to_i64_nan_returns_zero() {
+        assert_eq!(LongDouble::NAN.to_i64(), 0);
+    }
+
+    #[test]
+    fn test_to_i64_infinity_saturates() {
+        assert_eq!(LongDouble::INFINITY.to_i64(), i64::MAX);
+        assert_eq!(LongDouble::NEG_INFINITY.to_i64(), i64::MIN);
+    }
+
+    #[test]
+    fn test_to_u64_negative_returns_zero() {
+        let ld = LongDouble::from_i64(-1);
+        assert_eq!(ld.to_u64(), 0);
+    }
+
+    #[test]
+    fn test_to_u64_nan_returns_zero() {
+        assert_eq!(LongDouble::NAN.to_u64(), 0);
+    }
+
+    #[test]
+    fn test_to_u64_infinity_saturates() {
+        assert_eq!(LongDouble::INFINITY.to_u64(), u64::MAX);
+    }
+
+    #[test]
+    fn test_to_i64_fractional_truncates() {
+        let ld = LongDouble::from_f64(3.9);
+        assert_eq!(ld.to_i64(), 3);
+    }
+
+    // ====================================================================
+    // Basic Arithmetic — Addition
+    // ====================================================================
+
+    #[test]
+    fn test_add_positive_values() {
+        let a = LongDouble::from_f64(1.5);
+        let b = LongDouble::from_f64(2.5);
+        let result = a.add(b);
+        assert_eq!(result.to_f64(), 4.0);
+    }
+
+    #[test]
+    fn test_add_negative_values() {
+        let a = LongDouble::from_f64(-1.0);
+        let b = LongDouble::from_f64(-2.0);
+        let result = a.add(b);
+        assert_eq!(result.to_f64(), -3.0);
+    }
+
+    #[test]
+    fn test_add_opposite_signs_positive_result() {
+        let a = LongDouble::from_f64(5.0);
+        let b = LongDouble::from_f64(-3.0);
+        let result = a.add(b);
+        assert_eq!(result.to_f64(), 2.0);
+    }
+
+    #[test]
+    fn test_add_opposite_signs_negative_result() {
+        let a = LongDouble::from_f64(3.0);
+        let b = LongDouble::from_f64(-5.0);
+        let result = a.add(b);
+        assert_eq!(result.to_f64(), -2.0);
+    }
+
+    #[test]
+    fn test_add_cancel_to_zero() {
+        let a = LongDouble::from_f64(3.0);
+        let b = LongDouble::from_f64(-3.0);
+        let result = a.add(b);
+        assert!(result.is_zero());
+    }
+
+    #[test]
+    fn test_add_zero_identity() {
+        let a = LongDouble::from_f64(42.0);
+        let result = a.add(LongDouble::ZERO);
+        assert_eq!(result.to_f64(), 42.0);
+    }
+
+    #[test]
+    fn test_add_nan_propagation() {
+        let a = LongDouble::from_f64(1.0);
+        let result = a.add(LongDouble::NAN);
+        assert!(result.is_nan());
+        let result2 = LongDouble::NAN.add(a);
+        assert!(result2.is_nan());
+    }
+
+    #[test]
+    fn test_add_infinity_plus_finite() {
+        let result = LongDouble::INFINITY.add(LongDouble::from_f64(1.0));
+        assert!(result.is_infinity());
+        assert!(!result.is_negative());
+    }
+
+    #[test]
+    fn test_add_infinity_plus_neg_infinity_is_nan() {
+        let result = LongDouble::INFINITY.add(LongDouble::NEG_INFINITY);
+        assert!(result.is_nan());
+    }
+
+    #[test]
+    fn test_add_neg_zero_plus_neg_zero() {
+        let result = LongDouble::NEG_ZERO.add(LongDouble::NEG_ZERO);
+        assert!(result.is_zero());
+        assert!(result.is_negative());
+    }
+
+    #[test]
+    fn test_add_pos_zero_plus_neg_zero() {
+        let result = LongDouble::ZERO.add(LongDouble::NEG_ZERO);
+        assert!(result.is_zero());
+        // Per round-to-nearest-even: +0 + -0 = +0
+        assert!(!result.is_negative());
+    }
+
+    // ====================================================================
+    // Basic Arithmetic — Subtraction
+    // ====================================================================
+
+    #[test]
+    fn test_sub_positive_values() {
+        let a = LongDouble::from_f64(5.0);
+        let b = LongDouble::from_f64(3.0);
+        let result = a.sub(b);
+        assert_eq!(result.to_f64(), 2.0);
+    }
+
+    #[test]
+    fn test_sub_nan_propagation() {
+        let result = LongDouble::NAN.sub(LongDouble::from_f64(1.0));
+        assert!(result.is_nan());
+    }
+
+    // ====================================================================
+    // Basic Arithmetic — Multiplication
+    // ====================================================================
+
+    #[test]
+    fn test_mul_positive_values() {
+        let a = LongDouble::from_f64(3.0);
+        let b = LongDouble::from_f64(4.0);
+        let result = a.mul(b);
+        assert_eq!(result.to_f64(), 12.0);
+    }
+
+    #[test]
+    fn test_mul_negative_result() {
+        let a = LongDouble::from_f64(3.0);
+        let b = LongDouble::from_f64(-4.0);
+        let result = a.mul(b);
+        assert_eq!(result.to_f64(), -12.0);
+    }
+
+    #[test]
+    fn test_mul_both_negative() {
+        let a = LongDouble::from_f64(-3.0);
+        let b = LongDouble::from_f64(-4.0);
+        let result = a.mul(b);
+        assert_eq!(result.to_f64(), 12.0);
+    }
+
+    #[test]
+    fn test_mul_by_zero() {
+        let a = LongDouble::from_f64(42.0);
+        let result = a.mul(LongDouble::ZERO);
+        assert!(result.is_zero());
+    }
+
+    #[test]
+    fn test_mul_infinity_by_zero_is_nan() {
+        let result = LongDouble::INFINITY.mul(LongDouble::ZERO);
+        assert!(result.is_nan());
+    }
+
+    #[test]
+    fn test_mul_infinity_by_finite() {
+        let result = LongDouble::INFINITY.mul(LongDouble::from_f64(2.0));
+        assert!(result.is_infinity());
+        assert!(!result.is_negative());
+    }
+
+    #[test]
+    fn test_mul_infinity_by_negative() {
+        let result = LongDouble::INFINITY.mul(LongDouble::from_f64(-2.0));
+        assert!(result.is_infinity());
+        assert!(result.is_negative());
+    }
+
+    #[test]
+    fn test_mul_nan_propagation() {
+        let result = LongDouble::NAN.mul(LongDouble::from_f64(1.0));
+        assert!(result.is_nan());
+    }
+
+    #[test]
+    fn test_mul_by_one_identity() {
+        let a = LongDouble::from_f64(42.0);
+        let result = a.mul(LongDouble::ONE);
+        assert_eq!(result.to_f64(), 42.0);
+    }
+
+    // ====================================================================
+    // Basic Arithmetic — Division
+    // ====================================================================
+
+    #[test]
+    fn test_div_positive_values() {
+        let a = LongDouble::from_f64(12.0);
+        let b = LongDouble::from_f64(4.0);
+        let result = a.div(b);
+        assert_eq!(result.to_f64(), 3.0);
+    }
+
+    #[test]
+    fn test_div_negative_result() {
+        let a = LongDouble::from_f64(12.0);
+        let b = LongDouble::from_f64(-4.0);
+        let result = a.div(b);
+        assert_eq!(result.to_f64(), -3.0);
+    }
+
+    #[test]
+    fn test_div_by_zero_finite_is_infinity() {
+        let a = LongDouble::from_f64(1.0);
+        let result = a.div(LongDouble::ZERO);
+        assert!(result.is_infinity());
+        assert!(!result.is_negative());
+    }
+
+    #[test]
+    fn test_div_negative_by_zero_is_neg_infinity() {
+        let a = LongDouble::from_f64(-1.0);
+        let result = a.div(LongDouble::ZERO);
+        assert!(result.is_infinity());
+        assert!(result.is_negative());
+    }
+
+    #[test]
+    fn test_div_zero_by_zero_is_nan() {
+        let result = LongDouble::ZERO.div(LongDouble::ZERO);
+        assert!(result.is_nan());
+    }
+
+    #[test]
+    fn test_div_infinity_by_infinity_is_nan() {
+        let result = LongDouble::INFINITY.div(LongDouble::INFINITY);
+        assert!(result.is_nan());
+    }
+
+    #[test]
+    fn test_div_zero_by_finite() {
+        let result = LongDouble::ZERO.div(LongDouble::from_f64(5.0));
+        assert!(result.is_zero());
+    }
+
+    #[test]
+    fn test_div_nan_propagation() {
+        let result = LongDouble::NAN.div(LongDouble::from_f64(1.0));
+        assert!(result.is_nan());
+    }
+
+    // ====================================================================
+    // Negation
+    // ====================================================================
+
+    #[test]
+    fn test_neg_positive_to_negative() {
+        let a = LongDouble::from_f64(5.0);
+        let result = a.neg();
+        assert!(result.is_negative());
+        assert_eq!(result.to_f64(), -5.0);
+    }
+
+    #[test]
+    fn test_neg_negative_to_positive() {
+        let a = LongDouble::from_f64(-5.0);
+        let result = a.neg();
+        assert!(!result.is_negative());
+        assert_eq!(result.to_f64(), 5.0);
+    }
+
+    #[test]
+    fn test_neg_zero() {
+        let result = LongDouble::ZERO.neg();
+        assert!(result.is_zero());
+        assert!(result.is_negative());
+    }
+
+    // ====================================================================
+    // std::ops trait implementations
+    // ====================================================================
+
+    #[test]
+    fn test_ops_add_trait() {
+        let a = LongDouble::from_f64(1.0);
+        let b = LongDouble::from_f64(2.0);
+        let result = a + b;
+        assert_eq!(result.to_f64(), 3.0);
+    }
+
+    #[test]
+    fn test_ops_sub_trait() {
+        let a = LongDouble::from_f64(5.0);
+        let b = LongDouble::from_f64(3.0);
+        let result = a - b;
+        assert_eq!(result.to_f64(), 2.0);
+    }
+
+    #[test]
+    fn test_ops_mul_trait() {
+        let a = LongDouble::from_f64(3.0);
+        let b = LongDouble::from_f64(7.0);
+        let result = a * b;
+        assert_eq!(result.to_f64(), 21.0);
+    }
+
+    #[test]
+    fn test_ops_div_trait() {
+        let a = LongDouble::from_f64(10.0);
+        let b = LongDouble::from_f64(2.0);
+        let result = a / b;
+        assert_eq!(result.to_f64(), 5.0);
+    }
+
+    #[test]
+    fn test_ops_neg_trait() {
+        let a = LongDouble::from_f64(3.0);
+        let result = -a;
+        assert_eq!(result.to_f64(), -3.0);
+    }
+
+    // ====================================================================
+    // Comparison — PartialEq
+    // ====================================================================
+
+    #[test]
+    fn test_eq_same_value() {
+        let a = LongDouble::from_f64(1.0);
+        let b = LongDouble::from_f64(1.0);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_eq_different_values() {
+        let a = LongDouble::from_f64(1.0);
+        let b = LongDouble::from_f64(2.0);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_eq_nan_not_equal_to_itself() {
+        assert_ne!(LongDouble::NAN, LongDouble::NAN);
+    }
+
+    #[test]
+    fn test_eq_pos_zero_equals_neg_zero() {
+        assert_eq!(LongDouble::ZERO, LongDouble::NEG_ZERO);
+    }
+
+    // ====================================================================
+    // Comparison — PartialOrd
+    // ====================================================================
+
+    #[test]
+    fn test_ord_positive_ordering() {
+        let a = LongDouble::from_f64(1.0);
+        let b = LongDouble::from_f64(2.0);
+        assert!(a < b);
+        assert!(b > a);
+    }
+
+    #[test]
+    fn test_ord_negative_ordering() {
+        let a = LongDouble::from_f64(-2.0);
+        let b = LongDouble::from_f64(-1.0);
+        assert!(a < b);
+    }
+
+    #[test]
+    fn test_ord_mixed_sign() {
+        let a = LongDouble::from_f64(-1.0);
+        let b = LongDouble::from_f64(1.0);
+        assert!(a < b);
+    }
+
+    #[test]
+    fn test_ord_nan_is_unordered() {
+        let a = LongDouble::from_f64(1.0);
+        assert_eq!(a.partial_cmp(&LongDouble::NAN), None);
+        assert_eq!(LongDouble::NAN.partial_cmp(&a), None);
+    }
+
+    #[test]
+    fn test_ord_zeros_are_equal() {
+        assert_eq!(
+            LongDouble::ZERO.partial_cmp(&LongDouble::NEG_ZERO),
+            Some(Ordering::Equal)
+        );
+    }
+
+    // ====================================================================
+    // Comparison — total_cmp
+    // ====================================================================
+
+    #[test]
+    fn test_total_cmp_basic_ordering() {
+        let neg_inf = LongDouble::NEG_INFINITY;
+        let neg_one = LongDouble::from_f64(-1.0);
+        let zero = LongDouble::ZERO;
+        let pos_one = LongDouble::from_f64(1.0);
+        let pos_inf = LongDouble::INFINITY;
+
+        assert_eq!(neg_inf.total_cmp(&neg_one), Ordering::Less);
+        assert_eq!(neg_one.total_cmp(&zero), Ordering::Less);
+        assert_eq!(zero.total_cmp(&pos_one), Ordering::Less);
+        assert_eq!(pos_one.total_cmp(&pos_inf), Ordering::Less);
+    }
+
+    #[test]
+    fn test_total_cmp_neg_zero_less_than_pos_zero() {
+        assert_eq!(
+            LongDouble::NEG_ZERO.total_cmp(&LongDouble::ZERO),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn test_total_cmp_nan_is_ordered() {
+        // total_cmp places +NaN above +infinity
+        assert_eq!(
+            LongDouble::INFINITY.total_cmp(&LongDouble::NAN),
+            Ordering::Less
+        );
+    }
+
+    // ====================================================================
+    // 10-byte Serialization — to_bytes / from_bytes Round-Trip
+    // ====================================================================
+
+    #[test]
+    fn test_to_bytes_from_bytes_roundtrip_zero() {
+        let original = LongDouble::ZERO;
+        let bytes = original.to_bytes();
+        let recovered = LongDouble::from_bytes(&bytes);
+        assert!(recovered.is_zero());
+        assert!(!recovered.is_negative());
+    }
+
+    #[test]
+    fn test_to_bytes_from_bytes_roundtrip_neg_zero() {
+        let original = LongDouble::NEG_ZERO;
+        let bytes = original.to_bytes();
+        let recovered = LongDouble::from_bytes(&bytes);
+        assert!(recovered.is_zero());
+        assert!(recovered.is_negative());
+    }
+
+    #[test]
+    fn test_to_bytes_from_bytes_roundtrip_one() {
+        let original = LongDouble::ONE;
+        let bytes = original.to_bytes();
+        let recovered = LongDouble::from_bytes(&bytes);
+        assert_eq!(recovered.to_f64(), 1.0);
+    }
+
+    #[test]
+    fn test_to_bytes_from_bytes_roundtrip_infinity() {
+        let original = LongDouble::INFINITY;
+        let bytes = original.to_bytes();
+        let recovered = LongDouble::from_bytes(&bytes);
+        assert!(recovered.is_infinity());
+        assert!(!recovered.is_negative());
+    }
+
+    #[test]
+    fn test_to_bytes_from_bytes_roundtrip_neg_infinity() {
+        let original = LongDouble::NEG_INFINITY;
+        let bytes = original.to_bytes();
+        let recovered = LongDouble::from_bytes(&bytes);
+        assert!(recovered.is_infinity());
+        assert!(recovered.is_negative());
+    }
+
+    #[test]
+    fn test_to_bytes_from_bytes_roundtrip_nan() {
+        let original = LongDouble::NAN;
+        let bytes = original.to_bytes();
+        let recovered = LongDouble::from_bytes(&bytes);
+        assert!(recovered.is_nan());
+    }
+
+    #[test]
+    fn test_to_bytes_from_bytes_roundtrip_various() {
+        let values = [1.0, -1.0, 0.5, 42.0, -42.0, 3.14159, 1.0e10, -1.0e10];
+        for &v in &values {
+            let original = LongDouble::from_f64(v);
+            let bytes = original.to_bytes();
+            let recovered = LongDouble::from_bytes(&bytes);
+            assert_eq!(
+                recovered.to_f64(),
+                original.to_f64(),
+                "Round-trip failed for f64 value {}",
+                v
+            );
+        }
+    }
+
+    #[test]
+    fn test_to_bytes_layout_zero() {
+        let bytes = LongDouble::ZERO.to_bytes();
+        // Significand = 0, exponent = 0, sign = 0
+        assert_eq!(bytes, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    }
+
+    // ====================================================================
+    // Display and Debug
+    // ====================================================================
+
+    #[test]
+    fn test_display_nan() {
+        let s = format!("{}", LongDouble::NAN);
+        assert_eq!(s, "NaN");
+    }
+
+    #[test]
+    fn test_display_infinity() {
+        assert_eq!(format!("{}", LongDouble::INFINITY), "inf");
+        assert_eq!(format!("{}", LongDouble::NEG_INFINITY), "-inf");
+    }
+
+    #[test]
+    fn test_display_finite() {
+        let ld = LongDouble::from_f64(42.0);
+        let s = format!("{}", ld);
+        assert_eq!(s, "42");
+    }
+
+    #[test]
+    fn test_debug_format() {
+        let ld = LongDouble::ZERO;
+        let s = format!("{:?}", ld);
+        assert!(s.starts_with("LongDouble {"));
+        assert!(s.contains("sign:"));
+        assert!(s.contains("exp:"));
+        assert!(s.contains("sig:"));
+    }
+
+    // ====================================================================
+    // Denormal Numbers
+    // ====================================================================
+
+    #[test]
+    fn test_denormal_classification() {
+        let denormal = LongDouble {
+            sign: false,
+            exponent: 0,
+            significand: 1,
+        };
+        assert!(denormal.is_denormal());
+        assert!(!denormal.is_zero());
+        assert!(!denormal.is_nan());
+        assert!(!denormal.is_infinity());
+    }
+
+    // ====================================================================
+    // Overflow and Underflow
+    // ====================================================================
+
+    #[test]
+    fn test_mul_overflow_to_infinity() {
+        // Construct a value near the maximum representable long double.
+        // Biased exponent 32766 (max normal), integer bit set = largest normal.
+        // Squaring this produces unbiased exponent 16383 + 16383 = 32766,
+        // biased = 32766 + 16383 = 49149 > 32767, which overflows to infinity.
+        let big = LongDouble {
+            sign: false,
+            exponent: 32766,
+            significand: LongDouble::INTEGER_BIT,
+        };
+        let result = big.mul(big);
+        assert!(result.is_infinity());
+    }
+
+    #[test]
+    fn test_div_very_small_underflow() {
+        // Divide a small number by a very large number
+        let tiny = LongDouble::from_f64(f64::MIN_POSITIVE);
+        let huge = LongDouble::from_f64(f64::MAX);
+        let result = tiny.div(huge);
+        // Result should be very small (possibly zero/denormal)
+        assert!(!result.is_nan());
+        assert!(!result.is_infinity());
+    }
+
+    // ====================================================================
+    // Mixed Arithmetic Verification
+    // ====================================================================
+
+    #[test]
+    fn test_arithmetic_chain() {
+        // (2 + 3) * 4 - 10 / 2 = 20 - 5 = 15
+        let two = LongDouble::from_f64(2.0);
+        let three = LongDouble::from_f64(3.0);
+        let four = LongDouble::from_f64(4.0);
+        let ten = LongDouble::from_f64(10.0);
+
+        let sum = two.add(three);
+        let product = sum.mul(four);
+        let quotient = ten.div(two);
+        let result = product.sub(quotient);
+        assert_eq!(result.to_f64(), 15.0);
+    }
+
+    #[test]
+    fn test_clone_copy() {
+        let a = LongDouble::from_f64(1.0);
+        let b = a; // copy
+        let c = a.clone();
+        assert_eq!(a.to_f64(), b.to_f64());
+        assert_eq!(a.to_f64(), c.to_f64());
+    }
+}

@@ -359,3 +359,282 @@ impl fmt::Debug for Interner {
             .finish()
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ===================================================================
+    // Interner — construction and basic operations
+    // ===================================================================
+
+    #[test]
+    fn test_new_interner_is_empty() {
+        let interner = Interner::new();
+        assert!(interner.is_empty());
+        assert_eq!(interner.len(), 0);
+    }
+
+    #[test]
+    fn test_default_interner_is_empty() {
+        let interner: Interner = Default::default();
+        assert!(interner.is_empty());
+        assert_eq!(interner.len(), 0);
+    }
+
+    #[test]
+    fn test_intern_new_string() {
+        let mut interner = Interner::new();
+        let sym = interner.intern("hello");
+        assert_eq!(interner.len(), 1);
+        assert!(!interner.is_empty());
+        assert_eq!(sym.as_u32(), 0);
+    }
+
+    #[test]
+    fn test_intern_duplicate_returns_same_symbol() {
+        let mut interner = Interner::new();
+        let sym1 = interner.intern("hello");
+        let sym2 = interner.intern("hello");
+        assert_eq!(sym1, sym2);
+        assert_eq!(interner.len(), 1); // no duplicate stored
+    }
+
+    #[test]
+    fn test_intern_different_strings_return_different_symbols() {
+        let mut interner = Interner::new();
+        let sym_a = interner.intern("alpha");
+        let sym_b = interner.intern("beta");
+        assert_ne!(sym_a, sym_b);
+        assert_eq!(interner.len(), 2);
+    }
+
+    #[test]
+    fn test_intern_sequential_indices() {
+        let mut interner = Interner::new();
+        let s0 = interner.intern("first");
+        let s1 = interner.intern("second");
+        let s2 = interner.intern("third");
+        assert_eq!(s0.as_u32(), 0);
+        assert_eq!(s1.as_u32(), 1);
+        assert_eq!(s2.as_u32(), 2);
+    }
+
+    // ===================================================================
+    // Resolve — Symbol → &str
+    // ===================================================================
+
+    #[test]
+    fn test_resolve_returns_original_string() {
+        let mut interner = Interner::new();
+        let sym = interner.intern("world");
+        assert_eq!(interner.resolve(sym), "world");
+    }
+
+    #[test]
+    fn test_resolve_multiple_strings() {
+        let mut interner = Interner::new();
+        let s_int = interner.intern("int");
+        let s_main = interner.intern("main");
+        let s_return = interner.intern("return");
+        assert_eq!(interner.resolve(s_int), "int");
+        assert_eq!(interner.resolve(s_main), "main");
+        assert_eq!(interner.resolve(s_return), "return");
+    }
+
+    // ===================================================================
+    // Index<Symbol> — bracket syntax
+    // ===================================================================
+
+    #[test]
+    fn test_index_trait() {
+        let mut interner = Interner::new();
+        let sym = interner.intern("test");
+        assert_eq!(&interner[sym], "test");
+    }
+
+    #[test]
+    fn test_index_trait_multiple() {
+        let mut interner = Interner::new();
+        let sym_a = interner.intern("foo");
+        let sym_b = interner.intern("bar");
+        assert_eq!(&interner[sym_a], "foo");
+        assert_eq!(&interner[sym_b], "bar");
+    }
+
+    // ===================================================================
+    // get — lookup without interning
+    // ===================================================================
+
+    #[test]
+    fn test_get_existing_string() {
+        let mut interner = Interner::new();
+        let sym = interner.intern("present");
+        assert_eq!(interner.get("present"), Some(sym));
+    }
+
+    #[test]
+    fn test_get_nonexistent_string() {
+        let interner = Interner::new();
+        assert_eq!(interner.get("absent"), None);
+    }
+
+    #[test]
+    fn test_get_does_not_intern() {
+        let mut interner = Interner::new();
+        interner.intern("a");
+        assert_eq!(interner.get("b"), None);
+        assert_eq!(interner.len(), 1); // "b" was NOT added
+    }
+
+    // ===================================================================
+    // Empty string handling
+    // ===================================================================
+
+    #[test]
+    fn test_intern_empty_string() {
+        let mut interner = Interner::new();
+        let sym = interner.intern("");
+        assert_eq!(interner.resolve(sym), "");
+        assert_eq!(interner.len(), 1);
+    }
+
+    #[test]
+    fn test_intern_empty_string_dedup() {
+        let mut interner = Interner::new();
+        let s1 = interner.intern("");
+        let s2 = interner.intern("");
+        assert_eq!(s1, s2);
+        assert_eq!(interner.len(), 1);
+    }
+
+    // ===================================================================
+    // Unicode string handling
+    // ===================================================================
+
+    #[test]
+    fn test_intern_unicode_string() {
+        let mut interner = Interner::new();
+        let sym = interner.intern("日本語");
+        assert_eq!(interner.resolve(sym), "日本語");
+    }
+
+    #[test]
+    fn test_intern_unicode_dedup() {
+        let mut interner = Interner::new();
+        let s1 = interner.intern("αβγ");
+        let s2 = interner.intern("αβγ");
+        assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn test_intern_emoji() {
+        let mut interner = Interner::new();
+        let sym = interner.intern("🦀");
+        assert_eq!(interner.resolve(sym), "🦀");
+    }
+
+    // ===================================================================
+    // Symbol — properties and traits
+    // ===================================================================
+
+    #[test]
+    fn test_symbol_as_u32() {
+        let mut interner = Interner::new();
+        let sym = interner.intern("x");
+        assert_eq!(sym.as_u32(), 0);
+    }
+
+    #[test]
+    fn test_symbol_display() {
+        let mut interner = Interner::new();
+        let sym = interner.intern("test");
+        let s = format!("{}", sym);
+        assert_eq!(s, "Symbol(0)");
+    }
+
+    #[test]
+    fn test_symbol_debug() {
+        let mut interner = Interner::new();
+        let sym = interner.intern("test");
+        let s = format!("{:?}", sym);
+        assert_eq!(s, "Symbol(0)");
+    }
+
+    #[test]
+    fn test_symbol_clone_copy() {
+        let mut interner = Interner::new();
+        let sym = interner.intern("test");
+        let copied = sym;
+        let cloned = sym.clone();
+        assert_eq!(sym, copied);
+        assert_eq!(sym, cloned);
+    }
+
+    #[test]
+    fn test_symbol_hash() {
+        use std::collections::HashSet;
+        let mut interner = Interner::new();
+        let sym_a = interner.intern("a");
+        let sym_b = interner.intern("b");
+        let mut set = HashSet::new();
+        set.insert(sym_a);
+        set.insert(sym_b);
+        set.insert(sym_a); // duplicate
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn test_symbol_ordering() {
+        let mut interner = Interner::new();
+        let s0 = interner.intern("first");
+        let s1 = interner.intern("second");
+        // Ordering is by insertion index, not lexicographic
+        assert!(s0 < s1);
+    }
+
+    // ===================================================================
+    // Interner Debug
+    // ===================================================================
+
+    #[test]
+    fn test_interner_debug() {
+        let mut interner = Interner::new();
+        interner.intern("x");
+        let s = format!("{:?}", interner);
+        assert!(s.contains("Interner"));
+        assert!(s.contains("count"));
+        assert!(s.contains("x"));
+    }
+
+    // ===================================================================
+    // Many strings — stress test
+    // ===================================================================
+
+    #[test]
+    fn test_many_unique_strings() {
+        let mut interner = Interner::new();
+        let mut symbols = Vec::new();
+        for i in 0..1000 {
+            let s = format!("identifier_{}", i);
+            let sym = interner.intern(&s);
+            symbols.push((sym, s));
+        }
+        assert_eq!(interner.len(), 1000);
+
+        // Verify all resolve correctly
+        for (sym, expected) in &symbols {
+            assert_eq!(interner.resolve(*sym), expected.as_str());
+        }
+
+        // Verify interning again returns same symbols
+        for (sym, s) in &symbols {
+            assert_eq!(interner.intern(s), *sym);
+        }
+        assert_eq!(interner.len(), 1000); // no growth
+    }
+}
