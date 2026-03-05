@@ -65,7 +65,11 @@ impl Position {
     /// Create a new position with explicit values.
     #[inline]
     pub fn new(offset: u32, line: u32, column: u32) -> Self {
-        Self { offset, line, column }
+        Self {
+            offset,
+            line,
+            column,
+        }
     }
 }
 
@@ -223,9 +227,9 @@ impl<'src> Scanner<'src> {
             return Some(ch);
         }
         // Peek at the raw iterator with \r normalization.
-        self.chars.peek().map(|&(_, ch)| {
-            if ch == '\r' { '\n' } else { ch }
-        })
+        self.chars
+            .peek()
+            .map(|&(_, ch)| if ch == '\r' { '\n' } else { ch })
     }
 
     /// Look ahead `n` characters (0-indexed) without consuming.
