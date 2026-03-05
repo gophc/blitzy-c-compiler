@@ -13,6 +13,7 @@
 //! ## Submodules
 //! - [`registers`] — Register definitions (GPRs, x87 FPU stack)
 
+pub mod abi;
 pub mod assembler;
 pub mod linker;
 pub mod registers;

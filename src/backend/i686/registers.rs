@@ -424,7 +424,7 @@ pub fn is_reserved(reg: u16) -> bool {
 /// FPU registers use indices 100–107 (ST(0)–ST(7)).
 #[inline]
 pub fn is_fpu_reg(reg: u16) -> bool {
-    reg >= ST0 && reg <= ST7
+    (ST0..=ST7).contains(&reg)
 }
 
 /// Returns `true` if the given register is a general-purpose register.
