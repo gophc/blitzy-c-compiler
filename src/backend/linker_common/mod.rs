@@ -16,3 +16,4 @@
 pub mod dynamic;
 pub mod linker_script;
 pub mod section_merger;
+pub mod symbol_resolver;
