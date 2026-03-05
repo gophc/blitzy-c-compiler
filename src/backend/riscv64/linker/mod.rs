@@ -37,30 +37,24 @@ pub mod relocations;
 // ---------------------------------------------------------------------------
 
 use crate::backend::elf_writer_common::{
-    ElfWriter, ElfSymbol, Section, Elf64ProgramHeader,
-    ET_DYN, ET_EXEC,
-    SHT_PROGBITS, SHT_NOBITS, SHT_STRTAB, SHT_RELA, SHT_DYNSYM, SHT_NOTE,
-    SHF_ALLOC, SHF_WRITE, SHF_EXECINSTR,
-    STB_GLOBAL, STB_LOCAL,
+    Elf64ProgramHeader, ElfSymbol, ElfWriter, Section, ET_DYN, ET_EXEC, SHF_ALLOC, SHF_EXECINSTR,
+    SHF_WRITE, SHT_DYNSYM, SHT_NOBITS, SHT_NOTE, SHT_PROGBITS, SHT_RELA, SHT_STRTAB, STB_GLOBAL,
+    STB_LOCAL,
 };
 use crate::backend::linker_common::dynamic::{
-    DynamicLinkContext, DynamicLinkResult,
-    ExportedSymbol, ImportedSymbol, build_dynamic_sections,
+    build_dynamic_sections, DynamicLinkContext, DynamicLinkResult, ExportedSymbol, ImportedSymbol,
 };
 use crate::backend::linker_common::linker_script::{
     DefaultLinkerScript, InputSectionInfo, LayoutResult,
 };
 use crate::backend::linker_common::relocation::{
-    RelocationCollector, Relocation, process_relocations, fits_signed,
+    fits_signed, process_relocations, Relocation, RelocationCollector,
 };
 use crate::backend::linker_common::section_merger::SectionMerger;
 use crate::backend::linker_common::symbol_resolver::{
-    SymbolResolver, ResolvedSymbol, SymbolTable,
-    SHN_UNDEF as SYM_SHN_UNDEF,
+    ResolvedSymbol, SymbolResolver, SymbolTable, SHN_UNDEF as SYM_SHN_UNDEF,
 };
-use crate::backend::linker_common::{
-    LinkerConfig, LinkerInput, OutputType,
-};
+use crate::backend::linker_common::{LinkerConfig, LinkerInput, OutputType};
 use crate::backend::riscv64::linker::relocations::RiscV64RelocationHandler;
 use crate::common::diagnostics::{DiagnosticEngine, Span};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
@@ -233,8 +227,9 @@ impl RiscV64Linker {
         }
 
         // Check for unresolved symbols (fatal for executables).
-        if let Err(undef_errors) =
-            self.symbol_resolver.check_undefined(self.config.allow_undefined)
+        if let Err(undef_errors) = self
+            .symbol_resolver
+            .check_undefined(self.config.allow_undefined)
         {
             for err_msg in &undef_errors {
                 diagnostics.emit_error(Span::dummy(), err_msg.clone());
@@ -252,9 +247,7 @@ impl RiscV64Linker {
         self.symbol_resolver.emit_diagnostics(diagnostics);
 
         if diagnostics.has_errors() && !self.config.allow_undefined {
-            return Err(
-                "RISC-V 64 linker: aborted due to symbol resolution errors".to_string(),
-            );
+            return Err("RISC-V 64 linker: aborted due to symbol resolution errors".to_string());
         }
 
         // -------------------------------------------------------------------
@@ -277,10 +270,7 @@ impl RiscV64Linker {
         // -------------------------------------------------------------------
         let mut section_addr_pairs: FxHashMap<String, (u64, u64)> = FxHashMap::default();
         for (name, addr_info) in &address_map.section_addresses {
-            section_addr_pairs.insert(
-                name.clone(),
-                (addr_info.virtual_address, addr_info.size),
-            );
+            section_addr_pairs.insert(name.clone(), (addr_info.virtual_address, addr_info.size));
         }
         self.symbol_resolver
             .define_linker_symbols(&section_addr_pairs);
@@ -351,7 +341,9 @@ impl RiscV64Linker {
                 self.generate_got(&got_symbols, &symbol_address_map);
             got_data = generated_got;
             #[allow(unused_assignments)]
-            { got_entries = generated_got_entries; }
+            {
+                got_entries = generated_got_entries;
+            }
 
             // Determine GOT section address — use a placeholder that will be
             // patched during layout.
@@ -381,8 +373,8 @@ impl RiscV64Linker {
                 for (plt_index, sym_name) in sorted_plt_syms.into_iter().enumerate() {
                     let got_plt_entry_offset =
                         got_plt_base + ((3 + plt_index) as u64) * (GOT_ENTRY_SIZE as u64);
-                    let plt_entry_addr = plt_base + (PLT0_SIZE as u64)
-                        + (plt_index as u64) * (PLTN_SIZE as u64);
+                    let plt_entry_addr =
+                        plt_base + (PLT0_SIZE as u64) + (plt_index as u64) * (PLTN_SIZE as u64);
 
                     // Initial GOT.PLT value points back to PLT0 for lazy binding
                     let initial_value = plt_base;
@@ -497,8 +489,7 @@ impl RiscV64Linker {
         // -------------------------------------------------------------------
         // Phase 11: Compute Final Layout
         // -------------------------------------------------------------------
-        let mut layout_script =
-            DefaultLinkerScript::new(Target::RiscV64, is_shared);
+        let mut layout_script = DefaultLinkerScript::new(Target::RiscV64, is_shared);
 
         // Build input section info from section data map.
         let mut input_sec_infos: Vec<InputSectionInfo> = Vec::new();
@@ -718,10 +709,8 @@ impl RiscV64Linker {
                                         let jal = encode_jal_instruction(rd, value as i32);
                                         let nop: u32 = 0x0000_0013;
 
-                                        data[off..off + 4]
-                                            .copy_from_slice(&jal.to_le_bytes());
-                                        data[off + 4..off + 8]
-                                            .copy_from_slice(&nop.to_le_bytes());
+                                        data[off..off + 4].copy_from_slice(&jal.to_le_bytes());
+                                        data[off + 4..off + 8].copy_from_slice(&nop.to_le_bytes());
 
                                         relaxations_this_pass += 1;
                                     }
@@ -753,14 +742,11 @@ impl RiscV64Linker {
                                         let rd = (addi_insn >> 7) & 0x1f;
 
                                         // Encode ADDI rd, x0, imm12
-                                        let new_addi =
-                                            encode_addi_instruction(rd, 0, value as i32);
+                                        let new_addi = encode_addi_instruction(rd, 0, value as i32);
                                         let nop: u32 = 0x0000_0013;
 
-                                        data[off..off + 4]
-                                            .copy_from_slice(&new_addi.to_le_bytes());
-                                        data[off + 4..off + 8]
-                                            .copy_from_slice(&nop.to_le_bytes());
+                                        data[off..off + 4].copy_from_slice(&new_addi.to_le_bytes());
+                                        data[off + 4..off + 8].copy_from_slice(&nop.to_le_bytes());
 
                                         relaxations_this_pass += 1;
                                     }
@@ -949,10 +935,7 @@ impl RiscV64Linker {
                 got_data.extend_from_slice(&0u64.to_le_bytes());
             } else {
                 // For static executables, fill with the resolved address.
-                let addr = resolved
-                    .get(sym_name)
-                    .map(|s| s.final_address)
-                    .unwrap_or(0);
+                let addr = resolved.get(sym_name).map(|s| s.final_address).unwrap_or(0);
                 got_data.extend_from_slice(&addr.to_le_bytes());
             }
         }
@@ -1243,15 +1226,9 @@ pub fn link_riscv64(
 /// section name following standard ELF conventions.
 fn classify_section(name: &str) -> (u32, u64) {
     match name {
-        ".text" | ".init" | ".fini" | ".plt" => {
-            (SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR)
-        }
-        ".rodata" | ".rodata.str1.1" | ".rodata.str1.8" => {
-            (SHT_PROGBITS, SHF_ALLOC)
-        }
-        ".data" | ".data.rel.ro" | ".got" | ".got.plt" => {
-            (SHT_PROGBITS, SHF_ALLOC | SHF_WRITE)
-        }
+        ".text" | ".init" | ".fini" | ".plt" => (SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR),
+        ".rodata" | ".rodata.str1.1" | ".rodata.str1.8" => (SHT_PROGBITS, SHF_ALLOC),
+        ".data" | ".data.rel.ro" | ".got" | ".got.plt" => (SHT_PROGBITS, SHF_ALLOC | SHF_WRITE),
         ".bss" => (SHT_NOBITS, SHF_ALLOC | SHF_WRITE),
         ".dynamic" => (6, SHF_ALLOC | SHF_WRITE), // SHT_DYNAMIC
         ".dynsym" => (SHT_DYNSYM, SHF_ALLOC),
@@ -1285,10 +1262,7 @@ fn encode_jal_instruction(rd: u32, offset: i32) -> u32 {
     let bit11 = (imm >> 11) & 1;
     let bits_19_12 = (imm >> 12) & 0xff;
 
-    let encoded_imm = (bit20 << 31)
-        | (bits_10_1 << 21)
-        | (bit11 << 20)
-        | (bits_19_12 << 12);
+    let encoded_imm = (bit20 << 31) | (bits_10_1 << 21) | (bit11 << 20) | (bits_19_12 << 12);
 
     encoded_imm | (rd << 7) | 0x6f // opcode for JAL
 }
@@ -1333,10 +1307,7 @@ mod tests {
 
     #[test]
     fn test_elf_flags_composition() {
-        assert_eq!(
-            ELF_FLAGS,
-            EF_RISCV_FLOAT_ABI_DOUBLE | EF_RISCV_RVC
-        );
+        assert_eq!(ELF_FLAGS, EF_RISCV_FLOAT_ABI_DOUBLE | EF_RISCV_RVC);
     }
 
     #[test]
