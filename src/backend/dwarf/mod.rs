@@ -10,3 +10,4 @@
 //! - `.debug_str` — String table for debug names
 
 pub mod abbrev;
+pub mod str;
