@@ -14,4 +14,5 @@
 //!   sections, with alignment padding, COMDAT group deduplication, and standard section ordering.
 
 pub mod dynamic;
+pub mod linker_script;
 pub mod section_merger;
