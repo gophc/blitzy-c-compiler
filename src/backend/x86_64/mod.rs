@@ -3,6 +3,7 @@
 //!
 //! This is the PRIMARY validation target in the BCC backend validation order.
 
+pub mod abi;
 pub mod assembler;
 pub mod linker;
 pub mod registers;
