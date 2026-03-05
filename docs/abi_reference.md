@@ -194,7 +194,7 @@ Low addresses
 - The stack pointer RSP must be 16-byte aligned immediately **before** the `call` instruction. After `call` pushes the 8-byte return address, RSP is misaligned by 8 bytes at function entry.
 - The **128-byte red zone** below RSP is reserved for the current function's use. Leaf functions (functions that make no further calls) may use this space for temporaries without adjusting RSP, saving the overhead of `sub rsp` / `add rsp` pairs.
 - When `-g` (debug mode) is active, BCC emits a frame pointer prologue (`push rbp; mov rbp, rsp`) to support debugger stack unwinding. In optimized builds, the frame pointer may be omitted.
-- Stack guard page probing is required for frames exceeding 4,096 bytes (one page). BCC implements a probe loop that touches each page in sequence to ensure the guard page is not skipped, preventing stack clash vulnerabilities. This is activated by the `-fcf-protection` flag or large stack frames.
+- Stack guard page probing is required for frames exceeding 4,096 bytes (one page). BCC implements a probe loop that touches each page in sequence to ensure the guard page is not skipped, preventing stack clash vulnerabilities. Stack probing is activated automatically when the stack frame size exceeds 4,096 bytes.
 
 ### Variadic Functions
 
