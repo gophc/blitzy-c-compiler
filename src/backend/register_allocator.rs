@@ -42,7 +42,6 @@
 //! project's zero-external-dependency policy.
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
-#[allow(unused_imports)]
 use crate::common::target::Target;
 #[allow(unused_imports)]
 use crate::ir::basic_block::BasicBlock;
@@ -144,11 +143,16 @@ pub struct LiveInterval {
 // RegisterInfo — Architecture register-set descriptor
 // ===========================================================================
 
-/// Describes the physical register set of a target architecture.
+/// Describes the physical register set of a target architecture for the
+/// register allocator's internal use.
 ///
-/// Architecture backends populate this structure so that the allocator
-/// can operate without any hard-coded register knowledge.  Register
-/// preference order within `allocatable_gpr` / `allocatable_fpr`
+/// This struct uses [`FxHashSet`] for callee/caller-saved and reserved
+/// register sets, enabling O(1) membership tests during allocation.
+/// Architecture backends produce a [`crate::backend::traits::RegisterInfo`]
+/// (using `Vec<u16>` for ABI-level register descriptions), which is
+/// converted to this struct via the [`From`] trait implementation below.
+///
+/// Register preference order within `allocatable_gpr` / `allocatable_fpr`
 /// influences allocation quality — prefer caller-saved registers first
 /// to reduce callee-save traffic.
 #[derive(Debug, Clone)]
@@ -163,6 +167,35 @@ pub struct RegisterInfo {
     pub caller_saved: FxHashSet<PhysReg>,
     /// Reserved registers that are never allocatable (SP, FP, …).
     pub reserved: FxHashSet<PhysReg>,
+}
+
+/// Conversion from the architecture-level [`crate::backend::traits::RegisterInfo`]
+/// (which uses `Vec<u16>` for register lists) to the allocator-internal
+/// `RegisterInfo` (which uses `PhysReg` wrappers and `FxHashSet` for O(1)
+/// membership tests).
+///
+/// This bridges the two `RegisterInfo` definitions, allowing architecture
+/// backends to return their canonical [`crate::backend::traits::RegisterInfo`]
+/// from `ArchCodegen::register_info()`, which the code generation driver
+/// then converts for the register allocator.
+impl From<crate::backend::traits::RegisterInfo> for RegisterInfo {
+    fn from(arch_info: crate::backend::traits::RegisterInfo) -> Self {
+        RegisterInfo {
+            allocatable_gpr: arch_info
+                .allocatable_gpr
+                .iter()
+                .map(|&r| PhysReg(r))
+                .collect(),
+            allocatable_fpr: arch_info
+                .allocatable_fpr
+                .iter()
+                .map(|&r| PhysReg(r))
+                .collect(),
+            callee_saved: arch_info.callee_saved.iter().map(|&r| PhysReg(r)).collect(),
+            caller_saved: arch_info.caller_saved.iter().map(|&r| PhysReg(r)).collect(),
+            reserved: arch_info.reserved.iter().map(|&r| PhysReg(r)).collect(),
+        }
+    }
 }
 
 // ===========================================================================
@@ -412,6 +445,19 @@ pub fn compute_live_intervals(func: &IrFunction) -> Vec<LiveInterval> {
 // allocate_registers — Linear scan allocation
 // ===========================================================================
 
+/// Returns the spill slot size in bytes for a given IR type on the target.
+///
+/// Derives the size from the type's storage requirements rather than
+/// using a fixed 8-byte slot.  This avoids wasting stack space for
+/// narrow types (e.g., 4-byte I32 on i686) and ensures sufficient
+/// space for wide types (e.g., 16-byte I128).
+///
+/// The minimum slot size is 1 byte; zero-sized types (Void, Function)
+/// are clamped to 1 to avoid degenerate slot allocation.
+fn spill_slot_size_for_type(ty: &IrType, target: &Target) -> usize {
+    ty.size_bytes(target).max(1)
+}
+
 /// Performs linear-scan register allocation over a set of live intervals.
 ///
 /// # Algorithm
@@ -432,6 +478,8 @@ pub fn compute_live_intervals(func: &IrFunction) -> Vec<LiveInterval> {
 /// - `intervals`: live intervals (mutated in-place with `assigned` /
 ///   `spill_slot` fields).
 /// - `reg_info`: architecture-supplied register descriptor.
+/// - `target`: target architecture — used to compute correct spill slot
+///   sizes from value types (e.g., 4 bytes for I32 on i686, 16 for I128).
 ///
 /// # Returns
 ///
@@ -440,6 +488,7 @@ pub fn compute_live_intervals(func: &IrFunction) -> Vec<LiveInterval> {
 pub fn allocate_registers(
     intervals: &mut [LiveInterval],
     reg_info: &RegisterInfo,
+    target: &Target,
 ) -> AllocationResult {
     // Pre-extract value types before any mutation.
     let value_types: FxHashMap<Value, IrType> = intervals
@@ -525,17 +574,19 @@ pub fn allocate_registers(
                     assignments.remove(&intervals[far_idx].vreg);
 
                     // Allocate a spill slot for the evicted interval.
-                    let slot_offset = -(frame_size as i32) - 8;
+                    // Derive slot size from the spilled value's type.
+                    let spill_size = spill_slot_size_for_type(&intervals[far_idx].ty, target);
+                    let slot_offset = -(frame_size as i32) - (spill_size as i32);
                     let slot = SpillSlot {
                         index: next_spill_index,
-                        size: 8,
+                        size: spill_size,
                         offset: slot_offset,
                     };
                     intervals[far_idx].spill_slot = Some(next_spill_index);
                     spill_map.insert(intervals[far_idx].vreg, next_spill_index);
                     spill_slots.push(slot);
                     next_spill_index += 1;
-                    frame_size += 8;
+                    frame_size += spill_size;
 
                     // Remove evicted interval from active.
                     active.retain(|&ai| ai != far_idx);
@@ -555,31 +606,35 @@ pub fn allocate_registers(
                     active.insert(insert_pos, i);
                 } else {
                     // Spill the current interval (shorter or equal — spill self).
-                    let slot_offset = -(frame_size as i32) - 8;
+                    // Derive slot size from the spilled value's type.
+                    let spill_size = spill_slot_size_for_type(&intervals[i].ty, target);
+                    let slot_offset = -(frame_size as i32) - (spill_size as i32);
                     let slot = SpillSlot {
                         index: next_spill_index,
-                        size: 8,
+                        size: spill_size,
                         offset: slot_offset,
                     };
                     intervals[i].spill_slot = Some(next_spill_index);
                     spill_map.insert(intervals[i].vreg, next_spill_index);
                     spill_slots.push(slot);
                     next_spill_index += 1;
-                    frame_size += 8;
+                    frame_size += spill_size;
                 }
             } else {
                 // No active intervals of the same class — spill current.
-                let slot_offset = -(frame_size as i32) - 8;
+                // Derive slot size from the spilled value's type.
+                let spill_size = spill_slot_size_for_type(&intervals[i].ty, target);
+                let slot_offset = -(frame_size as i32) - (spill_size as i32);
                 let slot = SpillSlot {
                     index: next_spill_index,
-                    size: 8,
+                    size: spill_size,
                     offset: slot_offset,
                 };
                 intervals[i].spill_slot = Some(next_spill_index);
                 spill_map.insert(intervals[i].vreg, next_spill_index);
                 spill_slots.push(slot);
                 next_spill_index += 1;
-                frame_size += 8;
+                frame_size += spill_size;
             }
         }
     }
@@ -863,7 +918,8 @@ mod tests {
         let func = make_simple_func();
         let mut intervals = compute_live_intervals(&func);
         let reg_info = make_reg_info(8, 4);
-        let result = allocate_registers(&mut intervals, &reg_info);
+        let target = Target::X86_64;
+        let result = allocate_registers(&mut intervals, &reg_info, &target);
 
         // With 8 GPRs and only 3 values, everything should be assigned.
         assert_eq!(result.assignments.len(), 3);
@@ -883,7 +939,8 @@ mod tests {
         let func = make_simple_func();
         let mut intervals = compute_live_intervals(&func);
         let reg_info = make_reg_info(1, 0);
-        let result = allocate_registers(&mut intervals, &reg_info);
+        let target = Target::X86_64;
+        let result = allocate_registers(&mut intervals, &reg_info, &target);
 
         // At least one value must be spilled.
         assert!(!result.spill_slots.is_empty());
@@ -909,7 +966,8 @@ mod tests {
 
         let func = make_simple_func();
         let mut intervals = compute_live_intervals(&func);
-        let result = allocate_registers(&mut intervals, &reg_info);
+        let target = Target::X86_64;
+        let result = allocate_registers(&mut intervals, &reg_info, &target);
 
         // If callee-saved regs were used, they appear in callee_saved_used.
         for reg in &result.callee_saved_used {
@@ -943,7 +1001,8 @@ mod tests {
         let mut func = func_orig;
         let mut intervals = compute_live_intervals(&func);
         let reg_info = make_reg_info(1, 0);
-        let result = allocate_registers(&mut intervals, &reg_info);
+        let target = Target::X86_64;
+        let result = allocate_registers(&mut intervals, &reg_info, &target);
 
         let inst_count_before: usize = func.blocks.iter().map(|b| b.instruction_count()).sum();
         insert_spill_code(&mut func, &result);
@@ -963,7 +1022,8 @@ mod tests {
         let mut func = make_simple_func();
         let mut intervals = compute_live_intervals(&func);
         let reg_info = make_reg_info(8, 4);
-        let result = allocate_registers(&mut intervals, &reg_info);
+        let target = Target::X86_64;
+        let result = allocate_registers(&mut intervals, &reg_info, &target);
 
         let inst_count_before: usize = func.blocks.iter().map(|b| b.instruction_count()).sum();
         insert_spill_code(&mut func, &result);

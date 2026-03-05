@@ -401,6 +401,38 @@ fn try_fold_bitcast(val: &ConstantValue, to_type: &IrType) -> Option<ConstantVal
 }
 
 // ===========================================================================
+// Instruction result type helper
+// ===========================================================================
+
+/// Returns the IR type produced by an instruction's result value.
+///
+/// This is used to build a `Value → IrType` map so that cast instructions
+/// (ZExt, SExt) can look up the source operand's type during constant
+/// folding.  For instructions without results (Store, Branch, …), the
+/// return value is a sensible default (`I64`) that will never be used
+/// because those instructions produce no `Value`.
+fn instruction_result_type(inst: &Instruction) -> IrType {
+    match inst {
+        Instruction::Alloca { .. } => IrType::Ptr,
+        Instruction::Load { ty, .. } => ty.clone(),
+        Instruction::BinOp { ty, .. } => ty.clone(),
+        Instruction::ICmp { .. } | Instruction::FCmp { .. } => IrType::I1,
+        Instruction::Call { return_type, .. } => return_type.clone(),
+        Instruction::Phi { ty, .. } => ty.clone(),
+        Instruction::GetElementPtr { .. } => IrType::Ptr,
+        Instruction::BitCast { to_type, .. }
+        | Instruction::Trunc { to_type, .. }
+        | Instruction::ZExt { to_type, .. }
+        | Instruction::SExt { to_type, .. } => to_type.clone(),
+        Instruction::IntToPtr { .. } => IrType::Ptr,
+        Instruction::PtrToInt { to_type, .. } => to_type.clone(),
+        Instruction::InlineAsm { .. } => IrType::I64,
+        // Store, Branch, CondBranch, Switch, Return — no result.
+        _ => IrType::I64,
+    }
+}
+
+// ===========================================================================
 // Instruction analysis helpers
 // ===========================================================================
 
@@ -409,13 +441,19 @@ fn try_fold_bitcast(val: &ConstantValue, to_type: &IrType) -> Option<ConstantVal
 ///
 /// Currently recognises:
 /// - `BinOp` with known constant operands (delegated to the folding pass)
-/// - Instructions whose result was already mapped in the constant table
+/// - `ICmp` / `FCmp` with known constant operands
+/// - `Trunc` / `ZExt` / `SExt` / `BitCast` with known constant operands
+/// - `Phi` where all incoming values are the same constant
+///
+/// The `value_types` map is used to resolve the source operand's type for
+/// ZExt/SExt instructions, which do not carry an explicit `from_type` field.
 ///
 /// The primary source of initial constants is the per-instruction analysis
 /// in the main pass loop.
 fn try_extract_constant_from_instruction(
     inst: &Instruction,
     constants: &FxHashMap<Value, ConstantValue>,
+    value_types: &FxHashMap<Value, IrType>,
 ) -> Option<(Value, ConstantValue)> {
     match inst {
         // A BinOp with both operands in the constant map.
@@ -481,11 +519,10 @@ fn try_extract_constant_from_instruction(
             ..
         } => {
             let val_const = constants.get(value)?;
-            // For ZExt without explicit source type on the instruction, we
-            // use I32 as a safe default for the source width.  The constant
-            // value's i128 representation already has the correct unsigned
-            // interpretation from when it was inserted into the map.
-            let src_type = IrType::I32; // Conservative default
+            // Look up the source operand's type from its defining instruction.
+            // The ZExt instruction only carries `to_type` (the target), so we
+            // must resolve the source type from the def-use chain via value_types.
+            let src_type = value_types.get(value).cloned().unwrap_or(IrType::I32);
             let folded = try_fold_zext(val_const, &src_type, to_type)?;
             Some((*result, folded))
         }
@@ -498,10 +535,10 @@ fn try_extract_constant_from_instruction(
             ..
         } => {
             let val_const = constants.get(value)?;
-            // For SExt without explicit source type on the instruction, we
-            // use I32 as a safe default.  The constant value's i128
-            // representation already has the correct sign from insertion.
-            let src_type = IrType::I32; // Conservative default
+            // Look up the source operand's type from its defining instruction.
+            // The SExt instruction only carries `to_type` (the target), so we
+            // must resolve the source type from the def-use chain via value_types.
+            let src_type = value_types.get(value).cloned().unwrap_or(IrType::I32);
             let folded = try_fold_sext(val_const, &src_type, to_type)?;
             Some((*result, folded))
         }
@@ -673,8 +710,33 @@ pub fn run_constant_folding(func: &mut IrFunction) -> bool {
     // Map from SSA Value to its known constant value.
     let mut constants: FxHashMap<Value, ConstantValue> = FxHashMap::default();
 
+    // Map from SSA Value to its result IR type.
+    // Used by ZExt/SExt folding to determine the source operand's width,
+    // since those instructions only carry the target type (`to_type`), not
+    // the source type.
+    let mut value_types: FxHashMap<Value, IrType> = FxHashMap::default();
+
     // Register UNDEF as a known constant so downstream lookups work.
     constants.insert(Value::UNDEF, ConstantValue::Undef);
+
+    // -----------------------------------------------------------------------
+    // Pre-pass: Build the value → type map from all instructions.
+    // -----------------------------------------------------------------------
+    {
+        let block_count = func.block_count();
+        for block_idx in 0..block_count {
+            let block = &func.blocks()[block_idx];
+            for inst in block.instructions().iter() {
+                if let Some(result) = inst.result() {
+                    if result != Value::UNDEF {
+                        value_types
+                            .entry(result)
+                            .or_insert_with(|| instruction_result_type(inst));
+                    }
+                }
+            }
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Phase A: Discover constant-producing instructions.
@@ -701,7 +763,7 @@ pub fn run_constant_folding(func: &mut IrFunction) -> bool {
                 }
 
                 if let Some((result_val, const_val)) =
-                    try_extract_constant_from_instruction(inst, &constants)
+                    try_extract_constant_from_instruction(inst, &constants, &value_types)
                 {
                     constants.insert(result_val, const_val);
                     made_progress = true;
