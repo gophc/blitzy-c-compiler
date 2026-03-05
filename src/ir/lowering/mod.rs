@@ -6,3 +6,4 @@
 pub mod asm_lowering;
 pub mod decl_lowering;
 pub mod expr_lowering;
+pub mod stmt_lowering;

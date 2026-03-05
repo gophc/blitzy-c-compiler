@@ -34,13 +34,11 @@ use crate::common::types::CType;
 use crate::frontend::parser::ast;
 use crate::ir::builder::IrBuilder;
 use crate::ir::function::{
-    CallingConvention, FunctionParam, IrFunction,
-    Linkage as FnLinkage, Visibility as FnVisibility,
+    CallingConvention, FunctionParam, IrFunction, Linkage as FnLinkage, Visibility as FnVisibility,
 };
 use crate::ir::instructions::{BlockId, Instruction, Value};
 use crate::ir::module::{
-    Constant, FunctionDeclaration, GlobalVariable, IrModule,
-    Linkage, Visibility,
+    Constant, FunctionDeclaration, GlobalVariable, IrModule, Linkage, Visibility,
 };
 use crate::ir::types::IrType;
 
@@ -53,7 +51,10 @@ use super::expr_lowering;
 /// Resolve an AST `Symbol` to its string representation using the name table.
 /// Returns an empty string if the symbol index is out of bounds.
 #[inline]
-fn resolve_sym<'a>(name_table: &'a [String], sym: &crate::common::string_interner::Symbol) -> &'a str {
+fn resolve_sym<'a>(
+    name_table: &'a [String],
+    sym: &crate::common::string_interner::Symbol,
+) -> &'a str {
     let idx = sym.as_u32() as usize;
     if idx < name_table.len() {
         &name_table[idx]
@@ -117,8 +118,14 @@ pub fn lower_global_variable(
         let ir_type = IrType::from_ctype(&c_type, target);
 
         let (initializer, is_definition) = if let Some(ref init) = init_decl.initializer {
-            let constant =
-                evaluate_initializer_constant(init, &c_type, target, type_builder, diagnostics, name_table);
+            let constant = evaluate_initializer_constant(
+                init,
+                &c_type,
+                target,
+                type_builder,
+                diagnostics,
+                name_table,
+            );
             (constant, true)
         } else if matches!(storage_class, Some(ast::StorageClass::Extern)) {
             (None, false)
@@ -251,8 +258,7 @@ pub fn lower_function_definition(
     }
 
     // Allocate stack-local variables in entry block.
-    let stack_locals: Vec<&LocalVarInfo> =
-        locals.iter().filter(|l| !l.is_static).collect();
+    let stack_locals: Vec<&LocalVarInfo> = locals.iter().filter(|l| !l.is_static).collect();
     allocate_local_variables(
         &mut builder,
         &mut ir_function,
@@ -267,12 +273,7 @@ pub fn lower_function_definition(
     setup_function_prologue(&mut builder, &mut ir_function);
 
     // --- Verify function termination ---
-    verify_function_termination(
-        &mut ir_function,
-        &return_ir_type,
-        &mut builder,
-        diagnostics,
-    );
+    verify_function_termination(&mut ir_function, &return_ir_type, &mut builder, diagnostics);
 
     // Sync value_count from builder.
     ir_function.value_count = builder.fresh_value().0;
@@ -326,7 +327,6 @@ pub fn lower_function_declaration(
         module.add_declaration(func_decl);
     }
 }
-
 
 // ===========================================================================
 // Public API - lower_local_initializer
@@ -389,28 +389,23 @@ fn lower_aggregate_local_init(
                 }
                 let actual_idx = resolve_designator_index(&desig_init.designators, idx);
                 let idx_val = make_index_value(ctx, actual_idx);
-                let (elem_ptr, gep_inst) = ctx.builder.build_gep(
-                    base_alloca,
-                    vec![idx_val],
-                    IrType::Ptr,
-                    span,
-                );
+                let (elem_ptr, gep_inst) =
+                    ctx.builder
+                        .build_gep(base_alloca, vec![idx_val], IrType::Ptr, span);
                 emit_inst_to_ctx(ctx, gep_inst);
                 lower_single_init_element(elem_ptr, &desig_init.initializer, element_type, ctx);
             }
         }
         CType::Struct { ref fields, .. } => {
             for (idx, desig_init) in init_list.iter().enumerate() {
-                let field_idx = resolve_field_designator(&desig_init.designators, fields, idx, ctx.name_table);
+                let field_idx =
+                    resolve_field_designator(&desig_init.designators, fields, idx, ctx.name_table);
                 if field_idx < fields.len() {
                     let field = &fields[field_idx];
                     let field_idx_val = make_index_value(ctx, field_idx);
-                    let (field_ptr, gep_inst) = ctx.builder.build_gep(
-                        base_alloca,
-                        vec![field_idx_val],
-                        IrType::Ptr,
-                        span,
-                    );
+                    let (field_ptr, gep_inst) =
+                        ctx.builder
+                            .build_gep(base_alloca, vec![field_idx_val], IrType::Ptr, span);
                     emit_inst_to_ctx(ctx, gep_inst);
                     lower_single_init_element(field_ptr, &desig_init.initializer, &field.ty, ctx);
                 }
@@ -418,7 +413,8 @@ fn lower_aggregate_local_init(
         }
         CType::Union { ref fields, .. } => {
             if let Some(first) = init_list.first() {
-                let field_idx = resolve_field_designator(&first.designators, fields, 0, ctx.name_table);
+                let field_idx =
+                    resolve_field_designator(&first.designators, fields, 0, ctx.name_table);
                 if field_idx < fields.len() {
                     lower_single_init_element(
                         base_alloca,
@@ -461,7 +457,6 @@ fn lower_single_init_element(
     }
 }
 
-
 // ===========================================================================
 // Constant initializer evaluation (for globals)
 // ===========================================================================
@@ -476,9 +471,14 @@ fn evaluate_initializer_constant(
     name_table: &[String],
 ) -> Option<Constant> {
     match init {
-        ast::Initializer::Expression(expr) => {
-            evaluate_constant_expr(expr, expected_type, target, type_builder, diagnostics, name_table)
-        }
+        ast::Initializer::Expression(expr) => evaluate_constant_expr(
+            expr,
+            expected_type,
+            target,
+            type_builder,
+            diagnostics,
+            name_table,
+        ),
         ast::Initializer::List {
             designators_and_initializers,
             ..
@@ -518,77 +518,151 @@ fn evaluate_constant_expr(
             let name_str = resolve_sym(name_table, name).to_string();
             Some(Constant::GlobalRef(name_str))
         }
-        ast::Expression::UnaryOp { op, operand, .. } => {
-            match op {
-                ast::UnaryOp::AddressOf => {
-                    if let ast::Expression::Identifier { name, .. } = operand.as_ref() {
-                        let name_str = resolve_sym(name_table, name).to_string();
-                        Some(Constant::GlobalRef(name_str))
-                    } else {
-                        Some(Constant::Undefined)
-                    }
+        ast::Expression::UnaryOp { op, operand, .. } => match op {
+            ast::UnaryOp::AddressOf => {
+                if let ast::Expression::Identifier { name, .. } = operand.as_ref() {
+                    let name_str = resolve_sym(name_table, name).to_string();
+                    Some(Constant::GlobalRef(name_str))
+                } else {
+                    Some(Constant::Undefined)
                 }
-                ast::UnaryOp::Negate => {
-                    let inner = evaluate_constant_expr(operand, _expected_type, target, type_builder, diagnostics, name_table)?;
-                    match inner {
-                        Constant::Integer(v) => Some(Constant::Integer(-v)),
-                        Constant::Float(v) => Some(Constant::Float(-v)),
-                        _ => Some(Constant::Undefined),
-                    }
-                }
-                ast::UnaryOp::BitwiseNot => {
-                    let inner = evaluate_constant_expr(operand, _expected_type, target, type_builder, diagnostics, name_table)?;
-                    match inner {
-                        Constant::Integer(v) => Some(Constant::Integer(!v)),
-                        _ => Some(Constant::Undefined),
-                    }
-                }
-                ast::UnaryOp::LogicalNot => {
-                    let inner = evaluate_constant_expr(operand, _expected_type, target, type_builder, diagnostics, name_table)?;
-                    match inner {
-                        Constant::Integer(v) => Some(Constant::Integer(if v == 0 { 1 } else { 0 })),
-                        _ => Some(Constant::Undefined),
-                    }
-                }
-                _ => Some(Constant::Undefined),
             }
-        }
-        ast::Expression::Binary { op, left, right, .. } => {
-            let lhs = evaluate_constant_expr(left, _expected_type, target, type_builder, diagnostics, name_table)?;
-            let rhs = evaluate_constant_expr(right, _expected_type, target, type_builder, diagnostics, name_table)?;
+            ast::UnaryOp::Negate => {
+                let inner = evaluate_constant_expr(
+                    operand,
+                    _expected_type,
+                    target,
+                    type_builder,
+                    diagnostics,
+                    name_table,
+                )?;
+                match inner {
+                    Constant::Integer(v) => Some(Constant::Integer(-v)),
+                    Constant::Float(v) => Some(Constant::Float(-v)),
+                    _ => Some(Constant::Undefined),
+                }
+            }
+            ast::UnaryOp::BitwiseNot => {
+                let inner = evaluate_constant_expr(
+                    operand,
+                    _expected_type,
+                    target,
+                    type_builder,
+                    diagnostics,
+                    name_table,
+                )?;
+                match inner {
+                    Constant::Integer(v) => Some(Constant::Integer(!v)),
+                    _ => Some(Constant::Undefined),
+                }
+            }
+            ast::UnaryOp::LogicalNot => {
+                let inner = evaluate_constant_expr(
+                    operand,
+                    _expected_type,
+                    target,
+                    type_builder,
+                    diagnostics,
+                    name_table,
+                )?;
+                match inner {
+                    Constant::Integer(v) => Some(Constant::Integer(if v == 0 { 1 } else { 0 })),
+                    _ => Some(Constant::Undefined),
+                }
+            }
+            _ => Some(Constant::Undefined),
+        },
+        ast::Expression::Binary {
+            op, left, right, ..
+        } => {
+            let lhs = evaluate_constant_expr(
+                left,
+                _expected_type,
+                target,
+                type_builder,
+                diagnostics,
+                name_table,
+            )?;
+            let rhs = evaluate_constant_expr(
+                right,
+                _expected_type,
+                target,
+                type_builder,
+                diagnostics,
+                name_table,
+            )?;
             evaluate_const_binop(op, &lhs, &rhs)
         }
-        ast::Expression::Cast { operand, .. } => {
-            evaluate_constant_expr(operand, _expected_type, target, type_builder, diagnostics, name_table)
-        }
-        ast::Expression::SizeofExpr { .. } | ast::Expression::SizeofType { .. } => {
-            Some(Constant::Integer(evaluate_sizeof_expr(expr, target, type_builder) as i128))
-        }
+        ast::Expression::Cast { operand, .. } => evaluate_constant_expr(
+            operand,
+            _expected_type,
+            target,
+            type_builder,
+            diagnostics,
+            name_table,
+        ),
+        ast::Expression::SizeofExpr { .. } | ast::Expression::SizeofType { .. } => Some(
+            Constant::Integer(evaluate_sizeof_expr(expr, target, type_builder) as i128),
+        ),
         ast::Expression::AlignofType { .. } => {
-            Some(Constant::Integer(evaluate_alignof_expr(expr, target, type_builder) as i128))
+            Some(Constant::Integer(
+                evaluate_alignof_expr(expr, target, type_builder) as i128,
+            ))
         }
-        ast::Expression::Conditional { condition, then_expr, else_expr, .. } => {
-            let cond = evaluate_constant_expr(condition, _expected_type, target, type_builder, diagnostics, name_table)?;
+        ast::Expression::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+            ..
+        } => {
+            let cond = evaluate_constant_expr(
+                condition,
+                _expected_type,
+                target,
+                type_builder,
+                diagnostics,
+                name_table,
+            )?;
             match cond {
                 Constant::Integer(v) if v != 0 => {
                     if let Some(ref te) = then_expr {
-                        evaluate_constant_expr(te, _expected_type, target, type_builder, diagnostics, name_table)
+                        evaluate_constant_expr(
+                            te,
+                            _expected_type,
+                            target,
+                            type_builder,
+                            diagnostics,
+                            name_table,
+                        )
                     } else {
                         // GCC extension: x ?: y — if condition is true, value is condition
                         Some(Constant::Integer(v))
                     }
                 }
-                Constant::Integer(_) => {
-                    evaluate_constant_expr(else_expr, _expected_type, target, type_builder, diagnostics, name_table)
-                }
+                Constant::Integer(_) => evaluate_constant_expr(
+                    else_expr,
+                    _expected_type,
+                    target,
+                    type_builder,
+                    diagnostics,
+                    name_table,
+                ),
                 _ => Some(Constant::Undefined),
             }
         }
-        ast::Expression::Parenthesized { inner, .. } => {
-            evaluate_constant_expr(inner, _expected_type, target, type_builder, diagnostics, name_table)
-        }
+        ast::Expression::Parenthesized { inner, .. } => evaluate_constant_expr(
+            inner,
+            _expected_type,
+            target,
+            type_builder,
+            diagnostics,
+            name_table,
+        ),
         _ => {
-            diagnostics.emit_error(Span::dummy(), "initializer element is not a compile-time constant");
+            diagnostics.emit_error(
+                Span::dummy(),
+                "initializer element is not a compile-time constant",
+            );
             Some(Constant::Undefined)
         }
     }
@@ -609,14 +683,62 @@ fn evaluate_const_binop(op: &ast::BinaryOp, lhs: &Constant, rhs: &Constant) -> O
                 ast::BinaryOp::BitwiseXor => *a ^ *b,
                 ast::BinaryOp::ShiftLeft => a.wrapping_shl(*b as u32),
                 ast::BinaryOp::ShiftRight => a.wrapping_shr(*b as u32),
-                ast::BinaryOp::Equal => if a == b { 1 } else { 0 },
-                ast::BinaryOp::NotEqual => if a != b { 1 } else { 0 },
-                ast::BinaryOp::Less => if a < b { 1 } else { 0 },
-                ast::BinaryOp::LessEqual => if a <= b { 1 } else { 0 },
-                ast::BinaryOp::Greater => if a > b { 1 } else { 0 },
-                ast::BinaryOp::GreaterEqual => if a >= b { 1 } else { 0 },
-                ast::BinaryOp::LogicalAnd => if *a != 0 && *b != 0 { 1 } else { 0 },
-                ast::BinaryOp::LogicalOr => if *a != 0 || *b != 0 { 1 } else { 0 },
+                ast::BinaryOp::Equal => {
+                    if a == b {
+                        1
+                    } else {
+                        0
+                    }
+                }
+                ast::BinaryOp::NotEqual => {
+                    if a != b {
+                        1
+                    } else {
+                        0
+                    }
+                }
+                ast::BinaryOp::Less => {
+                    if a < b {
+                        1
+                    } else {
+                        0
+                    }
+                }
+                ast::BinaryOp::LessEqual => {
+                    if a <= b {
+                        1
+                    } else {
+                        0
+                    }
+                }
+                ast::BinaryOp::Greater => {
+                    if a > b {
+                        1
+                    } else {
+                        0
+                    }
+                }
+                ast::BinaryOp::GreaterEqual => {
+                    if a >= b {
+                        1
+                    } else {
+                        0
+                    }
+                }
+                ast::BinaryOp::LogicalAnd => {
+                    if *a != 0 && *b != 0 {
+                        1
+                    } else {
+                        0
+                    }
+                }
+                ast::BinaryOp::LogicalOr => {
+                    if *a != 0 || *b != 0 {
+                        1
+                    } else {
+                        0
+                    }
+                }
                 _ => return Some(Constant::Undefined),
             };
             Some(Constant::Integer(result))
@@ -634,7 +756,6 @@ fn evaluate_const_binop(op: &ast::BinaryOp, lhs: &Constant, rhs: &Constant) -> O
         _ => Some(Constant::Undefined),
     }
 }
-
 
 // ===========================================================================
 // Designated initializer lowering (constant, for globals)
@@ -660,7 +781,12 @@ fn lower_designated_initializer(
                 current_idx = resolve_designator_index(&desig_init.designators, current_idx);
                 if current_idx < array_len {
                     if let Some(c) = evaluate_initializer_constant(
-                        &desig_init.initializer, element_type, target, type_builder, diagnostics, name_table,
+                        &desig_init.initializer,
+                        element_type,
+                        target,
+                        type_builder,
+                        diagnostics,
+                        name_table,
                     ) {
                         elements[current_idx] = c;
                     }
@@ -674,11 +800,21 @@ fn lower_designated_initializer(
             let mut field_values = vec![Constant::ZeroInit; field_count];
             let mut current_idx = 0usize;
             for desig_init in init_list {
-                current_idx = resolve_field_designator(&desig_init.designators, fields, current_idx, name_table);
+                current_idx = resolve_field_designator(
+                    &desig_init.designators,
+                    fields,
+                    current_idx,
+                    name_table,
+                );
                 if current_idx < field_count {
                     let field_type = &fields[current_idx].ty;
                     if let Some(c) = evaluate_initializer_constant(
-                        &desig_init.initializer, field_type, target, type_builder, diagnostics, name_table,
+                        &desig_init.initializer,
+                        field_type,
+                        target,
+                        type_builder,
+                        diagnostics,
+                        name_table,
                     ) {
                         field_values[current_idx] = c;
                     }
@@ -692,7 +828,12 @@ fn lower_designated_initializer(
                 let field_idx = resolve_field_designator(&first.designators, fields, 0, name_table);
                 if field_idx < fields.len() {
                     return evaluate_initializer_constant(
-                        &first.initializer, &fields[field_idx].ty, target, type_builder, diagnostics, name_table,
+                        &first.initializer,
+                        &fields[field_idx].ty,
+                        target,
+                        type_builder,
+                        diagnostics,
+                        name_table,
                     );
                 }
             }
@@ -701,7 +842,12 @@ fn lower_designated_initializer(
         _ => {
             if let Some(first) = init_list.first() {
                 evaluate_initializer_constant(
-                    &first.initializer, target_type, target, type_builder, diagnostics, name_table,
+                    &first.initializer,
+                    target_type,
+                    target,
+                    type_builder,
+                    diagnostics,
+                    name_table,
                 )
             } else {
                 Some(Constant::ZeroInit)
@@ -709,7 +855,6 @@ fn lower_designated_initializer(
         }
     }
 }
-
 
 // ===========================================================================
 // Parameter allocation
@@ -760,7 +905,11 @@ fn collect_local_variables(body: &ast::Statement, name_table: &[String]) -> Vec<
     locals
 }
 
-fn collect_locals_recursive(stmt: &ast::Statement, locals: &mut Vec<LocalVarInfo>, name_table: &[String]) {
+fn collect_locals_recursive(
+    stmt: &ast::Statement,
+    locals: &mut Vec<LocalVarInfo>,
+    name_table: &[String],
+) {
     match stmt {
         ast::Statement::Compound(compound) => {
             for item in &compound.items {
@@ -774,7 +923,11 @@ fn collect_locals_recursive(stmt: &ast::Statement, locals: &mut Vec<LocalVarInfo
                 }
             }
         }
-        ast::Statement::If { then_branch, else_branch, .. } => {
+        ast::Statement::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
             collect_locals_recursive(then_branch, locals, name_table);
             if let Some(ref else_stmt) = else_branch {
                 collect_locals_recursive(else_stmt, locals, name_table);
@@ -809,7 +962,11 @@ fn collect_locals_recursive(stmt: &ast::Statement, locals: &mut Vec<LocalVarInfo
     }
 }
 
-fn collect_locals_from_declaration(decl: &ast::Declaration, locals: &mut Vec<LocalVarInfo>, name_table: &[String]) {
+fn collect_locals_from_declaration(
+    decl: &ast::Declaration,
+    locals: &mut Vec<LocalVarInfo>,
+    name_table: &[String],
+) {
     let specifiers = &decl.specifiers;
     let storage_class = specifiers.storage_class;
 
@@ -860,7 +1017,6 @@ fn allocate_local_variables(
     }
 }
 
-
 // ===========================================================================
 // Static local and thread-local variable lowering
 // ===========================================================================
@@ -904,10 +1060,8 @@ fn verify_function_termination(
                     let ret_inst = builder.build_return(None, Span::dummy());
                     block.push_instruction(ret_inst);
                 } else {
-                    diagnostics.emit_warning(
-                        Span::dummy(),
-                        "control reaches end of non-void function",
-                    );
+                    diagnostics
+                        .emit_warning(Span::dummy(), "control reaches end of non-void function");
                     let ret_inst = builder.build_return(Some(Value::UNDEF), Span::dummy());
                     block.push_instruction(ret_inst);
                 }
@@ -949,14 +1103,12 @@ fn determine_visibility(attributes: &[ast::Attribute], name_table: &[String]) ->
                             _ => {}
                         }
                     }
-                    ast::AttributeArg::Identifier(sym, _) => {
-                        match resolve_sym(name_table, sym) {
-                            "hidden" => return Visibility::Hidden,
-                            "protected" => return Visibility::Protected,
-                            "default" => return Visibility::Default,
-                            _ => {}
-                        }
-                    }
+                    ast::AttributeArg::Identifier(sym, _) => match resolve_sym(name_table, sym) {
+                        "hidden" => return Visibility::Hidden,
+                        "protected" => return Visibility::Protected,
+                        "default" => return Visibility::Default,
+                        _ => {}
+                    },
                     _ => {}
                 }
             }
@@ -984,16 +1136,20 @@ fn convert_visibility_to_fn(vis: Visibility) -> FnVisibility {
     }
 }
 
-
 // ===========================================================================
 // Attribute extraction helpers
 // ===========================================================================
 
 fn has_attribute(attributes: &[ast::Attribute], name: &str, name_table: &[String]) -> bool {
-    attributes.iter().any(|a| resolve_sym(name_table, &a.name) == name)
+    attributes
+        .iter()
+        .any(|a| resolve_sym(name_table, &a.name) == name)
 }
 
-fn extract_section_attribute(attributes: &[ast::Attribute], name_table: &[String]) -> Option<String> {
+fn extract_section_attribute(
+    attributes: &[ast::Attribute],
+    name_table: &[String],
+) -> Option<String> {
     for attr in attributes {
         if resolve_sym(name_table, &attr.name) == "section" {
             if let Some(first_arg) = attr.args.first() {
@@ -1012,7 +1168,10 @@ fn extract_section_attribute(attributes: &[ast::Attribute], name_table: &[String
     None
 }
 
-fn extract_alignment_attribute(attributes: &[ast::Attribute], name_table: &[String]) -> Option<usize> {
+fn extract_alignment_attribute(
+    attributes: &[ast::Attribute],
+    name_table: &[String],
+) -> Option<usize> {
     for attr in attributes {
         if resolve_sym(name_table, &attr.name) == "aligned" {
             if let Some(first_arg) = attr.args.first() {
@@ -1040,7 +1199,6 @@ fn collect_all_attributes(
     all.extend_from_slice(&declarator.attributes);
     all
 }
-
 
 // ===========================================================================
 // Type resolution helpers
@@ -1121,29 +1279,59 @@ fn resolve_multi_word_type(specs: &[ast::TypeSpecifier]) -> CType {
     }
 
     if has_complex {
-        let base = if has_float { CType::Float }
-                   else if long_count > 0 { CType::LongDouble }
-                   else { CType::Double };
+        let base = if has_float {
+            CType::Float
+        } else if long_count > 0 {
+            CType::LongDouble
+        } else {
+            CType::Double
+        };
         return CType::Complex(Box::new(base));
     }
     if has_char {
-        return if has_unsigned { CType::UChar }
-               else if has_signed { CType::SChar }
-               else { CType::Char };
+        return if has_unsigned {
+            CType::UChar
+        } else if has_signed {
+            CType::SChar
+        } else {
+            CType::Char
+        };
     }
     if has_short {
-        return if has_unsigned { CType::UShort } else { CType::Short };
+        return if has_unsigned {
+            CType::UShort
+        } else {
+            CType::Short
+        };
     }
     if long_count >= 2 {
-        return if has_unsigned { CType::ULongLong } else { CType::LongLong };
+        return if has_unsigned {
+            CType::ULongLong
+        } else {
+            CType::LongLong
+        };
     }
     if long_count == 1 {
-        if has_double { return CType::LongDouble; }
-        return if has_unsigned { CType::ULong } else { CType::Long };
+        if has_double {
+            return CType::LongDouble;
+        }
+        return if has_unsigned {
+            CType::ULong
+        } else {
+            CType::Long
+        };
     }
-    if has_double { return CType::Double; }
-    if has_float { return CType::Float; }
-    if has_unsigned { CType::UInt } else { CType::Int }
+    if has_double {
+        return CType::Double;
+    }
+    if has_float {
+        return CType::Float;
+    }
+    if has_unsigned {
+        CType::UInt
+    } else {
+        CType::Int
+    }
 }
 
 fn resolve_declaration_type(
@@ -1156,7 +1344,11 @@ fn resolve_declaration_type(
     apply_declarator_type(base, declarator, name_table)
 }
 
-fn apply_declarator_type(base: CType, declarator: &ast::Declarator, name_table: &[String]) -> CType {
+fn apply_declarator_type(
+    base: CType,
+    declarator: &ast::Declarator,
+    name_table: &[String],
+) -> CType {
     let mut result = apply_direct_declarator(base, &declarator.direct, name_table);
     if let Some(ref pointer) = declarator.pointer {
         result = apply_pointer_layers(result, pointer);
@@ -1173,17 +1365,30 @@ fn apply_pointer_layers(base: CType, pointer: &ast::Pointer) -> CType {
     current
 }
 
-fn apply_direct_declarator(base: CType, direct: &ast::DirectDeclarator, name_table: &[String]) -> CType {
+fn apply_direct_declarator(
+    base: CType,
+    direct: &ast::DirectDeclarator,
+    name_table: &[String],
+) -> CType {
     match direct {
         ast::DirectDeclarator::Identifier(_, _) => base,
-        ast::DirectDeclarator::Parenthesized(inner) => apply_declarator_type(base, inner, name_table),
-        ast::DirectDeclarator::Array { base: inner_dd, size, .. } => {
+        ast::DirectDeclarator::Parenthesized(inner) => {
+            apply_declarator_type(base, inner, name_table)
+        }
+        ast::DirectDeclarator::Array {
+            base: inner_dd,
+            size,
+            ..
+        } => {
             let inner_type = apply_direct_declarator(base, inner_dd, name_table);
             let array_size = size.as_ref().and_then(|e| evaluate_const_int_expr(e));
             CType::Array(Box::new(inner_type), array_size)
         }
         ast::DirectDeclarator::Function {
-            base: inner_dd, params, is_variadic, ..
+            base: inner_dd,
+            params,
+            is_variadic,
+            ..
         } => {
             let return_type = apply_direct_declarator(base, inner_dd, name_table);
             let param_types: Vec<CType> = params
@@ -1211,9 +1416,11 @@ fn extract_function_params_from_dd(
     dd: &ast::DirectDeclarator,
 ) -> (Vec<ast::ParameterDeclaration>, bool) {
     match dd {
-        ast::DirectDeclarator::Function { params, is_variadic, .. } => {
-            (params.clone(), *is_variadic)
-        }
+        ast::DirectDeclarator::Function {
+            params,
+            is_variadic,
+            ..
+        } => (params.clone(), *is_variadic),
         ast::DirectDeclarator::Parenthesized(inner) => extract_function_params(inner),
         _ => (Vec::new(), false),
     }
@@ -1227,7 +1434,11 @@ fn extract_param_name(param: &ast::ParameterDeclaration, name_table: &[String]) 
     }
 }
 
-fn resolve_param_type(param: &ast::ParameterDeclaration, target: &Target, name_table: &[String]) -> CType {
+fn resolve_param_type(
+    param: &ast::ParameterDeclaration,
+    target: &Target,
+    name_table: &[String],
+) -> CType {
     let base = resolve_base_type(&param.specifiers, target);
     if let Some(ref declarator) = param.declarator {
         apply_declarator_type(base, declarator, name_table)
@@ -1242,9 +1453,7 @@ fn extract_declarator_name(declarator: &ast::Declarator, name_table: &[String]) 
 
 fn extract_name_from_dd(dd: &ast::DirectDeclarator, name_table: &[String]) -> Option<String> {
     match dd {
-        ast::DirectDeclarator::Identifier(sym, _) => {
-            Some(resolve_sym(name_table, sym).to_string())
-        }
+        ast::DirectDeclarator::Identifier(sym, _) => Some(resolve_sym(name_table, sym).to_string()),
         ast::DirectDeclarator::Parenthesized(inner) => extract_declarator_name(inner, name_table),
         ast::DirectDeclarator::Array { base, .. } => extract_name_from_dd(base, name_table),
         ast::DirectDeclarator::Function { base, .. } => extract_name_from_dd(base, name_table),
@@ -1261,12 +1470,16 @@ fn evaluate_const_int_expr(expr: &ast::Expression) -> Option<usize> {
     match expr {
         ast::Expression::IntegerLiteral { value, .. } => Some(*value as usize),
         ast::Expression::UnaryOp {
-            op: ast::UnaryOp::Negate, operand, ..
+            op: ast::UnaryOp::Negate,
+            operand,
+            ..
         } => {
             let inner = evaluate_const_int_expr(operand)?;
             Some((-(inner as i64)) as usize)
         }
-        ast::Expression::Binary { op, left, right, .. } => {
+        ast::Expression::Binary {
+            op, left, right, ..
+        } => {
             let l = evaluate_const_int_expr(left)?;
             let r = evaluate_const_int_expr(right)?;
             match op {
@@ -1291,7 +1504,9 @@ fn evaluate_const_int_expr(expr: &ast::Expression) -> Option<usize> {
 
 /// Evaluate sizeof for a type expression (simplified heuristic).
 fn evaluate_sizeof_expr(
-    _expr: &ast::Expression, _target: &Target, _type_builder: &TypeBuilder,
+    _expr: &ast::Expression,
+    _target: &Target,
+    _type_builder: &TypeBuilder,
 ) -> u64 {
     // In a full implementation, this would evaluate sizeof(type) using the target.
     // For now, return a reasonable default for the most common case (pointer size).
@@ -1300,7 +1515,9 @@ fn evaluate_sizeof_expr(
 
 /// Evaluate alignof for a type expression (simplified heuristic).
 fn evaluate_alignof_expr(
-    _expr: &ast::Expression, _target: &Target, _type_builder: &TypeBuilder,
+    _expr: &ast::Expression,
+    _target: &Target,
+    _type_builder: &TypeBuilder,
 ) -> u64 {
     // In a full implementation, this would evaluate alignof(type) using the target.
     // For now, return a reasonable default.
@@ -1315,9 +1532,7 @@ fn evaluate_alignof_expr(
 fn resolve_designator_index(designators: &[ast::Designator], default_idx: usize) -> usize {
     if let Some(di) = designators.first() {
         match di {
-            ast::Designator::Index(expr, _) => {
-                evaluate_const_int_expr(expr).unwrap_or(default_idx)
-            }
+            ast::Designator::Index(expr, _) => evaluate_const_int_expr(expr).unwrap_or(default_idx),
             _ => default_idx,
         }
     } else {

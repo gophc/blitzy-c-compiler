@@ -330,11 +330,7 @@ impl<'a> DebugInfoGenerator<'a> {
     /// # Returns
     ///
     /// The complete `.debug_info` section as a `Vec<u8>`.
-    pub fn generate(
-        &mut self,
-        module: &IrModule,
-        text_offsets: &[(String, u64, u64)],
-    ) -> Vec<u8> {
+    pub fn generate(&mut self, module: &IrModule, text_offsets: &[(String, u64, u64)]) -> Vec<u8> {
         self.buffer.clear();
         self.type_die_offsets.clear();
 
@@ -404,11 +400,7 @@ impl<'a> DebugInfoGenerator<'a> {
     /// 5. `DW_AT_low_pc`    (DW_FORM_addr)        — lowest .text address
     /// 6. `DW_AT_high_pc`   (DW_FORM_data8)       — .text range size
     /// 7. `DW_AT_stmt_list` (DW_FORM_sec_offset)  — offset into .debug_line
-    fn emit_compile_unit_die(
-        &mut self,
-        module: &IrModule,
-        text_offsets: &[(String, u64, u64)],
-    ) {
+    fn emit_compile_unit_die(&mut self, module: &IrModule, text_offsets: &[(String, u64, u64)]) {
         // Abbreviation code
         encode_uleb128(self.codes.compile_unit as u64, &mut self.buffer);
 
@@ -598,7 +590,10 @@ impl<'a> DebugInfoGenerator<'a> {
                 match ir_type {
                     IrType::Ptr => {
                         self.ensure_pointer_type_die();
-                        self.type_die_offsets.get(&IrType::Ptr).copied().unwrap_or(0)
+                        self.type_die_offsets
+                            .get(&IrType::Ptr)
+                            .copied()
+                            .unwrap_or(0)
                     }
                     _ => {
                         // Fallback — emit a generic base type
@@ -639,10 +634,7 @@ impl<'a> DebugInfoGenerator<'a> {
             IrType::Struct(st) => {
                 // For Struct types, emit as a named base type placeholder.
                 let die_offset = self.buffer.len() as u32;
-                let struct_name = st
-                    .name
-                    .as_deref()
-                    .unwrap_or("<anonymous struct>");
+                let struct_name = st.name.as_deref().unwrap_or("<anonymous struct>");
                 let total_size = ir_type.size_bytes(self.target);
                 encode_uleb128(self.codes.base_type as u64, &mut self.buffer);
                 let name_off = self.str_table.add_string(struct_name);
@@ -696,11 +688,7 @@ impl<'a> DebugInfoGenerator<'a> {
     /// If the function has parameters, the subprogram DIE uses the
     /// "with children" abbreviation and is followed by
     /// `DW_TAG_formal_parameter` DIEs and a null terminator.
-    fn emit_subprogram_die(
-        &mut self,
-        func: &IrFunction,
-        text_offsets: &[(String, u64, u64)],
-    ) {
+    fn emit_subprogram_die(&mut self, func: &IrFunction, text_offsets: &[(String, u64, u64)]) {
         let has_children = !func.params.is_empty();
 
         // Look up text section offset for this function
@@ -836,7 +824,11 @@ fn ir_type_to_base_info(ir_type: &IrType, target: &Target) -> (&'static str, u8,
         IrType::I128 => ("__int128", 16, DW_ATE_SIGNED),
         IrType::F32 => ("float", 4, DW_ATE_FLOAT),
         IrType::F64 => ("double", 8, DW_ATE_FLOAT),
-        IrType::F80 => ("long double", IrType::F80.size_bytes(target) as u8, DW_ATE_FLOAT),
+        IrType::F80 => (
+            "long double",
+            IrType::F80.size_bytes(target) as u8,
+            DW_ATE_FLOAT,
+        ),
         IrType::Ptr => ("void *", target.pointer_width() as u8, DW_ATE_UNSIGNED),
         IrType::Array(_, _) => ("<array>", 0, DW_ATE_UNSIGNED),
         IrType::Struct(_) => ("<struct>", 0, DW_ATE_UNSIGNED),
@@ -980,10 +972,7 @@ mod tests {
     fn test_emit_address_64bit() {
         let mut buf = Vec::new();
         emit_address(0x0000000012345678, 8, &mut buf);
-        assert_eq!(
-            buf,
-            vec![0x78, 0x56, 0x34, 0x12, 0x00, 0x00, 0x00, 0x00]
-        );
+        assert_eq!(buf, vec![0x78, 0x56, 0x34, 0x12, 0x00, 0x00, 0x00, 0x00]);
     }
 
     #[test]
@@ -1008,12 +997,7 @@ mod tests {
         let source_map = SourceMap::new();
         let target = Target::X86_64;
 
-        let gen = DebugInfoGenerator::new(
-            &mut str_table,
-            &mut abbrev_table,
-            &target,
-            &source_map,
-        );
+        let gen = DebugInfoGenerator::new(&mut str_table, &mut abbrev_table, &target, &source_map);
 
         assert_eq!(gen.address_size, 8);
         assert!(gen.type_die_offsets.is_empty());
@@ -1026,12 +1010,7 @@ mod tests {
         let source_map = SourceMap::new();
         let target = Target::I686;
 
-        let gen = DebugInfoGenerator::new(
-            &mut str_table,
-            &mut abbrev_table,
-            &target,
-            &source_map,
-        );
+        let gen = DebugInfoGenerator::new(&mut str_table, &mut abbrev_table, &target, &source_map);
 
         assert_eq!(gen.address_size, 4);
     }
@@ -1047,18 +1026,18 @@ mod tests {
         let source_map = SourceMap::new();
         let target = Target::X86_64;
 
-        let mut gen = DebugInfoGenerator::new(
-            &mut str_table,
-            &mut abbrev_table,
-            &target,
-            &source_map,
-        );
+        let mut gen =
+            DebugInfoGenerator::new(&mut str_table, &mut abbrev_table, &target, &source_map);
 
         let module = IrModule::new("test.c".to_string());
         let result = gen.generate(&module, &[]);
 
         // Verify minimum size: 11-byte header + at least 1 byte for CU DIE
-        assert!(result.len() >= 11, "result too short: {} bytes", result.len());
+        assert!(
+            result.len() >= 11,
+            "result too short: {} bytes",
+            result.len()
+        );
 
         // Verify unit_length field (first 4 bytes, LE)
         let unit_length = u32::from_le_bytes([result[0], result[1], result[2], result[3]]);
@@ -1094,12 +1073,8 @@ mod tests {
         let source_map = SourceMap::new();
         let target = Target::I686;
 
-        let mut gen = DebugInfoGenerator::new(
-            &mut str_table,
-            &mut abbrev_table,
-            &target,
-            &source_map,
-        );
+        let mut gen =
+            DebugInfoGenerator::new(&mut str_table, &mut abbrev_table, &target, &source_map);
 
         let module = IrModule::new("test.c".to_string());
         let result = gen.generate(&module, &[]);
@@ -1119,12 +1094,8 @@ mod tests {
         let source_map = SourceMap::new();
         let target = Target::X86_64;
 
-        let mut gen = DebugInfoGenerator::new(
-            &mut str_table,
-            &mut abbrev_table,
-            &target,
-            &source_map,
-        );
+        let mut gen =
+            DebugInfoGenerator::new(&mut str_table, &mut abbrev_table, &target, &source_map);
 
         let mut module = IrModule::new("test.c".to_string());
         let func = IrFunction::new("main".to_string(), vec![], IrType::I32);
@@ -1149,12 +1120,8 @@ mod tests {
         let source_map = SourceMap::new();
         let target = Target::X86_64;
 
-        let mut gen = DebugInfoGenerator::new(
-            &mut str_table,
-            &mut abbrev_table,
-            &target,
-            &source_map,
-        );
+        let mut gen =
+            DebugInfoGenerator::new(&mut str_table, &mut abbrev_table, &target, &source_map);
 
         let mut module = IrModule::new("test.c".to_string());
         let params = vec![
@@ -1190,12 +1157,8 @@ mod tests {
         let source_map = SourceMap::new();
         let target = Target::X86_64;
 
-        let mut gen = DebugInfoGenerator::new(
-            &mut str_table,
-            &mut abbrev_table,
-            &target,
-            &source_map,
-        );
+        let mut gen =
+            DebugInfoGenerator::new(&mut str_table, &mut abbrev_table, &target, &source_map);
 
         let mut module = IrModule::new("test.c".to_string());
 
@@ -1234,12 +1197,8 @@ mod tests {
         let source_map = SourceMap::new();
         let target = Target::X86_64;
 
-        let mut gen = DebugInfoGenerator::new(
-            &mut str_table,
-            &mut abbrev_table,
-            &target,
-            &source_map,
-        );
+        let mut gen =
+            DebugInfoGenerator::new(&mut str_table, &mut abbrev_table, &target, &source_map);
 
         let mut module = IrModule::new("test.c".to_string());
 
@@ -1263,12 +1222,8 @@ mod tests {
 
         let mut str_table2 = DebugStrTable::new();
         let mut abbrev_table2 = AbbrevTable::new();
-        let mut gen2 = DebugInfoGenerator::new(
-            &mut str_table2,
-            &mut abbrev_table2,
-            &target,
-            &source_map,
-        );
+        let mut gen2 =
+            DebugInfoGenerator::new(&mut str_table2, &mut abbrev_table2, &target, &source_map);
         let result_no_decl = gen2.generate(&module2, &offsets);
 
         // Both should produce the same output (declarations are skipped)
@@ -1286,12 +1241,8 @@ mod tests {
         let source_map = SourceMap::new();
         let target = Target::X86_64;
 
-        let mut gen = DebugInfoGenerator::new(
-            &mut str_table,
-            &mut abbrev_table,
-            &target,
-            &source_map,
-        );
+        let mut gen =
+            DebugInfoGenerator::new(&mut str_table, &mut abbrev_table, &target, &source_map);
 
         let module = IrModule::new("empty.c".to_string());
         let result = gen.generate(&module, &[]);
@@ -1315,12 +1266,8 @@ mod tests {
         let source_map = SourceMap::new();
         let target = Target::X86_64;
 
-        let mut gen = DebugInfoGenerator::new(
-            &mut str_table,
-            &mut abbrev_table,
-            &target,
-            &source_map,
-        );
+        let mut gen =
+            DebugInfoGenerator::new(&mut str_table, &mut abbrev_table, &target, &source_map);
 
         let mut module = IrModule::new("test.c".to_string());
 
@@ -1410,12 +1357,8 @@ mod tests {
         let source_map = SourceMap::new();
         let target = Target::X86_64;
 
-        let mut gen = DebugInfoGenerator::new(
-            &mut str_table,
-            &mut abbrev_table,
-            &target,
-            &source_map,
-        );
+        let mut gen =
+            DebugInfoGenerator::new(&mut str_table, &mut abbrev_table, &target, &source_map);
 
         let mut module = IrModule::new("test.c".to_string());
         let func = IrFunction::new("main".to_string(), vec![], IrType::I32);
@@ -1447,12 +1390,8 @@ mod tests {
             let mut abbrev_table = AbbrevTable::new();
             let source_map = SourceMap::new();
 
-            let mut gen = DebugInfoGenerator::new(
-                &mut str_table,
-                &mut abbrev_table,
-                target,
-                &source_map,
-            );
+            let mut gen =
+                DebugInfoGenerator::new(&mut str_table, &mut abbrev_table, target, &source_map);
 
             let module = IrModule::new("test.c".to_string());
             let result = gen.generate(&module, &[]);
@@ -1463,8 +1402,7 @@ mod tests {
                 target
             );
 
-            let unit_length =
-                u32::from_le_bytes([result[0], result[1], result[2], result[3]]);
+            let unit_length = u32::from_le_bytes([result[0], result[1], result[2], result[3]]);
             assert_eq!(unit_length as usize, result.len() - 4);
         }
     }
