@@ -44,7 +44,7 @@
 //! (For Thread-Local Storage support, used by kernel/glibc)
 
 use crate::backend::linker_common::relocation::{
-    RelocationHandler, RelocCategory, RelocationError, ResolvedRelocation,
+    RelocCategory, RelocationError, RelocationHandler, ResolvedRelocation,
 };
 use crate::common::target::Target;
 
@@ -264,9 +264,12 @@ impl AArch64RelocationType {
             | Self::Ldst128AbsLo12Nc => RelocCategory::SectionRelative,
 
             // MOVW group
-            Self::MovwUabsG0 | Self::MovwUabsG0Nc
-            | Self::MovwUabsG1 | Self::MovwUabsG1Nc
-            | Self::MovwUabsG2 | Self::MovwUabsG2Nc
+            Self::MovwUabsG0
+            | Self::MovwUabsG0Nc
+            | Self::MovwUabsG1
+            | Self::MovwUabsG1Nc
+            | Self::MovwUabsG2
+            | Self::MovwUabsG2Nc
             | Self::MovwUabsG3 => RelocCategory::Absolute,
 
             // GOT-relative relocations (require GOT entry)
@@ -292,10 +295,7 @@ impl AArch64RelocationType {
     pub fn needs_got_entry(&self) -> bool {
         matches!(
             self,
-            Self::AdrGotPage
-                | Self::Ld64GotLo12Nc
-                | Self::GlobDat
-                | Self::JumpSlot
+            Self::AdrGotPage | Self::Ld64GotLo12Nc | Self::GlobDat | Self::JumpSlot
         )
     }
 
@@ -476,7 +476,8 @@ pub fn apply_relocation(
             if !check_unsigned_overflow(val, 32) && !check_signed_overflow(sa, 32) {
                 return Err(format!(
                     "{}: value 0x{:x} does not fit in 32 bits",
-                    reloc_type.name(), val,
+                    reloc_type.name(),
+                    val,
                 ));
             }
             write_u32(data, offset, val as u32);
@@ -486,7 +487,8 @@ pub fn apply_relocation(
             if !check_unsigned_overflow(val, 16) && !check_signed_overflow(sa, 16) {
                 return Err(format!(
                     "{}: value 0x{:x} does not fit in 16 bits",
-                    reloc_type.name(), val,
+                    reloc_type.name(),
+                    val,
                 ));
             }
             write_u16(data, offset, val as u16);
@@ -502,7 +504,8 @@ pub fn apply_relocation(
             if !check_signed_overflow(val, 32) {
                 return Err(format!(
                     "{}: value 0x{:x} does not fit in signed 32 bits",
-                    reloc_type.name(), val,
+                    reloc_type.name(),
+                    val,
                 ));
             }
             write_u32(data, offset, val as u32);
@@ -512,7 +515,8 @@ pub fn apply_relocation(
             if !check_signed_overflow(val, 16) {
                 return Err(format!(
                     "{}: value 0x{:x} does not fit in signed 16 bits",
-                    reloc_type.name(), val,
+                    reloc_type.name(),
+                    val,
                 ));
             }
             write_u16(data, offset, val as u16);
@@ -526,7 +530,9 @@ pub fn apply_relocation(
             if !check_signed_overflow(page_off, 21) {
                 return Err(format!(
                     "{}: page offset {} (0x{:x}) does not fit in signed 21 bits",
-                    reloc_type.name(), page_off, page_off,
+                    reloc_type.name(),
+                    page_off,
+                    page_off,
                 ));
             }
             let inst = read_instruction(data, offset);
@@ -578,7 +584,9 @@ pub fn apply_relocation(
             if !check_signed_overflow(branch_off, 26) {
                 return Err(format!(
                     "{}: branch offset {} (0x{:x}) out of range (signed 26-bit, +/-128 MiB)",
-                    reloc_type.name(), branch_off, branch_off,
+                    reloc_type.name(),
+                    branch_off,
+                    branch_off,
                 ));
             }
             let inst = read_instruction(data, offset);
@@ -589,7 +597,9 @@ pub fn apply_relocation(
             if !check_signed_overflow(branch_off, 19) {
                 return Err(format!(
                     "{}: cond branch offset {} (0x{:x}) out of range (signed 19-bit, +/-1 MiB)",
-                    reloc_type.name(), branch_off, branch_off,
+                    reloc_type.name(),
+                    branch_off,
+                    branch_off,
                 ));
             }
             let inst = read_instruction(data, offset);
@@ -600,7 +610,9 @@ pub fn apply_relocation(
             if !check_signed_overflow(branch_off, 14) {
                 return Err(format!(
                     "{}: test/branch offset {} (0x{:x}) out of range (signed 14-bit, +/-32 KiB)",
-                    reloc_type.name(), branch_off, branch_off,
+                    reloc_type.name(),
+                    branch_off,
+                    branch_off,
                 ));
             }
             let inst = read_instruction(data, offset);
@@ -615,7 +627,8 @@ pub fn apply_relocation(
             if !check_signed_overflow(page_off, 21) {
                 return Err(format!(
                     "{}: GOT page offset {} does not fit in signed 21 bits",
-                    reloc_type.name(), page_off,
+                    reloc_type.name(),
+                    page_off,
                 ));
             }
             let inst = read_instruction(data, offset);
@@ -633,7 +646,8 @@ pub fn apply_relocation(
             if !check_unsigned_overflow(val, 16) {
                 return Err(format!(
                     "{}: value 0x{:x} does not fit in 16 bits",
-                    reloc_type.name(), val,
+                    reloc_type.name(),
+                    val,
                 ));
             }
             let inst = read_instruction(data, offset);
@@ -649,37 +663,59 @@ pub fn apply_relocation(
             if !check_unsigned_overflow(val, 32) {
                 return Err(format!(
                     "{}: value 0x{:x} does not fit in 32 bits",
-                    reloc_type.name(), val,
+                    reloc_type.name(),
+                    val,
                 ));
             }
             let inst = read_instruction(data, offset);
-            write_instruction(data, offset, patch_imm16(inst, ((val >> 16) & 0xFFFF) as u16));
+            write_instruction(
+                data,
+                offset,
+                patch_imm16(inst, ((val >> 16) & 0xFFFF) as u16),
+            );
         }
         AArch64RelocationType::MovwUabsG1Nc => {
             let val = sa as u64;
             let inst = read_instruction(data, offset);
-            write_instruction(data, offset, patch_imm16(inst, ((val >> 16) & 0xFFFF) as u16));
+            write_instruction(
+                data,
+                offset,
+                patch_imm16(inst, ((val >> 16) & 0xFFFF) as u16),
+            );
         }
         AArch64RelocationType::MovwUabsG2 => {
             let val = sa as u64;
             if !check_unsigned_overflow(val, 48) {
                 return Err(format!(
                     "{}: value 0x{:x} does not fit in 48 bits",
-                    reloc_type.name(), val,
+                    reloc_type.name(),
+                    val,
                 ));
             }
             let inst = read_instruction(data, offset);
-            write_instruction(data, offset, patch_imm16(inst, ((val >> 32) & 0xFFFF) as u16));
+            write_instruction(
+                data,
+                offset,
+                patch_imm16(inst, ((val >> 32) & 0xFFFF) as u16),
+            );
         }
         AArch64RelocationType::MovwUabsG2Nc => {
             let val = sa as u64;
             let inst = read_instruction(data, offset);
-            write_instruction(data, offset, patch_imm16(inst, ((val >> 32) & 0xFFFF) as u16));
+            write_instruction(
+                data,
+                offset,
+                patch_imm16(inst, ((val >> 32) & 0xFFFF) as u16),
+            );
         }
         AArch64RelocationType::MovwUabsG3 => {
             let val = sa as u64;
             let inst = read_instruction(data, offset);
-            write_instruction(data, offset, patch_imm16(inst, ((val >> 48) & 0xFFFF) as u16));
+            write_instruction(
+                data,
+                offset,
+                patch_imm16(inst, ((val >> 48) & 0xFFFF) as u16),
+            );
         }
 
         // === TLS descriptor relocations ===
@@ -690,7 +726,8 @@ pub fn apply_relocation(
             if !check_signed_overflow(page_off, 21) {
                 return Err(format!(
                     "{}: TLS page offset {} does not fit in signed 21 bits",
-                    reloc_type.name(), page_off,
+                    reloc_type.name(),
+                    page_off,
                 ));
             }
             let inst = read_instruction(data, offset);
@@ -780,8 +817,7 @@ impl RelocationHandler for AArch64RelocationHandler {
                 | AArch64RelocationType::GlobDat
                 | AArch64RelocationType::JumpSlot
                 | AArch64RelocationType::Relative => 8,
-                AArch64RelocationType::Abs16
-                | AArch64RelocationType::Prel16 => 2,
+                AArch64RelocationType::Abs16 | AArch64RelocationType::Prel16 => 2,
                 _ => 4,
             },
             None => 0,
@@ -1082,8 +1118,7 @@ mod tests {
     #[test]
     fn test_apply_abs64() {
         let mut data = [0u8; 8];
-        apply_relocation(&mut data, 0, AArch64RelocationType::Abs64, 0x1000, 0x10, 0)
-            .unwrap();
+        apply_relocation(&mut data, 0, AArch64RelocationType::Abs64, 0x1000, 0x10, 0).unwrap();
         assert_eq!(read_u64(&data, 0), 0x1010);
     }
 
@@ -1091,7 +1126,12 @@ mod tests {
     fn test_apply_abs32_overflow() {
         let mut data = [0u8; 4];
         let result = apply_relocation(
-            &mut data, 0, AArch64RelocationType::Abs32, 0x1_0000_0000, 0, 0,
+            &mut data,
+            0,
+            AArch64RelocationType::Abs32,
+            0x1_0000_0000,
+            0,
+            0,
         );
         assert!(result.is_err());
     }
@@ -1100,8 +1140,7 @@ mod tests {
     fn test_apply_call26_in_range() {
         let mut data = [0u8; 4];
         write_instruction(&mut data, 0, 0x9400_0000);
-        apply_relocation(&mut data, 0, AArch64RelocationType::Call26, 0x1000, 0, 0x0)
-            .unwrap();
+        apply_relocation(&mut data, 0, AArch64RelocationType::Call26, 0x1000, 0, 0x0).unwrap();
         let inst = read_instruction(&data, 0);
         assert_eq!(inst & 0x03FF_FFFF, 0x400);
     }
@@ -1111,7 +1150,12 @@ mod tests {
         let mut data = [0u8; 4];
         write_instruction(&mut data, 0, 0x9400_0000);
         let result = apply_relocation(
-            &mut data, 0, AArch64RelocationType::Call26, 0x1_0000_0000, 0, 0x0,
+            &mut data,
+            0,
+            AArch64RelocationType::Call26,
+            0x1_0000_0000,
+            0,
+            0x0,
         );
         assert!(result.is_err());
     }
@@ -1121,7 +1165,12 @@ mod tests {
         let mut data = [0u8; 4];
         write_instruction(&mut data, 0, 0x9000_0000);
         apply_relocation(
-            &mut data, 0, AArch64RelocationType::AdrPrelPgHi21, 0x2000, 0, 0x1000,
+            &mut data,
+            0,
+            AArch64RelocationType::AdrPrelPgHi21,
+            0x2000,
+            0,
+            0x1000,
         )
         .unwrap();
         let inst = read_instruction(&data, 0);
@@ -1136,7 +1185,12 @@ mod tests {
         let mut data = [0u8; 4];
         write_instruction(&mut data, 0, 0x9100_0020);
         apply_relocation(
-            &mut data, 0, AArch64RelocationType::AddAbsLo12Nc, 0x1234, 0, 0,
+            &mut data,
+            0,
+            AArch64RelocationType::AddAbsLo12Nc,
+            0x1234,
+            0,
+            0,
         )
         .unwrap();
         let inst = read_instruction(&data, 0);
@@ -1149,7 +1203,12 @@ mod tests {
         let mut data = [0u8; 4];
         write_instruction(&mut data, 0, 0xF940_0020);
         apply_relocation(
-            &mut data, 0, AArch64RelocationType::Ldst64AbsLo12Nc, 0x1018, 0, 0,
+            &mut data,
+            0,
+            AArch64RelocationType::Ldst64AbsLo12Nc,
+            0x1018,
+            0,
+            0,
         )
         .unwrap();
         let inst = read_instruction(&data, 0);
@@ -1161,7 +1220,12 @@ mod tests {
     fn test_prel32() {
         let mut data = [0u8; 4];
         apply_relocation(
-            &mut data, 0, AArch64RelocationType::Prel32, 0x2000, 0, 0x1000,
+            &mut data,
+            0,
+            AArch64RelocationType::Prel32,
+            0x2000,
+            0,
+            0x1000,
         )
         .unwrap();
         let val = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
@@ -1173,7 +1237,12 @@ mod tests {
         let mut data = [0u8; 4];
         write_instruction(&mut data, 0, 0x5400_0000);
         apply_relocation(
-            &mut data, 0, AArch64RelocationType::Condbr19, 0x1100, 0, 0x1000,
+            &mut data,
+            0,
+            AArch64RelocationType::Condbr19,
+            0x1100,
+            0,
+            0x1000,
         )
         .unwrap();
         let inst = read_instruction(&data, 0);
@@ -1186,7 +1255,12 @@ mod tests {
         let mut data = [0u8; 4];
         write_instruction(&mut data, 0, 0x3600_0000);
         apply_relocation(
-            &mut data, 0, AArch64RelocationType::Tstbr14, 0x1020, 0, 0x1000,
+            &mut data,
+            0,
+            AArch64RelocationType::Tstbr14,
+            0x1020,
+            0,
+            0x1000,
         )
         .unwrap();
         let inst = read_instruction(&data, 0);
@@ -1199,8 +1273,12 @@ mod tests {
         let mut data = [0u8; 4];
         write_instruction(&mut data, 0, 0xD280_0000);
         apply_relocation(
-            &mut data, 0, AArch64RelocationType::MovwUabsG0Nc,
-            0x1234_5678_9ABC_DEF0, 0, 0,
+            &mut data,
+            0,
+            AArch64RelocationType::MovwUabsG0Nc,
+            0x1234_5678_9ABC_DEF0,
+            0,
+            0,
         )
         .unwrap();
         let inst = read_instruction(&data, 0);
@@ -1213,8 +1291,12 @@ mod tests {
         let mut data = [0u8; 4];
         write_instruction(&mut data, 0, 0xF2A0_0000);
         apply_relocation(
-            &mut data, 0, AArch64RelocationType::MovwUabsG1Nc,
-            0x1234_5678_9ABC_DEF0, 0, 0,
+            &mut data,
+            0,
+            AArch64RelocationType::MovwUabsG1Nc,
+            0x1234_5678_9ABC_DEF0,
+            0,
+            0,
         )
         .unwrap();
         let inst = read_instruction(&data, 0);
@@ -1236,16 +1318,46 @@ mod tests {
 
     #[test]
     fn test_category_classification() {
-        assert_eq!(AArch64RelocationType::Abs64.category(), RelocCategory::Absolute);
-        assert_eq!(AArch64RelocationType::Prel32.category(), RelocCategory::PcRelative);
-        assert_eq!(AArch64RelocationType::Call26.category(), RelocCategory::PcRelative);
-        assert_eq!(AArch64RelocationType::AdrGotPage.category(), RelocCategory::GotRelative);
-        assert_eq!(AArch64RelocationType::GlobDat.category(), RelocCategory::GotEntry);
-        assert_eq!(AArch64RelocationType::JumpSlot.category(), RelocCategory::Plt);
-        assert_eq!(AArch64RelocationType::TlsdescAdrPage21.category(), RelocCategory::Tls);
-        assert_eq!(AArch64RelocationType::AddAbsLo12Nc.category(), RelocCategory::SectionRelative);
-        assert_eq!(AArch64RelocationType::MovwUabsG3.category(), RelocCategory::Absolute);
-        assert_eq!(AArch64RelocationType::Relative.category(), RelocCategory::Absolute);
+        assert_eq!(
+            AArch64RelocationType::Abs64.category(),
+            RelocCategory::Absolute
+        );
+        assert_eq!(
+            AArch64RelocationType::Prel32.category(),
+            RelocCategory::PcRelative
+        );
+        assert_eq!(
+            AArch64RelocationType::Call26.category(),
+            RelocCategory::PcRelative
+        );
+        assert_eq!(
+            AArch64RelocationType::AdrGotPage.category(),
+            RelocCategory::GotRelative
+        );
+        assert_eq!(
+            AArch64RelocationType::GlobDat.category(),
+            RelocCategory::GotEntry
+        );
+        assert_eq!(
+            AArch64RelocationType::JumpSlot.category(),
+            RelocCategory::Plt
+        );
+        assert_eq!(
+            AArch64RelocationType::TlsdescAdrPage21.category(),
+            RelocCategory::Tls
+        );
+        assert_eq!(
+            AArch64RelocationType::AddAbsLo12Nc.category(),
+            RelocCategory::SectionRelative
+        );
+        assert_eq!(
+            AArch64RelocationType::MovwUabsG3.category(),
+            RelocCategory::Absolute
+        );
+        assert_eq!(
+            AArch64RelocationType::Relative.category(),
+            RelocCategory::Absolute
+        );
         assert_eq!(AArch64RelocationType::Copy.category(), RelocCategory::Other);
     }
 
@@ -1329,7 +1441,12 @@ mod tests {
     fn test_apply_glob_dat() {
         let mut data = [0u8; 8];
         apply_relocation(
-            &mut data, 0, AArch64RelocationType::GlobDat, 0xDEAD_BEEF, 0, 0,
+            &mut data,
+            0,
+            AArch64RelocationType::GlobDat,
+            0xDEAD_BEEF,
+            0,
+            0,
         )
         .unwrap();
         assert_eq!(read_u64(&data, 0), 0xDEAD_BEEF);
@@ -1339,7 +1456,12 @@ mod tests {
     fn test_apply_jump_slot() {
         let mut data = [0u8; 8];
         apply_relocation(
-            &mut data, 0, AArch64RelocationType::JumpSlot, 0xCAFE_BABE, 4, 0,
+            &mut data,
+            0,
+            AArch64RelocationType::JumpSlot,
+            0xCAFE_BABE,
+            4,
+            0,
         )
         .unwrap();
         assert_eq!(read_u64(&data, 0), 0xCAFE_BAC2);
@@ -1351,7 +1473,7 @@ mod tests {
         // Verify first instruction is ADRP (opcode check: bit 31=1, bits[28:24]=10000)
         let inst0 = u32::from_le_bytes([stub[0], stub[1], stub[2], stub[3]]);
         assert_eq!(inst0 & 0x9F00_0000, 0x9000_0000); // ADRP
-        // Last instruction is BR X17
+                                                      // Last instruction is BR X17
         let inst3 = u32::from_le_bytes([stub[12], stub[13], stub[14], stub[15]]);
         assert_eq!(inst3, 0xD61F_0220);
     }
@@ -1364,7 +1486,7 @@ mod tests {
         assert_eq!(inst0, 0xA9BF_7BF0);
         // Last three instructions are NOP
         for i in [20, 24, 28] {
-            let inst = u32::from_le_bytes([header[i], header[i+1], header[i+2], header[i+3]]);
+            let inst = u32::from_le_bytes([header[i], header[i + 1], header[i + 2], header[i + 3]]);
             assert_eq!(inst, 0xD503_201F);
         }
     }

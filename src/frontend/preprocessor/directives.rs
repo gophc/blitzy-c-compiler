@@ -14,12 +14,10 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{
-    ConditionalState, MacroDef, MacroKind, PPToken, PPTokenKind, Preprocessor,
-};
-use super::include_handler::{IncludeHandler, IncludeError};
 use super::expression::evaluate_pp_expression;
+use super::include_handler::{IncludeError, IncludeHandler};
 use super::macro_expander::MacroExpander;
+use super::{ConditionalState, MacroDef, MacroKind, PPToken, PPTokenKind, Preprocessor};
 
 use crate::common::diagnostics::{Diagnostic, DiagnosticEngine, Severity, Span};
 use crate::common::encoding::read_source_file;
@@ -86,7 +84,8 @@ pub fn process_directive(
             "if" | "ifdef" | "ifndef" => {
                 // Push a nested *inactive* conditional so that the matching
                 // #endif will pop the correct level.
-                pp.conditional_stack.push(ConditionalState::new(false, directive_span));
+                pp.conditional_stack
+                    .push(ConditionalState::new(false, directive_span));
                 return Ok(DirectiveResult::None);
             }
             "elif" => return process_elif(pp, tokens, directive_span),
@@ -282,14 +281,11 @@ fn process_define(
             );
         } else if !macro_definitions_equivalent(existing, &kind, &replacement) {
             pp.diagnostics.emit(
-                Diagnostic::warning(
-                    name_span,
-                    format!("'{}' macro redefined", macro_name),
-                )
-                .with_note(
-                    existing.definition_span,
-                    "previous definition was here".to_string(),
-                ),
+                Diagnostic::warning(name_span, format!("'{}' macro redefined", macro_name))
+                    .with_note(
+                        existing.definition_span,
+                        "previous definition was here".to_string(),
+                    ),
             );
         }
     }
@@ -322,7 +318,12 @@ fn parse_function_like_params<'a>(
 
     loop {
         // Skip whitespace inside the parameter list.
-        while i < tokens.len() && matches!(tokens[i].kind, PPTokenKind::Whitespace | PPTokenKind::Newline) {
+        while i < tokens.len()
+            && matches!(
+                tokens[i].kind,
+                PPTokenKind::Whitespace | PPTokenKind::Newline
+            )
+        {
             i += 1;
         }
 
@@ -345,7 +346,12 @@ fn parse_function_like_params<'a>(
             variadic = true;
             i += 1;
             // Expect closing paren after `...`.
-            while i < tokens.len() && matches!(tokens[i].kind, PPTokenKind::Whitespace | PPTokenKind::Newline) {
+            while i < tokens.len()
+                && matches!(
+                    tokens[i].kind,
+                    PPTokenKind::Whitespace | PPTokenKind::Newline
+                )
+            {
                 i += 1;
             }
             if i >= tokens.len()
@@ -385,7 +391,12 @@ fn parse_function_like_params<'a>(
         i += 1;
 
         // Skip whitespace after parameter name.
-        while i < tokens.len() && matches!(tokens[i].kind, PPTokenKind::Whitespace | PPTokenKind::Newline) {
+        while i < tokens.len()
+            && matches!(
+                tokens[i].kind,
+                PPTokenKind::Whitespace | PPTokenKind::Newline
+            )
+        {
             i += 1;
         }
         if i >= tokens.len() {
@@ -400,7 +411,12 @@ fn parse_function_like_params<'a>(
         if tokens[i].kind == PPTokenKind::Punctuator && tokens[i].text == "," {
             i += 1;
             // After a comma, check for variadic `...`.
-            while i < tokens.len() && matches!(tokens[i].kind, PPTokenKind::Whitespace | PPTokenKind::Newline) {
+            while i < tokens.len()
+                && matches!(
+                    tokens[i].kind,
+                    PPTokenKind::Whitespace | PPTokenKind::Newline
+                )
+            {
                 i += 1;
             }
             if i < tokens.len()
@@ -409,7 +425,12 @@ fn parse_function_like_params<'a>(
             {
                 variadic = true;
                 i += 1;
-                while i < tokens.len() && matches!(tokens[i].kind, PPTokenKind::Whitespace | PPTokenKind::Newline) {
+                while i < tokens.len()
+                    && matches!(
+                        tokens[i].kind,
+                        PPTokenKind::Whitespace | PPTokenKind::Newline
+                    )
+                {
                     i += 1;
                 }
                 if i >= tokens.len()
@@ -576,10 +597,8 @@ fn process_include(
         .unwrap_or_else(|| PathBuf::from("."));
 
     // Create an include handler for path resolution and include-stack management.
-    let mut handler = IncludeHandler::new(
-        pp.include_paths.clone(),
-        pp.system_include_paths.clone(),
-    );
+    let mut handler =
+        IncludeHandler::new(pp.include_paths.clone(), pp.system_include_paths.clone());
 
     // Resolve to an absolute path.
     let resolved_path = match handler.resolve_include(&header_name, is_system, &including_file) {
@@ -792,20 +811,13 @@ fn detect_and_register_guard(
 
 /// Process `#if` — begin a conditional block whose activity depends on the
 /// value of a preprocessor constant expression.
-fn process_if(
-    pp: &mut Preprocessor,
-    tokens: &[PPToken],
-    directive_span: Span,
-) -> Result<(), ()> {
+fn process_if(pp: &mut Preprocessor, tokens: &[PPToken], directive_span: Span) -> Result<(), ()> {
     let tokens = skip_whitespace(tokens);
 
     // Macro-expand the expression tokens before evaluation.
     let expanded = {
-        let mut expander = MacroExpander::new(
-            &pp.macro_defs,
-            &mut *pp.diagnostics,
-            pp.max_recursion_depth,
-        );
+        let mut expander =
+            MacroExpander::new(&pp.macro_defs, &mut *pp.diagnostics, pp.max_recursion_depth);
         expander.expand_tokens(tokens)
     };
 
@@ -933,11 +945,8 @@ fn process_elif(
     // Evaluate the condition.
     let tokens = skip_whitespace(tokens);
     let expanded = {
-        let mut expander = MacroExpander::new(
-            &pp.macro_defs,
-            &mut *pp.diagnostics,
-            pp.max_recursion_depth,
-        );
+        let mut expander =
+            MacroExpander::new(&pp.macro_defs, &mut *pp.diagnostics, pp.max_recursion_depth);
         expander.expand_tokens(tokens)
     };
 
@@ -1065,10 +1074,8 @@ fn process_pragma(
                 .to_string();
             if !filename.is_empty() {
                 let path = PathBuf::from(&filename);
-                let mut handler = IncludeHandler::new(
-                    pp.include_paths.clone(),
-                    pp.system_include_paths.clone(),
-                );
+                let mut handler =
+                    IncludeHandler::new(pp.include_paths.clone(), pp.system_include_paths.clone());
                 handler.mark_pragma_once(&path);
             }
             Ok(())
@@ -1096,10 +1103,7 @@ fn process_pragma_pack(
     let tokens = skip_whitespace(tokens);
 
     // Expect '(' after 'pack'.
-    if tokens.is_empty()
-        || tokens[0].kind != PPTokenKind::Punctuator
-        || tokens[0].text != "("
-    {
+    if tokens.is_empty() || tokens[0].kind != PPTokenKind::Punctuator || tokens[0].text != "(" {
         // Bare `#pragma pack` without arguments — reset to default.
         return Ok(());
     }
@@ -1193,10 +1197,8 @@ fn process_error(pp: &mut Preprocessor, tokens: &[PPToken], directive_span: Span
     } else {
         directive_span
     };
-    pp.diagnostics.emit(Diagnostic::error(
-        diag_span,
-        format!("#error {}", message),
-    ));
+    pp.diagnostics
+        .emit(Diagnostic::error(diag_span, format!("#error {}", message)));
 }
 
 /// Process `#warning` — emit a non-fatal warning diagnostic.
@@ -1230,11 +1232,7 @@ fn process_warning(pp: &mut Preprocessor, tokens: &[PPToken], directive_span: Sp
 /// Accepted forms:
 /// - `#line 42` — set line number
 /// - `#line 42 "file.c"` — set line number and filename
-fn process_line(
-    pp: &mut Preprocessor,
-    tokens: &[PPToken],
-    directive_span: Span,
-) -> Result<(), ()> {
+fn process_line(pp: &mut Preprocessor, tokens: &[PPToken], directive_span: Span) -> Result<(), ()> {
     let tokens = skip_whitespace(tokens);
 
     if tokens.is_empty() || tokens[0].kind != PPTokenKind::Number {

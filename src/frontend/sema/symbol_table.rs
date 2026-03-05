@@ -279,26 +279,18 @@ impl SymbolTable {
                     return Ok(existing_id);
                 } else {
                     diagnostics.emit(
-                        Diagnostic::error(
-                            entry.span,
-                            format!("conflicting types for typedef"),
-                        )
-                        .with_note(existing.span, "previous declaration is here"),
+                        Diagnostic::error(entry.span, format!("conflicting types for typedef"))
+                            .with_note(existing.span, "previous declaration is here"),
                     );
                     return Err(());
                 }
             }
 
             // Enum constant redeclaration is always an error.
-            if existing.kind == SymbolKind::EnumConstant
-                || entry.kind == SymbolKind::EnumConstant
-            {
+            if existing.kind == SymbolKind::EnumConstant || entry.kind == SymbolKind::EnumConstant {
                 diagnostics.emit(
-                    Diagnostic::error(
-                        entry.span,
-                        format!("redefinition of enumerator"),
-                    )
-                    .with_note(existing.span, "previous definition is here"),
+                    Diagnostic::error(entry.span, format!("redefinition of enumerator"))
+                        .with_note(existing.span, "previous definition is here"),
                 );
                 return Err(());
             }
@@ -306,11 +298,8 @@ impl SymbolTable {
             // Check type compatibility.
             if !self.types_are_compatible(&existing.ty, &entry.ty) {
                 diagnostics.emit(
-                    Diagnostic::error(
-                        entry.span,
-                        format!("conflicting types for symbol"),
-                    )
-                    .with_note(existing.span, "previous declaration is here"),
+                    Diagnostic::error(entry.span, format!("conflicting types for symbol"))
+                        .with_note(existing.span, "previous declaration is here"),
                 );
                 return Err(());
             }
@@ -373,11 +362,8 @@ impl SymbolTable {
             // Two actual definitions in the same scope → error.
             if existing.is_defined && entry.is_defined {
                 diagnostics.emit(
-                    Diagnostic::error(
-                        entry.span,
-                        format!("redefinition of symbol"),
-                    )
-                    .with_note(existing.span, "previous definition is here"),
+                    Diagnostic::error(entry.span, format!("redefinition of symbol"))
+                        .with_note(existing.span, "previous definition is here"),
                 );
                 return Err(());
             }
@@ -428,9 +414,9 @@ impl SymbolTable {
     /// O(1) average-case via FxHashMap + a reverse scan of the per-name ID
     /// list (typically very short — one or two entries for most identifiers).
     pub fn lookup(&self, name: Symbol) -> Option<&SymbolEntry> {
-        self.name_to_ids.get(&name).and_then(|ids| {
-            ids.last().map(|id| &self.symbols[id.0 as usize])
-        })
+        self.name_to_ids
+            .get(&name)
+            .and_then(|ids| ids.last().map(|id| &self.symbols[id.0 as usize]))
     }
 
     /// Look up a declaration of `name` **only** in the current scope depth.
@@ -602,8 +588,7 @@ impl SymbolTable {
                     // Block-scope extern inherits the linkage of a prior
                     // file-scope declaration if one exists.
                     if let Some(prior) = self.lookup(name) {
-                        if prior.linkage == Linkage::Internal
-                            || prior.linkage == Linkage::External
+                        if prior.linkage == Linkage::Internal || prior.linkage == Linkage::External
                         {
                             return prior.linkage;
                         }
@@ -734,9 +719,10 @@ impl SymbolTable {
             }
 
             // Skip symbols with __attribute__((unused)) or __attribute__((used)).
-            let has_unused_attr = entry.attributes.iter().any(|a| {
-                matches!(a, ValidatedAttribute::Unused | ValidatedAttribute::Used)
-            });
+            let has_unused_attr = entry
+                .attributes
+                .iter()
+                .any(|a| matches!(a, ValidatedAttribute::Unused | ValidatedAttribute::Used));
             if has_unused_attr {
                 continue;
             }
@@ -971,9 +957,7 @@ impl SymbolTable {
 
             // Typedef: peel and compare.
             (CType::Typedef { underlying: u, .. }, other)
-            | (other, CType::Typedef { underlying: u, .. }) => {
-                self.types_are_compatible(u, other)
-            }
+            | (other, CType::Typedef { underlying: u, .. }) => self.types_are_compatible(u, other),
 
             // Qualified type: peel qualifiers and compare base.
             (CType::Qualified(inner, _), other) | (other, CType::Qualified(inner, _)) => {

@@ -914,10 +914,12 @@ impl RelocationHandler for AArch64RelocationHandler {
 
             // R_AARCH64_ADR_GOT_PAGE (311) — ADRP to GOT entry page
             R_AARCH64_ADR_GOT_PAGE => {
-                let got_addr = rel.got_address.ok_or_else(|| RelocationError::UndefinedSymbol {
-                    name: format!("GOT entry at 0x{:x}", rel.patch_address),
-                    reloc_name: "R_AARCH64_ADR_GOT_PAGE".to_string(),
-                })?;
+                let got_addr = rel
+                    .got_address
+                    .ok_or_else(|| RelocationError::UndefinedSymbol {
+                        name: format!("GOT entry at 0x{:x}", rel.patch_address),
+                        reloc_name: "R_AARCH64_ADR_GOT_PAGE".to_string(),
+                    })?;
                 let target_page = page(got_addr);
                 let source_page = page(rel.patch_address);
                 let page_delta = (target_page as i64).wrapping_sub(source_page as i64) >> 12;
@@ -938,10 +940,12 @@ impl RelocationHandler for AArch64RelocationHandler {
 
             // R_AARCH64_LD64_GOT_LO12_NC (312) — LDR from GOT :lo12:
             R_AARCH64_LD64_GOT_LO12_NC => {
-                let got_addr = rel.got_address.ok_or_else(|| RelocationError::UndefinedSymbol {
-                    name: format!("GOT entry at 0x{:x}", rel.patch_address),
-                    reloc_name: "R_AARCH64_LD64_GOT_LO12_NC".to_string(),
-                })?;
+                let got_addr = rel
+                    .got_address
+                    .ok_or_else(|| RelocationError::UndefinedSymbol {
+                        name: format!("GOT entry at 0x{:x}", rel.patch_address),
+                        reloc_name: "R_AARCH64_LD64_GOT_LO12_NC".to_string(),
+                    })?;
                 // Scale by 8 for doubleword LDR (64-bit pointer load)
                 let scaled = (lo12(got_addr) >> 3) as u32;
                 let inst = read_le(section_data, offset, 4) as u32;
@@ -1095,8 +1099,8 @@ mod tests {
             addend,
             rel_type,
             got_address,
-            None,      // plt_address
-            None,      // got_base
+            None, // plt_address
+            None, // got_base
             ".text".to_string(),
         )
     }
@@ -1151,12 +1155,30 @@ mod tests {
         assert_eq!(handler.classify(R_AARCH64_ABS64), RelocCategory::Absolute);
         assert_eq!(handler.classify(R_AARCH64_ABS32), RelocCategory::Absolute);
         assert_eq!(handler.classify(R_AARCH64_ABS16), RelocCategory::Absolute);
-        assert_eq!(handler.classify(R_AARCH64_PREL64), RelocCategory::PcRelative);
-        assert_eq!(handler.classify(R_AARCH64_PREL32), RelocCategory::PcRelative);
-        assert_eq!(handler.classify(R_AARCH64_CALL26), RelocCategory::PcRelative);
-        assert_eq!(handler.classify(R_AARCH64_JUMP26), RelocCategory::PcRelative);
-        assert_eq!(handler.classify(R_AARCH64_CONDBR19), RelocCategory::PcRelative);
-        assert_eq!(handler.classify(R_AARCH64_TSTBR14), RelocCategory::PcRelative);
+        assert_eq!(
+            handler.classify(R_AARCH64_PREL64),
+            RelocCategory::PcRelative
+        );
+        assert_eq!(
+            handler.classify(R_AARCH64_PREL32),
+            RelocCategory::PcRelative
+        );
+        assert_eq!(
+            handler.classify(R_AARCH64_CALL26),
+            RelocCategory::PcRelative
+        );
+        assert_eq!(
+            handler.classify(R_AARCH64_JUMP26),
+            RelocCategory::PcRelative
+        );
+        assert_eq!(
+            handler.classify(R_AARCH64_CONDBR19),
+            RelocCategory::PcRelative
+        );
+        assert_eq!(
+            handler.classify(R_AARCH64_TSTBR14),
+            RelocCategory::PcRelative
+        );
         assert_eq!(
             handler.classify(R_AARCH64_ADR_PREL_PG_HI21),
             RelocCategory::PcRelative
@@ -1173,14 +1195,14 @@ mod tests {
             handler.classify(R_AARCH64_ADR_GOT_PAGE),
             RelocCategory::GotRelative
         );
-        assert_eq!(handler.classify(R_AARCH64_GLOB_DAT), RelocCategory::GotEntry);
+        assert_eq!(
+            handler.classify(R_AARCH64_GLOB_DAT),
+            RelocCategory::GotEntry
+        );
         assert_eq!(handler.classify(R_AARCH64_JUMP_SLOT), RelocCategory::Plt);
         assert_eq!(handler.classify(R_AARCH64_RELATIVE), RelocCategory::Other);
         assert_eq!(handler.classify(R_AARCH64_NONE), RelocCategory::Other);
-        assert_eq!(
-            handler.classify(R_AARCH64_TLS_TPREL64),
-            RelocCategory::Tls
-        );
+        assert_eq!(handler.classify(R_AARCH64_TLS_TPREL64), RelocCategory::Tls);
     }
 
     // -----------------------------------------------------------------------
@@ -1297,10 +1319,10 @@ mod tests {
 
         let rel = make_rel(
             R_AARCH64_CALL26,
-            0x1000,  // patch_address (P)
-            0,       // patch_offset
-            0x1100,  // symbol_value (S)
-            0,       // addend (A)
+            0x1000, // patch_address (P)
+            0,      // patch_offset
+            0x1100, // symbol_value (S)
+            0,      // addend (A)
             None,
         );
 
@@ -1321,9 +1343,9 @@ mod tests {
         // ±128 MiB limit: create offset exceeding range
         let rel = make_rel(
             R_AARCH64_CALL26,
-            0x0000_0000,     // P
+            0x0000_0000, // P
             0,
-            0x1000_0000,     // S = 256 MiB away — exceeds ±128 MiB
+            0x1000_0000, // S = 256 MiB away — exceeds ±128 MiB
             0,
             None,
         );
@@ -1343,10 +1365,10 @@ mod tests {
 
         let rel = make_rel(
             R_AARCH64_ADR_PREL_PG_HI21,
-            0x1000,   // P (on page 0x1000)
+            0x1000, // P (on page 0x1000)
             0,
-            0x3456,   // S (on page 0x3000)
-            0,        // A
+            0x3456, // S (on page 0x3000)
+            0,      // A
             None,
         );
 
@@ -1378,7 +1400,7 @@ mod tests {
             R_AARCH64_ADD_ABS_LO12_NC,
             0x1000,
             0,
-            0x3456,  // S: lo12 = 0x456
+            0x3456, // S: lo12 = 0x456
             0,
             None,
         );
@@ -1405,7 +1427,7 @@ mod tests {
             R_AARCH64_LDST64_ABS_LO12_NC,
             0x1000,
             0,
-            0x3018,  // S: lo12 = 0x018, scaled >> 3 = 3
+            0x3018, // S: lo12 = 0x018, scaled >> 3 = 3
             0,
             None,
         );
@@ -1428,10 +1450,10 @@ mod tests {
 
         let rel = make_rel(
             R_AARCH64_CONDBR19,
-            0x1000,   // P
+            0x1000, // P
             0,
-            0x1080,   // S — 128 bytes forward
-            0,        // A
+            0x1080, // S — 128 bytes forward
+            0,      // A
             None,
         );
 
@@ -1454,10 +1476,10 @@ mod tests {
 
         let rel = make_rel(
             R_AARCH64_TSTBR14,
-            0x1000,   // P
+            0x1000, // P
             0,
-            0x1040,   // S — 64 bytes forward
-            0,        // A
+            0x1040, // S — 64 bytes forward
+            0,      // A
             None,
         );
 
@@ -1480,11 +1502,11 @@ mod tests {
 
         let rel = make_rel(
             R_AARCH64_ADR_GOT_PAGE,
-            0x1000,         // P (page 0x1000)
+            0x1000, // P (page 0x1000)
             0,
-            0x0,            // symbol_value (ignored for GOT)
+            0x0, // symbol_value (ignored for GOT)
             0,
-            Some(0x5000),   // GOT entry at page 0x5000
+            Some(0x5000), // GOT entry at page 0x5000
         );
 
         handler.apply_relocation(&rel, &mut data).unwrap();

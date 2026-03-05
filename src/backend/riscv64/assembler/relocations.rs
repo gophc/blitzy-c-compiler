@@ -1126,9 +1126,7 @@ impl RelocationHandler for RiscV64RelocationHandler {
 
         // For GOT relocations, use the GOT entry address as effective symbol
         let effective_symbol = match rt {
-            RiscV64RelocationType::GotHi20 => {
-                rel.got_address.unwrap_or(rel.symbol_value)
-            }
+            RiscV64RelocationType::GotHi20 => rel.got_address.unwrap_or(rel.symbol_value),
             _ => rel.symbol_value,
         };
 
@@ -1350,7 +1348,7 @@ mod tests {
     #[test]
     fn test_b_type_immediate_round_trip() {
         let base_insn = 0x00000063_u32; // BEQ x0, x0
-        // Positive offset
+                                        // Positive offset
         let imm = 256i32;
         let patched = insert_b_imm(base_insn, imm);
         assert_eq!(extract_b_imm(patched), imm);
@@ -1417,7 +1415,9 @@ mod tests {
             &mut code,
             0,
             RiscV64RelocationType::Branch,
-            0x1100, 0, 0x1000,
+            0x1100,
+            0,
+            0x1000,
         )
         .unwrap();
         let insn = read_insn32(&code, 0);
@@ -1432,7 +1432,9 @@ mod tests {
             &mut code,
             0,
             RiscV64RelocationType::Branch,
-            0x2000, 0, 0x0000,
+            0x2000,
+            0,
+            0x0000,
         );
         assert!(result.is_err());
     }
@@ -1441,13 +1443,7 @@ mod tests {
     fn test_apply_jal() {
         let mut code = [0u8; 4];
         write_insn32(&mut code, 0, 0x0000006F); // JAL x0
-        apply_relocation(
-            &mut code,
-            0,
-            RiscV64RelocationType::Jal,
-            0x1400, 0, 0x1000,
-        )
-        .unwrap();
+        apply_relocation(&mut code, 0, RiscV64RelocationType::Jal, 0x1400, 0, 0x1000).unwrap();
         let insn = read_insn32(&code, 0);
         assert_eq!(extract_j_imm(insn), 0x400);
     }
@@ -1460,13 +1456,7 @@ mod tests {
         let sym = 0x12345000u64;
         let p = 0x10000000u64;
         let value = sym as i64 - p as i64;
-        apply_relocation(
-            &mut code,
-            0,
-            RiscV64RelocationType::Call,
-            sym, 0, p,
-        )
-        .unwrap();
+        apply_relocation(&mut code, 0, RiscV64RelocationType::Call, sym, 0, p).unwrap();
         let (hi, lo) = compute_hi_lo(value);
         // Verify AUIPC upper 20 bits
         let auipc = read_insn32(&code, 0);
@@ -1544,7 +1534,9 @@ mod tests {
             &mut code,
             0,
             RiscV64RelocationType::R32Pcrel,
-            0x2000, 0, 0x1000,
+            0x2000,
+            0,
+            0x1000,
         )
         .unwrap();
         assert_eq!(read_u32_le(&code, 0), 0x1000); // S + A - P
@@ -1622,21 +1614,21 @@ mod tests {
     #[test]
     fn test_handler_reloc_size() {
         let h = RiscV64RelocationHandler;
-        assert_eq!(h.reloc_size(2), 8);   // R64
-        assert_eq!(h.reloc_size(1), 4);   // R32
-        assert_eq!(h.reloc_size(16), 4);  // BRANCH
-        assert_eq!(h.reloc_size(55), 2);  // SET16
-        assert_eq!(h.reloc_size(54), 1);  // SET8
-        assert_eq!(h.reloc_size(51), 0);  // RELAX
+        assert_eq!(h.reloc_size(2), 8); // R64
+        assert_eq!(h.reloc_size(1), 4); // R32
+        assert_eq!(h.reloc_size(16), 4); // BRANCH
+        assert_eq!(h.reloc_size(55), 2); // SET16
+        assert_eq!(h.reloc_size(54), 1); // SET8
+        assert_eq!(h.reloc_size(51), 0); // RELAX
     }
 
     #[test]
     fn test_handler_needs_got_plt() {
         let h = RiscV64RelocationHandler;
-        assert!(h.needs_got(20));   // GOT_HI20
-        assert!(!h.needs_got(18));  // CALL
-        assert!(h.needs_plt(19));   // CALL_PLT
-        assert!(!h.needs_plt(18));  // CALL
+        assert!(h.needs_got(20)); // GOT_HI20
+        assert!(!h.needs_got(18)); // CALL
+        assert!(h.needs_plt(19)); // CALL_PLT
+        assert!(!h.needs_plt(18)); // CALL
     }
 
     #[test]
@@ -1686,12 +1678,14 @@ mod tests {
         let p_auipc = 0x10000000u64;
         let _p_addi = 0x10000004u64;
         let pcrel_value = sym as i64 - p_auipc as i64; // 0x2000
-        // Patch AUIPC with PCREL_HI20
+                                                       // Patch AUIPC with PCREL_HI20
         apply_relocation(
             &mut code,
             0,
             RiscV64RelocationType::PcrelHi20,
-            sym, 0, p_auipc,
+            sym,
+            0,
+            p_auipc,
         )
         .unwrap();
         // Patch ADDI with PCREL_LO12_I — referencing the AUIPC label
@@ -1700,7 +1694,9 @@ mod tests {
             &mut code,
             4,
             RiscV64RelocationType::PcrelLo12I,
-            sym, 0, p_auipc,
+            sym,
+            0,
+            p_auipc,
         )
         .unwrap();
         // Verify the upper/lower split reconstructs to pcrel_value

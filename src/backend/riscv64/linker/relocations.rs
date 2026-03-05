@@ -40,12 +40,12 @@
 use std::cell::RefCell;
 
 use crate::backend::linker_common::relocation::{
-    RelocationHandler, ResolvedRelocation, RelocationError, RelocCategory,
-    sign_extend, fits_signed, fits_unsigned, read_le, write_le,
-    compute_pc_relative, compute_absolute, compute_got_relative,
+    compute_absolute, compute_got_relative, compute_pc_relative, fits_signed, fits_unsigned,
+    read_le, sign_extend, write_le, RelocCategory, RelocationError, RelocationHandler,
+    ResolvedRelocation,
 };
-use crate::common::target::Target;
 use crate::common::fx_hash::FxHashMap;
+use crate::common::target::Target;
 
 // ---------------------------------------------------------------------------
 // RISC-V ELF Relocation Type Constants (from RISC-V ELF psABI)
@@ -195,10 +195,10 @@ fn write_insn16(data: &mut [u8], offset: usize, insn: u16) {
 fn encode_b_type_imm(insn: u32, value: i64) -> u32 {
     let imm = value as u32;
     let mut result = insn & 0x01FFF07F; // clear immediate bits
-    result |= ((imm >> 12) & 1) << 31;   // imm[12]
+    result |= ((imm >> 12) & 1) << 31; // imm[12]
     result |= ((imm >> 5) & 0x3F) << 25; // imm[10:5]
-    result |= ((imm >> 1) & 0xF) << 8;   // imm[4:1]
-    result |= ((imm >> 11) & 1) << 7;    // imm[11]
+    result |= ((imm >> 1) & 0xF) << 8; // imm[4:1]
+    result |= ((imm >> 11) & 1) << 7; // imm[11]
     result
 }
 
@@ -210,10 +210,10 @@ fn encode_b_type_imm(insn: u32, value: i64) -> u32 {
 fn encode_j_type_imm(insn: u32, value: i64) -> u32 {
     let imm = value as u32;
     let mut result = insn & 0x00000FFF; // clear immediate bits (keep opcode+rd)
-    result |= ((imm >> 20) & 1) << 31;       // imm[20]
-    result |= ((imm >> 1) & 0x3FF) << 21;    // imm[10:1]
-    result |= ((imm >> 11) & 1) << 20;       // imm[11]
-    result |= ((imm >> 12) & 0xFF) << 12;    // imm[19:12]
+    result |= ((imm >> 20) & 1) << 31; // imm[20]
+    result |= ((imm >> 1) & 0x3FF) << 21; // imm[10:1]
+    result |= ((imm >> 11) & 1) << 20; // imm[11]
+    result |= ((imm >> 12) & 0xFF) << 12; // imm[19:12]
     result
 }
 
@@ -245,7 +245,7 @@ fn encode_s_type_imm(insn: u32, value: i64) -> u32 {
     let imm = (value as u32) & 0xFFF;
     let mut result = insn & 0x01FFF07F; // clear immediate bits
     result |= ((imm >> 5) & 0x7F) << 25; // imm[11:5]
-    result |= (imm & 0x1F) << 7;         // imm[4:0]
+    result |= (imm & 0x1F) << 7; // imm[4:0]
     result
 }
 
@@ -257,11 +257,11 @@ fn encode_s_type_imm(insn: u32, value: i64) -> u32 {
 fn encode_cb_type_imm(insn: u16, value: i64) -> u16 {
     let imm = value as u16;
     let mut result = insn & 0xE383; // clear immediate bits
-    result |= ((imm >> 8) & 1) << 12;   // offset[8]
+    result |= ((imm >> 8) & 1) << 12; // offset[8]
     result |= ((imm >> 3) & 0x3) << 10; // offset[4:3]
-    result |= ((imm >> 6) & 0x3) << 5;  // offset[7:6]
-    result |= ((imm >> 1) & 0x3) << 3;  // offset[2:1]
-    result |= ((imm >> 5) & 1) << 2;    // offset[5]
+    result |= ((imm >> 6) & 0x3) << 5; // offset[7:6]
+    result |= ((imm >> 1) & 0x3) << 3; // offset[2:1]
+    result |= ((imm >> 5) & 1) << 2; // offset[5]
     result
 }
 
@@ -273,14 +273,14 @@ fn encode_cb_type_imm(insn: u16, value: i64) -> u16 {
 fn encode_cj_type_imm(insn: u16, value: i64) -> u16 {
     let imm = value as u16;
     let mut result = insn & 0xE003; // clear immediate bits
-    result |= ((imm >> 11) & 1) << 12;  // offset[11]
-    result |= ((imm >> 4) & 1) << 11;   // offset[4]
-    result |= ((imm >> 8) & 0x3) << 9;  // offset[9:8]
-    result |= ((imm >> 10) & 1) << 8;   // offset[10]
-    result |= ((imm >> 6) & 1) << 7;    // offset[6]
-    result |= ((imm >> 7) & 1) << 6;    // offset[7]
-    result |= ((imm >> 1) & 0x7) << 3;  // offset[3:1]
-    result |= ((imm >> 5) & 1) << 2;    // offset[5]
+    result |= ((imm >> 11) & 1) << 12; // offset[11]
+    result |= ((imm >> 4) & 1) << 11; // offset[4]
+    result |= ((imm >> 8) & 0x3) << 9; // offset[9:8]
+    result |= ((imm >> 10) & 1) << 8; // offset[10]
+    result |= ((imm >> 6) & 1) << 7; // offset[6]
+    result |= ((imm >> 7) & 1) << 6; // offset[7]
+    result |= ((imm >> 1) & 0x7) << 3; // offset[3:1]
+    result |= ((imm >> 5) & 1) << 2; // offset[5]
     result
 }
 
@@ -495,46 +495,22 @@ impl RelocationHandler for RiscV64RelocationHandler {
             R_RISCV_32 | R_RISCV_64 | R_RISCV_HI20 | R_RISCV_LO12_I | R_RISCV_LO12_S => {
                 RelocCategory::Absolute
             }
-            R_RISCV_BRANCH
-            | R_RISCV_JAL
-            | R_RISCV_CALL
-            | R_RISCV_PCREL_HI20
-            | R_RISCV_PCREL_LO12_I
-            | R_RISCV_PCREL_LO12_S
-            | R_RISCV_32_PCREL
-            | R_RISCV_RVC_BRANCH
-            | R_RISCV_RVC_JUMP => RelocCategory::PcRelative,
+            R_RISCV_BRANCH | R_RISCV_JAL | R_RISCV_CALL | R_RISCV_PCREL_HI20
+            | R_RISCV_PCREL_LO12_I | R_RISCV_PCREL_LO12_S | R_RISCV_32_PCREL
+            | R_RISCV_RVC_BRANCH | R_RISCV_RVC_JUMP => RelocCategory::PcRelative,
             R_RISCV_GOT_HI20 => RelocCategory::GotRelative,
             R_RISCV_CALL_PLT => RelocCategory::Plt,
             R_RISCV_JUMP_SLOT => RelocCategory::GotEntry,
-            R_RISCV_TLS_DTPMOD32
-            | R_RISCV_TLS_DTPMOD64
-            | R_RISCV_TLS_DTPREL32
-            | R_RISCV_TLS_DTPREL64
-            | R_RISCV_TLS_TPREL32
-            | R_RISCV_TLS_TPREL64
-            | R_RISCV_TLS_GD_HI20
-            | R_RISCV_TPREL_HI20
-            | R_RISCV_TPREL_LO12_I
-            | R_RISCV_TPREL_LO12_S
-            | R_RISCV_TPREL_ADD => RelocCategory::Tls,
+            R_RISCV_TLS_DTPMOD32 | R_RISCV_TLS_DTPMOD64 | R_RISCV_TLS_DTPREL32
+            | R_RISCV_TLS_DTPREL64 | R_RISCV_TLS_TPREL32 | R_RISCV_TLS_TPREL64
+            | R_RISCV_TLS_GD_HI20 | R_RISCV_TPREL_HI20 | R_RISCV_TPREL_LO12_I
+            | R_RISCV_TPREL_LO12_S | R_RISCV_TPREL_ADD => RelocCategory::Tls,
             R_RISCV_NONE | R_RISCV_RELAX | R_RISCV_ALIGN => RelocCategory::Other,
-            R_RISCV_ADD8
-            | R_RISCV_ADD16
-            | R_RISCV_ADD32
-            | R_RISCV_ADD64
-            | R_RISCV_SUB8
-            | R_RISCV_SUB16
-            | R_RISCV_SUB32
-            | R_RISCV_SUB64
-            | R_RISCV_SET6
-            | R_RISCV_SET8
-            | R_RISCV_SET16
-            | R_RISCV_SET32 => RelocCategory::SectionRelative,
+            R_RISCV_ADD8 | R_RISCV_ADD16 | R_RISCV_ADD32 | R_RISCV_ADD64 | R_RISCV_SUB8
+            | R_RISCV_SUB16 | R_RISCV_SUB32 | R_RISCV_SUB64 | R_RISCV_SET6 | R_RISCV_SET8
+            | R_RISCV_SET16 | R_RISCV_SET32 => RelocCategory::SectionRelative,
             R_RISCV_RELATIVE | R_RISCV_COPY => RelocCategory::Absolute,
-            R_RISCV_GNU_VTINHERIT | R_RISCV_GNU_VTENTRY | R_RISCV_RVC_LUI => {
-                RelocCategory::Other
-            }
+            R_RISCV_GNU_VTINHERIT | R_RISCV_GNU_VTENTRY | R_RISCV_RVC_LUI => RelocCategory::Other,
             _ => RelocCategory::Other,
         }
     }
@@ -598,34 +574,19 @@ impl RelocationHandler for RiscV64RelocationHandler {
     fn reloc_size(&self, rel_type: u32) -> u8 {
         match rel_type {
             R_RISCV_64 | R_RISCV_ADD64 | R_RISCV_SUB64 => 8,
-            R_RISCV_32
-            | R_RISCV_ADD32
-            | R_RISCV_SUB32
-            | R_RISCV_SET32
-            | R_RISCV_32_PCREL => 4,
-            R_RISCV_BRANCH
-            | R_RISCV_JAL
-            | R_RISCV_HI20
-            | R_RISCV_LO12_I
-            | R_RISCV_LO12_S
-            | R_RISCV_PCREL_HI20
-            | R_RISCV_PCREL_LO12_I
-            | R_RISCV_PCREL_LO12_S
-            | R_RISCV_GOT_HI20
-            | R_RISCV_TPREL_HI20
-            | R_RISCV_TPREL_LO12_I
-            | R_RISCV_TPREL_LO12_S
-            | R_RISCV_TLS_GD_HI20 => 4, // 32-bit instruction width
+            R_RISCV_32 | R_RISCV_ADD32 | R_RISCV_SUB32 | R_RISCV_SET32 | R_RISCV_32_PCREL => 4,
+            R_RISCV_BRANCH | R_RISCV_JAL | R_RISCV_HI20 | R_RISCV_LO12_I | R_RISCV_LO12_S
+            | R_RISCV_PCREL_HI20 | R_RISCV_PCREL_LO12_I | R_RISCV_PCREL_LO12_S
+            | R_RISCV_GOT_HI20 | R_RISCV_TPREL_HI20 | R_RISCV_TPREL_LO12_I
+            | R_RISCV_TPREL_LO12_S | R_RISCV_TLS_GD_HI20 => 4, // 32-bit instruction width
             R_RISCV_CALL | R_RISCV_CALL_PLT => 8, // AUIPC (4) + JALR (4)
             R_RISCV_RVC_BRANCH | R_RISCV_RVC_JUMP | R_RISCV_RVC_LUI => 2, // compressed
             R_RISCV_ADD16 | R_RISCV_SUB16 | R_RISCV_SET16 => 2,
             R_RISCV_ADD8 | R_RISCV_SUB8 | R_RISCV_SET8 => 1,
             R_RISCV_SET6 => 1,
-            R_RISCV_RELATIVE | R_RISCV_JUMP_SLOT | R_RISCV_TLS_DTPMOD64
-            | R_RISCV_TLS_DTPREL64 | R_RISCV_TLS_TPREL64 => 8,
-            R_RISCV_TLS_DTPMOD32 | R_RISCV_TLS_DTPREL32 | R_RISCV_TLS_TPREL32 | R_RISCV_COPY => {
-                4
-            }
+            R_RISCV_RELATIVE | R_RISCV_JUMP_SLOT | R_RISCV_TLS_DTPMOD64 | R_RISCV_TLS_DTPREL64
+            | R_RISCV_TLS_TPREL64 => 8,
+            R_RISCV_TLS_DTPMOD32 | R_RISCV_TLS_DTPREL32 | R_RISCV_TLS_TPREL32 | R_RISCV_COPY => 4,
             _ => 0,
         }
     }
@@ -666,7 +627,10 @@ impl RelocationHandler for RiscV64RelocationHandler {
             // -----------------------------------------------------------------
             // No-op relocations
             // -----------------------------------------------------------------
-            R_RISCV_NONE | R_RISCV_RELAX | R_RISCV_TPREL_ADD | R_RISCV_GNU_VTINHERIT
+            R_RISCV_NONE
+            | R_RISCV_RELAX
+            | R_RISCV_TPREL_ADD
+            | R_RISCV_GNU_VTINHERIT
             | R_RISCV_GNU_VTENTRY => Ok(()),
 
             // -----------------------------------------------------------------
@@ -856,7 +820,6 @@ impl RelocationHandler for RiscV64RelocationHandler {
             // -----------------------------------------------------------------
             // TLS relocations — HI20/LO12 style
             // -----------------------------------------------------------------
-
             R_RISCV_TLS_GD_HI20 => {
                 // TLS General Dynamic: GOT-relative upper 20 bits.
                 let got_addr = rel.got_address.unwrap_or(s);
