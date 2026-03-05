@@ -19,10 +19,10 @@
 //! - Lvalue checking
 //! - Default argument promotions
 
-use crate::common::types::{self, CType, TypeQualifiers, StructField};
-use crate::common::type_builder::{self, TypeBuilder};
-use crate::common::diagnostics::{DiagnosticEngine, Span, Diagnostic};
+use crate::common::diagnostics::{Diagnostic, DiagnosticEngine, Span};
 use crate::common::target::Target;
+use crate::common::type_builder::{self, TypeBuilder};
+use crate::common::types::{self, CType, StructField, TypeQualifiers};
 use crate::frontend::parser::ast::*;
 
 /// Empty type qualifiers constant — no const/volatile/restrict/atomic.
@@ -369,12 +369,8 @@ impl<'a> TypeChecker<'a> {
             Expression::IntegerLiteral { value, suffix, .. } => {
                 Ok(self.integer_literal_type(*value, suffix))
             }
-            Expression::FloatLiteral { suffix, .. } => {
-                Ok(self.float_literal_type(suffix))
-            }
-            Expression::StringLiteral { prefix, .. } => {
-                Ok(self.string_literal_type(prefix))
-            }
+            Expression::FloatLiteral { suffix, .. } => Ok(self.float_literal_type(suffix)),
+            Expression::StringLiteral { prefix, .. } => Ok(self.string_literal_type(prefix)),
             Expression::CharLiteral { .. } => {
                 // C11 §6.4.4.4: character constants have type int
                 Ok(CType::Int)
@@ -414,7 +410,8 @@ impl<'a> TypeChecker<'a> {
                 let obj_ty = self.check_expression_type(object)?;
                 let resolved = Self::strip_type(&obj_ty);
                 if !types::is_struct_or_union(&resolved) {
-                    self.diagnostics.emit_error(*span, "member access on non-struct/union type");
+                    self.diagnostics
+                        .emit_error(*span, "member access on non-struct/union type");
                     return Err(());
                 }
                 // Cannot resolve member Symbol without interner; caller handles full flow
@@ -435,10 +432,8 @@ impl<'a> TypeChecker<'a> {
                         return Err(());
                     }
                 } else {
-                    self.diagnostics.emit_error(
-                        *span,
-                        "'->' operator requires pointer to struct/union",
-                    );
+                    self.diagnostics
+                        .emit_error(*span, "'->' operator requires pointer to struct/union");
                     return Err(());
                 }
                 Err(())
@@ -493,7 +488,12 @@ impl<'a> TypeChecker<'a> {
             }
 
             // ── Binary expression: left op right ────────────────────
-            Expression::Binary { op, left, right, span } => {
+            Expression::Binary {
+                op,
+                left,
+                right,
+                span,
+            } => {
                 let lhs_ty = self.check_expression_type(left)?;
                 let rhs_ty = self.check_expression_type(right)?;
                 let lhs_decayed = Self::decay_type(&lhs_ty);
@@ -502,7 +502,12 @@ impl<'a> TypeChecker<'a> {
             }
 
             // ── Conditional: cond ? then : else ─────────────────────
-            Expression::Conditional { condition, then_expr, else_expr, span } => {
+            Expression::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+                span,
+            } => {
                 let cond_ty = self.check_expression_type(condition)?;
                 let cond_stripped = Self::strip_type(&cond_ty);
                 if !types::is_scalar(&cond_stripped) {
@@ -523,7 +528,12 @@ impl<'a> TypeChecker<'a> {
             }
 
             // ── Assignment: target op= value ────────────────────────
-            Expression::Assignment { target, value, span, op } => {
+            Expression::Assignment {
+                target,
+                value,
+                span,
+                op,
+            } => {
                 let target_ty = self.check_expression_type(target)?;
                 let value_ty = self.check_expression_type(value)?;
                 match op {
@@ -534,9 +544,8 @@ impl<'a> TypeChecker<'a> {
                         let bin_op = Self::assign_op_to_binary_op(op);
                         let target_decayed = Self::decay_type(&target_ty);
                         let value_decayed = Self::decay_type(&value_ty);
-                        let _result_ty = self.check_binary_op(
-                            &bin_op, &target_decayed, &value_decayed, *span,
-                        )?;
+                        let _result_ty =
+                            self.check_binary_op(&bin_op, &target_decayed, &value_decayed, *span)?;
                     }
                 }
                 Ok(types::unqualified(types::resolve_typedef(&target_ty)).clone())
@@ -561,9 +570,11 @@ impl<'a> TypeChecker<'a> {
             Expression::StatementExpression { .. } => Err(()),
 
             // ── Builtin call: __builtin_xxx(args...) ────────────────
-            Expression::BuiltinCall { builtin, args, span } => {
-                self.builtin_result_type(builtin, args, *span)
-            }
+            Expression::BuiltinCall {
+                builtin,
+                args,
+                span,
+            } => self.builtin_result_type(builtin, args, *span),
 
             // ── _Generic selection (needs TypeName resolution) ──────
             Expression::Generic { controlling, .. } => {
@@ -608,8 +619,9 @@ impl<'a> TypeChecker<'a> {
             BuiltinKind::ConstantP | BuiltinKind::TypesCompatibleP => Ok(CType::Int),
             BuiltinKind::Offsetof => Ok(self.size_t_type()),
             BuiltinKind::ChooseExpr => Err(()),
-            BuiltinKind::Clz | BuiltinKind::Ctz
-            | BuiltinKind::Popcount | BuiltinKind::Ffs => Ok(CType::Int),
+            BuiltinKind::Clz | BuiltinKind::Ctz | BuiltinKind::Popcount | BuiltinKind::Ffs => {
+                Ok(CType::Int)
+            }
             BuiltinKind::Bswap16 => Ok(CType::UShort),
             BuiltinKind::Bswap32 => Ok(CType::UInt),
             BuiltinKind::Bswap64 => Ok(CType::ULongLong),
@@ -618,11 +630,10 @@ impl<'a> TypeChecker<'a> {
             BuiltinKind::FrameAddress | BuiltinKind::ReturnAddress => {
                 Ok(CType::Pointer(Box::new(CType::Void), EMPTY_QUALS))
             }
-            BuiltinKind::AssumeAligned => {
-                Ok(CType::Pointer(Box::new(CType::Void), EMPTY_QUALS))
+            BuiltinKind::AssumeAligned => Ok(CType::Pointer(Box::new(CType::Void), EMPTY_QUALS)),
+            BuiltinKind::AddOverflow | BuiltinKind::SubOverflow | BuiltinKind::MulOverflow => {
+                Ok(CType::Bool)
             }
-            BuiltinKind::AddOverflow | BuiltinKind::SubOverflow
-            | BuiltinKind::MulOverflow => Ok(CType::Bool),
             BuiltinKind::PrefetchData => Ok(CType::Void),
         }
     }
@@ -660,7 +671,8 @@ impl<'a> TypeChecker<'a> {
                 if types::is_arithmetic(&lhs) && types::is_arithmetic(&rhs) {
                     return Ok(self.usual_arithmetic_conversion(lhs_ty, rhs_ty));
                 }
-                self.diagnostics.emit_error(span, "invalid operands to binary '+'");
+                self.diagnostics
+                    .emit_error(span, "invalid operands to binary '+'");
                 Err(())
             }
 
@@ -691,7 +703,8 @@ impl<'a> TypeChecker<'a> {
                 if types::is_arithmetic(&lhs) && types::is_arithmetic(&rhs) {
                     return Ok(self.usual_arithmetic_conversion(lhs_ty, rhs_ty));
                 }
-                self.diagnostics.emit_error(span, "invalid operands to binary '-'");
+                self.diagnostics
+                    .emit_error(span, "invalid operands to binary '-'");
                 Err(())
             }
 
@@ -701,8 +714,14 @@ impl<'a> TypeChecker<'a> {
                 }
                 self.diagnostics.emit_error(
                     span,
-                    format!("invalid operands to binary '{}'",
-                        if matches!(op, BinaryOp::Mul) { "*" } else { "/" }),
+                    format!(
+                        "invalid operands to binary '{}'",
+                        if matches!(op, BinaryOp::Mul) {
+                            "*"
+                        } else {
+                            "/"
+                        }
+                    ),
                 );
                 Err(())
             }
@@ -711,7 +730,8 @@ impl<'a> TypeChecker<'a> {
                 if types::is_integer(&lhs) && types::is_integer(&rhs) {
                     return Ok(self.usual_arithmetic_conversion(lhs_ty, rhs_ty));
                 }
-                self.diagnostics.emit_error(span, "invalid operands to binary '%'");
+                self.diagnostics
+                    .emit_error(span, "invalid operands to binary '%'");
                 Err(())
             }
 
@@ -723,8 +743,14 @@ impl<'a> TypeChecker<'a> {
                 }
                 self.diagnostics.emit_error(
                     span,
-                    format!("invalid operands to binary '{}'",
-                        if matches!(op, BinaryOp::ShiftLeft) { "<<" } else { ">>" }),
+                    format!(
+                        "invalid operands to binary '{}'",
+                        if matches!(op, BinaryOp::ShiftLeft) {
+                            "<<"
+                        } else {
+                            ">>"
+                        }
+                    ),
                 );
                 Err(())
             }
@@ -743,21 +769,16 @@ impl<'a> TypeChecker<'a> {
                 if (types::is_pointer(&lhs) && types::is_integer(&rhs))
                     || (types::is_integer(&lhs) && types::is_pointer(&rhs))
                 {
-                    self.diagnostics.emit_warning(
-                        span,
-                        "comparison between pointer and integer",
-                    );
+                    self.diagnostics
+                        .emit_warning(span, "comparison between pointer and integer");
                     return Ok(CType::Int);
                 }
-                self.diagnostics.emit_error(
-                    span,
-                    "invalid operands to comparison operator",
-                );
+                self.diagnostics
+                    .emit_error(span, "invalid operands to comparison operator");
                 Err(())
             }
 
-            BinaryOp::Less | BinaryOp::Greater
-            | BinaryOp::LessEqual | BinaryOp::GreaterEqual => {
+            BinaryOp::Less | BinaryOp::Greater | BinaryOp::LessEqual | BinaryOp::GreaterEqual => {
                 // arithmetic < arithmetic
                 if types::is_arithmetic(&lhs) && types::is_arithmetic(&rhs) {
                     return Ok(CType::Int);
@@ -766,10 +787,8 @@ impl<'a> TypeChecker<'a> {
                 if types::is_pointer(&lhs) && types::is_pointer(&rhs) {
                     return Ok(CType::Int);
                 }
-                self.diagnostics.emit_error(
-                    span,
-                    "invalid operands to relational operator",
-                );
+                self.diagnostics
+                    .emit_error(span, "invalid operands to relational operator");
                 Err(())
             }
 
@@ -778,10 +797,8 @@ impl<'a> TypeChecker<'a> {
                 if types::is_integer(&lhs) && types::is_integer(&rhs) {
                     return Ok(self.usual_arithmetic_conversion(lhs_ty, rhs_ty));
                 }
-                self.diagnostics.emit_error(
-                    span,
-                    "invalid operands to bitwise operator",
-                );
+                self.diagnostics
+                    .emit_error(span, "invalid operands to bitwise operator");
                 Err(())
             }
 
@@ -790,10 +807,8 @@ impl<'a> TypeChecker<'a> {
                 if types::is_scalar(&lhs) && types::is_scalar(&rhs) {
                     return Ok(CType::Int);
                 }
-                self.diagnostics.emit_error(
-                    span,
-                    "invalid operands to logical operator",
-                );
+                self.diagnostics
+                    .emit_error(span, "invalid operands to logical operator");
                 Err(())
             }
         }
@@ -817,22 +832,18 @@ impl<'a> TypeChecker<'a> {
 
         match op {
             // ── Address-of: &operand → pointer to operand type ──────
-            UnaryOp::AddressOf => {
-                Ok(CType::Pointer(
-                    Box::new(types::resolve_typedef(operand_ty).clone()),
-                    EMPTY_QUALS,
-                ))
-            }
+            UnaryOp::AddressOf => Ok(CType::Pointer(
+                Box::new(types::resolve_typedef(operand_ty).clone()),
+                EMPTY_QUALS,
+            )),
 
             // ── Dereference: *operand → pointee type ────────────────
             UnaryOp::Deref => {
                 if let CType::Pointer(ref inner, _) = resolved {
                     Ok((**inner).clone())
                 } else {
-                    self.diagnostics.emit_error(
-                        span,
-                        "indirection requires pointer operand",
-                    );
+                    self.diagnostics
+                        .emit_error(span, "indirection requires pointer operand");
                     Err(())
                 }
             }
@@ -842,10 +853,8 @@ impl<'a> TypeChecker<'a> {
                 if types::is_arithmetic(&resolved) {
                     Ok(self.integer_promotion(operand_ty))
                 } else {
-                    self.diagnostics.emit_error(
-                        span,
-                        "unary '+' requires arithmetic operand",
-                    );
+                    self.diagnostics
+                        .emit_error(span, "unary '+' requires arithmetic operand");
                     Err(())
                 }
             }
@@ -855,10 +864,8 @@ impl<'a> TypeChecker<'a> {
                 if types::is_arithmetic(&resolved) {
                     Ok(self.integer_promotion(operand_ty))
                 } else {
-                    self.diagnostics.emit_error(
-                        span,
-                        "unary '-' requires arithmetic operand",
-                    );
+                    self.diagnostics
+                        .emit_error(span, "unary '-' requires arithmetic operand");
                     Err(())
                 }
             }
@@ -868,10 +875,8 @@ impl<'a> TypeChecker<'a> {
                 if types::is_integer(&resolved) {
                     Ok(self.integer_promotion(operand_ty))
                 } else {
-                    self.diagnostics.emit_error(
-                        span,
-                        "bitwise '~' requires integer operand",
-                    );
+                    self.diagnostics
+                        .emit_error(span, "bitwise '~' requires integer operand");
                     Err(())
                 }
             }
@@ -881,10 +886,8 @@ impl<'a> TypeChecker<'a> {
                 if types::is_scalar(&resolved) {
                     Ok(CType::Int)
                 } else {
-                    self.diagnostics.emit_error(
-                        span,
-                        "logical '!' requires scalar operand",
-                    );
+                    self.diagnostics
+                        .emit_error(span, "logical '!' requires scalar operand");
                     Err(())
                 }
             }
@@ -917,16 +920,16 @@ impl<'a> TypeChecker<'a> {
         };
 
         match &func_type {
-            CType::Function { return_type, params, variadic } => {
+            CType::Function {
+                return_type,
+                params,
+                variadic,
+            } => {
                 // Check argument count
                 if !variadic && args.len() != params.len() {
                     self.diagnostics.emit(Diagnostic::error(
                         span,
-                        format!(
-                            "expected {} arguments, got {}",
-                            params.len(),
-                            args.len()
-                        ),
+                        format!("expected {} arguments, got {}", params.len(), args.len()),
                     ));
                     return Err(());
                 }
@@ -948,10 +951,7 @@ impl<'a> TypeChecker<'a> {
                     if !self.is_implicitly_convertible(&arg_decayed, param_ty) {
                         self.diagnostics.emit(Diagnostic::warning(
                             span,
-                            format!(
-                                "incompatible type for argument {}",
-                                i + 1
-                            ),
+                            format!("incompatible type for argument {}", i + 1),
                         ));
                     }
                 }
@@ -964,10 +964,8 @@ impl<'a> TypeChecker<'a> {
                 Ok((**return_type).clone())
             }
             _ => {
-                self.diagnostics.emit_error(
-                    span,
-                    "called object is not a function or function pointer",
-                );
+                self.diagnostics
+                    .emit_error(span, "called object is not a function or function pointer");
                 Err(())
             }
         }
@@ -1001,10 +999,8 @@ impl<'a> TypeChecker<'a> {
             if let CType::Pointer(ref inner, _) = resolved {
                 Self::strip_type(inner)
             } else {
-                self.diagnostics.emit_error(
-                    span,
-                    "member reference through '->' requires pointer type",
-                );
+                self.diagnostics
+                    .emit_error(span, "member reference through '->' requires pointer type");
                 return Err(());
             }
         } else {
@@ -1058,8 +1054,14 @@ impl<'a> TypeChecker<'a> {
                 // Anonymous struct/union member — search nested fields
                 let inner_type = Self::strip_type(&field.ty);
                 match &inner_type {
-                    CType::Struct { fields: inner_fields, .. }
-                    | CType::Union { fields: inner_fields, .. } => {
+                    CType::Struct {
+                        fields: inner_fields,
+                        ..
+                    }
+                    | CType::Union {
+                        fields: inner_fields,
+                        ..
+                    } => {
                         if let Some(ty) = Self::find_member_in_fields(inner_fields, member_name) {
                             return Some(ty);
                         }
@@ -1096,19 +1098,15 @@ impl<'a> TypeChecker<'a> {
         // Check for const-qualified target (not modifiable)
         let quals = Self::get_qualifiers(target_resolved);
         if quals.is_const {
-            self.diagnostics.emit_error(
-                span,
-                "assignment to const-qualified variable",
-            );
+            self.diagnostics
+                .emit_error(span, "assignment to const-qualified variable");
             return Err(());
         }
 
         // Arrays are not assignable
         if types::is_array(&target_stripped) {
-            self.diagnostics.emit_error(
-                span,
-                "assignment to expression with array type",
-            );
+            self.diagnostics
+                .emit_error(span, "assignment to expression with array type");
             return Err(());
         }
 
@@ -1122,15 +1120,11 @@ impl<'a> TypeChecker<'a> {
         if self.is_implicitly_convertible(&value_stripped, &target_stripped) {
             // Warn on pointer-to-integer or integer-to-pointer implicit conversion
             if types::is_pointer(&target_stripped) && types::is_integer(&value_stripped) {
-                self.diagnostics.emit_warning(
-                    span,
-                    "implicit conversion from integer to pointer type",
-                );
+                self.diagnostics
+                    .emit_warning(span, "implicit conversion from integer to pointer type");
             } else if types::is_integer(&target_stripped) && types::is_pointer(&value_stripped) {
-                self.diagnostics.emit_warning(
-                    span,
-                    "implicit conversion from pointer to integer type",
-                );
+                self.diagnostics
+                    .emit_warning(span, "implicit conversion from pointer to integer type");
             }
 
             // Warn on incompatible pointer types
@@ -1144,10 +1138,8 @@ impl<'a> TypeChecker<'a> {
                         && !matches!(t_base, CType::Void)
                         && !matches!(v_base, CType::Void)
                     {
-                        self.diagnostics.emit_warning(
-                            span,
-                            "assignment from incompatible pointer type",
-                        );
+                        self.diagnostics
+                            .emit_warning(span, "assignment from incompatible pointer type");
                     }
                 }
             }
@@ -1156,21 +1148,18 @@ impl<'a> TypeChecker<'a> {
         }
 
         // Struct/union assignment requires compatible types
-        if types::is_struct_or_union(&target_stripped) && types::is_struct_or_union(&value_stripped) {
+        if types::is_struct_or_union(&target_stripped) && types::is_struct_or_union(&value_stripped)
+        {
             if !types::is_compatible(&target_stripped, &value_stripped) {
-                self.diagnostics.emit_error(
-                    span,
-                    "assignment between incompatible struct/union types",
-                );
+                self.diagnostics
+                    .emit_error(span, "assignment between incompatible struct/union types");
                 return Err(());
             }
             return Ok(());
         }
 
-        self.diagnostics.emit_error(
-            span,
-            "incompatible types in assignment",
-        );
+        self.diagnostics
+            .emit_error(span, "incompatible types in assignment");
         Err(())
     }
 
@@ -1195,7 +1184,9 @@ impl<'a> TypeChecker<'a> {
             // Identifiers are lvalues (the SemanticAnalyzer filters functions/arrays)
             Expression::Identifier { .. } => true,
             // Dereference of a pointer is an lvalue
-            Expression::UnaryOp { op: UnaryOp::Deref, .. } => true,
+            Expression::UnaryOp {
+                op: UnaryOp::Deref, ..
+            } => true,
             // Array subscript is an lvalue (equivalent to *(base + index))
             Expression::ArraySubscript { .. } => true,
             // Member access is an lvalue if the object is an lvalue
@@ -1233,10 +1224,8 @@ impl<'a> TypeChecker<'a> {
     ) -> Result<CType, ()> {
         // Only + and - are valid for pointer arithmetic
         if !matches!(op, BinaryOp::Add | BinaryOp::Sub) {
-            self.diagnostics.emit_error(
-                span,
-                "invalid pointer arithmetic operation",
-            );
+            self.diagnostics
+                .emit_error(span, "invalid pointer arithmetic operation");
             return Err(());
         }
 
@@ -1266,10 +1255,8 @@ impl<'a> TypeChecker<'a> {
 
             // Pointer must point to complete type
             if !types::is_complete(&pointee_stripped) {
-                self.diagnostics.emit_error(
-                    span,
-                    "arithmetic on pointer to incomplete type",
-                );
+                self.diagnostics
+                    .emit_error(span, "arithmetic on pointer to incomplete type");
                 return Err(());
             }
 
@@ -1277,29 +1264,23 @@ impl<'a> TypeChecker<'a> {
             let pointee_size = types::sizeof_ctype(&pointee_stripped, &self.target);
             let _pointee_align = types::alignof_ctype(&pointee_stripped, &self.target);
             if pointee_size == 0 {
-                self.diagnostics.emit_warning(
-                    span,
-                    "pointer arithmetic on zero-sized type",
-                );
+                self.diagnostics
+                    .emit_warning(span, "pointer arithmetic on zero-sized type");
             }
 
             // The integer operand must be an integer type
             let int_resolved = Self::strip_type(int_ty);
             if !types::is_integer(&int_resolved) {
-                self.diagnostics.emit_error(
-                    span,
-                    "pointer arithmetic requires integer operand",
-                );
+                self.diagnostics
+                    .emit_error(span, "pointer arithmetic requires integer operand");
                 return Err(());
             }
 
             // Result is the same pointer type
             Ok(CType::Pointer(pointee.clone(), quals))
         } else {
-            self.diagnostics.emit_error(
-                span,
-                "expected pointer type in pointer arithmetic",
-            );
+            self.diagnostics
+                .emit_error(span, "expected pointer type in pointer arithmetic");
             Err(())
         }
     }
@@ -1412,10 +1393,8 @@ impl<'a> TypeChecker<'a> {
                 }
             }
             // Incompatible pointers — warn but allow
-            self.diagnostics.emit_warning(
-                span,
-                "pointer type mismatch in conditional expression",
-            );
+            self.diagnostics
+                .emit_warning(span, "pointer type mismatch in conditional expression");
             return Ok(then_stripped);
         }
 
@@ -1427,10 +1406,8 @@ impl<'a> TypeChecker<'a> {
             return Ok(else_stripped);
         }
 
-        self.diagnostics.emit_error(
-            span,
-            "incompatible types in conditional expression",
-        );
+        self.diagnostics
+            .emit_error(span, "incompatible types in conditional expression");
         Err(())
     }
 
@@ -1451,12 +1428,7 @@ impl<'a> TypeChecker<'a> {
     /// - Struct/union casts (not allowed in C)
     /// - Void → non-void (except void → void)
     /// - Function pointer casts: allowed with warning
-    pub fn check_cast(
-        &mut self,
-        from: &CType,
-        to: &CType,
-        span: Span,
-    ) -> Result<(), ()> {
+    pub fn check_cast(&mut self, from: &CType, to: &CType, span: Span) -> Result<(), ()> {
         let from_stripped = Self::strip_type(from);
         let to_stripped = Self::strip_type(to);
 
@@ -1472,10 +1444,8 @@ impl<'a> TypeChecker<'a> {
 
         // Cannot cast FROM void (except to void, handled above)
         if matches!(from_stripped, CType::Void) {
-            self.diagnostics.emit_error(
-                span,
-                "cannot cast from void type",
-            );
+            self.diagnostics
+                .emit_error(span, "cannot cast from void type");
             return Err(());
         }
 
@@ -1499,10 +1469,8 @@ impl<'a> TypeChecker<'a> {
 
         // Integer → pointer: allowed with warning
         if types::is_integer(&from_stripped) && types::is_pointer(&to_stripped) {
-            self.diagnostics.emit_warning(
-                span,
-                "cast to pointer from integer of different size",
-            );
+            self.diagnostics
+                .emit_warning(span, "cast to pointer from integer of different size");
             return Ok(());
         }
 
@@ -1513,17 +1481,16 @@ impl<'a> TypeChecker<'a> {
 
         // Struct/union casts: not allowed
         if types::is_struct_or_union(&from_stripped) || types::is_struct_or_union(&to_stripped) {
-            self.diagnostics.emit_error(
-                span,
-                "invalid cast involving struct or union type",
-            );
+            self.diagnostics
+                .emit_error(span, "invalid cast involving struct or union type");
             return Err(());
         }
 
         // Array and function types (should have decayed already, but handle gracefully)
         if types::is_array(&from_stripped) || types::is_function(&from_stripped) {
             // Array/function should have decayed to pointer
-            self.diagnostics.emit_warning(span, "unusual cast from array/function type");
+            self.diagnostics
+                .emit_warning(span, "unusual cast from array/function type");
             return Ok(());
         }
 

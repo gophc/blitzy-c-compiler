@@ -553,9 +553,7 @@ impl BasicBlock {
     /// ```
     #[inline]
     pub fn phi_instructions(&self) -> impl Iterator<Item = &Instruction> {
-        self.instructions
-            .iter()
-            .take_while(|inst| inst.is_phi())
+        self.instructions.iter().take_while(|inst| inst.is_phi())
     }
 
     /// Inserts a phi instruction at the correct position in the block.
