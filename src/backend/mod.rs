@@ -4,6 +4,7 @@
 //! code generation, register allocation, ELF writing, DWARF debug info,
 //! shared linker infrastructure, and four architecture-specific backends.
 
+pub mod aarch64;
 pub mod dwarf;
 pub mod elf_writer_common;
 pub mod linker_common;
