@@ -918,6 +918,45 @@ impl<'src> Lexer<'src> {
         self.scanner.source()
     }
 
+    // ===================================================================
+    // Accessor methods for parser integration
+    // ===================================================================
+
+    /// Return a shared reference to the diagnostic engine.
+    ///
+    /// Used by the parser to query error state (e.g., [`DiagnosticEngine::has_errors`]).
+    #[inline]
+    pub fn diagnostics(&self) -> &DiagnosticEngine {
+        self.diagnostics
+    }
+
+    /// Return a mutable reference to the diagnostic engine.
+    ///
+    /// Used by the parser to emit diagnostic errors and warnings during
+    /// parsing (e.g., syntax errors, recursion overflow).
+    #[inline]
+    pub fn diagnostics_mut(&mut self) -> &mut DiagnosticEngine {
+        self.diagnostics
+    }
+
+    /// Return a shared reference to the string interner.
+    ///
+    /// Used by the parser to resolve interned [`Symbol`] handles back to
+    /// their string representation.
+    #[inline]
+    pub fn interner(&self) -> &Interner {
+        self.interner
+    }
+
+    /// Return a mutable reference to the string interner.
+    ///
+    /// Used by the parser to intern new strings (e.g., synthesized
+    /// identifiers) during parsing.
+    #[inline]
+    pub fn interner_mut(&mut self) -> &mut Interner {
+        self.interner
+    }
+
     /// Attempt to consume a single identifier-continuation character.
     ///
     /// Returns `true` if the next character is `[a-zA-Z0-9_]` and was
