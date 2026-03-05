@@ -28,3 +28,6 @@ pub use instructions::{BinOp, BlockId, FCmpOp, ICmpOp, Instruction, Value};
 pub use module::IrModule;
 pub use types::IrType;
 pub use types::StructType;
+
+// Phase 6 — AST-to-IR lowering
+pub mod lowering;
