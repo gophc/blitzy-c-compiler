@@ -17,6 +17,9 @@ pub mod instructions;
 pub mod module;
 pub mod types;
 
+// SSA construction passes
+pub mod mem2reg;
+
 // Re-export core IR types for convenient access
 pub use basic_block::BasicBlock;
 pub use builder::IrBuilder;
