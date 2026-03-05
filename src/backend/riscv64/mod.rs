@@ -5,3 +5,4 @@
 
 pub mod assembler;
 pub mod linker;
+pub mod registers;
