@@ -144,6 +144,36 @@ pub struct ResolvedRelocation {
 }
 
 impl ResolvedRelocation {
+    /// Create a new `ResolvedRelocation` with all fields specified.
+    ///
+    /// This constructor is primarily used by the relocation resolution pipeline
+    /// and by test infrastructure to create relocation entries for validation.
+    pub fn new(
+        patch_address: u64,
+        patch_offset: u64,
+        symbol_value: u64,
+        addend: i64,
+        rel_type: u32,
+        got_address: Option<u64>,
+        plt_address: Option<u64>,
+        got_base: Option<u64>,
+        section_name: String,
+    ) -> Self {
+        let category = RelocCategory::Other; // Caller should re-classify if needed
+        Self {
+            patch_address,
+            patch_offset,
+            symbol_value,
+            addend,
+            rel_type,
+            got_address,
+            plt_address,
+            got_base,
+            category,
+            section_name,
+        }
+    }
+
     /// Returns the name of the output section this relocation patches.
     #[inline]
     pub fn section_name(&self) -> &str {
