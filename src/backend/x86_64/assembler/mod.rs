@@ -11,4 +11,5 @@
 //! No external assembler (`as`, `nasm`, `llvm-mc`) is invoked — everything
 //! is built-in.
 
+pub mod encoder;
 pub mod relocations;
