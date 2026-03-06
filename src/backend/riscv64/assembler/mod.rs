@@ -4,4 +4,5 @@
 //! standalone backend. This module contains the assembler infrastructure
 //! including relocation type definitions and instruction encoding.
 
+pub mod encoder;
 pub mod relocations;
