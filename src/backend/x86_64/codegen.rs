@@ -24,8 +24,12 @@ use crate::backend::traits::{
     self as traits, ArchCodegen, MachineBasicBlock, MachineFunction, MachineInstruction,
     MachineOperand, RegisterInfo, RelocationTypeInfo,
 };
-use crate::backend::x86_64::abi::{self, RetLocation, X86_64Abi, INTEGER_ARG_REGS, RED_ZONE_SIZE, SSE_ARG_REGS};
-use crate::backend::x86_64::registers::{self, CALLEE_SAVED_GPRS, RAX, RBP, RCX, RDX, RSP, XMM0, XMM1};
+use crate::backend::x86_64::abi::{
+    self, RetLocation, X86_64Abi, INTEGER_ARG_REGS, RED_ZONE_SIZE, SSE_ARG_REGS,
+};
+use crate::backend::x86_64::registers::{
+    self, CALLEE_SAVED_GPRS, RAX, RBP, RCX, RDX, RSP, XMM0, XMM1,
+};
 use crate::common::diagnostics::{DiagnosticEngine, Span};
 use crate::common::fx_hash::FxHashMap;
 use crate::common::target::Target;
@@ -204,32 +208,95 @@ impl X86Opcode {
     pub fn from_u32(val: u32) -> Option<Self> {
         // Safe table-driven lookup (avoids transmute size mismatch).
         const TABLE: &[X86Opcode] = &[
-            X86Opcode::Mov, X86Opcode::MovZX, X86Opcode::MovSX, X86Opcode::Lea,
-            X86Opcode::Push, X86Opcode::Pop, X86Opcode::Xchg,
-            X86Opcode::Add, X86Opcode::Sub, X86Opcode::Imul, X86Opcode::Idiv,
-            X86Opcode::Div, X86Opcode::Neg, X86Opcode::Inc, X86Opcode::Dec,
-            X86Opcode::And, X86Opcode::Or, X86Opcode::Xor, X86Opcode::Not,
-            X86Opcode::Shl, X86Opcode::Shr, X86Opcode::Sar, X86Opcode::Rol, X86Opcode::Ror,
-            X86Opcode::Cmp, X86Opcode::Test,
-            X86Opcode::Cmove, X86Opcode::Cmovne, X86Opcode::Cmovl, X86Opcode::Cmovle,
-            X86Opcode::Cmovg, X86Opcode::Cmovge, X86Opcode::Cmovb, X86Opcode::Cmovbe,
-            X86Opcode::Cmova, X86Opcode::Cmovae, X86Opcode::Cmovs, X86Opcode::Cmovns,
-            X86Opcode::Sete, X86Opcode::Setne, X86Opcode::Setl, X86Opcode::Setle,
-            X86Opcode::Setg, X86Opcode::Setge, X86Opcode::Setb, X86Opcode::Setbe,
-            X86Opcode::Seta, X86Opcode::Setae,
-            X86Opcode::Jmp, X86Opcode::Je, X86Opcode::Jne, X86Opcode::Jl, X86Opcode::Jle,
-            X86Opcode::Jg, X86Opcode::Jge, X86Opcode::Jb, X86Opcode::Jbe,
-            X86Opcode::Ja, X86Opcode::Jae, X86Opcode::Js, X86Opcode::Jns,
-            X86Opcode::Call, X86Opcode::Ret, X86Opcode::Nop,
-            X86Opcode::Movsd, X86Opcode::Movss,
-            X86Opcode::Addsd, X86Opcode::Addss, X86Opcode::Subsd, X86Opcode::Subss,
-            X86Opcode::Mulsd, X86Opcode::Mulss, X86Opcode::Divsd, X86Opcode::Divss,
-            X86Opcode::Ucomisd, X86Opcode::Ucomiss,
-            X86Opcode::Cvtsi2sd, X86Opcode::Cvtsi2ss, X86Opcode::Cvtsd2si,
-            X86Opcode::Cvtss2si, X86Opcode::Cvtsd2ss, X86Opcode::Cvtss2sd,
-            X86Opcode::Enter, X86Opcode::Leave,
-            X86Opcode::Cdq, X86Opcode::Cqo,
-            X86Opcode::Endbr64, X86Opcode::Pause, X86Opcode::Lfence,
+            X86Opcode::Mov,
+            X86Opcode::MovZX,
+            X86Opcode::MovSX,
+            X86Opcode::Lea,
+            X86Opcode::Push,
+            X86Opcode::Pop,
+            X86Opcode::Xchg,
+            X86Opcode::Add,
+            X86Opcode::Sub,
+            X86Opcode::Imul,
+            X86Opcode::Idiv,
+            X86Opcode::Div,
+            X86Opcode::Neg,
+            X86Opcode::Inc,
+            X86Opcode::Dec,
+            X86Opcode::And,
+            X86Opcode::Or,
+            X86Opcode::Xor,
+            X86Opcode::Not,
+            X86Opcode::Shl,
+            X86Opcode::Shr,
+            X86Opcode::Sar,
+            X86Opcode::Rol,
+            X86Opcode::Ror,
+            X86Opcode::Cmp,
+            X86Opcode::Test,
+            X86Opcode::Cmove,
+            X86Opcode::Cmovne,
+            X86Opcode::Cmovl,
+            X86Opcode::Cmovle,
+            X86Opcode::Cmovg,
+            X86Opcode::Cmovge,
+            X86Opcode::Cmovb,
+            X86Opcode::Cmovbe,
+            X86Opcode::Cmova,
+            X86Opcode::Cmovae,
+            X86Opcode::Cmovs,
+            X86Opcode::Cmovns,
+            X86Opcode::Sete,
+            X86Opcode::Setne,
+            X86Opcode::Setl,
+            X86Opcode::Setle,
+            X86Opcode::Setg,
+            X86Opcode::Setge,
+            X86Opcode::Setb,
+            X86Opcode::Setbe,
+            X86Opcode::Seta,
+            X86Opcode::Setae,
+            X86Opcode::Jmp,
+            X86Opcode::Je,
+            X86Opcode::Jne,
+            X86Opcode::Jl,
+            X86Opcode::Jle,
+            X86Opcode::Jg,
+            X86Opcode::Jge,
+            X86Opcode::Jb,
+            X86Opcode::Jbe,
+            X86Opcode::Ja,
+            X86Opcode::Jae,
+            X86Opcode::Js,
+            X86Opcode::Jns,
+            X86Opcode::Call,
+            X86Opcode::Ret,
+            X86Opcode::Nop,
+            X86Opcode::Movsd,
+            X86Opcode::Movss,
+            X86Opcode::Addsd,
+            X86Opcode::Addss,
+            X86Opcode::Subsd,
+            X86Opcode::Subss,
+            X86Opcode::Mulsd,
+            X86Opcode::Mulss,
+            X86Opcode::Divsd,
+            X86Opcode::Divss,
+            X86Opcode::Ucomisd,
+            X86Opcode::Ucomiss,
+            X86Opcode::Cvtsi2sd,
+            X86Opcode::Cvtsi2ss,
+            X86Opcode::Cvtsd2si,
+            X86Opcode::Cvtss2si,
+            X86Opcode::Cvtsd2ss,
+            X86Opcode::Cvtss2sd,
+            X86Opcode::Enter,
+            X86Opcode::Leave,
+            X86Opcode::Cdq,
+            X86Opcode::Cqo,
+            X86Opcode::Endbr64,
+            X86Opcode::Pause,
+            X86Opcode::Lfence,
             X86Opcode::InlineAsm,
         ];
         TABLE.get(val as usize).copied()
@@ -403,10 +470,7 @@ impl X86_64CodeGen {
     }
 
     /// Build a terminator instruction.
-    fn mk_term(
-        opcode: X86Opcode,
-        operands: &[MachineOperand],
-    ) -> MachineInstruction {
+    fn mk_term(opcode: X86Opcode, operands: &[MachineOperand]) -> MachineInstruction {
         let mut inst = MachineInstruction::new(opcode.as_u32());
         for op in operands {
             inst.operands.push(op.clone());
@@ -827,9 +891,9 @@ impl X86_64CodeGen {
                 let _mem_op = match &src {
                     MachineOperand::Memory { .. } => src.clone(),
                     _ => MachineOperand::Memory {
-                        base: src.as_register().or_else(|| {
-                            src.as_virtual_register().map(|v| v as u16)
-                        }),
+                        base: src
+                            .as_register()
+                            .or_else(|| src.as_virtual_register().map(|v| v as u16)),
                         index: None,
                         scale: 1,
                         displacement: 0,
@@ -842,9 +906,7 @@ impl X86_64CodeGen {
             // ---------------------------------------------------------------
             // Store
             // ---------------------------------------------------------------
-            Instruction::Store {
-                value, ptr, ..
-            } => {
+            Instruction::Store { value, ptr, .. } => {
                 let src = self.get_value(*value);
                 let dest = self.get_value(*ptr);
 
@@ -912,11 +974,7 @@ impl X86_64CodeGen {
 
                 let mut out = Vec::new();
                 // test cond, cond
-                out.push(Self::mk_inst(
-                    X86Opcode::Test,
-                    None,
-                    &[cond.clone(), cond],
-                ));
+                out.push(Self::mk_inst(X86Opcode::Test, None, &[cond.clone(), cond]));
                 // jne then_block
                 let mut jne = Self::mk_term(
                     X86Opcode::Jne,
@@ -1029,7 +1087,12 @@ impl X86_64CodeGen {
             // ---------------------------------------------------------------
             // Phi — should be eliminated before codegen (Phase 9)
             // ---------------------------------------------------------------
-            Instruction::Phi { result, ty: _, incoming: _, .. } => {
+            Instruction::Phi {
+                result,
+                ty: _,
+                incoming: _,
+                ..
+            } => {
                 // Phi nodes should have been eliminated by phi_eliminate.rs.
                 // If encountered, emit a diagnostic warning and create a
                 // virtual register as a placeholder.
@@ -1063,11 +1126,7 @@ impl X86_64CodeGen {
                     out.push(Self::mk_inst(X86Opcode::Mov, Some(dst), &[base_op]));
                 } else {
                     // Accumulate offset into dst.
-                    out.push(Self::mk_inst(
-                        X86Opcode::Mov,
-                        Some(dst.clone()),
-                        &[base_op],
-                    ));
+                    out.push(Self::mk_inst(X86Opcode::Mov, Some(dst.clone()), &[base_op]));
                     for idx_val in indices {
                         let idx_op = self.get_value(*idx_val);
                         // add dst, idx  (simplified — real GEP would scale by element size)
@@ -1247,11 +1306,7 @@ impl X86_64CodeGen {
                     Some(dst.clone()),
                     &[lhs_op.clone()],
                 ));
-                out.push(Self::mk_inst(
-                    X86Opcode::Add,
-                    Some(dst),
-                    &[lhs_op, rhs_op],
-                ));
+                out.push(Self::mk_inst(X86Opcode::Add, Some(dst), &[lhs_op, rhs_op]));
             }
             BinOp::Sub => {
                 out.push(Self::mk_inst(
@@ -1259,19 +1314,11 @@ impl X86_64CodeGen {
                     Some(dst.clone()),
                     &[lhs_op.clone()],
                 ));
-                out.push(Self::mk_inst(
-                    X86Opcode::Sub,
-                    Some(dst),
-                    &[lhs_op, rhs_op],
-                ));
+                out.push(Self::mk_inst(X86Opcode::Sub, Some(dst), &[lhs_op, rhs_op]));
             }
             BinOp::Mul => {
                 // IMUL dst, lhs, rhs (three-operand form)
-                out.push(Self::mk_inst(
-                    X86Opcode::Imul,
-                    Some(dst),
-                    &[lhs_op, rhs_op],
-                ));
+                out.push(Self::mk_inst(X86Opcode::Imul, Some(dst), &[lhs_op, rhs_op]));
             }
             BinOp::SDiv => {
                 // CQO ; IDIV rhs → quotient in RAX
@@ -1297,10 +1344,7 @@ impl X86_64CodeGen {
                 out.push(Self::mk_inst(
                     X86Opcode::Xor,
                     Some(MachineOperand::Register(RDX)),
-                    &[
-                        MachineOperand::Register(RDX),
-                        MachineOperand::Register(RDX),
-                    ],
+                    &[MachineOperand::Register(RDX), MachineOperand::Register(RDX)],
                 ));
                 out.push(Self::mk_inst(
                     X86Opcode::Mov,
@@ -1333,10 +1377,7 @@ impl X86_64CodeGen {
                 out.push(Self::mk_inst(
                     X86Opcode::Xor,
                     Some(MachineOperand::Register(RDX)),
-                    &[
-                        MachineOperand::Register(RDX),
-                        MachineOperand::Register(RDX),
-                    ],
+                    &[MachineOperand::Register(RDX), MachineOperand::Register(RDX)],
                 ));
                 out.push(Self::mk_inst(
                     X86Opcode::Mov,
@@ -1358,11 +1399,7 @@ impl X86_64CodeGen {
                     Some(dst.clone()),
                     &[lhs_op.clone()],
                 ));
-                out.push(Self::mk_inst(
-                    X86Opcode::And,
-                    Some(dst),
-                    &[lhs_op, rhs_op],
-                ));
+                out.push(Self::mk_inst(X86Opcode::And, Some(dst), &[lhs_op, rhs_op]));
             }
             BinOp::Or => {
                 out.push(Self::mk_inst(
@@ -1370,11 +1407,7 @@ impl X86_64CodeGen {
                     Some(dst.clone()),
                     &[lhs_op.clone()],
                 ));
-                out.push(Self::mk_inst(
-                    X86Opcode::Or,
-                    Some(dst),
-                    &[lhs_op, rhs_op],
-                ));
+                out.push(Self::mk_inst(X86Opcode::Or, Some(dst), &[lhs_op, rhs_op]));
             }
             BinOp::Xor => {
                 out.push(Self::mk_inst(
@@ -1382,20 +1415,12 @@ impl X86_64CodeGen {
                     Some(dst.clone()),
                     &[lhs_op.clone()],
                 ));
-                out.push(Self::mk_inst(
-                    X86Opcode::Xor,
-                    Some(dst),
-                    &[lhs_op, rhs_op],
-                ));
+                out.push(Self::mk_inst(X86Opcode::Xor, Some(dst), &[lhs_op, rhs_op]));
             }
 
             // -- Shifts (shift amount must be in CL) --
             BinOp::Shl => {
-                out.push(Self::mk_inst(
-                    X86Opcode::Mov,
-                    Some(dst.clone()),
-                    &[lhs_op],
-                ));
+                out.push(Self::mk_inst(X86Opcode::Mov, Some(dst.clone()), &[lhs_op]));
                 out.push(Self::mk_inst(
                     X86Opcode::Mov,
                     Some(MachineOperand::Register(RCX)),
@@ -1408,11 +1433,7 @@ impl X86_64CodeGen {
                 ));
             }
             BinOp::AShr => {
-                out.push(Self::mk_inst(
-                    X86Opcode::Mov,
-                    Some(dst.clone()),
-                    &[lhs_op],
-                ));
+                out.push(Self::mk_inst(X86Opcode::Mov, Some(dst.clone()), &[lhs_op]));
                 out.push(Self::mk_inst(
                     X86Opcode::Mov,
                     Some(MachineOperand::Register(RCX)),
@@ -1425,11 +1446,7 @@ impl X86_64CodeGen {
                 ));
             }
             BinOp::LShr => {
-                out.push(Self::mk_inst(
-                    X86Opcode::Mov,
-                    Some(dst.clone()),
-                    &[lhs_op],
-                ));
+                out.push(Self::mk_inst(X86Opcode::Mov, Some(dst.clone()), &[lhs_op]));
                 out.push(Self::mk_inst(
                     X86Opcode::Mov,
                     Some(MachineOperand::Register(RCX)),
@@ -1585,14 +1602,14 @@ impl X86_64CodeGen {
         //   CF=0, ZF=1 → a == b
         //   CF=1, ZF=1 → unordered (NaN)
         let setcc = match op {
-            FCmpOp::Oeq => X86Opcode::Sete,   // ZF=1 and PF=0
-            FCmpOp::One => X86Opcode::Setne,   // ZF=0 and PF=0
-            FCmpOp::Olt => X86Opcode::Setb,    // CF=1
-            FCmpOp::Ole => X86Opcode::Setbe,   // CF=1 or ZF=1
-            FCmpOp::Ogt => X86Opcode::Seta,    // CF=0 and ZF=0
-            FCmpOp::Oge => X86Opcode::Setae,   // CF=0
-            FCmpOp::Uno => X86Opcode::Sete,    // PF=1 (parity flag set for NaN)
-            FCmpOp::Ord => X86Opcode::Setne,   // PF=0 (no NaN)
+            FCmpOp::Oeq => X86Opcode::Sete,  // ZF=1 and PF=0
+            FCmpOp::One => X86Opcode::Setne, // ZF=0 and PF=0
+            FCmpOp::Olt => X86Opcode::Setb,  // CF=1
+            FCmpOp::Ole => X86Opcode::Setbe, // CF=1 or ZF=1
+            FCmpOp::Ogt => X86Opcode::Seta,  // CF=0 and ZF=0
+            FCmpOp::Oge => X86Opcode::Setae, // CF=0
+            FCmpOp::Uno => X86Opcode::Sete,  // PF=1 (parity flag set for NaN)
+            FCmpOp::Ord => X86Opcode::Setne, // PF=0 (no NaN)
         };
 
         vec![

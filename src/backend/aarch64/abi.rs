@@ -268,8 +268,7 @@ fn composite_size_align(ty: &CType) -> (usize, usize) {
             ..
         } => {
             let field_types: Vec<CType> = fields.iter().map(|f| f.ty.clone()).collect();
-            let layout: StructLayout =
-                tb.compute_struct_layout(&field_types, *packed, *aligned);
+            let layout: StructLayout = tb.compute_struct_layout(&field_types, *packed, *aligned);
             // Use layout.fields for per-field verification — ensures the
             // TypeBuilder produced a consistent layout entry for each field.
             debug_assert_eq!(layout.fields.len(), field_types.len());
@@ -290,9 +289,7 @@ fn collect_fp_leaves(ty: &CType) -> Option<Vec<CType>> {
     let stripped = strip_decorators(ty);
     match stripped {
         // Leaf FP types.
-        CType::Float | CType::Double | CType::LongDouble => {
-            Some(vec![stripped.clone()])
-        }
+        CType::Float | CType::Double | CType::LongDouble => Some(vec![stripped.clone()]),
         // Array of FP types: flatten by repeating the element pattern.
         CType::Array(elem, Some(count)) => {
             let count = *count;
@@ -569,10 +566,9 @@ impl AArch64Abi {
                     self.ngrn += 1;
                     return ArgLocation::Register(reg as u16);
                 }
-                return ArgLocation::Stack(self.alloc_stack(
-                    Target::AArch64.pointer_width(),
-                    ARG_SLOT_SIZE,
-                ));
+                return ArgLocation::Stack(
+                    self.alloc_stack(Target::AArch64.pointer_width(), ARG_SLOT_SIZE),
+                );
             }
 
             // Rule 4: Small composite ≤ 16 bytes.
@@ -647,10 +643,7 @@ impl AArch64Abi {
         // _Complex floating-point — two consecutive FP return registers.
         if let CType::Complex(ref base) = stripped {
             if is_fp_scalar(strip_decorators(base)) {
-                return ArgLocation::RegisterPair(
-                    FP_RET_REGS[0] as u16,
-                    FP_RET_REGS[1] as u16,
-                );
+                return ArgLocation::RegisterPair(FP_RET_REGS[0] as u16, FP_RET_REGS[1] as u16);
             }
         }
 
@@ -659,10 +652,7 @@ impl AArch64Abi {
             if count == 1 {
                 return ArgLocation::Register(FP_RET_REGS[0] as u16);
             } else if count == 2 {
-                return ArgLocation::RegisterPair(
-                    FP_RET_REGS[0] as u16,
-                    FP_RET_REGS[1] as u16,
-                );
+                return ArgLocation::RegisterPair(FP_RET_REGS[0] as u16, FP_RET_REGS[1] as u16);
             } else {
                 // 3 or 4 members: return first FP register; codegen reads type.
                 return ArgLocation::Register(FP_RET_REGS[0] as u16);
@@ -679,10 +669,7 @@ impl AArch64Abi {
                 return ArgLocation::Register(INT_RET_REGS[0] as u16);
             }
             if size <= MAX_COMPOSITE_REG_SIZE {
-                return ArgLocation::RegisterPair(
-                    INT_RET_REGS[0] as u16,
-                    INT_RET_REGS[1] as u16,
-                );
+                return ArgLocation::RegisterPair(INT_RET_REGS[0] as u16, INT_RET_REGS[1] as u16);
             }
             // Large composite — indirect return: callee writes to [X8].
             return ArgLocation::Register(INDIRECT_RESULT_REG as u16);
@@ -728,9 +715,7 @@ impl AArch64Abi {
                     return ArgLocation::RegisterPair(r1 as u16, r2 as u16);
                 }
                 self.ngrn = NUM_INT_ARG_REGS;
-                return ArgLocation::Stack(
-                    self.alloc_stack(size, ARG_SLOT_SIZE),
-                );
+                return ArgLocation::Stack(self.alloc_stack(size, ARG_SLOT_SIZE));
             }
         }
 
@@ -755,10 +740,9 @@ impl AArch64Abi {
                     self.ngrn += 1;
                     return ArgLocation::Register(reg as u16);
                 }
-                return ArgLocation::Stack(self.alloc_stack(
-                    Target::AArch64.pointer_width(),
-                    ARG_SLOT_SIZE,
-                ));
+                return ArgLocation::Stack(
+                    self.alloc_stack(Target::AArch64.pointer_width(), ARG_SLOT_SIZE),
+                );
             }
 
             // Small composite ≤ 8 bytes.
@@ -1081,11 +1065,31 @@ mod tests {
         let ty = CType::Struct {
             name: None,
             fields: vec![
-                StructField { name: None, ty: CType::Float, bit_width: None },
-                StructField { name: None, ty: CType::Float, bit_width: None },
-                StructField { name: None, ty: CType::Float, bit_width: None },
-                StructField { name: None, ty: CType::Float, bit_width: None },
-                StructField { name: None, ty: CType::Float, bit_width: None },
+                StructField {
+                    name: None,
+                    ty: CType::Float,
+                    bit_width: None,
+                },
+                StructField {
+                    name: None,
+                    ty: CType::Float,
+                    bit_width: None,
+                },
+                StructField {
+                    name: None,
+                    ty: CType::Float,
+                    bit_width: None,
+                },
+                StructField {
+                    name: None,
+                    ty: CType::Float,
+                    bit_width: None,
+                },
+                StructField {
+                    name: None,
+                    ty: CType::Float,
+                    bit_width: None,
+                },
             ],
             packed: false,
             aligned: None,
@@ -1146,9 +1150,21 @@ mod tests {
         let ty = CType::Struct {
             name: None,
             fields: vec![
-                StructField { name: None, ty: CType::LongLong, bit_width: None },
-                StructField { name: None, ty: CType::LongLong, bit_width: None },
-                StructField { name: None, ty: CType::LongLong, bit_width: None },
+                StructField {
+                    name: None,
+                    ty: CType::LongLong,
+                    bit_width: None,
+                },
+                StructField {
+                    name: None,
+                    ty: CType::LongLong,
+                    bit_width: None,
+                },
+                StructField {
+                    name: None,
+                    ty: CType::LongLong,
+                    bit_width: None,
+                },
             ],
             packed: false,
             aligned: None,
@@ -1214,8 +1230,16 @@ mod tests {
         let ty = CType::Struct {
             name: None,
             fields: vec![
-                StructField { name: None, ty: CType::Long, bit_width: None },
-                StructField { name: None, ty: CType::Long, bit_width: None },
+                StructField {
+                    name: None,
+                    ty: CType::Long,
+                    bit_width: None,
+                },
+                StructField {
+                    name: None,
+                    ty: CType::Long,
+                    bit_width: None,
+                },
             ],
             packed: false,
             aligned: None,
@@ -1241,8 +1265,16 @@ mod tests {
         let hfa = CType::Struct {
             name: None,
             fields: vec![
-                StructField { name: None, ty: CType::Float, bit_width: None },
-                StructField { name: None, ty: CType::Float, bit_width: None },
+                StructField {
+                    name: None,
+                    ty: CType::Float,
+                    bit_width: None,
+                },
+                StructField {
+                    name: None,
+                    ty: CType::Float,
+                    bit_width: None,
+                },
             ],
             packed: false,
             aligned: None,
@@ -1258,8 +1290,16 @@ mod tests {
         let hfa = CType::Struct {
             name: None,
             fields: vec![
-                StructField { name: None, ty: CType::Double, bit_width: None },
-                StructField { name: None, ty: CType::Double, bit_width: None },
+                StructField {
+                    name: None,
+                    ty: CType::Double,
+                    bit_width: None,
+                },
+                StructField {
+                    name: None,
+                    ty: CType::Double,
+                    bit_width: None,
+                },
             ],
             packed: false,
             aligned: None,

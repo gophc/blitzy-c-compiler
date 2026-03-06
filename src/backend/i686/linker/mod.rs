@@ -996,12 +996,8 @@ impl I686Linker {
     /// - `_edata` — end of `.data` section
     /// - `_end` / `__end` — end of all sections
     /// - `__executable_start` — base load address (`0x08048000`)
-    pub fn define_linker_symbols(
-        &mut self,
-        section_addr_map: &FxHashMap<String, (u64, u64)>,
-    ) {
-        self.symbol_resolver
-            .define_linker_symbols(section_addr_map);
+    pub fn define_linker_symbols(&mut self, section_addr_map: &FxHashMap<String, (u64, u64)>) {
+        self.symbol_resolver.define_linker_symbols(section_addr_map);
     }
 
     /// Resolve symbol names for relocations using the symbol resolver.

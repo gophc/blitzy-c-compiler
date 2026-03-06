@@ -44,10 +44,10 @@
 // Submodule declarations
 // ============================================================================
 
+pub mod asm_lowering;
+pub mod decl_lowering;
 pub mod expr_lowering;
 pub mod stmt_lowering;
-pub mod decl_lowering;
-pub mod asm_lowering;
 
 // ============================================================================
 // Imports — only `std` and `crate::` references (zero-dependency mandate)
@@ -553,9 +553,7 @@ impl<'a> LoweringContext<'a> {
     /// gotos that referenced this label before it was defined. Returns
     /// an empty Vec if there were no pending gotos.
     pub fn resolve_pending_gotos(&mut self, name: &str) -> Vec<(BlockId, usize)> {
-        self.pending_gotos
-            .remove(name)
-            .unwrap_or_default()
+        self.pending_gotos.remove(name).unwrap_or_default()
     }
 }
 
@@ -693,10 +691,10 @@ pub fn lower_translation_unit(
 
                 // Determine if this declaration contains function-type
                 // declarators (function prototypes).
-                let has_func_shape =
-                    decl.declarators.iter().any(|id| {
-                        declarator_has_function_shape(&id.declarator)
-                    });
+                let has_func_shape = decl
+                    .declarators
+                    .iter()
+                    .any(|id| declarator_has_function_shape(&id.declarator));
 
                 // Function declarations (prototypes without bodies) produce
                 // FunctionDeclaration entries in the IR module.
@@ -875,9 +873,7 @@ pub fn size_of(ctype: &CType, target: &Target) -> usize {
 fn declarator_has_function_shape(decl: &ast::Declarator) -> bool {
     match &decl.direct {
         ast::DirectDeclarator::Function { .. } => true,
-        ast::DirectDeclarator::Parenthesized(inner) => {
-            declarator_has_function_shape(inner)
-        }
+        ast::DirectDeclarator::Parenthesized(inner) => declarator_has_function_shape(inner),
         _ => false,
     }
 }
@@ -885,9 +881,7 @@ fn declarator_has_function_shape(decl: &ast::Declarator) -> bool {
 /// Check if a declaration has any initializer (i.e., is a definition
 /// rather than a pure declaration).
 fn declaration_has_initializer(decl: &ast::Declaration) -> bool {
-    decl.declarators
-        .iter()
-        .any(|id| id.initializer.is_some())
+    decl.declarators.iter().any(|id| id.initializer.is_some())
 }
 
 /// Extract the template string from a file-scope `AsmStatement`.

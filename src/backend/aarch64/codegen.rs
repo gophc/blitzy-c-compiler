@@ -20,9 +20,7 @@
 //! - 32 SIMD/FP registers: V0–V31 (128-bit), D0–D31 (64-bit double), S0–S31 (32-bit float)
 //! - NZCV condition flags register
 
-use crate::backend::aarch64::abi::{
-    AArch64Abi, FrameLayout, INT_ARG_REGS, NUM_INT_ARG_REGS,
-};
+use crate::backend::aarch64::abi::{AArch64Abi, FrameLayout, INT_ARG_REGS, NUM_INT_ARG_REGS};
 use crate::backend::aarch64::registers::*;
 use crate::backend::traits::ArgLocation;
 use crate::common::diagnostics::Span;
@@ -36,8 +34,7 @@ use crate::ir::types::IrType;
 // Re-import items used only in test verification module to avoid unused import warnings.
 #[cfg(test)]
 use crate::backend::aarch64::abi::{
-    ArgClass, FP_ARG_REGS, INDIRECT_RESULT_REG, INT_RET_REGS,
-    NUM_FP_ARG_REGS, STACK_ALIGNMENT,
+    ArgClass, FP_ARG_REGS, INDIRECT_RESULT_REG, INT_RET_REGS, NUM_FP_ARG_REGS, STACK_ALIGNMENT,
 };
 #[cfg(test)]
 use crate::backend::traits::{
@@ -790,10 +787,9 @@ impl AArch64InstructionSelector {
                     is_atomic: false,
                 },
             ),
-            IrType::Array(inner, size) => CType::Array(
-                Box::new(Self::irtype_to_ctype(inner)),
-                Some(*size),
-            ),
+            IrType::Array(inner, size) => {
+                CType::Array(Box::new(Self::irtype_to_ctype(inner)), Some(*size))
+            }
             IrType::Struct(_) => CType::Struct {
                 name: None,
                 fields: Vec::new(),
@@ -909,7 +905,12 @@ impl AArch64InstructionSelector {
                     .with_rd(rd)
                     .with_rn(rd)
                     .with_symbol(format!(":got_lo12:{}", symbol))
-                    .with_comment(format!("ldr {}, [{}, :got_lo12:{}]", gpr_name(rd), gpr_name(rd), symbol)),
+                    .with_comment(format!(
+                        "ldr {}, [{}, :got_lo12:{}]",
+                        gpr_name(rd),
+                        gpr_name(rd),
+                        symbol
+                    )),
             );
         } else {
             // Direct PC-relative addressing.
@@ -924,7 +925,12 @@ impl AArch64InstructionSelector {
                     .with_rd(rd)
                     .with_rn(rd)
                     .with_symbol(format!(":lo12:{}", symbol))
-                    .with_comment(format!("add {}, {}, :lo12:{}", gpr_name(rd), gpr_name(rd), symbol)),
+                    .with_comment(format!(
+                        "add {}, {}, :lo12:{}",
+                        gpr_name(rd),
+                        gpr_name(rd),
+                        symbol
+                    )),
             );
         }
         result
@@ -944,11 +950,7 @@ impl AArch64InstructionSelector {
     /// 4. Set up argument registers
     /// 5. Process each basic block
     /// 6. Emit epilogue (restore callee-saved; LDP x29,x30; RET)
-    pub fn select_function(
-        &mut self,
-        func: &IrFunction,
-        abi: &AArch64Abi,
-    ) -> Vec<A64Instruction> {
+    pub fn select_function(&mut self, func: &IrFunction, abi: &AArch64Abi) -> Vec<A64Instruction> {
         self.reset();
         if !func.is_definition {
             return Vec::new();
@@ -1038,8 +1040,12 @@ impl AArch64InstructionSelector {
                     .with_rn(gprs[i + 1])
                     .with_rm(SP_REG)
                     .with_imm(offset)
-                    .with_comment(format!("stp {}, {}, [sp, #{}]",
-                        gpr_name(gprs[i]), gpr_name(gprs[i + 1]), offset)),
+                    .with_comment(format!(
+                        "stp {}, {}, [sp, #{}]",
+                        gpr_name(gprs[i]),
+                        gpr_name(gprs[i + 1]),
+                        offset
+                    )),
             );
             offset += 16;
             i += 2;
@@ -1067,8 +1073,12 @@ impl AArch64InstructionSelector {
                     .with_rm(SP_REG)
                     .with_imm(offset)
                     .set_fp()
-                    .with_comment(format!("stp {}, {}, [sp, #{}]",
-                        fpr_name_d(fprs[fi]), fpr_name_d(fprs[fi + 1]), offset)),
+                    .with_comment(format!(
+                        "stp {}, {}, [sp, #{}]",
+                        fpr_name_d(fprs[fi]),
+                        fpr_name_d(fprs[fi + 1]),
+                        offset
+                    )),
             );
             offset += 16;
             fi += 2;
@@ -1105,8 +1115,12 @@ impl AArch64InstructionSelector {
                     .with_rn(gprs[i + 1])
                     .with_rm(SP_REG)
                     .with_imm(offset)
-                    .with_comment(format!("ldp {}, {}, [sp, #{}]",
-                        gpr_name(gprs[i]), gpr_name(gprs[i + 1]), offset)),
+                    .with_comment(format!(
+                        "ldp {}, {}, [sp, #{}]",
+                        gpr_name(gprs[i]),
+                        gpr_name(gprs[i + 1]),
+                        offset
+                    )),
             );
             offset += 16;
             i += 2;
@@ -1133,8 +1147,12 @@ impl AArch64InstructionSelector {
                     .with_rm(SP_REG)
                     .with_imm(offset)
                     .set_fp()
-                    .with_comment(format!("ldp {}, {}, [sp, #{}]",
-                        fpr_name_d(fprs[fi]), fpr_name_d(fprs[fi + 1]), offset)),
+                    .with_comment(format!(
+                        "ldp {}, {}, [sp, #{}]",
+                        fpr_name_d(fprs[fi]),
+                        fpr_name_d(fprs[fi + 1]),
+                        offset
+                    )),
             );
             offset += 16;
             fi += 2;
@@ -1177,17 +1195,19 @@ impl AArch64InstructionSelector {
                 ArgLocation::Register(reg) => {
                     // Argument is already in the correct register; emit
                     // a NOP placeholder tracking the location.
-                    self.emit(
-                        A64Instruction::new(A64Opcode::NOP)
-                            .with_comment(format!("arg {} in reg {}", i, gpr_name(reg as u8))),
-                    );
+                    self.emit(A64Instruction::new(A64Opcode::NOP).with_comment(format!(
+                        "arg {} in reg {}",
+                        i,
+                        gpr_name(reg as u8)
+                    )));
                 }
                 ArgLocation::RegisterPair(r1, r2) => {
-                    self.emit(
-                        A64Instruction::new(A64Opcode::NOP)
-                            .with_comment(format!("arg {} in regs {},{}", i,
-                                gpr_name(r1 as u8), gpr_name(r2 as u8))),
-                    );
+                    self.emit(A64Instruction::new(A64Opcode::NOP).with_comment(format!(
+                        "arg {} in regs {},{}",
+                        i,
+                        gpr_name(r1 as u8),
+                        gpr_name(r2 as u8)
+                    )));
                 }
                 ArgLocation::Stack(offset) => {
                     // Load stack argument via frame pointer.
@@ -1196,7 +1216,11 @@ impl AArch64InstructionSelector {
                             .with_rd(X9)
                             .with_rn(FP_REG)
                             .with_imm(offset as i64 + 16)
-                            .with_comment(format!("load stack arg {} from [fp+{}]", i, offset + 16)),
+                            .with_comment(format!(
+                                "load stack arg {} from [fp+{}]",
+                                i,
+                                offset + 16
+                            )),
                     );
                 }
             }
@@ -1234,66 +1258,134 @@ impl AArch64InstructionSelector {
     /// Dispatches to type-specific selection methods based on the IR instruction variant.
     pub fn select_instruction(&mut self, ir_inst: &Instruction) -> Vec<A64Instruction> {
         match ir_inst {
-            Instruction::Alloca { result, ty, alignment, span } => {
-                self.select_alloca(result, ty, alignment, span)
-            }
-            Instruction::Load { result, ptr, ty, volatile: _, span: _ } => {
-                self.select_load(result, ptr, ty)
-            }
-            Instruction::Store { value, ptr, volatile: _, span: _ } => {
-                self.select_store(value, ptr)
-            }
-            Instruction::BinOp { result, op, lhs, rhs, ty, span: _ } => {
-                self.select_binop(result, op, lhs, rhs, ty)
-            }
-            Instruction::ICmp { result, op, lhs, rhs, span: _ } => {
-                self.select_icmp(result, op, lhs, rhs)
-            }
-            Instruction::FCmp { result, op, lhs, rhs, span: _ } => {
-                self.select_fcmp(result, op, lhs, rhs)
-            }
+            Instruction::Alloca {
+                result,
+                ty,
+                alignment,
+                span,
+            } => self.select_alloca(result, ty, alignment, span),
+            Instruction::Load {
+                result,
+                ptr,
+                ty,
+                volatile: _,
+                span: _,
+            } => self.select_load(result, ptr, ty),
+            Instruction::Store {
+                value,
+                ptr,
+                volatile: _,
+                span: _,
+            } => self.select_store(value, ptr),
+            Instruction::BinOp {
+                result,
+                op,
+                lhs,
+                rhs,
+                ty,
+                span: _,
+            } => self.select_binop(result, op, lhs, rhs, ty),
+            Instruction::ICmp {
+                result,
+                op,
+                lhs,
+                rhs,
+                span: _,
+            } => self.select_icmp(result, op, lhs, rhs),
+            Instruction::FCmp {
+                result,
+                op,
+                lhs,
+                rhs,
+                span: _,
+            } => self.select_fcmp(result, op, lhs, rhs),
             Instruction::Branch { target, span: _ } => self.select_branch(target),
-            Instruction::CondBranch { condition, then_block, else_block, span: _ } => {
-                self.select_cond_branch(condition, then_block, else_block)
-            }
-            Instruction::Switch { value, default, cases, span: _ } => {
-                self.select_switch(value, default, cases)
-            }
-            Instruction::Call { result, callee, args, return_type, span: _ } => {
-                self.select_call(result, callee, args, return_type)
-            }
+            Instruction::CondBranch {
+                condition,
+                then_block,
+                else_block,
+                span: _,
+            } => self.select_cond_branch(condition, then_block, else_block),
+            Instruction::Switch {
+                value,
+                default,
+                cases,
+                span: _,
+            } => self.select_switch(value, default, cases),
+            Instruction::Call {
+                result,
+                callee,
+                args,
+                return_type,
+                span: _,
+            } => self.select_call(result, callee, args, return_type),
             Instruction::Return { value, span: _ } => self.select_return(value),
             Instruction::Phi { .. } => {
                 // Phi nodes are eliminated before code generation; emit NOP placeholder.
                 vec![A64Instruction::new(A64Opcode::NOP).with_comment("phi (eliminated)")]
             }
-            Instruction::GetElementPtr { result, base, indices, result_type, in_bounds: _, span: _ } => {
-                self.select_gep(result, base, indices, result_type)
-            }
-            Instruction::BitCast { result, value, to_type, span: _ } => {
-                self.select_bitcast(result, value, to_type)
-            }
-            Instruction::Trunc { result, value, to_type, span: _ } => {
-                self.select_trunc(result, value, to_type)
-            }
-            Instruction::ZExt { result, value, to_type, span: _ } => {
-                self.select_zext(result, value, to_type)
-            }
-            Instruction::SExt { result, value, to_type, span: _ } => {
-                self.select_sext(result, value, to_type)
-            }
-            Instruction::IntToPtr { result, value, span: _ } => {
-                self.select_int_to_ptr(result, value)
-            }
-            Instruction::PtrToInt { result, value, to_type, span: _ } => {
-                self.select_ptr_to_int(result, value, to_type)
-            }
+            Instruction::GetElementPtr {
+                result,
+                base,
+                indices,
+                result_type,
+                in_bounds: _,
+                span: _,
+            } => self.select_gep(result, base, indices, result_type),
+            Instruction::BitCast {
+                result,
+                value,
+                to_type,
+                span: _,
+            } => self.select_bitcast(result, value, to_type),
+            Instruction::Trunc {
+                result,
+                value,
+                to_type,
+                span: _,
+            } => self.select_trunc(result, value, to_type),
+            Instruction::ZExt {
+                result,
+                value,
+                to_type,
+                span: _,
+            } => self.select_zext(result, value, to_type),
+            Instruction::SExt {
+                result,
+                value,
+                to_type,
+                span: _,
+            } => self.select_sext(result, value, to_type),
+            Instruction::IntToPtr {
+                result,
+                value,
+                span: _,
+            } => self.select_int_to_ptr(result, value),
+            Instruction::PtrToInt {
+                result,
+                value,
+                to_type,
+                span: _,
+            } => self.select_ptr_to_int(result, value, to_type),
             Instruction::InlineAsm {
-                result, template, constraints, operands, clobbers,
-                has_side_effects: _, is_volatile: _, goto_targets, span,
-            } => {
-                self.select_inline_asm(result, template, constraints, operands, clobbers, goto_targets, span)
-            }
+                result,
+                template,
+                constraints,
+                operands,
+                clobbers,
+                has_side_effects: _,
+                is_volatile: _,
+                goto_targets,
+                span,
+            } => self.select_inline_asm(
+                result,
+                template,
+                constraints,
+                operands,
+                clobbers,
+                goto_targets,
+                span,
+            ),
         }
     }
 
@@ -1319,13 +1411,11 @@ impl AArch64InstructionSelector {
         // Compute address as FP - offset.
         let abs_off = (offset + size) as u64;
         if fits_add_sub_imm(abs_off) {
-            vec![
-                A64Instruction::new(A64Opcode::SUB_imm)
-                    .with_rd(rd)
-                    .with_rn(FP_REG)
-                    .with_imm(abs_off as i64)
-                    .with_comment(format!("alloca {} bytes (align {})", size, align)),
-            ]
+            vec![A64Instruction::new(A64Opcode::SUB_imm)
+                .with_rd(rd)
+                .with_rn(FP_REG)
+                .with_imm(abs_off as i64)
+                .with_comment(format!("alloca {} bytes (align {})", size, align))]
         } else {
             let mut v = self.materialize_immediate(IP0, abs_off);
             v.push(
@@ -1340,12 +1430,7 @@ impl AArch64InstructionSelector {
     }
 
     /// Select load instructions based on the loaded type's size.
-    fn select_load(
-        &mut self,
-        result: &Value,
-        ptr: &Value,
-        ty: &IrType,
-    ) -> Vec<A64Instruction> {
+    fn select_load(&mut self, result: &Value, ptr: &Value, ty: &IrType) -> Vec<A64Instruction> {
         let rd = result.index() as u8;
         let rn = ptr.index() as u8;
         let size = self.type_size_for_mem(ty);
@@ -1381,21 +1466,15 @@ impl AArch64InstructionSelector {
     /// Select store instructions. Since the IR Store does not carry the stored
     /// type directly, we default to a 64-bit store. The register allocator
     /// and type analysis passes refine this.
-    fn select_store(
-        &mut self,
-        value: &Value,
-        ptr: &Value,
-    ) -> Vec<A64Instruction> {
+    fn select_store(&mut self, value: &Value, ptr: &Value) -> Vec<A64Instruction> {
         let rd = value.index() as u8;
         let rn = ptr.index() as u8;
 
-        vec![
-            A64Instruction::new(A64Opcode::STR_imm)
-                .with_rd(rd)
-                .with_rn(rn)
-                .with_imm(0)
-                .with_comment("store (64-bit default)"),
-        ]
+        vec![A64Instruction::new(A64Opcode::STR_imm)
+            .with_rd(rd)
+            .with_rn(rn)
+            .with_imm(0)
+            .with_comment("store (64-bit default)")]
     }
 
     /// Select instructions for a binary operation (integer or FP).
@@ -1416,33 +1495,54 @@ impl AArch64InstructionSelector {
         match op {
             BinOp::Add => {
                 let mut inst = A64Instruction::new(A64Opcode::ADD_reg)
-                    .with_rd(rd).with_rn(rn).with_rm(rm);
-                if is_32 { inst = inst.set_32bit(); }
+                    .with_rd(rd)
+                    .with_rn(rn)
+                    .with_rm(rm);
+                if is_32 {
+                    inst = inst.set_32bit();
+                }
                 insts.push(inst);
             }
             BinOp::Sub => {
                 let mut inst = A64Instruction::new(A64Opcode::SUB_reg)
-                    .with_rd(rd).with_rn(rn).with_rm(rm);
-                if is_32 { inst = inst.set_32bit(); }
+                    .with_rd(rd)
+                    .with_rn(rn)
+                    .with_rm(rm);
+                if is_32 {
+                    inst = inst.set_32bit();
+                }
                 insts.push(inst);
             }
             BinOp::Mul => {
                 // MUL is alias for MADD Rd, Rn, Rm, XZR.
                 let mut inst = A64Instruction::new(A64Opcode::MADD)
-                    .with_rd(rd).with_rn(rn).with_rm(rm).with_ra(XZR);
-                if is_32 { inst = inst.set_32bit(); }
+                    .with_rd(rd)
+                    .with_rn(rn)
+                    .with_rm(rm)
+                    .with_ra(XZR);
+                if is_32 {
+                    inst = inst.set_32bit();
+                }
                 insts.push(inst);
             }
             BinOp::SDiv => {
                 let mut inst = A64Instruction::new(A64Opcode::SDIV)
-                    .with_rd(rd).with_rn(rn).with_rm(rm);
-                if is_32 { inst = inst.set_32bit(); }
+                    .with_rd(rd)
+                    .with_rn(rn)
+                    .with_rm(rm);
+                if is_32 {
+                    inst = inst.set_32bit();
+                }
                 insts.push(inst);
             }
             BinOp::UDiv => {
                 let mut inst = A64Instruction::new(A64Opcode::UDIV)
-                    .with_rd(rd).with_rn(rn).with_rm(rm);
-                if is_32 { inst = inst.set_32bit(); }
+                    .with_rd(rd)
+                    .with_rn(rn)
+                    .with_rm(rm);
+                if is_32 {
+                    inst = inst.set_32bit();
+                }
                 insts.push(inst);
             }
             BinOp::SRem => {
@@ -1451,81 +1551,167 @@ impl AArch64InstructionSelector {
                 // Implementation: SDIV tmp, Rn, Rm; MSUB Rd, tmp, Rm, Rn
                 let tmp = IP0;
                 let mut div = A64Instruction::new(A64Opcode::SDIV)
-                    .with_rd(tmp).with_rn(rn).with_rm(rm);
-                if is_32 { div = div.set_32bit(); }
+                    .with_rd(tmp)
+                    .with_rn(rn)
+                    .with_rm(rm);
+                if is_32 {
+                    div = div.set_32bit();
+                }
                 insts.push(div);
                 let mut msub = A64Instruction::new(A64Opcode::MSUB)
-                    .with_rd(rd).with_rn(tmp).with_rm(rm).with_ra(rn);
-                if is_32 { msub = msub.set_32bit(); }
+                    .with_rd(rd)
+                    .with_rn(tmp)
+                    .with_rm(rm)
+                    .with_ra(rn);
+                if is_32 {
+                    msub = msub.set_32bit();
+                }
                 insts.push(msub);
             }
             BinOp::URem => {
                 let tmp = IP0;
                 let mut div = A64Instruction::new(A64Opcode::UDIV)
-                    .with_rd(tmp).with_rn(rn).with_rm(rm);
-                if is_32 { div = div.set_32bit(); }
+                    .with_rd(tmp)
+                    .with_rn(rn)
+                    .with_rm(rm);
+                if is_32 {
+                    div = div.set_32bit();
+                }
                 insts.push(div);
                 let mut msub = A64Instruction::new(A64Opcode::MSUB)
-                    .with_rd(rd).with_rn(tmp).with_rm(rm).with_ra(rn);
-                if is_32 { msub = msub.set_32bit(); }
+                    .with_rd(rd)
+                    .with_rn(tmp)
+                    .with_rm(rm)
+                    .with_ra(rn);
+                if is_32 {
+                    msub = msub.set_32bit();
+                }
                 insts.push(msub);
             }
             BinOp::And => {
                 let mut inst = A64Instruction::new(A64Opcode::AND_reg)
-                    .with_rd(rd).with_rn(rn).with_rm(rm);
-                if is_32 { inst = inst.set_32bit(); }
+                    .with_rd(rd)
+                    .with_rn(rn)
+                    .with_rm(rm);
+                if is_32 {
+                    inst = inst.set_32bit();
+                }
                 insts.push(inst);
             }
             BinOp::Or => {
                 let mut inst = A64Instruction::new(A64Opcode::ORR_reg)
-                    .with_rd(rd).with_rn(rn).with_rm(rm);
-                if is_32 { inst = inst.set_32bit(); }
+                    .with_rd(rd)
+                    .with_rn(rn)
+                    .with_rm(rm);
+                if is_32 {
+                    inst = inst.set_32bit();
+                }
                 insts.push(inst);
             }
             BinOp::Xor => {
                 let mut inst = A64Instruction::new(A64Opcode::EOR_reg)
-                    .with_rd(rd).with_rn(rn).with_rm(rm);
-                if is_32 { inst = inst.set_32bit(); }
+                    .with_rd(rd)
+                    .with_rn(rn)
+                    .with_rm(rm);
+                if is_32 {
+                    inst = inst.set_32bit();
+                }
                 insts.push(inst);
             }
             BinOp::Shl => {
                 let mut inst = A64Instruction::new(A64Opcode::LSL_reg)
-                    .with_rd(rd).with_rn(rn).with_rm(rm);
-                if is_32 { inst = inst.set_32bit(); }
+                    .with_rd(rd)
+                    .with_rn(rn)
+                    .with_rm(rm);
+                if is_32 {
+                    inst = inst.set_32bit();
+                }
                 insts.push(inst);
             }
             BinOp::AShr => {
                 let mut inst = A64Instruction::new(A64Opcode::ASR_reg)
-                    .with_rd(rd).with_rn(rn).with_rm(rm);
-                if is_32 { inst = inst.set_32bit(); }
+                    .with_rd(rd)
+                    .with_rn(rn)
+                    .with_rm(rm);
+                if is_32 {
+                    inst = inst.set_32bit();
+                }
                 insts.push(inst);
             }
             BinOp::LShr => {
                 let mut inst = A64Instruction::new(A64Opcode::LSR_reg)
-                    .with_rd(rd).with_rn(rn).with_rm(rm);
-                if is_32 { inst = inst.set_32bit(); }
+                    .with_rd(rd)
+                    .with_rn(rn)
+                    .with_rm(rm);
+                if is_32 {
+                    inst = inst.set_32bit();
+                }
                 insts.push(inst);
             }
             // Floating-point arithmetic
             BinOp::FAdd => {
-                let opc = if matches!(ty, IrType::F32) { A64Opcode::FADD_s } else { A64Opcode::FADD_d };
-                insts.push(A64Instruction::new(opc).with_rd(rd).with_rn(rn).with_rm(rm).set_fp());
+                let opc = if matches!(ty, IrType::F32) {
+                    A64Opcode::FADD_s
+                } else {
+                    A64Opcode::FADD_d
+                };
+                insts.push(
+                    A64Instruction::new(opc)
+                        .with_rd(rd)
+                        .with_rn(rn)
+                        .with_rm(rm)
+                        .set_fp(),
+                );
             }
             BinOp::FSub => {
-                let opc = if matches!(ty, IrType::F32) { A64Opcode::FSUB_s } else { A64Opcode::FSUB_d };
-                insts.push(A64Instruction::new(opc).with_rd(rd).with_rn(rn).with_rm(rm).set_fp());
+                let opc = if matches!(ty, IrType::F32) {
+                    A64Opcode::FSUB_s
+                } else {
+                    A64Opcode::FSUB_d
+                };
+                insts.push(
+                    A64Instruction::new(opc)
+                        .with_rd(rd)
+                        .with_rn(rn)
+                        .with_rm(rm)
+                        .set_fp(),
+                );
             }
             BinOp::FMul => {
-                let opc = if matches!(ty, IrType::F32) { A64Opcode::FMUL_s } else { A64Opcode::FMUL_d };
-                insts.push(A64Instruction::new(opc).with_rd(rd).with_rn(rn).with_rm(rm).set_fp());
+                let opc = if matches!(ty, IrType::F32) {
+                    A64Opcode::FMUL_s
+                } else {
+                    A64Opcode::FMUL_d
+                };
+                insts.push(
+                    A64Instruction::new(opc)
+                        .with_rd(rd)
+                        .with_rn(rn)
+                        .with_rm(rm)
+                        .set_fp(),
+                );
             }
             BinOp::FDiv => {
-                let opc = if matches!(ty, IrType::F32) { A64Opcode::FDIV_s } else { A64Opcode::FDIV_d };
-                insts.push(A64Instruction::new(opc).with_rd(rd).with_rn(rn).with_rm(rm).set_fp());
+                let opc = if matches!(ty, IrType::F32) {
+                    A64Opcode::FDIV_s
+                } else {
+                    A64Opcode::FDIV_d
+                };
+                insts.push(
+                    A64Instruction::new(opc)
+                        .with_rd(rd)
+                        .with_rn(rn)
+                        .with_rm(rm)
+                        .set_fp(),
+                );
             }
             BinOp::FRem => {
                 // AArch64 has no FREM instruction; delegate to runtime fmodf/fmod.
-                let fname = if matches!(ty, IrType::F32) { "fmodf" } else { "fmod" };
+                let fname = if matches!(ty, IrType::F32) {
+                    "fmodf"
+                } else {
+                    "fmod"
+                };
                 insts.push(
                     A64Instruction::new(A64Opcode::CALL)
                         .with_symbol(fname.to_string())
@@ -1599,11 +1785,9 @@ impl AArch64InstructionSelector {
         } else {
             format!(".LBB_{}", target.index())
         };
-        vec![
-            A64Instruction::new(A64Opcode::B)
-                .with_symbol(label)
-                .with_comment(format!("b -> bb{}", target.index())),
-        ]
+        vec![A64Instruction::new(A64Opcode::B)
+            .with_symbol(label)
+            .with_comment(format!("b -> bb{}", target.index()))]
     }
 
     /// Select a conditional branch (CBNZ for true path, B for false path).
@@ -1828,27 +2012,21 @@ impl AArch64InstructionSelector {
 
         if to_type.is_float() {
             // GP register -> FP register.
-            vec![
-                A64Instruction::new(A64Opcode::FMOV_gen_to_fp)
-                    .with_rd(rd)
-                    .with_rn(rn)
-                    .set_fp()
-                    .with_comment("bitcast gp -> fp"),
-            ]
+            vec![A64Instruction::new(A64Opcode::FMOV_gen_to_fp)
+                .with_rd(rd)
+                .with_rn(rn)
+                .set_fp()
+                .with_comment("bitcast gp -> fp")]
         } else if to_type.is_pointer() || to_type.is_integer() {
-            vec![
-                A64Instruction::new(A64Opcode::MOV_reg)
-                    .with_rd(rd)
-                    .with_rn(rn)
-                    .with_comment("bitcast (mov)"),
-            ]
+            vec![A64Instruction::new(A64Opcode::MOV_reg)
+                .with_rd(rd)
+                .with_rn(rn)
+                .with_comment("bitcast (mov)")]
         } else {
-            vec![
-                A64Instruction::new(A64Opcode::MOV_reg)
-                    .with_rd(rd)
-                    .with_rn(rn)
-                    .with_comment("bitcast"),
-            ]
+            vec![A64Instruction::new(A64Opcode::MOV_reg)
+                .with_rd(rd)
+                .with_rn(rn)
+                .with_comment("bitcast")]
         }
     }
 
@@ -1865,50 +2043,40 @@ impl AArch64InstructionSelector {
         match to_type {
             IrType::I1 => {
                 // AND Wd, Wn, #1
-                vec![
-                    A64Instruction::new(A64Opcode::AND_imm)
-                        .with_rd(rd)
-                        .with_rn(rn)
-                        .with_imm(1)
-                        .set_32bit()
-                        .with_comment("trunc to i1"),
-                ]
+                vec![A64Instruction::new(A64Opcode::AND_imm)
+                    .with_rd(rd)
+                    .with_rn(rn)
+                    .with_imm(1)
+                    .set_32bit()
+                    .with_comment("trunc to i1")]
             }
             IrType::I8 => {
-                vec![
-                    A64Instruction::new(A64Opcode::UXTB)
-                        .with_rd(rd)
-                        .with_rn(rn)
-                        .set_32bit()
-                        .with_comment("trunc to i8 (uxtb)"),
-                ]
+                vec![A64Instruction::new(A64Opcode::UXTB)
+                    .with_rd(rd)
+                    .with_rn(rn)
+                    .set_32bit()
+                    .with_comment("trunc to i8 (uxtb)")]
             }
             IrType::I16 => {
-                vec![
-                    A64Instruction::new(A64Opcode::UXTH)
-                        .with_rd(rd)
-                        .with_rn(rn)
-                        .set_32bit()
-                        .with_comment("trunc to i16 (uxth)"),
-                ]
+                vec![A64Instruction::new(A64Opcode::UXTH)
+                    .with_rd(rd)
+                    .with_rn(rn)
+                    .set_32bit()
+                    .with_comment("trunc to i16 (uxth)")]
             }
             IrType::I32 => {
                 // MOV Wd, Wn: writing to W-register implicitly zero-extends.
-                vec![
-                    A64Instruction::new(A64Opcode::MOV_reg)
-                        .with_rd(rd)
-                        .with_rn(rn)
-                        .set_32bit()
-                        .with_comment("trunc to i32 (mov w)"),
-                ]
+                vec![A64Instruction::new(A64Opcode::MOV_reg)
+                    .with_rd(rd)
+                    .with_rn(rn)
+                    .set_32bit()
+                    .with_comment("trunc to i32 (mov w)")]
             }
             _ => {
-                vec![
-                    A64Instruction::new(A64Opcode::MOV_reg)
-                        .with_rd(rd)
-                        .with_rn(rn)
-                        .with_comment("trunc (nop)"),
-                ]
+                vec![A64Instruction::new(A64Opcode::MOV_reg)
+                    .with_rd(rd)
+                    .with_rn(rn)
+                    .with_comment("trunc (nop)")]
             }
         }
     }
@@ -1926,12 +2094,10 @@ impl AArch64InstructionSelector {
         // On AArch64, writing to a W-register implicitly zero-extends the
         // upper 32 bits of the containing X-register. For sub-32-bit sources,
         // use UXTB/UXTH; for 32->64, a simple MOV Wd suffices.
-        vec![
-            A64Instruction::new(A64Opcode::MOV_reg)
-                .with_rd(rd)
-                .with_rn(rn)
-                .with_comment(format!("zext to {:?}", to_type)),
-        ]
+        vec![A64Instruction::new(A64Opcode::MOV_reg)
+            .with_rd(rd)
+            .with_rn(rn)
+            .with_comment(format!("zext to {:?}", to_type))]
     }
 
     /// Select sign-extension instructions (SXTB, SXTH, SXTW).
@@ -1952,28 +2118,20 @@ impl AArch64InstructionSelector {
             _ => A64Opcode::SXTW,
         };
 
-        vec![
-            A64Instruction::new(opcode)
-                .with_rd(rd)
-                .with_rn(rn)
-                .with_comment(format!("sext to {:?}", to_type)),
-        ]
+        vec![A64Instruction::new(opcode)
+            .with_rd(rd)
+            .with_rn(rn)
+            .with_comment(format!("sext to {:?}", to_type))]
     }
 
     /// Select integer-to-pointer conversion (no-op on LP64).
-    fn select_int_to_ptr(
-        &mut self,
-        result: &Value,
-        value: &Value,
-    ) -> Vec<A64Instruction> {
+    fn select_int_to_ptr(&mut self, result: &Value, value: &Value) -> Vec<A64Instruction> {
         let rd = result.index() as u8;
         let rn = value.index() as u8;
-        vec![
-            A64Instruction::new(A64Opcode::MOV_reg)
-                .with_rd(rd)
-                .with_rn(rn)
-                .with_comment("inttoptr (nop on LP64)"),
-        ]
+        vec![A64Instruction::new(A64Opcode::MOV_reg)
+            .with_rd(rd)
+            .with_rn(rn)
+            .with_comment("inttoptr (nop on LP64)")]
     }
 
     /// Select pointer-to-integer conversion (no-op on LP64).
@@ -1985,12 +2143,10 @@ impl AArch64InstructionSelector {
     ) -> Vec<A64Instruction> {
         let rd = result.index() as u8;
         let rn = value.index() as u8;
-        vec![
-            A64Instruction::new(A64Opcode::MOV_reg)
-                .with_rd(rd)
-                .with_rn(rn)
-                .with_comment("ptrtoint (nop on LP64)"),
-        ]
+        vec![A64Instruction::new(A64Opcode::MOV_reg)
+            .with_rd(rd)
+            .with_rn(rn)
+            .with_comment("ptrtoint (nop on LP64)")]
     }
 
     /// Select inline assembly. Emits a pseudo-instruction that will be
@@ -2005,10 +2161,8 @@ impl AArch64InstructionSelector {
         _goto_targets: &[BlockId],
         _span: &Span,
     ) -> Vec<A64Instruction> {
-        vec![
-            A64Instruction::new(A64Opcode::INLINE_ASM)
-                .with_comment(format!("asm \"{}\" constraints: {}", template, constraints)),
-        ]
+        vec![A64Instruction::new(A64Opcode::INLINE_ASM)
+            .with_comment(format!("asm \"{}\" constraints: {}", template, constraints))]
     }
 }
 
@@ -2024,14 +2178,13 @@ mod _schema_verification {
 
     fn verify_register_usage() {
         let _regs: [u8; 37] = [
-            X0, X1, X2, X3, X4, X5, X6, X7, X8, X9, X10, X11, X12, X13,
-            X14, X15, X16, X17, X18, X19, X20, X21, X22, X23, X24, X25,
-            X26, X27, X28, X29, X30, SP_REG, XZR, FP_REG, LR, IP0, IP1,
+            X0, X1, X2, X3, X4, X5, X6, X7, X8, X9, X10, X11, X12, X13, X14, X15, X16, X17, X18,
+            X19, X20, X21, X22, X23, X24, X25, X26, X27, X28, X29, X30, SP_REG, XZR, FP_REG, LR,
+            IP0, IP1,
         ];
         let _fprs: [u8; 32] = [
-            V0, V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12,
-            V13, V14, V15, V16, V17, V18, V19, V20, V21, V22, V23,
-            V24, V25, V26, V27, V28, V29, V30, V31,
+            V0, V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15, V16, V17, V18,
+            V19, V20, V21, V22, V23, V24, V25, V26, V27, V28, V29, V30, V31,
         ];
         let _a = ALLOCATABLE_GPRS;
         let _b = ALLOCATABLE_FPRS;
@@ -2059,7 +2212,10 @@ mod _schema_verification {
         let _mo_vreg = MachineOperand::VirtualRegister(0);
         let _mo_imm = MachineOperand::Immediate(0);
         let _mo_mem = MachineOperand::Memory {
-            base: Some(0), index: None, scale: 1, displacement: 0,
+            base: Some(0),
+            index: None,
+            scale: 1,
+            displacement: 0,
         };
         let _mo_fs = MachineOperand::FrameSlot(0);
         let _mo_gs = MachineOperand::GlobalSymbol("test".to_string());
@@ -2078,18 +2234,45 @@ mod _schema_verification {
         let bid = BlockId(0);
         let _ = bid.index();
         let _ops = [
-            BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::SDiv, BinOp::UDiv,
-            BinOp::SRem, BinOp::URem, BinOp::And, BinOp::Or, BinOp::Xor,
-            BinOp::Shl, BinOp::AShr, BinOp::LShr, BinOp::FAdd, BinOp::FSub,
-            BinOp::FMul, BinOp::FDiv,
+            BinOp::Add,
+            BinOp::Sub,
+            BinOp::Mul,
+            BinOp::SDiv,
+            BinOp::UDiv,
+            BinOp::SRem,
+            BinOp::URem,
+            BinOp::And,
+            BinOp::Or,
+            BinOp::Xor,
+            BinOp::Shl,
+            BinOp::AShr,
+            BinOp::LShr,
+            BinOp::FAdd,
+            BinOp::FSub,
+            BinOp::FMul,
+            BinOp::FDiv,
         ];
         let _icmps = [
-            ICmpOp::Eq, ICmpOp::Ne, ICmpOp::Slt, ICmpOp::Sle, ICmpOp::Sgt,
-            ICmpOp::Sge, ICmpOp::Ult, ICmpOp::Ule, ICmpOp::Ugt, ICmpOp::Uge,
+            ICmpOp::Eq,
+            ICmpOp::Ne,
+            ICmpOp::Slt,
+            ICmpOp::Sle,
+            ICmpOp::Sgt,
+            ICmpOp::Sge,
+            ICmpOp::Ult,
+            ICmpOp::Ule,
+            ICmpOp::Ugt,
+            ICmpOp::Uge,
         ];
         let _fcmps = [
-            FCmpOp::Oeq, FCmpOp::One, FCmpOp::Olt, FCmpOp::Ole, FCmpOp::Ogt,
-            FCmpOp::Oge, FCmpOp::Uno, FCmpOp::Ord,
+            FCmpOp::Oeq,
+            FCmpOp::One,
+            FCmpOp::Olt,
+            FCmpOp::Ole,
+            FCmpOp::Ogt,
+            FCmpOp::Oge,
+            FCmpOp::Uno,
+            FCmpOp::Ord,
         ];
     }
 
@@ -2103,8 +2286,16 @@ mod _schema_verification {
         let _mf64 = MachineType::F64;
         let _mm = MachineType::Memory;
         let types: Vec<IrType> = vec![
-            IrType::I1, IrType::I8, IrType::I16, IrType::I32, IrType::I64,
-            IrType::I128, IrType::F32, IrType::F64, IrType::F80, IrType::Ptr,
+            IrType::I1,
+            IrType::I8,
+            IrType::I16,
+            IrType::I32,
+            IrType::I64,
+            IrType::I128,
+            IrType::F32,
+            IrType::F64,
+            IrType::F80,
+            IrType::Ptr,
             IrType::Void,
         ];
         for t in &types {
@@ -2172,7 +2363,10 @@ mod _schema_verification {
 
     fn verify_instruction_methods() {
         let span = Span::dummy();
-        let inst = Instruction::Branch { target: BlockId(0), span };
+        let inst = Instruction::Branch {
+            target: BlockId(0),
+            span,
+        };
         let _ = inst.result();
         let _ = inst.is_terminator();
         let _ = inst.span();

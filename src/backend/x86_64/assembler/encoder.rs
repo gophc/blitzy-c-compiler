@@ -31,10 +31,8 @@ use super::relocations::{RelocationEntry, X86_64RelocationType};
 use crate::backend::traits::{MachineInstruction, MachineOperand};
 use crate::backend::x86_64::codegen::X86Opcode;
 use crate::backend::x86_64::registers::{
-    hw_encoding, is_gpr, is_sse, needs_rex, OPERAND_SIZE_PREFIX,
-    RAX, RBP, RBX, RCX, RDI, RDX, RSI, RSP,
-    R8, R9, R10, R11, R12, R13, R14, R15,
-    XMM0, XMM8,
+    hw_encoding, is_gpr, is_sse, needs_rex, OPERAND_SIZE_PREFIX, R10, R11, R12, R13, R14, R15, R8,
+    R9, RAX, RBP, RBX, RCX, RDI, RDX, RSI, RSP, XMM0, XMM8,
 };
 use crate::common::fx_hash::FxHashMap;
 
@@ -148,10 +146,18 @@ pub struct OpcodeEntry {
 #[inline]
 fn rex_byte(w: bool, r: bool, x: bool, b: bool) -> u8 {
     let mut rex: u8 = 0x40;
-    if w { rex |= 0x08; }
-    if r { rex |= 0x04; }
-    if x { rex |= 0x02; }
-    if b { rex |= 0x01; }
+    if w {
+        rex |= 0x08;
+    }
+    if r {
+        rex |= 0x04;
+    }
+    if x {
+        rex |= 0x02;
+    }
+    if b {
+        rex |= 0x01;
+    }
     rex
 }
 
@@ -291,19 +297,20 @@ fn encode_memory_operand(
     displacement: i64,
 ) -> MemoryEncoding {
     let base_enc_low = base.map(|b| hw_encoding(b) & 0x7);
-    let has_real_index = index.is_some()
-        && index.map(|i| hw_encoding(i) & 0x7).unwrap_or(4) != 4;
+    let has_real_index = index.is_some() && index.map(|i| hw_encoding(i) & 0x7).unwrap_or(4) != 4;
 
-    let need_sib = has_real_index
-        || base_enc_low == Some(SIB_REQUIRED_ENC)
-        || base.is_none();
+    let need_sib = has_real_index || base_enc_low == Some(SIB_REQUIRED_ENC) || base.is_none();
 
     if need_sib {
         let index_enc = match index {
             Some(idx) if hw_encoding(idx) & 0x7 != 4 => hw_encoding(idx) & 0x7,
             _ => 0b100, // 100 = no index
         };
-        let scale_enc = if has_real_index { scale_encoding(scale) } else { 0b00 };
+        let scale_enc = if has_real_index {
+            scale_encoding(scale)
+        } else {
+            0b00
+        };
 
         match base {
             None => {
@@ -358,7 +365,7 @@ fn condition_code(op: &X86Opcode) -> u8 {
 fn alu_info(op: &X86Opcode) -> Option<(u8, u8, u8)> {
     match op {
         X86Opcode::Add => Some((0, 0x01, 0x03)),
-        X86Opcode::Or  => Some((1, 0x09, 0x0B)),
+        X86Opcode::Or => Some((1, 0x09, 0x0B)),
         X86Opcode::And => Some((4, 0x21, 0x23)),
         X86Opcode::Sub => Some((5, 0x29, 0x2B)),
         X86Opcode::Xor => Some((6, 0x31, 0x33)),
@@ -386,50 +393,105 @@ fn shift_opext(op: &X86Opcode) -> u8 {
 fn build_opcode_table() -> FxHashMap<u32, OpcodeEntry> {
     let mut table: FxHashMap<u32, OpcodeEntry> = FxHashMap::default();
 
-    table.insert(X86Opcode::Ret.as_u32(), OpcodeEntry {
-        opcode: &[0xC3], reg_opext: None, default_64bit: false,
-        form: EncodingForm::NoOperands,
-    });
-    table.insert(X86Opcode::Nop.as_u32(), OpcodeEntry {
-        opcode: &[0x90], reg_opext: None, default_64bit: false,
-        form: EncodingForm::NoOperands,
-    });
-    table.insert(X86Opcode::Cdq.as_u32(), OpcodeEntry {
-        opcode: &[0x99], reg_opext: None, default_64bit: false,
-        form: EncodingForm::NoOperands,
-    });
-    table.insert(X86Opcode::Cqo.as_u32(), OpcodeEntry {
-        opcode: &[0x99], reg_opext: None, default_64bit: true,
-        form: EncodingForm::NoOperands,
-    });
-    table.insert(X86Opcode::Endbr64.as_u32(), OpcodeEntry {
-        opcode: &[0xF3, 0x0F, 0x1E, 0xFA], reg_opext: None, default_64bit: false,
-        form: EncodingForm::NoOperands,
-    });
-    table.insert(X86Opcode::Pause.as_u32(), OpcodeEntry {
-        opcode: &[0xF3, 0x90], reg_opext: None, default_64bit: false,
-        form: EncodingForm::NoOperands,
-    });
-    table.insert(X86Opcode::Lfence.as_u32(), OpcodeEntry {
-        opcode: &[0x0F, 0xAE, 0xE8], reg_opext: None, default_64bit: false,
-        form: EncodingForm::NoOperands,
-    });
-    table.insert(X86Opcode::Neg.as_u32(), OpcodeEntry {
-        opcode: &[0xF7], reg_opext: Some(3), default_64bit: true,
-        form: EncodingForm::RmOnly,
-    });
-    table.insert(X86Opcode::Not.as_u32(), OpcodeEntry {
-        opcode: &[0xF7], reg_opext: Some(2), default_64bit: true,
-        form: EncodingForm::RmOnly,
-    });
-    table.insert(X86Opcode::Idiv.as_u32(), OpcodeEntry {
-        opcode: &[0xF7], reg_opext: Some(7), default_64bit: true,
-        form: EncodingForm::RmOnly,
-    });
-    table.insert(X86Opcode::Div.as_u32(), OpcodeEntry {
-        opcode: &[0xF7], reg_opext: Some(6), default_64bit: true,
-        form: EncodingForm::RmOnly,
-    });
+    table.insert(
+        X86Opcode::Ret.as_u32(),
+        OpcodeEntry {
+            opcode: &[0xC3],
+            reg_opext: None,
+            default_64bit: false,
+            form: EncodingForm::NoOperands,
+        },
+    );
+    table.insert(
+        X86Opcode::Nop.as_u32(),
+        OpcodeEntry {
+            opcode: &[0x90],
+            reg_opext: None,
+            default_64bit: false,
+            form: EncodingForm::NoOperands,
+        },
+    );
+    table.insert(
+        X86Opcode::Cdq.as_u32(),
+        OpcodeEntry {
+            opcode: &[0x99],
+            reg_opext: None,
+            default_64bit: false,
+            form: EncodingForm::NoOperands,
+        },
+    );
+    table.insert(
+        X86Opcode::Cqo.as_u32(),
+        OpcodeEntry {
+            opcode: &[0x99],
+            reg_opext: None,
+            default_64bit: true,
+            form: EncodingForm::NoOperands,
+        },
+    );
+    table.insert(
+        X86Opcode::Endbr64.as_u32(),
+        OpcodeEntry {
+            opcode: &[0xF3, 0x0F, 0x1E, 0xFA],
+            reg_opext: None,
+            default_64bit: false,
+            form: EncodingForm::NoOperands,
+        },
+    );
+    table.insert(
+        X86Opcode::Pause.as_u32(),
+        OpcodeEntry {
+            opcode: &[0xF3, 0x90],
+            reg_opext: None,
+            default_64bit: false,
+            form: EncodingForm::NoOperands,
+        },
+    );
+    table.insert(
+        X86Opcode::Lfence.as_u32(),
+        OpcodeEntry {
+            opcode: &[0x0F, 0xAE, 0xE8],
+            reg_opext: None,
+            default_64bit: false,
+            form: EncodingForm::NoOperands,
+        },
+    );
+    table.insert(
+        X86Opcode::Neg.as_u32(),
+        OpcodeEntry {
+            opcode: &[0xF7],
+            reg_opext: Some(3),
+            default_64bit: true,
+            form: EncodingForm::RmOnly,
+        },
+    );
+    table.insert(
+        X86Opcode::Not.as_u32(),
+        OpcodeEntry {
+            opcode: &[0xF7],
+            reg_opext: Some(2),
+            default_64bit: true,
+            form: EncodingForm::RmOnly,
+        },
+    );
+    table.insert(
+        X86Opcode::Idiv.as_u32(),
+        OpcodeEntry {
+            opcode: &[0xF7],
+            reg_opext: Some(7),
+            default_64bit: true,
+            form: EncodingForm::RmOnly,
+        },
+    );
+    table.insert(
+        X86Opcode::Div.as_u32(),
+        OpcodeEntry {
+            opcode: &[0xF7],
+            reg_opext: Some(6),
+            default_64bit: true,
+            form: EncodingForm::RmOnly,
+        },
+    );
 
     table
 }
@@ -500,10 +562,7 @@ impl X86_64Encoder {
     /// [`MachineInstruction`] in the function. It converts the opcode `u32`
     /// back to [`X86Opcode`], examines operand types, and delegates to
     /// the appropriate encoding helper.
-    pub fn encode_instruction(
-        &mut self,
-        inst: &MachineInstruction,
-    ) -> EncodedInstruction {
+    pub fn encode_instruction(&mut self, inst: &MachineInstruction) -> EncodedInstruction {
         let opcode = match X86Opcode::from_u32(inst.opcode) {
             Some(op) => op,
             None => {
@@ -529,17 +588,19 @@ impl X86_64Encoder {
 
         let result = match opcode {
             // ALU binary ops
-            X86Opcode::Add | X86Opcode::Sub | X86Opcode::And
-            | X86Opcode::Or | X86Opcode::Xor | X86Opcode::Cmp => {
+            X86Opcode::Add
+            | X86Opcode::Sub
+            | X86Opcode::And
+            | X86Opcode::Or
+            | X86Opcode::Xor
+            | X86Opcode::Cmp => {
                 let (opext, rm_reg_opc, reg_rm_opc) = alu_info(&opcode).unwrap();
                 self.encode_alu_op(inst, opext, rm_reg_opc, reg_rm_opc)
             }
             X86Opcode::Test => self.encode_test(inst),
             X86Opcode::Mov => self.encode_mov(inst),
             X86Opcode::Lea => self.encode_lea(inst),
-            X86Opcode::Shl | X86Opcode::Shr | X86Opcode::Sar => {
-                self.encode_shift(inst, &opcode)
-            }
+            X86Opcode::Shl | X86Opcode::Shr | X86Opcode::Sar => self.encode_shift(inst, &opcode),
             X86Opcode::Neg | X86Opcode::Not | X86Opcode::Idiv | X86Opcode::Div => {
                 self.encode_unary(inst, &opcode)
             }
@@ -552,12 +613,14 @@ impl X86_64Encoder {
                 let reg = self.extract_register(&inst.operands, 0);
                 self.encode_push_pop(0x58, reg)
             }
-            X86Opcode::MovZX => {
-                self.encode_movzx_movsx(inst, &[0x0F, 0xB6], &[0x0F, 0xB7])
-            }
+            X86Opcode::MovZX => self.encode_movzx_movsx(inst, &[0x0F, 0xB6], &[0x0F, 0xB7]),
             X86Opcode::MovSX => self.encode_movsx(inst),
-            X86Opcode::Je | X86Opcode::Jne | X86Opcode::Jl
-            | X86Opcode::Jle | X86Opcode::Jg | X86Opcode::Jge => {
+            X86Opcode::Je
+            | X86Opcode::Jne
+            | X86Opcode::Jl
+            | X86Opcode::Jle
+            | X86Opcode::Jg
+            | X86Opcode::Jge => {
                 let cc = condition_code(&opcode);
                 self.encode_jcc(inst, cc)
             }
@@ -582,8 +645,12 @@ impl X86_64Encoder {
             X86Opcode::Cvtsi2sd => self.encode_cvtsi2sd(inst),
             X86Opcode::Cvtsd2si => self.encode_cvtsd2si(inst),
             // Fixed-encoding instructions (fallback if not caught above)
-            X86Opcode::Ret | X86Opcode::Nop | X86Opcode::Cdq
-            | X86Opcode::Cqo | X86Opcode::Endbr64 | X86Opcode::Pause
+            X86Opcode::Ret
+            | X86Opcode::Nop
+            | X86Opcode::Cdq
+            | X86Opcode::Cqo
+            | X86Opcode::Endbr64
+            | X86Opcode::Pause
             | X86Opcode::Lfence => {
                 if let Some(entry) = self.opcode_table.get(&inst.opcode) {
                     let mut bytes = Vec::new();
@@ -628,7 +695,11 @@ impl X86_64Encoder {
             bytes.push(rex);
         }
         bytes.extend_from_slice(opcode);
-        bytes.push(modrm_byte(0b11, hw_encoding(src) & 0x7, hw_encoding(dst) & 0x7));
+        bytes.push(modrm_byte(
+            0b11,
+            hw_encoding(src) & 0x7,
+            hw_encoding(dst) & 0x7,
+        ));
         EncodedInstruction::new(bytes)
     }
 
@@ -651,9 +722,13 @@ impl X86_64Encoder {
         }
         bytes.extend_from_slice(opcode);
         bytes.push(modrm_byte(0b11, opext, hw_encoding(dst) & 0x7));
-        let imm_size = if opcode.last() == Some(&0x83) { 1 }
-            else if operand_size <= 4 { operand_size.max(1) }
-            else { 4 };
+        let imm_size = if opcode.last() == Some(&0x83) {
+            1
+        } else if operand_size <= 4 {
+            operand_size.max(1)
+        } else {
+            4
+        };
         bytes.extend_from_slice(&encode_immediate(imm, imm_size));
         EncodedInstruction::new(bytes)
     }
@@ -719,11 +794,7 @@ impl X86_64Encoder {
     }
 
     /// Encode a relative branch/call instruction (e.g., `jmp label`).
-    pub fn encode_relative_op(
-        &mut self,
-        opcode: &[u8],
-        target_offset: i64,
-    ) -> EncodedInstruction {
+    pub fn encode_relative_op(&mut self, opcode: &[u8], target_offset: i64) -> EncodedInstruction {
         let mut bytes = Vec::with_capacity(8);
         bytes.extend_from_slice(opcode);
         let inst_size = (opcode.len() + 4) as i64;
@@ -760,11 +831,7 @@ impl X86_64Encoder {
     }
 
     /// Encode a PUSH or POP instruction using the opcode+rd form.
-    pub fn encode_push_pop(
-        &mut self,
-        base_opcode: u8,
-        reg: u16,
-    ) -> EncodedInstruction {
+    pub fn encode_push_pop(&mut self, base_opcode: u8, reg: u16) -> EncodedInstruction {
         let mut bytes = Vec::with_capacity(2);
         if needs_rex(reg) {
             bytes.push(rex_byte(false, false, false, true));
@@ -787,7 +854,11 @@ impl X86_64Encoder {
             bytes.push(rex);
         }
         bytes.extend_from_slice(opcode);
-        bytes.push(modrm_byte(0b11, hw_encoding(dst) & 0x7, hw_encoding(src) & 0x7));
+        bytes.push(modrm_byte(
+            0b11,
+            hw_encoding(dst) & 0x7,
+            hw_encoding(src) & 0x7,
+        ));
         EncodedInstruction::new(bytes)
     }
 
@@ -825,27 +896,57 @@ impl X86_64Encoder {
                     self.encode_reg_imm_op(&[0x81], opext, *dst, imm, 8)
                 }
             }
-            (Some(MachineOperand::Register(reg)), Some(MachineOperand::Memory { base, index, scale, displacement })) => {
+            (
+                Some(MachineOperand::Register(reg)),
+                Some(MachineOperand::Memory {
+                    base,
+                    index,
+                    scale,
+                    displacement,
+                }),
+            ) => {
                 self.encode_reg_mem_op(&[reg_rm_opc], *reg, *base, *index, *scale, *displacement, 8)
             }
             (Some(MachineOperand::Register(reg)), Some(MachineOperand::FrameSlot(offset))) => {
                 self.encode_reg_mem_op(&[reg_rm_opc], *reg, Some(RBP), None, 1, *offset as i64, 8)
             }
-            (Some(MachineOperand::Memory { base, index, scale, displacement }), Some(MachineOperand::Register(reg))) => {
+            (
+                Some(MachineOperand::Memory {
+                    base,
+                    index,
+                    scale,
+                    displacement,
+                }),
+                Some(MachineOperand::Register(reg)),
+            ) => {
                 self.encode_mem_reg_op(&[rm_reg_opc], *base, *index, *scale, *displacement, *reg, 8)
             }
-            (Some(MachineOperand::Memory { base, index, scale, displacement }), Some(MachineOperand::Immediate(imm))) => {
+            (
+                Some(MachineOperand::Memory {
+                    base,
+                    index,
+                    scale,
+                    displacement,
+                }),
+                Some(MachineOperand::Immediate(imm)),
+            ) => {
                 let imm = *imm;
                 let (base, index, scale, displacement) = (*base, *index, *scale, *displacement);
                 let mut bytes = Vec::with_capacity(16);
-                let opc = if (-128..=127).contains(&imm) { 0x83u8 } else { 0x81u8 };
+                let opc = if (-128..=127).contains(&imm) {
+                    0x83u8
+                } else {
+                    0x81u8
+                };
                 let mem_enc = encode_memory_operand(opext, base, index, scale, displacement);
                 if let Some(rex) = compute_rex(true, None, index, base) {
                     bytes.push(rex);
                 }
                 bytes.push(opc);
                 bytes.push(mem_enc.modrm);
-                if let Some(s) = mem_enc.sib { bytes.push(s); }
+                if let Some(s) = mem_enc.sib {
+                    bytes.push(s);
+                }
                 bytes.extend_from_slice(&mem_enc.displacement);
                 let imm_size = if opc == 0x83 { 1 } else { 4 };
                 bytes.extend_from_slice(&encode_immediate(imm, imm_size));
@@ -892,19 +993,39 @@ impl X86_64Encoder {
                     EncodedInstruction::new(bytes)
                 }
             }
-            (Some(MachineOperand::Register(reg)), Some(MachineOperand::Memory { base, index, scale, displacement })) => {
-                self.encode_reg_mem_op(&[0x8B], *reg, *base, *index, *scale, *displacement, 8)
-            }
+            (
+                Some(MachineOperand::Register(reg)),
+                Some(MachineOperand::Memory {
+                    base,
+                    index,
+                    scale,
+                    displacement,
+                }),
+            ) => self.encode_reg_mem_op(&[0x8B], *reg, *base, *index, *scale, *displacement, 8),
             (Some(MachineOperand::Register(reg)), Some(MachineOperand::FrameSlot(offset))) => {
                 self.encode_reg_mem_op(&[0x8B], *reg, Some(RBP), None, 1, *offset as i64, 8)
             }
-            (Some(MachineOperand::Memory { base, index, scale, displacement }), Some(MachineOperand::Register(reg))) => {
-                self.encode_mem_reg_op(&[0x89], *base, *index, *scale, *displacement, *reg, 8)
-            }
+            (
+                Some(MachineOperand::Memory {
+                    base,
+                    index,
+                    scale,
+                    displacement,
+                }),
+                Some(MachineOperand::Register(reg)),
+            ) => self.encode_mem_reg_op(&[0x89], *base, *index, *scale, *displacement, *reg, 8),
             (Some(MachineOperand::FrameSlot(offset)), Some(MachineOperand::Register(reg))) => {
                 self.encode_mem_reg_op(&[0x89], Some(RBP), None, 1, *offset as i64, *reg, 8)
             }
-            (Some(MachineOperand::Memory { base, index, scale, displacement }), Some(MachineOperand::Immediate(imm))) => {
+            (
+                Some(MachineOperand::Memory {
+                    base,
+                    index,
+                    scale,
+                    displacement,
+                }),
+                Some(MachineOperand::Immediate(imm)),
+            ) => {
                 let (base, index, scale, displacement) = (*base, *index, *scale, *displacement);
                 let mut bytes = Vec::with_capacity(16);
                 let mem_enc = encode_memory_operand(0, base, index, scale, displacement);
@@ -913,7 +1034,9 @@ impl X86_64Encoder {
                 }
                 bytes.push(0xC7);
                 bytes.push(mem_enc.modrm);
-                if let Some(s) = mem_enc.sib { bytes.push(s); }
+                if let Some(s) = mem_enc.sib {
+                    bytes.push(s);
+                }
                 bytes.extend_from_slice(&mem_enc.displacement);
                 bytes.extend_from_slice(&encode_immediate(*imm, 4));
                 EncodedInstruction::new(bytes)
@@ -934,8 +1057,11 @@ impl X86_64Encoder {
                 let reloc_offset = self.current_offset + bytes.len();
                 bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
                 let reloc = RelocationEntry::new(
-                    reloc_offset as u64, sym_clone,
-                    X86_64RelocationType::Pc32, -4, ".text".to_string(),
+                    reloc_offset as u64,
+                    sym_clone,
+                    X86_64RelocationType::Pc32,
+                    -4,
+                    ".text".to_string(),
                 );
                 EncodedInstruction::with_relocations(bytes, vec![reloc])
             }
@@ -947,9 +1073,15 @@ impl X86_64Encoder {
     fn encode_lea(&mut self, inst: &MachineInstruction) -> EncodedInstruction {
         let ops = &inst.operands;
         match (ops.first(), ops.get(1)) {
-            (Some(MachineOperand::Register(reg)), Some(MachineOperand::Memory { base, index, scale, displacement })) => {
-                self.encode_reg_mem_op(&[0x8D], *reg, *base, *index, *scale, *displacement, 8)
-            }
+            (
+                Some(MachineOperand::Register(reg)),
+                Some(MachineOperand::Memory {
+                    base,
+                    index,
+                    scale,
+                    displacement,
+                }),
+            ) => self.encode_reg_mem_op(&[0x8D], *reg, *base, *index, *scale, *displacement, 8),
             (Some(MachineOperand::Register(reg)), Some(MachineOperand::FrameSlot(offset))) => {
                 self.encode_reg_mem_op(&[0x8D], *reg, Some(RBP), None, 1, *offset as i64, 8)
             }
@@ -961,7 +1093,11 @@ impl X86_64Encoder {
     }
 
     /// Encode shift instruction (SHL, SHR, SAR).
-    fn encode_shift(&mut self, inst: &MachineInstruction, opcode: &X86Opcode) -> EncodedInstruction {
+    fn encode_shift(
+        &mut self,
+        inst: &MachineInstruction,
+        opcode: &X86Opcode,
+    ) -> EncodedInstruction {
         let opext = shift_opext(opcode);
         let ops = &inst.operands;
         match (ops.first(), ops.get(1)) {
@@ -996,7 +1132,11 @@ impl X86_64Encoder {
     }
 
     /// Encode unary instruction (NEG, NOT, IDIV, DIV).
-    fn encode_unary(&mut self, inst: &MachineInstruction, opcode: &X86Opcode) -> EncodedInstruction {
+    fn encode_unary(
+        &mut self,
+        inst: &MachineInstruction,
+        opcode: &X86Opcode,
+    ) -> EncodedInstruction {
         let entry = self.opcode_table.get(&opcode.as_u32());
         let (opc_byte, opext) = match entry {
             Some(e) => (e.opcode[0], e.reg_opext.unwrap_or(0)),
@@ -1013,7 +1153,12 @@ impl X86_64Encoder {
                 bytes.push(modrm_byte(0b11, opext, hw_encoding(*reg) & 0x7));
                 EncodedInstruction::new(bytes)
             }
-            Some(MachineOperand::Memory { base, index, scale, displacement }) => {
+            Some(MachineOperand::Memory {
+                base,
+                index,
+                scale,
+                displacement,
+            }) => {
                 let mut bytes = Vec::with_capacity(12);
                 let mem_enc = encode_memory_operand(opext, *base, *index, *scale, *displacement);
                 if let Some(rex) = compute_rex(true, None, *index, *base) {
@@ -1021,7 +1166,9 @@ impl X86_64Encoder {
                 }
                 bytes.push(opc_byte);
                 bytes.push(mem_enc.modrm);
-                if let Some(s) = mem_enc.sib { bytes.push(s); }
+                if let Some(s) = mem_enc.sib {
+                    bytes.push(s);
+                }
                 bytes.extend_from_slice(&mem_enc.displacement);
                 EncodedInstruction::new(bytes)
             }
@@ -1040,10 +1187,18 @@ impl X86_64Encoder {
                 }
                 bytes.push(0x0F);
                 bytes.push(0xAF);
-                bytes.push(modrm_byte(0b11, hw_encoding(*dst) & 0x7, hw_encoding(*src) & 0x7));
+                bytes.push(modrm_byte(
+                    0b11,
+                    hw_encoding(*dst) & 0x7,
+                    hw_encoding(*src) & 0x7,
+                ));
                 EncodedInstruction::new(bytes)
             }
-            (Some(MachineOperand::Register(dst)), Some(MachineOperand::Register(src)), Some(MachineOperand::Immediate(imm))) => {
+            (
+                Some(MachineOperand::Register(dst)),
+                Some(MachineOperand::Register(src)),
+                Some(MachineOperand::Immediate(imm)),
+            ) => {
                 let imm = *imm;
                 let mut bytes = Vec::with_capacity(8);
                 if let Some(rex) = compute_rex(true, Some(*dst), None, Some(*src)) {
@@ -1051,25 +1206,50 @@ impl X86_64Encoder {
                 }
                 if (-128..=127).contains(&imm) {
                     bytes.push(0x6B);
-                    bytes.push(modrm_byte(0b11, hw_encoding(*dst) & 0x7, hw_encoding(*src) & 0x7));
+                    bytes.push(modrm_byte(
+                        0b11,
+                        hw_encoding(*dst) & 0x7,
+                        hw_encoding(*src) & 0x7,
+                    ));
                     bytes.push(imm as u8);
                 } else {
                     bytes.push(0x69);
-                    bytes.push(modrm_byte(0b11, hw_encoding(*dst) & 0x7, hw_encoding(*src) & 0x7));
+                    bytes.push(modrm_byte(
+                        0b11,
+                        hw_encoding(*dst) & 0x7,
+                        hw_encoding(*src) & 0x7,
+                    ));
                     bytes.extend_from_slice(&(imm as i32).to_le_bytes());
                 }
                 EncodedInstruction::new(bytes)
             }
-            (Some(MachineOperand::Register(dst)), Some(MachineOperand::Memory { base, index, scale, displacement }), None) => {
+            (
+                Some(MachineOperand::Register(dst)),
+                Some(MachineOperand::Memory {
+                    base,
+                    index,
+                    scale,
+                    displacement,
+                }),
+                None,
+            ) => {
                 let mut bytes = Vec::with_capacity(10);
-                let mem_enc = encode_memory_operand(hw_encoding(*dst) & 0x7, *base, *index, *scale, *displacement);
+                let mem_enc = encode_memory_operand(
+                    hw_encoding(*dst) & 0x7,
+                    *base,
+                    *index,
+                    *scale,
+                    *displacement,
+                );
                 if let Some(rex) = compute_rex(true, Some(*dst), *index, *base) {
                     bytes.push(rex);
                 }
                 bytes.push(0x0F);
                 bytes.push(0xAF);
                 bytes.push(mem_enc.modrm);
-                if let Some(s) = mem_enc.sib { bytes.push(s); }
+                if let Some(s) = mem_enc.sib {
+                    bytes.push(s);
+                }
                 bytes.extend_from_slice(&mem_enc.displacement);
                 EncodedInstruction::new(bytes)
             }
@@ -1078,7 +1258,12 @@ impl X86_64Encoder {
     }
 
     /// Encode MOVZX.
-    fn encode_movzx_movsx(&mut self, inst: &MachineInstruction, byte_opc: &[u8], _word_opc: &[u8]) -> EncodedInstruction {
+    fn encode_movzx_movsx(
+        &mut self,
+        inst: &MachineInstruction,
+        byte_opc: &[u8],
+        _word_opc: &[u8],
+    ) -> EncodedInstruction {
         let ops = &inst.operands;
         match (ops.first(), ops.get(1)) {
             (Some(MachineOperand::Register(dst)), Some(MachineOperand::Register(src))) => {
@@ -1087,18 +1272,38 @@ impl X86_64Encoder {
                     bytes.push(rex);
                 }
                 bytes.extend_from_slice(byte_opc);
-                bytes.push(modrm_byte(0b11, hw_encoding(*dst) & 0x7, hw_encoding(*src) & 0x7));
+                bytes.push(modrm_byte(
+                    0b11,
+                    hw_encoding(*dst) & 0x7,
+                    hw_encoding(*src) & 0x7,
+                ));
                 EncodedInstruction::new(bytes)
             }
-            (Some(MachineOperand::Register(dst)), Some(MachineOperand::Memory { base, index, scale, displacement })) => {
-                let mem_enc = encode_memory_operand(hw_encoding(*dst) & 0x7, *base, *index, *scale, *displacement);
+            (
+                Some(MachineOperand::Register(dst)),
+                Some(MachineOperand::Memory {
+                    base,
+                    index,
+                    scale,
+                    displacement,
+                }),
+            ) => {
+                let mem_enc = encode_memory_operand(
+                    hw_encoding(*dst) & 0x7,
+                    *base,
+                    *index,
+                    *scale,
+                    *displacement,
+                );
                 let mut bytes = Vec::with_capacity(10);
                 if let Some(rex) = compute_rex(false, Some(*dst), *index, *base) {
                     bytes.push(rex);
                 }
                 bytes.extend_from_slice(byte_opc);
                 bytes.push(mem_enc.modrm);
-                if let Some(s) = mem_enc.sib { bytes.push(s); }
+                if let Some(s) = mem_enc.sib {
+                    bytes.push(s);
+                }
                 bytes.extend_from_slice(&mem_enc.displacement);
                 EncodedInstruction::new(bytes)
             }
@@ -1116,18 +1321,38 @@ impl X86_64Encoder {
                     bytes.push(rex);
                 }
                 bytes.push(0x63); // MOVSXD
-                bytes.push(modrm_byte(0b11, hw_encoding(*dst) & 0x7, hw_encoding(*src) & 0x7));
+                bytes.push(modrm_byte(
+                    0b11,
+                    hw_encoding(*dst) & 0x7,
+                    hw_encoding(*src) & 0x7,
+                ));
                 EncodedInstruction::new(bytes)
             }
-            (Some(MachineOperand::Register(dst)), Some(MachineOperand::Memory { base, index, scale, displacement })) => {
-                let mem_enc = encode_memory_operand(hw_encoding(*dst) & 0x7, *base, *index, *scale, *displacement);
+            (
+                Some(MachineOperand::Register(dst)),
+                Some(MachineOperand::Memory {
+                    base,
+                    index,
+                    scale,
+                    displacement,
+                }),
+            ) => {
+                let mem_enc = encode_memory_operand(
+                    hw_encoding(*dst) & 0x7,
+                    *base,
+                    *index,
+                    *scale,
+                    *displacement,
+                );
                 let mut bytes = Vec::with_capacity(10);
                 if let Some(rex) = compute_rex(true, Some(*dst), *index, *base) {
                     bytes.push(rex);
                 }
                 bytes.push(0x63);
                 bytes.push(mem_enc.modrm);
-                if let Some(s) = mem_enc.sib { bytes.push(s); }
+                if let Some(s) = mem_enc.sib {
+                    bytes.push(s);
+                }
                 bytes.extend_from_slice(&mem_enc.displacement);
                 EncodedInstruction::new(bytes)
             }
@@ -1268,7 +1493,12 @@ impl X86_64Encoder {
                 bytes.extend_from_slice(&(rel as i32).to_le_bytes());
                 EncodedInstruction::new(bytes)
             }
-            Some(MachineOperand::Memory { base, index, scale, displacement }) => {
+            Some(MachineOperand::Memory {
+                base,
+                index,
+                scale,
+                displacement,
+            }) => {
                 // CALL [mem]: 0xFF /2
                 let mem_enc = encode_memory_operand(2, *base, *index, *scale, *displacement);
                 let mut bytes = Vec::with_capacity(10);
@@ -1277,7 +1507,9 @@ impl X86_64Encoder {
                 }
                 bytes.push(0xFF);
                 bytes.push(mem_enc.modrm);
-                if let Some(s) = mem_enc.sib { bytes.push(s); }
+                if let Some(s) = mem_enc.sib {
+                    bytes.push(s);
+                }
                 bytes.extend_from_slice(&mem_enc.displacement);
                 EncodedInstruction::new(bytes)
             }
@@ -1296,11 +1528,29 @@ impl X86_64Encoder {
                 }
                 bytes.push(0x0F);
                 bytes.push(0x40 + cc);
-                bytes.push(modrm_byte(0b11, hw_encoding(*dst) & 0x7, hw_encoding(*src) & 0x7));
+                bytes.push(modrm_byte(
+                    0b11,
+                    hw_encoding(*dst) & 0x7,
+                    hw_encoding(*src) & 0x7,
+                ));
                 EncodedInstruction::new(bytes)
             }
-            (Some(MachineOperand::Register(dst)), Some(MachineOperand::Memory { base, index, scale, displacement })) => {
-                let mem_enc = encode_memory_operand(hw_encoding(*dst) & 0x7, *base, *index, *scale, *displacement);
+            (
+                Some(MachineOperand::Register(dst)),
+                Some(MachineOperand::Memory {
+                    base,
+                    index,
+                    scale,
+                    displacement,
+                }),
+            ) => {
+                let mem_enc = encode_memory_operand(
+                    hw_encoding(*dst) & 0x7,
+                    *base,
+                    *index,
+                    *scale,
+                    *displacement,
+                );
                 let mut bytes = Vec::with_capacity(10);
                 if let Some(rex) = compute_rex(true, Some(*dst), *index, *base) {
                     bytes.push(rex);
@@ -1308,7 +1558,9 @@ impl X86_64Encoder {
                 bytes.push(0x0F);
                 bytes.push(0x40 + cc);
                 bytes.push(mem_enc.modrm);
-                if let Some(s) = mem_enc.sib { bytes.push(s); }
+                if let Some(s) = mem_enc.sib {
+                    bytes.push(s);
+                }
                 bytes.extend_from_slice(&mem_enc.displacement);
                 EncodedInstruction::new(bytes)
             }
@@ -1339,12 +1591,28 @@ impl X86_64Encoder {
     fn encode_movsd(&mut self, inst: &MachineInstruction) -> EncodedInstruction {
         let ops = &inst.operands;
         match (ops.first(), ops.get(1)) {
-            (Some(MachineOperand::Register(dst)), Some(MachineOperand::Register(src))) if is_sse(*dst) && is_sse(*src) => {
+            (Some(MachineOperand::Register(dst)), Some(MachineOperand::Register(src)))
+                if is_sse(*dst) && is_sse(*src) =>
+            {
                 self.encode_sse_reg_reg(0xF2, &[0x0F, 0x10], *dst, *src)
             }
-            (Some(MachineOperand::Register(xmm)), Some(MachineOperand::Memory { base, index, scale, displacement })) if is_sse(*xmm) => {
+            (
+                Some(MachineOperand::Register(xmm)),
+                Some(MachineOperand::Memory {
+                    base,
+                    index,
+                    scale,
+                    displacement,
+                }),
+            ) if is_sse(*xmm) => {
                 // MOVSD xmm, [mem]: F2 0F 10 /r
-                let mem_enc = encode_memory_operand(hw_encoding(*xmm) & 0x7, *base, *index, *scale, *displacement);
+                let mem_enc = encode_memory_operand(
+                    hw_encoding(*xmm) & 0x7,
+                    *base,
+                    *index,
+                    *scale,
+                    *displacement,
+                );
                 let mut bytes = Vec::with_capacity(12);
                 bytes.push(0xF2);
                 if let Some(rex) = compute_rex(false, Some(*xmm), *index, *base) {
@@ -1353,13 +1621,29 @@ impl X86_64Encoder {
                 bytes.push(0x0F);
                 bytes.push(0x10);
                 bytes.push(mem_enc.modrm);
-                if let Some(s) = mem_enc.sib { bytes.push(s); }
+                if let Some(s) = mem_enc.sib {
+                    bytes.push(s);
+                }
                 bytes.extend_from_slice(&mem_enc.displacement);
                 EncodedInstruction::new(bytes)
             }
-            (Some(MachineOperand::Memory { base, index, scale, displacement }), Some(MachineOperand::Register(xmm))) if is_sse(*xmm) => {
+            (
+                Some(MachineOperand::Memory {
+                    base,
+                    index,
+                    scale,
+                    displacement,
+                }),
+                Some(MachineOperand::Register(xmm)),
+            ) if is_sse(*xmm) => {
                 // MOVSD [mem], xmm: F2 0F 11 /r
-                let mem_enc = encode_memory_operand(hw_encoding(*xmm) & 0x7, *base, *index, *scale, *displacement);
+                let mem_enc = encode_memory_operand(
+                    hw_encoding(*xmm) & 0x7,
+                    *base,
+                    *index,
+                    *scale,
+                    *displacement,
+                );
                 let mut bytes = Vec::with_capacity(12);
                 bytes.push(0xF2);
                 if let Some(rex) = compute_rex(false, Some(*xmm), *index, *base) {
@@ -1368,12 +1652,17 @@ impl X86_64Encoder {
                 bytes.push(0x0F);
                 bytes.push(0x11);
                 bytes.push(mem_enc.modrm);
-                if let Some(s) = mem_enc.sib { bytes.push(s); }
+                if let Some(s) = mem_enc.sib {
+                    bytes.push(s);
+                }
                 bytes.extend_from_slice(&mem_enc.displacement);
                 EncodedInstruction::new(bytes)
             }
-            (Some(MachineOperand::Register(xmm)), Some(MachineOperand::FrameSlot(off))) if is_sse(*xmm) => {
-                let mem_enc = encode_memory_operand(hw_encoding(*xmm) & 0x7, Some(RBP), None, 1, *off as i64);
+            (Some(MachineOperand::Register(xmm)), Some(MachineOperand::FrameSlot(off)))
+                if is_sse(*xmm) =>
+            {
+                let mem_enc =
+                    encode_memory_operand(hw_encoding(*xmm) & 0x7, Some(RBP), None, 1, *off as i64);
                 let mut bytes = Vec::with_capacity(12);
                 bytes.push(0xF2);
                 if let Some(rex) = compute_rex(false, Some(*xmm), None, Some(RBP)) {
@@ -1382,12 +1671,17 @@ impl X86_64Encoder {
                 bytes.push(0x0F);
                 bytes.push(0x10);
                 bytes.push(mem_enc.modrm);
-                if let Some(s) = mem_enc.sib { bytes.push(s); }
+                if let Some(s) = mem_enc.sib {
+                    bytes.push(s);
+                }
                 bytes.extend_from_slice(&mem_enc.displacement);
                 EncodedInstruction::new(bytes)
             }
-            (Some(MachineOperand::FrameSlot(off)), Some(MachineOperand::Register(xmm))) if is_sse(*xmm) => {
-                let mem_enc = encode_memory_operand(hw_encoding(*xmm) & 0x7, Some(RBP), None, 1, *off as i64);
+            (Some(MachineOperand::FrameSlot(off)), Some(MachineOperand::Register(xmm)))
+                if is_sse(*xmm) =>
+            {
+                let mem_enc =
+                    encode_memory_operand(hw_encoding(*xmm) & 0x7, Some(RBP), None, 1, *off as i64);
                 let mut bytes = Vec::with_capacity(12);
                 bytes.push(0xF2);
                 if let Some(rex) = compute_rex(false, Some(*xmm), None, Some(RBP)) {
@@ -1396,7 +1690,9 @@ impl X86_64Encoder {
                 bytes.push(0x0F);
                 bytes.push(0x11);
                 bytes.push(mem_enc.modrm);
-                if let Some(s) = mem_enc.sib { bytes.push(s); }
+                if let Some(s) = mem_enc.sib {
+                    bytes.push(s);
+                }
                 bytes.extend_from_slice(&mem_enc.displacement);
                 EncodedInstruction::new(bytes)
             }
@@ -1408,11 +1704,27 @@ impl X86_64Encoder {
     fn encode_movss(&mut self, inst: &MachineInstruction) -> EncodedInstruction {
         let ops = &inst.operands;
         match (ops.first(), ops.get(1)) {
-            (Some(MachineOperand::Register(dst)), Some(MachineOperand::Register(src))) if is_sse(*dst) && is_sse(*src) => {
+            (Some(MachineOperand::Register(dst)), Some(MachineOperand::Register(src)))
+                if is_sse(*dst) && is_sse(*src) =>
+            {
                 self.encode_sse_reg_reg(0xF3, &[0x0F, 0x10], *dst, *src)
             }
-            (Some(MachineOperand::Register(xmm)), Some(MachineOperand::Memory { base, index, scale, displacement })) if is_sse(*xmm) => {
-                let mem_enc = encode_memory_operand(hw_encoding(*xmm) & 0x7, *base, *index, *scale, *displacement);
+            (
+                Some(MachineOperand::Register(xmm)),
+                Some(MachineOperand::Memory {
+                    base,
+                    index,
+                    scale,
+                    displacement,
+                }),
+            ) if is_sse(*xmm) => {
+                let mem_enc = encode_memory_operand(
+                    hw_encoding(*xmm) & 0x7,
+                    *base,
+                    *index,
+                    *scale,
+                    *displacement,
+                );
                 let mut bytes = Vec::with_capacity(12);
                 bytes.push(0xF3);
                 if let Some(rex) = compute_rex(false, Some(*xmm), *index, *base) {
@@ -1421,12 +1733,28 @@ impl X86_64Encoder {
                 bytes.push(0x0F);
                 bytes.push(0x10);
                 bytes.push(mem_enc.modrm);
-                if let Some(s) = mem_enc.sib { bytes.push(s); }
+                if let Some(s) = mem_enc.sib {
+                    bytes.push(s);
+                }
                 bytes.extend_from_slice(&mem_enc.displacement);
                 EncodedInstruction::new(bytes)
             }
-            (Some(MachineOperand::Memory { base, index, scale, displacement }), Some(MachineOperand::Register(xmm))) if is_sse(*xmm) => {
-                let mem_enc = encode_memory_operand(hw_encoding(*xmm) & 0x7, *base, *index, *scale, *displacement);
+            (
+                Some(MachineOperand::Memory {
+                    base,
+                    index,
+                    scale,
+                    displacement,
+                }),
+                Some(MachineOperand::Register(xmm)),
+            ) if is_sse(*xmm) => {
+                let mem_enc = encode_memory_operand(
+                    hw_encoding(*xmm) & 0x7,
+                    *base,
+                    *index,
+                    *scale,
+                    *displacement,
+                );
                 let mut bytes = Vec::with_capacity(12);
                 bytes.push(0xF3);
                 if let Some(rex) = compute_rex(false, Some(*xmm), *index, *base) {
@@ -1435,7 +1763,9 @@ impl X86_64Encoder {
                 bytes.push(0x0F);
                 bytes.push(0x11);
                 bytes.push(mem_enc.modrm);
-                if let Some(s) = mem_enc.sib { bytes.push(s); }
+                if let Some(s) = mem_enc.sib {
+                    bytes.push(s);
+                }
                 bytes.extend_from_slice(&mem_enc.displacement);
                 EncodedInstruction::new(bytes)
             }
@@ -1444,14 +1774,35 @@ impl X86_64Encoder {
     }
 
     /// Encode a generic SSE arithmetic operation (addsd, subsd, mulsd, divsd, etc.).
-    fn encode_sse_op(&mut self, inst: &MachineInstruction, prefix: u8, opc_suffix: u8) -> EncodedInstruction {
+    fn encode_sse_op(
+        &mut self,
+        inst: &MachineInstruction,
+        prefix: u8,
+        opc_suffix: u8,
+    ) -> EncodedInstruction {
         let ops = &inst.operands;
         match (ops.first(), ops.get(1)) {
-            (Some(MachineOperand::Register(dst)), Some(MachineOperand::Register(src))) if is_sse(*dst) && is_sse(*src) => {
+            (Some(MachineOperand::Register(dst)), Some(MachineOperand::Register(src)))
+                if is_sse(*dst) && is_sse(*src) =>
+            {
                 self.encode_sse_reg_reg(prefix, &[0x0F, opc_suffix], *dst, *src)
             }
-            (Some(MachineOperand::Register(xmm)), Some(MachineOperand::Memory { base, index, scale, displacement })) if is_sse(*xmm) => {
-                let mem_enc = encode_memory_operand(hw_encoding(*xmm) & 0x7, *base, *index, *scale, *displacement);
+            (
+                Some(MachineOperand::Register(xmm)),
+                Some(MachineOperand::Memory {
+                    base,
+                    index,
+                    scale,
+                    displacement,
+                }),
+            ) if is_sse(*xmm) => {
+                let mem_enc = encode_memory_operand(
+                    hw_encoding(*xmm) & 0x7,
+                    *base,
+                    *index,
+                    *scale,
+                    *displacement,
+                );
                 let mut bytes = Vec::with_capacity(12);
                 bytes.push(prefix);
                 if let Some(rex) = compute_rex(false, Some(*xmm), *index, *base) {
@@ -1460,7 +1811,9 @@ impl X86_64Encoder {
                 bytes.push(0x0F);
                 bytes.push(opc_suffix);
                 bytes.push(mem_enc.modrm);
-                if let Some(s) = mem_enc.sib { bytes.push(s); }
+                if let Some(s) = mem_enc.sib {
+                    bytes.push(s);
+                }
                 bytes.extend_from_slice(&mem_enc.displacement);
                 EncodedInstruction::new(bytes)
             }
@@ -1472,7 +1825,9 @@ impl X86_64Encoder {
     fn encode_ucomisd(&mut self, inst: &MachineInstruction) -> EncodedInstruction {
         let ops = &inst.operands;
         match (ops.first(), ops.get(1)) {
-            (Some(MachineOperand::Register(dst)), Some(MachineOperand::Register(src))) if is_sse(*dst) && is_sse(*src) => {
+            (Some(MachineOperand::Register(dst)), Some(MachineOperand::Register(src)))
+                if is_sse(*dst) && is_sse(*src) =>
+            {
                 let mut bytes = Vec::with_capacity(6);
                 bytes.push(0x66);
                 if let Some(rex) = compute_rex(false, Some(*dst), None, Some(*src)) {
@@ -1480,11 +1835,29 @@ impl X86_64Encoder {
                 }
                 bytes.push(0x0F);
                 bytes.push(0x2E);
-                bytes.push(modrm_byte(0b11, hw_encoding(*dst) & 0x7, hw_encoding(*src) & 0x7));
+                bytes.push(modrm_byte(
+                    0b11,
+                    hw_encoding(*dst) & 0x7,
+                    hw_encoding(*src) & 0x7,
+                ));
                 EncodedInstruction::new(bytes)
             }
-            (Some(MachineOperand::Register(xmm)), Some(MachineOperand::Memory { base, index, scale, displacement })) if is_sse(*xmm) => {
-                let mem_enc = encode_memory_operand(hw_encoding(*xmm) & 0x7, *base, *index, *scale, *displacement);
+            (
+                Some(MachineOperand::Register(xmm)),
+                Some(MachineOperand::Memory {
+                    base,
+                    index,
+                    scale,
+                    displacement,
+                }),
+            ) if is_sse(*xmm) => {
+                let mem_enc = encode_memory_operand(
+                    hw_encoding(*xmm) & 0x7,
+                    *base,
+                    *index,
+                    *scale,
+                    *displacement,
+                );
                 let mut bytes = Vec::with_capacity(12);
                 bytes.push(0x66);
                 if let Some(rex) = compute_rex(false, Some(*xmm), *index, *base) {
@@ -1493,7 +1866,9 @@ impl X86_64Encoder {
                 bytes.push(0x0F);
                 bytes.push(0x2E);
                 bytes.push(mem_enc.modrm);
-                if let Some(s) = mem_enc.sib { bytes.push(s); }
+                if let Some(s) = mem_enc.sib {
+                    bytes.push(s);
+                }
                 bytes.extend_from_slice(&mem_enc.displacement);
                 EncodedInstruction::new(bytes)
             }
@@ -1505,7 +1880,9 @@ impl X86_64Encoder {
     fn encode_cvtsi2sd(&mut self, inst: &MachineInstruction) -> EncodedInstruction {
         let ops = &inst.operands;
         match (ops.first(), ops.get(1)) {
-            (Some(MachineOperand::Register(xmm)), Some(MachineOperand::Register(gpr))) if is_sse(*xmm) => {
+            (Some(MachineOperand::Register(xmm)), Some(MachineOperand::Register(gpr)))
+                if is_sse(*xmm) =>
+            {
                 let mut bytes = Vec::with_capacity(6);
                 bytes.push(0xF2);
                 if let Some(rex) = compute_rex(true, Some(*xmm), None, Some(*gpr)) {
@@ -1513,7 +1890,11 @@ impl X86_64Encoder {
                 }
                 bytes.push(0x0F);
                 bytes.push(0x2A);
-                bytes.push(modrm_byte(0b11, hw_encoding(*xmm) & 0x7, hw_encoding(*gpr) & 0x7));
+                bytes.push(modrm_byte(
+                    0b11,
+                    hw_encoding(*xmm) & 0x7,
+                    hw_encoding(*gpr) & 0x7,
+                ));
                 EncodedInstruction::new(bytes)
             }
             _ => EncodedInstruction::new(vec![0x90]),
@@ -1524,7 +1905,9 @@ impl X86_64Encoder {
     fn encode_cvtsd2si(&mut self, inst: &MachineInstruction) -> EncodedInstruction {
         let ops = &inst.operands;
         match (ops.first(), ops.get(1)) {
-            (Some(MachineOperand::Register(gpr)), Some(MachineOperand::Register(xmm))) if is_sse(*xmm) => {
+            (Some(MachineOperand::Register(gpr)), Some(MachineOperand::Register(xmm)))
+                if is_sse(*xmm) =>
+            {
                 let mut bytes = Vec::with_capacity(6);
                 bytes.push(0xF2);
                 if let Some(rex) = compute_rex(true, Some(*gpr), None, Some(*xmm)) {
@@ -1532,13 +1915,16 @@ impl X86_64Encoder {
                 }
                 bytes.push(0x0F);
                 bytes.push(0x2D);
-                bytes.push(modrm_byte(0b11, hw_encoding(*gpr) & 0x7, hw_encoding(*xmm) & 0x7));
+                bytes.push(modrm_byte(
+                    0b11,
+                    hw_encoding(*gpr) & 0x7,
+                    hw_encoding(*xmm) & 0x7,
+                ));
                 EncodedInstruction::new(bytes)
             }
             _ => EncodedInstruction::new(vec![0x90]),
         }
     }
-
 } // end impl X86_64Encoder
 
 // =====================================================================
@@ -1600,7 +1986,10 @@ mod tests {
     fn test_encode_immediate_sizes() {
         assert_eq!(encode_immediate(0x12, 1), vec![0x12]);
         assert_eq!(encode_immediate(0x1234, 2), vec![0x34, 0x12]);
-        assert_eq!(encode_immediate(0x12345678, 4), vec![0x78, 0x56, 0x34, 0x12]);
+        assert_eq!(
+            encode_immediate(0x12345678, 4),
+            vec![0x78, 0x56, 0x34, 0x12]
+        );
     }
 
     #[test]
@@ -1756,7 +2145,8 @@ mod tests {
     fn test_encoder_call_symbol() {
         let mut enc = X86_64Encoder::new(0);
         let mut inst = MachineInstruction::new(X86Opcode::Call.as_u32());
-        inst.operands.push(MachineOperand::GlobalSymbol("printf".to_string()));
+        inst.operands
+            .push(MachineOperand::GlobalSymbol("printf".to_string()));
         let result = enc.encode_instruction(&inst);
         assert_eq!(result.bytes[0], 0xE8);
         assert_eq!(result.bytes.len(), 5);
