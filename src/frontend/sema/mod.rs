@@ -179,7 +179,7 @@ impl<'a> SemanticAnalyzer<'a> {
         let scopes = ScopeStack::new();
         let symbols = SymbolTable::new();
 
-        SemanticAnalyzer {
+        let mut analyzer = SemanticAnalyzer {
             diagnostics,
             type_builder,
             target,
@@ -193,6 +193,49 @@ impl<'a> SemanticAnalyzer<'a> {
             in_switch: false,
             switch_case_values: FxHashMap::default(),
             switch_has_default: false,
+        };
+
+        // Pre-register GCC builtin type names as typedefs at global scope.
+        // __builtin_va_list is the underlying type behind va_list in <stdarg.h>
+        // and is represented internally as a pointer to void (char *).
+        analyzer.register_builtin_typedef("__builtin_va_list",
+            CType::Pointer(Box::new(CType::Void), TypeQualifiers::default()));
+
+        analyzer
+    }
+
+    /// Register a compiler-builtin typedef at global scope.
+    fn register_builtin_typedef(&mut self, name: &str, ty: CType) {
+        // Intern the name to get a Symbol.
+        // Safety: We need to look up the symbol by string.  The interner is
+        // shared with the parser which has already interned the name, so
+        // this will return the same Symbol handle.
+        let sym = match self.interner.get(name) {
+            Some(s) => s,
+            None => {
+                // If not yet interned (unusual), the typedef won't be available.
+                return;
+            }
+        };
+        let entry = SymbolEntry {
+            name: sym,
+            ty,
+            kind: SymbolKind::TypedefName,
+            linkage: Linkage::None,
+            storage_class: StorageClass::Typedef,
+            is_defined: true,
+            is_tentative: false,
+            span: Span::dummy(),
+            attributes: Vec::new(),
+            is_weak: false,
+            visibility: None,
+            section: None,
+            is_used: false,
+            scope_depth: 0,
+        };
+        if let Ok(id) = self.symbols.declare(entry, self.diagnostics) {
+            self.scopes.declare_ordinary(sym, id);
+            self.scopes.register_typedef(sym);
         }
     }
 
@@ -302,6 +345,9 @@ impl<'a> SemanticAnalyzer<'a> {
             );
             if let Ok(id) = sym_id {
                 self.symbols.define(id);
+                // Register the function in the scope system so that
+                // it is resolvable by name from other functions.
+                self.scopes.declare_ordinary(name, id);
                 // Propagate validated attributes to the symbol.
                 for attr in &validated_attrs {
                     self.propagate_attribute_to_symbol(id, attr);
@@ -1219,14 +1265,8 @@ impl<'a> SemanticAnalyzer<'a> {
                 next_value
             };
 
-            // Declare in symbol table as enum constant.
-            let _ = self.symbols.declare_enum_constant(
-                enumerator.name,
-                enum_val,
-                underlying_type.clone(),
-                enumerator.span,
-            );
-            // Also declare in scope for name lookup.
+            // Declare in symbol table as enum constant AND in scope
+            // for name lookup.
             if let Ok(id) = self.symbols.declare_enum_constant(
                 enumerator.name,
                 enum_val,
@@ -1979,14 +2019,19 @@ impl<'a> SemanticAnalyzer<'a> {
             match spec {
                 TypeSpecifier::Struct(s) | TypeSpecifier::Union(s) => {
                     if s.members.is_some() {
-                        // This is a definition — register tag in namespace.
-                        let is_struct = matches!(spec, TypeSpecifier::Struct(_));
-                        self.register_struct_union_tag(s, is_struct);
+                        // This is a definition — fully process the struct/union
+                        // so that member field information is recorded in the
+                        // tag entry.  Previously called `register_struct_union_tag`
+                        // which registered the tag with an empty fields list,
+                        // causing member access (e.g. `s.x`) to fail.
+                        let mut s_clone = s.clone();
+                        let _ = self.analyze_struct_definition(&mut s_clone);
                     }
                 }
                 TypeSpecifier::Enum(e) => {
                     if e.enumerators.is_some() {
-                        self.register_enum_tag(e);
+                        let mut e_clone = e.clone();
+                        let _ = self.analyze_enum_definition(&mut e_clone);
                     }
                 }
                 _ => {}

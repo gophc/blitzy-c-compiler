@@ -131,12 +131,18 @@ pub fn parse_declaration(parser: &mut Parser<'_>) -> Result<Declaration, ()> {
         register_declarator_name(parser, &first_declarator);
     }
 
+    // Skip optional GCC asm label: `__asm__("symbol_name")`
+    skip_asm_label(parser);
+
     // Parse optional initializer for the first declarator.
     let first_init = if parser.match_token(&TokenKind::Equal) {
         Some(parse_initializer(parser)?)
     } else {
         None
     };
+
+    // Skip optional trailing GCC __attribute__ after initializer
+    skip_trailing_attributes(parser);
 
     let first_span = parser.make_span(first_decl_start);
     init_declarators.push(InitDeclarator {
@@ -155,11 +161,17 @@ pub fn parse_declaration(parser: &mut Parser<'_>) -> Result<Declaration, ()> {
             register_declarator_name(parser, &decl);
         }
 
+        // Skip optional GCC asm label
+        skip_asm_label(parser);
+
         let init = if parser.match_token(&TokenKind::Equal) {
             Some(parse_initializer(parser)?)
         } else {
             None
         };
+
+        // Skip optional trailing GCC __attribute__
+        skip_trailing_attributes(parser);
 
         let decl_span = parser.make_span(decl_start);
         init_declarators.push(InitDeclarator {
@@ -1984,6 +1996,11 @@ fn parse_specifier_qualifier_list_for_type_name(
 
 /// Extract the declared name from a declarator and register it as a typedef
 /// name in the parser.
+/// Public wrapper for typedef name registration, callable from mod.rs.
+pub fn register_declarator_name_pub(parser: &mut Parser<'_>, decl: &Declarator) {
+    register_declarator_name(parser, decl);
+}
+
 fn register_declarator_name(parser: &mut Parser<'_>, decl: &Declarator) {
     if let Some(sym) = extract_declarator_name(&decl.direct) {
         let _id: u32 = sym.as_u32();
@@ -2031,6 +2048,67 @@ fn parse_string_literal_value(parser: &mut Parser<'_>) -> Option<Vec<u8>> {
             let span = parser.current_span();
             parser.error(span, "expected string literal");
             None
+        }
+    }
+}
+
+// ===========================================================================
+// GCC asm labels and trailing attributes on declarations
+// ===========================================================================
+
+/// Skip an optional GCC `__asm__("symbol_name")` label on a declaration.
+///
+/// This construct allows specifying the assembly-level symbol name for a
+/// function or variable.  It appears after the declarator and before any
+/// initializer or trailing `__attribute__`.
+///
+/// Grammar: `asm-label: '__asm__' '(' string-literal ')'`
+fn skip_asm_label(parser: &mut Parser<'_>) {
+    if parser.check(&TokenKind::Asm) {
+        parser.advance(); // consume `__asm__` / `asm`
+        if parser.match_token(&TokenKind::LeftParen) {
+            // Skip the string literal contents and any concatenated strings.
+            let mut depth: u32 = 1;
+            while depth > 0 && !parser.check(&TokenKind::Eof) {
+                if parser.check(&TokenKind::LeftParen) {
+                    depth += 1;
+                } else if parser.check(&TokenKind::RightParen) {
+                    depth -= 1;
+                    if depth == 0 {
+                        parser.advance(); // consume closing ')'
+                        break;
+                    }
+                }
+                parser.advance();
+            }
+        }
+    }
+}
+
+/// Skip optional trailing `__attribute__((...))` lists that appear after a
+/// declarator or initializer but before `;` or `,`.
+///
+/// Glibc headers attach `__attribute__((__nonnull__(1)))` and similar
+/// constructs to extern declarations.  The parser's normal attribute
+/// handling runs during declarator parsing; this function handles the
+/// after-declarator position where additional attributes may appear.
+fn skip_trailing_attributes(parser: &mut Parser<'_>) {
+    while parser.check(&TokenKind::Attribute) {
+        parser.advance(); // consume `__attribute__`
+        if parser.match_token(&TokenKind::LeftParen) {
+            let mut depth: u32 = 1;
+            while depth > 0 && !parser.check(&TokenKind::Eof) {
+                if parser.check(&TokenKind::LeftParen) {
+                    depth += 1;
+                } else if parser.check(&TokenKind::RightParen) {
+                    depth -= 1;
+                    if depth == 0 {
+                        parser.advance(); // consume closing ')'
+                        break;
+                    }
+                }
+                parser.advance();
+            }
         }
     }
 }

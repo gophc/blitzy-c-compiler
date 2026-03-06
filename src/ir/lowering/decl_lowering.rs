@@ -30,7 +30,7 @@ use crate::common::diagnostics::{DiagnosticEngine, Span};
 use crate::common::fx_hash::FxHashMap;
 use crate::common::target::Target;
 use crate::common::type_builder::TypeBuilder;
-use crate::common::types::CType;
+use crate::common::types::{CType, StructField};
 use crate::frontend::parser::ast;
 use crate::ir::builder::IrBuilder;
 use crate::ir::function::{
@@ -77,6 +77,9 @@ struct LocalVarInfo {
     has_initializer: bool,
     alignment: Option<usize>,
     span: Span,
+    /// For static locals with initializers, store the AST initializer
+    /// for compile-time constant evaluation.
+    static_init: Option<ast::Initializer>,
 }
 
 // ===========================================================================
@@ -167,6 +170,8 @@ pub fn lower_function_definition(
     type_builder: &TypeBuilder,
     diagnostics: &mut DiagnosticEngine,
     name_table: &[String],
+    enum_constants: &FxHashMap<String, i128>,
+    struct_defs: &FxHashMap<String, CType>,
 ) {
     let specifiers = &func_def.specifiers;
     let declarator = &func_def.declarator;
@@ -225,7 +230,11 @@ pub fn lower_function_definition(
     ir_function.alignment = extract_alignment_attribute(&all_attributes, name_table);
 
     // --- Alloca-first: parameter allocation in entry block ---
-    let entry_block_id = BlockId(0);
+    // Consume BlockId(0) from the builder so that subsequent create_block()
+    // calls return BlockId(1), BlockId(2), etc.  The entry block already
+    // exists (created by IrFunction::new) at blocks[0] = BlockId(0).
+    let entry_block_id = builder.create_block(); // Returns BlockId(0), bumps next_block to 1
+    debug_assert_eq!(entry_block_id.index(), 0);
     builder.set_insert_point(entry_block_id);
 
     let mut local_vars: FxHashMap<String, Value> = FxHashMap::default();
@@ -241,7 +250,15 @@ pub fn lower_function_definition(
 
     // --- Alloca-first: scan for ALL local variable declarations ---
     let body_stmt = ast::Statement::Compound(func_def.body.clone());
-    let locals = collect_local_variables(&body_stmt, name_table);
+    let mut locals = collect_local_variables(&body_stmt, name_table);
+
+    // Resolve struct/union forward references: when a local variable is
+    // declared as `struct S s;` and the struct definition came from a
+    // top-level declaration, the collected CType has empty fields.
+    // Replace with the full definition from struct_defs.
+    for local_info in &mut locals {
+        resolve_struct_forward_ref(&mut local_info.c_type, struct_defs);
+    }
 
     // Handle static locals separately — they become globals.
     for local_info in &locals {
@@ -250,6 +267,8 @@ pub fn lower_function_definition(
                 &local_info.name,
                 &func_name,
                 &local_info.c_type,
+                local_info.has_initializer,
+                local_info.static_init.as_ref(),
                 module,
                 target,
                 type_builder,
@@ -300,6 +319,15 @@ pub fn lower_function_definition(
         }
     }
 
+    // --- Build static_locals map from collected locals ---
+    let mut static_locals: FxHashMap<String, String> = FxHashMap::default();
+    for local_info in &locals {
+        if local_info.is_static {
+            let mangled = format!("{}.{}", func_name, local_info.name);
+            static_locals.insert(local_info.name.clone(), mangled);
+        }
+    }
+
     // --- Lower the function body statements ---
     {
         let mut label_blocks: FxHashMap<String, BlockId> = FxHashMap::default();
@@ -319,6 +347,8 @@ pub fn lower_function_definition(
             param_values: &param_values,
             name_table,
             local_types: &local_types,
+            enum_constants,
+            static_locals: &static_locals,
         };
         stmt_lowering::lower_statement(&mut stmt_ctx, &body_stmt);
     }
@@ -1038,6 +1068,12 @@ fn collect_locals_from_declaration(
         let c_type = resolve_declaration_type(specifiers, declarator, &Target::X86_64, name_table);
         let alignment = extract_alignment_attribute(&specifiers.attributes, name_table);
 
+        let static_init = if is_static {
+            init_decl.initializer.clone()
+        } else {
+            None
+        };
+
         locals.push(LocalVarInfo {
             name: var_name,
             c_type,
@@ -1045,6 +1081,7 @@ fn collect_locals_from_declaration(
             has_initializer: init_decl.initializer.is_some(),
             alignment,
             span: decl.span,
+            static_init,
         });
     }
 }
@@ -1076,6 +1113,8 @@ fn lower_static_local(
     name: &str,
     func_name: &str,
     c_type: &CType,
+    has_initializer: bool,
+    init_expr: Option<&ast::Initializer>,
     module: &mut IrModule,
     target: &Target,
     _type_builder: &TypeBuilder,
@@ -1083,10 +1122,40 @@ fn lower_static_local(
 ) {
     let mangled_name = format!("{}.{}", func_name, name);
     let ir_type = IrType::from_ctype(c_type, target);
-    let mut global = GlobalVariable::new(mangled_name, ir_type, Some(Constant::ZeroInit));
+
+    // Attempt to extract a compile-time constant from the initializer.
+    let constant = if has_initializer {
+        if let Some(ast::Initializer::Expression(expr)) = init_expr {
+            eval_static_init_expr(expr, c_type)
+        } else {
+            Some(Constant::ZeroInit)
+        }
+    } else {
+        Some(Constant::ZeroInit)
+    };
+
+    let mut global = GlobalVariable::new(mangled_name, ir_type, constant);
     global.linkage = Linkage::Internal;
     global.is_definition = true;
     module.add_global(global);
+}
+
+/// Evaluate a simple constant expression for static variable initialization.
+fn eval_static_init_expr(expr: &ast::Expression, _c_type: &CType) -> Option<Constant> {
+    match expr {
+        ast::Expression::IntegerLiteral { value, .. } => {
+            Some(Constant::Integer(*value as i128))
+        }
+        ast::Expression::UnaryOp { op, operand, .. } => {
+            if matches!(op, ast::UnaryOp::Negate) {
+                if let ast::Expression::IntegerLiteral { value, .. } = operand.as_ref() {
+                    return Some(Constant::Integer(-(*value as i128)));
+                }
+            }
+            Some(Constant::ZeroInit)
+        }
+        _ => Some(Constant::ZeroInit),
+    }
 }
 
 // ===========================================================================
@@ -1219,6 +1288,95 @@ fn extract_section_attribute(
     None
 }
 
+/// Extract struct/union fields from the AST `StructOrUnionSpecifier` into
+/// `StructField` entries that can be used in `CType::Struct` / `CType::Union`.
+pub fn extract_struct_union_fields(spec: &ast::StructOrUnionSpecifier) -> Vec<StructField> {
+    // Use thread-local name table for symbol resolution
+    let name_table = super::INTERNER_SNAPSHOT.with(|snap| {
+        snap.borrow().as_ref().cloned().unwrap_or_default()
+    });
+    let mut fields = Vec::new();
+    if let Some(ref members) = spec.members {
+        for member in members {
+            // Resolve base type from the member's specifier-qualifier list
+            let member_base = resolve_base_type_from_sqlist(&member.specifiers);
+            if member.declarators.is_empty() {
+                // Anonymous struct/union member (no declarators)
+                fields.push(StructField {
+                    name: None,
+                    ty: member_base.clone(),
+                    bit_width: None,
+                });
+            } else {
+                for sd in &member.declarators {
+                    let bit_width = sd.bit_width.as_ref().and_then(|e| {
+                        evaluate_const_int_expr(e).map(|v| v as u32)
+                    });
+                    if let Some(ref declarator) = sd.declarator {
+                        let name = extract_declarator_name(declarator, &name_table);
+                        // Apply pointer/array modifiers from declarator
+                        let member_type = apply_declarator_type(member_base.clone(), declarator, &name_table);
+                        fields.push(StructField {
+                            name,
+                            ty: member_type,
+                            bit_width,
+                        });
+                    } else {
+                        // Anonymous bitfield: `int : 3;`
+                        fields.push(StructField {
+                            name: None,
+                            ty: member_base.clone(),
+                            bit_width,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    fields
+}
+
+/// Resolve forward-referenced struct/union types: if a CType::Struct (or Union)
+/// has a tag name but empty fields, replace it with the full definition from the
+/// struct definitions registry.
+fn resolve_struct_forward_ref(ctype: &mut CType, struct_defs: &FxHashMap<String, CType>) {
+    match ctype {
+        CType::Struct {
+            name: Some(ref tag),
+            ref fields,
+            ..
+        } if fields.is_empty() => {
+            if let Some(full_def) = struct_defs.get(tag) {
+                *ctype = full_def.clone();
+            }
+        }
+        CType::Union {
+            name: Some(ref tag),
+            ref fields,
+            ..
+        } if fields.is_empty() => {
+            if let Some(full_def) = struct_defs.get(tag) {
+                *ctype = full_def.clone();
+            }
+        }
+        CType::Pointer(inner, _) => resolve_struct_forward_ref(inner, struct_defs),
+        CType::Array(inner, _) => resolve_struct_forward_ref(inner, struct_defs),
+        _ => {}
+    }
+}
+
+/// Resolve a base C type from a specifier-qualifier list (used for struct members).
+fn resolve_base_type_from_sqlist(sqlist: &ast::SpecifierQualifierList) -> CType {
+    let type_specs = &sqlist.type_specifiers;
+    if type_specs.is_empty() {
+        return CType::Int;
+    }
+    if type_specs.len() == 1 {
+        return map_single_type_specifier(&type_specs[0]);
+    }
+    resolve_multi_word_type(type_specs)
+}
+
 fn extract_alignment_attribute(
     attributes: &[ast::Attribute],
     name_table: &[String],
@@ -1264,7 +1422,27 @@ fn resolve_base_type(specifiers: &ast::DeclarationSpecifiers, _target: &Target) 
     resolve_multi_word_type(type_specs)
 }
 
+/// Resolve a Symbol to its actual string name using the name_table.
+/// Returns the symbol string if the index is in range, otherwise the
+/// debug representation.
+fn sym_to_string(sym: &crate::common::string_interner::Symbol, name_table: &[String]) -> String {
+    let idx = sym.as_u32() as usize;
+    if idx < name_table.len() {
+        name_table[idx].clone()
+    } else {
+        sym.to_string()
+    }
+}
+
 fn map_single_type_specifier(spec: &ast::TypeSpecifier) -> CType {
+    // Use thread-local name table for symbol resolution
+    let name_table = super::INTERNER_SNAPSHOT.with(|snap| {
+        snap.borrow().as_ref().cloned().unwrap_or_default()
+    });
+    map_single_type_specifier_with_names(spec, &name_table)
+}
+
+fn map_single_type_specifier_with_names(spec: &ast::TypeSpecifier, name_table: &[String]) -> CType {
     match spec {
         ast::TypeSpecifier::Void => CType::Void,
         ast::TypeSpecifier::Char => CType::Char,
@@ -1276,24 +1454,30 @@ fn map_single_type_specifier(spec: &ast::TypeSpecifier) -> CType {
         ast::TypeSpecifier::Bool => CType::Bool,
         ast::TypeSpecifier::Signed => CType::Int,
         ast::TypeSpecifier::Unsigned => CType::UInt,
-        ast::TypeSpecifier::Struct(s) => CType::Struct {
-            name: s.tag.as_ref().map(|t| t.to_string()),
-            fields: Vec::new(),
-            packed: false,
-            aligned: None,
+        ast::TypeSpecifier::Struct(s) => {
+            let fields = extract_struct_union_fields(s);
+            CType::Struct {
+                name: s.tag.as_ref().map(|t| sym_to_string(t, name_table)),
+                fields,
+                packed: false,
+                aligned: None,
+            }
         },
-        ast::TypeSpecifier::Union(u) => CType::Union {
-            name: u.tag.as_ref().map(|t| t.to_string()),
-            fields: Vec::new(),
-            packed: false,
-            aligned: None,
+        ast::TypeSpecifier::Union(u) => {
+            let fields = extract_struct_union_fields(u);
+            CType::Union {
+                name: u.tag.as_ref().map(|t| sym_to_string(t, name_table)),
+                fields,
+                packed: false,
+                aligned: None,
+            }
         },
         ast::TypeSpecifier::Enum(e) => CType::Enum {
-            name: e.tag.as_ref().map(|t| t.to_string()),
+            name: e.tag.as_ref().map(|t| sym_to_string(t, name_table)),
             underlying_type: Box::new(CType::Int),
         },
         ast::TypeSpecifier::TypedefName(name) => CType::Typedef {
-            name: name.to_string(),
+            name: sym_to_string(name, name_table),
             underlying: Box::new(CType::Int),
         },
         ast::TypeSpecifier::Typeof(_) => CType::Int,

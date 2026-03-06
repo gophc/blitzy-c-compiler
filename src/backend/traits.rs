@@ -43,8 +43,10 @@
 use std::fmt;
 
 use crate::common::diagnostics::DiagnosticEngine;
+use crate::common::fx_hash::FxHashMap;
 use crate::common::target::Target;
 use crate::ir::function::IrFunction;
+use crate::ir::instructions::Value;
 use crate::ir::types::IrType;
 
 // ===========================================================================
@@ -704,6 +706,15 @@ pub struct MachineFunction {
     /// RSP without adjusting the stack pointer, improving performance
     /// for small functions.
     pub is_leaf: bool,
+
+    /// Reverse mapping from codegen virtual register numbers to IR Values.
+    ///
+    /// Populated by the architecture-specific instruction selector when it
+    /// maps IR Values to `MachineOperand::VirtualRegister(vreg)` operands.
+    /// Used by [`apply_allocation_result`](crate::backend::generation)
+    /// to correctly look up physical register assignments from the register
+    /// allocator (which operates on IR `Value` indices).
+    pub vreg_to_ir_value: FxHashMap<u32, Value>,
 }
 
 impl MachineFunction {
@@ -723,6 +734,7 @@ impl MachineFunction {
             spill_slots: Vec::new(),
             callee_saved_regs: Vec::new(),
             is_leaf: true,
+            vreg_to_ir_value: FxHashMap::default(),
         }
     }
 
@@ -945,6 +957,46 @@ impl Default for RegisterInfo {
 // ===========================================================================
 // RelocationTypeInfo — architecture-specific relocation metadata
 // ===========================================================================
+
+/// Result of assembling a single [`MachineFunction`] into machine code.
+///
+/// Contains the encoded instruction bytes and any unresolved relocations
+/// that must be applied later (either by resolving intra-module references
+/// during text section concatenation, or by writing `.rela.text` entries
+/// into the relocatable ELF object for the linker to process).
+#[derive(Debug, Clone)]
+pub struct AssembledFunction {
+    /// Encoded machine code bytes for this function.
+    pub bytes: Vec<u8>,
+    /// Unresolved relocations emitted by the assembler.
+    ///
+    /// Each entry has an `offset` relative to the start of *this* function's
+    /// bytes, a `symbol` name, a relocation type (encoded as `rel_type_id`),
+    /// and an `addend`.  The code generation driver adjusts offsets to be
+    /// relative to the combined `.text` section before writing them.
+    pub relocations: Vec<FunctionRelocation>,
+}
+
+/// A single unresolved relocation from function assembly.
+///
+/// This is a simplified, architecture-neutral relocation record used to
+/// transport relocation information from the assembler through the code
+/// generation pipeline.  It is converted to architecture-specific ELF
+/// relocation entries when writing the relocatable object file.
+#[derive(Debug, Clone)]
+pub struct FunctionRelocation {
+    /// Byte offset within the function's encoded bytes where the relocation
+    /// must be applied.
+    pub offset: u64,
+    /// Target symbol name (e.g., `"add"`, `"printf"`, `".Lstr0"`).
+    pub symbol: String,
+    /// ELF relocation type ID (architecture-specific).
+    pub rel_type_id: u32,
+    /// Addend value for the relocation computation.
+    pub addend: i64,
+    /// Section name this relocation targets (usually `".text"`).
+    pub section: String,
+}
 
 /// Metadata describing an architecture-specific ELF relocation type.
 ///
@@ -1177,6 +1229,8 @@ pub trait ArchCodegen {
         func: &IrFunction,
         diag: &mut DiagnosticEngine,
         globals: &[crate::ir::module::GlobalVariable],
+        func_ref_map: &FxHashMap<Value, String>,
+        global_var_refs: &FxHashMap<Value, String>,
     ) -> Result<MachineFunction, String>;
 
     /// Encode machine instructions to raw bytes (built-in assembler).
@@ -1193,9 +1247,9 @@ pub trait ArchCodegen {
     ///
     /// # Returns
     ///
-    /// `Ok(Vec<u8>)` containing the complete encoded function body, or
-    /// `Err(String)` on encoding failure (e.g., immediate out of range).
-    fn emit_assembly(&self, mf: &MachineFunction) -> Result<Vec<u8>, String>;
+    /// `Ok(AssembledFunction)` containing the encoded function body and any
+    /// unresolved relocations, or `Err(String)` on encoding failure.
+    fn emit_assembly(&self, mf: &MachineFunction) -> Result<AssembledFunction, String>;
 
     /// Returns the target architecture for this codegen implementation.
     ///

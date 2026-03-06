@@ -165,6 +165,16 @@ pub enum X86Opcode {
     Call,
     /// `RET`
     Ret,
+
+    /// `LoadInd dst, ptr` — Load from memory at address in ptr register.
+    /// Encoded as `MOV dst, [ptr]`. Ptr operand is a plain register;
+    /// the encoder wraps it in a memory access.
+    LoadInd,
+
+    /// `StoreInd ptr, src` — Store src to memory at address in ptr register.
+    /// Encoded as `MOV [ptr], src`. Ptr operand is a plain register;
+    /// the encoder wraps it in a memory access.
+    StoreInd,
     /// `NOP`
     Nop,
 
@@ -299,6 +309,8 @@ impl X86Opcode {
             X86Opcode::Jg,
             X86Opcode::Call,
             X86Opcode::Ret,
+            X86Opcode::LoadInd,
+            X86Opcode::StoreInd,
             X86Opcode::Nop,
             X86Opcode::Movsd,
             X86Opcode::Movss,
@@ -430,6 +442,20 @@ pub struct X86_64CodeGen {
     /// constant-sentinel pattern (`BinOp(Add, result, UNDEF)`).
     /// Populated by a pre-scan pass during `lower_function`.
     constant_cache: FxHashMap<Value, i64>,
+    /// Accumulator mapping every allocated vreg to its IR Value.
+    /// Unlike `value_map` (which stores only the *latest* operand per Value
+    /// and loses earlier vregs when a Value is redefined in a later block,
+    /// e.g. after phi-elimination), this map preserves every single
+    /// vreg→Value association created during codegen so that
+    /// `apply_allocation_result` can map *all* vregs to physical registers.
+    vreg_ir_map: FxHashMap<u32, Value>,
+    /// Map from IR callee `Value` to function name for direct call
+    /// resolution. Populated from `IrModule::func_ref_map` during lowering.
+    func_ref_names: FxHashMap<Value, String>,
+    /// Map from IR `Value` (representing a global variable address) to the
+    /// global variable name.  Used to emit RIP-relative addressing for
+    /// global variable loads/stores on x86-64.
+    global_var_refs: FxHashMap<Value, String>,
 }
 
 impl X86_64CodeGen {
@@ -453,7 +479,21 @@ impl X86_64CodeGen {
             block_map: FxHashMap::default(),
             frame: None,
             constant_cache: FxHashMap::default(),
+            vreg_ir_map: FxHashMap::default(),
+            func_ref_names: FxHashMap::default(),
+            global_var_refs: FxHashMap::default(),
         }
+    }
+
+    /// Set module-level function reference map for direct call resolution.
+    pub fn set_func_ref_names(&mut self, map: FxHashMap<Value, String>) {
+        self.func_ref_names = map;
+    }
+
+    /// Set module-level global variable reference map for RIP-relative
+    /// addressing during instruction selection.
+    pub fn set_global_var_refs(&mut self, map: FxHashMap<Value, String>) {
+        self.global_var_refs = map;
     }
 
     /// Pre-populate the constant cache by scanning the given IR function
@@ -503,7 +543,15 @@ impl X86_64CodeGen {
 
         // Orphaned values: referenced but not defined (their sentinel
         // BinOp was removed by optimisation passes).
-        let mut orphans: Vec<u32> = referenced.difference(&defined).copied().collect();
+        // IMPORTANT: exclude function-reference values — they are NOT integer
+        // constants and must not consume entries from the constant pool.
+        let func_ref_indices: std::collections::HashSet<u32> =
+            self.func_ref_names.keys().map(|v| v.index()).collect();
+        let mut orphans: Vec<u32> = referenced
+            .difference(&defined)
+            .copied()
+            .filter(|idx| !func_ref_indices.contains(idx))
+            .collect();
         orphans.sort();
 
         // Collect integer constants from globals, sorted by their
@@ -521,11 +569,26 @@ impl X86_64CodeGen {
         int_consts.sort_by_key(|(idx, _)| *idx);
 
         // Pair orphaned values with constants in order.
-        for (orphan, (_idx, value)) in orphans.iter().zip(int_consts.iter()) {
+        let mut used_const_indices: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
+        for (pair_idx, (orphan, (_idx, value))) in
+            orphans.iter().zip(int_consts.iter()).enumerate()
+        {
             self.constant_cache.insert(Value(*orphan), *value);
+            used_const_indices.insert(pair_idx);
         }
 
+        // Collect remaining (unused) constants for surviving sentinels.
+        let remaining_consts: Vec<i64> = int_consts
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !used_const_indices.contains(i))
+            .map(|(_, (_, val))| *val)
+            .collect();
+
         // Also cache any surviving sentinel BinOp(Add, result, UNDEF) patterns.
+        // Pair them with remaining constants in instruction order.
+        let mut remaining_idx = 0usize;
         for block in func.blocks() {
             for inst in block.instructions() {
                 if let Instruction::BinOp {
@@ -539,10 +602,11 @@ impl X86_64CodeGen {
                     if *rhs == Value::UNDEF
                         && *lhs == *result
                         && !self.constant_cache.contains_key(result)
+                        && remaining_idx < remaining_consts.len()
                     {
-                        if let Some(&(_, val)) = int_consts.first() {
-                            self.constant_cache.insert(*result, val);
-                        }
+                        self.constant_cache
+                            .insert(*result, remaining_consts[remaining_idx]);
+                        remaining_idx += 1;
                     }
                 }
             }
@@ -566,8 +630,15 @@ impl X86_64CodeGen {
     }
 
     /// Record the machine operand that holds an IR value's result.
+    ///
+    /// Also accumulates every vreg→Value association in `vreg_ir_map`
+    /// so that values defined more than once (e.g. phi-eliminated copies)
+    /// have ALL of their vregs mapped for register allocation.
     #[inline]
     fn set_value(&mut self, val: Value, op: MachineOperand) {
+        if let MachineOperand::VirtualRegister(vreg) = &op {
+            self.vreg_ir_map.insert(*vreg, val);
+        }
         self.value_map.insert(val, op);
     }
 
@@ -584,6 +655,12 @@ impl X86_64CodeGen {
         // by optimisation passes.
         if let Some(&imm) = self.constant_cache.get(&val) {
             return MachineOperand::Immediate(imm);
+        }
+        // Check global variable reference map — the value may represent
+        // the address of a global variable.  Return a GlobalSymbol so
+        // the load/store handlers can emit RIP-relative addressing.
+        if let Some(name) = self.global_var_refs.get(&val) {
+            return MachineOperand::GlobalSymbol(name.clone());
         }
         MachineOperand::Immediate(0)
     }
@@ -943,10 +1020,40 @@ impl X86_64CodeGen {
         // Create virtual registers for each parameter and record in value_map.
         // Also populate value_types so call-site ABI classification can route
         // FP arguments to SSE registers (XMM0–XMM7) rather than GPRs.
+        //
+        // Additionally, emit MOV instructions from ABI parameter registers
+        // (RDI, RSI, RDX, RCX, R8, R9 for integer; XMM0-7 for FP) into
+        // the virtual registers, so the register allocator can properly
+        // track parameter live ranges.
+        let mut param_insts: Vec<MachineInstruction> = Vec::new();
+        let mut gpr_idx: usize = 0;
+        let mut sse_idx: usize = 0;
         for param in &func.params {
             let vreg = self.new_vreg();
-            self.set_value(param.value, vreg);
+            self.set_value(param.value, vreg.clone());
             self.value_types.insert(param.value, param.ty.clone());
+
+            // Determine whether the parameter is floating-point.
+            let is_fp = matches!(param.ty, IrType::F32 | IrType::F64 | IrType::F80);
+
+            if is_fp && sse_idx < SSE_ARG_REGS.len() {
+                let abi_reg = SSE_ARG_REGS[sse_idx];
+                param_insts.push(Self::mk_inst(
+                    X86Opcode::Movsd,
+                    Some(vreg),
+                    &[MachineOperand::Register(abi_reg)],
+                ));
+                sse_idx += 1;
+            } else if !is_fp && gpr_idx < INTEGER_ARG_REGS.len() {
+                let abi_reg = INTEGER_ARG_REGS[gpr_idx];
+                param_insts.push(Self::mk_inst(
+                    X86Opcode::Mov,
+                    Some(vreg),
+                    &[MachineOperand::Register(abi_reg)],
+                ));
+                gpr_idx += 1;
+            }
+            // Stack parameters would need memory operands — handled later if needed.
         }
 
         // 3. Create MachineFunction and build block map.
@@ -1027,6 +1134,13 @@ impl X86_64CodeGen {
             }
         }
 
+        // 3.6  Inject parameter-loading MOV instructions into the entry block.
+        //       These move values from ABI parameter registers (RDI, RSI, ...)
+        //       into the virtual registers created for each IR parameter Value.
+        for inst in param_insts {
+            mf.blocks[0].push_instruction(inst);
+        }
+
         // 4. Lower each IR basic block.
         for (ir_idx, ir_block) in func.blocks().iter().enumerate() {
             let mach_idx = *self.block_map.get(&ir_idx).unwrap_or(&0);
@@ -1053,6 +1167,19 @@ impl X86_64CodeGen {
         // Mark calls.
         if self.frame.as_ref().map_or(false, |f| f.has_calls) {
             mf.mark_has_calls();
+        }
+
+        // 6. Build the reverse mapping (vreg → IR Value) so that
+        // apply_allocation_result can correctly resolve VirtualRegister
+        // operands to physical registers via the register allocator's
+        // IR Value-indexed assignment table.
+        //
+        // Use vreg_ir_map (which accumulates ALL vreg→Value associations,
+        // even when a Value is defined in multiple blocks after phi
+        // elimination) instead of value_map (which only stores the LAST
+        // operand for each Value and loses earlier vregs).
+        for (&vreg, &ir_val) in &self.vreg_ir_map {
+            mf.vreg_to_ir_value.insert(vreg, ir_val);
         }
 
         Ok(mf)
@@ -1112,22 +1239,28 @@ impl X86_64CodeGen {
                 let src = self.get_value(*ptr);
                 let dst = self.new_vreg();
                 self.set_value(*result, dst.clone());
-                let opcode = Self::mov_opcode(ty);
 
-                // mov/movsd/movss dst, [src]
-                let _mem_op = match &src {
-                    MachineOperand::Memory { .. } => src.clone(),
-                    _ => MachineOperand::Memory {
-                        base: src
-                            .as_register()
-                            .or_else(|| src.as_virtual_register().map(|v| v as u16)),
-                        index: None,
-                        scale: 1,
-                        displacement: 0,
-                    },
-                };
-
-                vec![Self::mk_inst(opcode, Some(dst), &[src])]
+                // If the pointer is already a Memory or FrameSlot,
+                // use a regular Mov with that operand.
+                match &src {
+                    MachineOperand::Memory { .. } | MachineOperand::FrameSlot(_) => {
+                        let opcode = Self::mov_opcode(ty);
+                        vec![Self::mk_inst(opcode, Some(dst), &[src])]
+                    }
+                    MachineOperand::GlobalSymbol(name) => {
+                        // Global variable access: emit RIP-relative load.
+                        // On x86-64, this becomes `mov dst, [rip + sym]` with
+                        // a relocation for the symbol.
+                        let mem = MachineOperand::GlobalSymbol(name.clone());
+                        let opcode = Self::mov_opcode(ty);
+                        vec![Self::mk_inst(opcode, Some(dst), &[mem])]
+                    }
+                    _ => {
+                        // Pointer is in a register (virtual or physical).
+                        // Use LoadInd: the encoder will dereference it.
+                        vec![Self::mk_inst(X86Opcode::LoadInd, Some(dst), &[src])]
+                    }
+                }
             }
 
             // ---------------------------------------------------------------
@@ -1135,9 +1268,19 @@ impl X86_64CodeGen {
             // ---------------------------------------------------------------
             Instruction::Store { value, ptr, .. } => {
                 let src = self.get_value(*value);
-                let dest = self.get_value(*ptr);
+                let dest_ptr = self.get_value(*ptr);
 
-                vec![Self::mk_inst(X86Opcode::Mov, None, &[dest, src])]
+                // If the pointer is already a Memory or FrameSlot,
+                // use a regular Mov with that operand as destination.
+                match &dest_ptr {
+                    MachineOperand::Memory { .. } | MachineOperand::FrameSlot(_) => {
+                        vec![Self::mk_inst(X86Opcode::Mov, None, &[dest_ptr, src])]
+                    }
+                    _ => {
+                        // Pointer is in a register. Use StoreInd.
+                        vec![Self::mk_inst(X86Opcode::StoreInd, None, &[dest_ptr, src])]
+                    }
+                }
             }
 
             // ---------------------------------------------------------------
@@ -1379,94 +1522,59 @@ impl X86_64CodeGen {
                     out.push(Self::mk_inst(X86Opcode::Mov, Some(dst.clone()), &[base_op]));
 
                     for idx_val in indices {
+                        // Check constant cache first — compile-time constant
+                        // indices can be folded into immediate offsets.
+                        let const_idx = self.constant_cache.get(idx_val).copied();
+                        if let Some(cidx) = const_idx {
+                            let byte_offset = cidx * elem_size;
+                            if byte_offset != 0 {
+                                out.push(Self::mk_inst(
+                                    X86Opcode::Add,
+                                    Some(dst.clone()),
+                                    &[dst.clone(), MachineOperand::Immediate(byte_offset)],
+                                ));
+                            }
+                            // If offset is 0, no instruction needed.
+                            continue;
+                        }
+
                         let idx_op = self.get_value(*idx_val);
 
-                        if elem_size == 1 {
+                        // Check if index is an immediate — can compute offset at compile time
+                        if let MachineOperand::Immediate(imm) = &idx_op {
+                            let byte_offset = imm * elem_size;
+                            if byte_offset != 0 {
+                                out.push(Self::mk_inst(
+                                    X86Opcode::Add,
+                                    Some(dst.clone()),
+                                    &[dst.clone(), MachineOperand::Immediate(byte_offset)],
+                                ));
+                            }
+                            // If offset is 0, no instruction needed.
+                        } else if elem_size == 1 {
                             // Element size is 1 byte — no scaling needed.
                             out.push(Self::mk_inst(
                                 X86Opcode::Add,
                                 Some(dst.clone()),
                                 &[dst.clone(), idx_op],
                             ));
-                        } else if (elem_size > 0)
-                            && (elem_size == 2 || elem_size == 4 || elem_size == 8)
-                        {
-                            // Use LEA with scale factor for power-of-2 sizes
-                            // that fit in the SIB byte (1, 2, 4, 8).
-                            let idx_reg = match &idx_op {
-                                MachineOperand::Register(r) => Some(*r),
-                                MachineOperand::VirtualRegister(v) => Some(*v as u16),
-                                _ => None,
-                            };
-                            if let Some(index_r) = idx_reg {
-                                let base_r = match &dst {
-                                    MachineOperand::Register(r) => Some(*r),
-                                    MachineOperand::VirtualRegister(v) => Some(*v as u16),
-                                    _ => None,
-                                };
-                                if let Some(base_reg) = base_r {
-                                    out.push(Self::mk_inst(
-                                        X86Opcode::Lea,
-                                        Some(dst.clone()),
-                                        &[MachineOperand::Memory {
-                                            base: Some(base_reg),
-                                            index: Some(index_r),
-                                            scale: elem_size as u8,
-                                            displacement: 0,
-                                        }],
-                                    ));
-                                } else {
-                                    // Fallback: IMUL + ADD
-                                    let scaled = self.new_vreg();
-                                    out.push(Self::mk_inst(
-                                        X86Opcode::Imul,
-                                        Some(scaled.clone()),
-                                        &[idx_op, MachineOperand::Immediate(elem_size)],
-                                    ));
-                                    out.push(Self::mk_inst(
-                                        X86Opcode::Add,
-                                        Some(dst.clone()),
-                                        &[dst.clone(), scaled],
-                                    ));
-                                }
-                            } else {
-                                // Index is an immediate — multiply at compile time.
-                                if let MachineOperand::Immediate(imm) = &idx_op {
-                                    let byte_offset = imm * elem_size;
-                                    out.push(Self::mk_inst(
-                                        X86Opcode::Add,
-                                        Some(dst.clone()),
-                                        &[dst.clone(), MachineOperand::Immediate(byte_offset)],
-                                    ));
-                                } else {
-                                    // Unexpected operand — scale with IMUL.
-                                    let scaled = self.new_vreg();
-                                    out.push(Self::mk_inst(
-                                        X86Opcode::Imul,
-                                        Some(scaled.clone()),
-                                        &[idx_op, MachineOperand::Immediate(elem_size)],
-                                    ));
-                                    out.push(Self::mk_inst(
-                                        X86Opcode::Add,
-                                        Some(dst.clone()),
-                                        &[dst.clone(), scaled],
-                                    ));
-                                }
-                            }
                         } else {
-                            // Non-power-of-2 element size: IMUL index by elem_size,
-                            // then ADD to base.
-                            let scaled = self.new_vreg();
-                            out.push(Self::mk_inst(
-                                X86Opcode::Imul,
-                                Some(scaled.clone()),
-                                &[idx_op, MachineOperand::Immediate(elem_size)],
-                            ));
-                            out.push(Self::mk_inst(
-                                X86Opcode::Add,
-                                Some(dst.clone()),
-                                &[dst.clone(), scaled],
-                            ));
+                            // Register index with non-unity element size.
+                            // Use IMUL + ADD to avoid embedding vregs in Memory operands
+                            // (the register allocator cannot see inside Memory base/index).
+                            {
+                                let scaled = self.new_vreg();
+                                out.push(Self::mk_inst(
+                                    X86Opcode::Imul,
+                                    Some(scaled.clone()),
+                                    &[idx_op, MachineOperand::Immediate(elem_size)],
+                                ));
+                                out.push(Self::mk_inst(
+                                    X86Opcode::Add,
+                                    Some(dst.clone()),
+                                    &[dst.clone(), scaled],
+                                ));
+                            }
                         }
                     }
                 }
@@ -1636,13 +1744,13 @@ impl X86_64CodeGen {
                 // x86 two-address form: dst = lhs + rhs
                 // 1. MOV dst, lhs     (dst now holds the lhs value)
                 // 2. ADD dst, rhs     (dst += rhs)
-                // Operand convention: Some(dst) is the destination (modified
-                // in place), the first input is dst itself, the second is rhs.
+                // NOTE: The encoder normalizes result into operands[0],
+                // so we provide only rhs as the explicit operand.
                 out.push(Self::mk_inst(X86Opcode::Mov, Some(dst.clone()), &[lhs_op]));
                 out.push(Self::mk_inst(
                     X86Opcode::Add,
                     Some(dst.clone()),
-                    &[dst.clone(), rhs_op],
+                    &[rhs_op],
                 ));
             }
             BinOp::Sub => {
@@ -1651,7 +1759,7 @@ impl X86_64CodeGen {
                 out.push(Self::mk_inst(
                     X86Opcode::Sub,
                     Some(dst.clone()),
-                    &[dst.clone(), rhs_op],
+                    &[rhs_op],
                 ));
             }
             BinOp::Mul => {
@@ -1679,10 +1787,12 @@ impl X86_64CodeGen {
             }
             BinOp::UDiv => {
                 // xor RDX, RDX ; DIV rhs → quotient in RAX
+                // Encoder normalizes result into operands[0], so we only
+                // need to supply one copy of RDX in operands.
                 out.push(Self::mk_inst(
                     X86Opcode::Xor,
                     Some(MachineOperand::Register(RDX)),
-                    &[MachineOperand::Register(RDX), MachineOperand::Register(RDX)],
+                    &[MachineOperand::Register(RDX)],
                 ));
                 out.push(Self::mk_inst(
                     X86Opcode::Mov,
@@ -1715,7 +1825,7 @@ impl X86_64CodeGen {
                 out.push(Self::mk_inst(
                     X86Opcode::Xor,
                     Some(MachineOperand::Register(RDX)),
-                    &[MachineOperand::Register(RDX), MachineOperand::Register(RDX)],
+                    &[MachineOperand::Register(RDX)],
                 ));
                 out.push(Self::mk_inst(
                     X86Opcode::Mov,
@@ -1731,29 +1841,31 @@ impl X86_64CodeGen {
             }
 
             // -- Bitwise --
+            // NOTE: The encoder normalizes result into operands[0],
+            // so we provide only rhs as the explicit operand.
             BinOp::And => {
                 out.push(Self::mk_inst(
                     X86Opcode::Mov,
                     Some(dst.clone()),
-                    std::slice::from_ref(&lhs_op),
+                    &[lhs_op],
                 ));
-                out.push(Self::mk_inst(X86Opcode::And, Some(dst), &[lhs_op, rhs_op]));
+                out.push(Self::mk_inst(X86Opcode::And, Some(dst), &[rhs_op]));
             }
             BinOp::Or => {
                 out.push(Self::mk_inst(
                     X86Opcode::Mov,
                     Some(dst.clone()),
-                    std::slice::from_ref(&lhs_op),
+                    &[lhs_op],
                 ));
-                out.push(Self::mk_inst(X86Opcode::Or, Some(dst), &[lhs_op, rhs_op]));
+                out.push(Self::mk_inst(X86Opcode::Or, Some(dst), &[rhs_op]));
             }
             BinOp::Xor => {
                 out.push(Self::mk_inst(
                     X86Opcode::Mov,
                     Some(dst.clone()),
-                    std::slice::from_ref(&lhs_op),
+                    &[lhs_op],
                 ));
-                out.push(Self::mk_inst(X86Opcode::Xor, Some(dst), &[lhs_op, rhs_op]));
+                out.push(Self::mk_inst(X86Opcode::Xor, Some(dst), &[rhs_op]));
             }
 
             // -- Shifts (shift amount must be in CL) --
@@ -2072,7 +2184,12 @@ impl X86_64CodeGen {
         }
 
         // 3. Emit CALL instruction.
-        let callee_op = self.get_value(callee);
+        // Resolve callee — check func_ref_names for direct call target.
+        let callee_op = if let Some(fname) = self.func_ref_names.get(&callee) {
+            MachineOperand::GlobalSymbol(fname.clone())
+        } else {
+            self.get_value(callee)
+        };
         let mut call_inst = Self::mk_inst(X86Opcode::Call, None, &[callee_op]);
         call_inst.is_call = true;
         out.push(call_inst);
@@ -2134,13 +2251,17 @@ impl ArchCodegen for X86_64CodeGen {
         func: &IrFunction,
         diag: &mut DiagnosticEngine,
         globals: &[crate::ir::module::GlobalVariable],
+        func_ref_map: &FxHashMap<Value, String>,
+        global_var_refs: &FxHashMap<Value, String>,
     ) -> Result<MachineFunction, String> {
         let mut codegen = Self::new(self.target);
+        codegen.set_func_ref_names(func_ref_map.clone());
+        codegen.set_global_var_refs(global_var_refs.clone());
         codegen.lower_function_impl(func, diag, globals)
     }
 
     /// Emit machine code bytes from a MachineFunction.
-    fn emit_assembly(&self, mf: &MachineFunction) -> Result<Vec<u8>, String> {
+    fn emit_assembly(&self, mf: &MachineFunction) -> Result<crate::backend::traits::AssembledFunction, String> {
         use crate::backend::x86_64::assembler::encoder::X86_64Encoder;
 
         let mut encoder = X86_64Encoder::new(0);
@@ -2152,7 +2273,10 @@ impl ArchCodegen for X86_64CodeGen {
                 bytes.extend_from_slice(&encoded.bytes);
             }
         }
-        Ok(bytes)
+        Ok(crate::backend::traits::AssembledFunction {
+            bytes,
+            relocations: Vec::new(),
+        })
     }
 
     /// Return the target architecture.
@@ -2480,6 +2604,8 @@ impl std::fmt::Display for X86Opcode {
             X86Opcode::Pause => "pause",
             X86Opcode::Lfence => "lfence",
             X86Opcode::InlineAsm => "<inline-asm>",
+            X86Opcode::LoadInd => "movq_ind_load",
+            X86Opcode::StoreInd => "movq_ind_store",
         };
         f.write_str(name)
     }

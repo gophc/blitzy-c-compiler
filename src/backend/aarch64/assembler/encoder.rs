@@ -1297,12 +1297,28 @@ impl AArch64Encoder {
                 let rt2 = rm;
                 ok(enc_ldst_pair(opc, 0, 0b10, 1, imm7, rt2, rn, rd))
             }
+            // LDP post-index: LDP Rt, Rt2, [Rn], #imm  (idx=0b01)
+            A64Opcode::LDP_post => {
+                let opc = if inst.is_32bit { 0b00u32 } else { 0b10 };
+                let scale = if inst.is_32bit { 4i64 } else { 8 };
+                let imm7 = (imm / scale) as i32;
+                let rt2 = rm;
+                ok(enc_ldst_pair(opc, 0, 0b01, 1, imm7, rt2, rn, rd))
+            }
             A64Opcode::STP => {
                 let opc = if inst.is_32bit { 0b00u32 } else { 0b10 };
                 let scale = if inst.is_32bit { 4i64 } else { 8 };
                 let imm7 = (imm / scale) as i32;
                 let rt2 = rm;
                 ok(enc_ldst_pair(opc, 0, 0b10, 0, imm7, rt2, rn, rd))
+            }
+            // STP pre-index: STP Rt, Rt2, [Rn, #imm]!  (idx=0b11)
+            A64Opcode::STP_pre => {
+                let opc = if inst.is_32bit { 0b00u32 } else { 0b10 };
+                let scale = if inst.is_32bit { 4i64 } else { 8 };
+                let imm7 = (imm / scale) as i32;
+                let rt2 = rm;
+                ok(enc_ldst_pair(opc, 0, 0b11, 0, imm7, rt2, rn, rd))
             }
             A64Opcode::LDPSW => {
                 let imm7 = (imm / 4) as i32;

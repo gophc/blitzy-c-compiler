@@ -694,17 +694,33 @@ impl X86_64Encoder {
             | X86Opcode::Jl
             | X86Opcode::Jle
             | X86Opcode::Jg
-            | X86Opcode::Jge => {
+            | X86Opcode::Jge
+            | X86Opcode::Jb
+            | X86Opcode::Jbe
+            | X86Opcode::Ja
+            | X86Opcode::Jae
+            | X86Opcode::Jp
+            | X86Opcode::Jnp => {
                 let cc = condition_code(&opcode);
                 self.encode_jcc(inst, cc)
             }
             X86Opcode::Jmp => self.encode_jmp(inst),
             X86Opcode::Call => self.encode_call(inst),
-            X86Opcode::Cmove | X86Opcode::Cmovne => {
+            X86Opcode::Cmove | X86Opcode::Cmovne
+            | X86Opcode::Cmovl | X86Opcode::Cmovle
+            | X86Opcode::Cmovg | X86Opcode::Cmovge
+            | X86Opcode::Cmovb | X86Opcode::Cmovbe
+            | X86Opcode::Cmova | X86Opcode::Cmovae
+            | X86Opcode::Cmovp | X86Opcode::Cmovnp => {
                 let cc = condition_code(&opcode);
                 self.encode_cmovcc(inst, cc)
             }
-            X86Opcode::Sete | X86Opcode::Setne => {
+            X86Opcode::Sete | X86Opcode::Setne
+            | X86Opcode::Setl | X86Opcode::Setle
+            | X86Opcode::Setg | X86Opcode::Setge
+            | X86Opcode::Setb | X86Opcode::Setbe
+            | X86Opcode::Seta | X86Opcode::Setae
+            | X86Opcode::Setp | X86Opcode::Setnp => {
                 let cc = condition_code(&opcode);
                 let dst = self.extract_register(&inst.operands, 0);
                 self.encode_setcc(inst, cc, dst)
@@ -735,6 +751,46 @@ impl X86_64Encoder {
                     EncodedInstruction::new(bytes)
                 } else {
                     EncodedInstruction::new(vec![0x0F, 0x0B])
+                }
+            }
+            // LoadInd dst, ptr — MOV dst, [ptr]
+            X86Opcode::LoadInd => {
+                let ops = &inst.operands;
+                match (ops.first(), ops.get(1)) {
+                    (Some(MachineOperand::Register(dst)), Some(MachineOperand::Register(ptr))) => {
+                        // MOV r64, [r64]:  encode as reg_mem_op with base=ptr
+                        self.encode_reg_mem_op(&[0x8B], *dst, Some(*ptr), None, 1, 0, 8)
+                    }
+                    _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
+                }
+            }
+            // StoreInd ptr, src — MOV [ptr], src
+            X86Opcode::StoreInd => {
+                let ops = &inst.operands;
+                match (ops.first(), ops.get(1)) {
+                    (Some(MachineOperand::Register(ptr)), Some(MachineOperand::Register(src))) => {
+                        // MOV [r64], r64:  encode as mem_reg_op with base=ptr
+                        self.encode_mem_reg_op(&[0x89], Some(*ptr), None, 1, 0, *src, 8)
+                    }
+                    (Some(MachineOperand::Register(ptr)), Some(MachineOperand::Immediate(imm))) => {
+                        // MOV [r64], imm32
+                        let mut bytes = Vec::with_capacity(16);
+                        let mem_enc = encode_memory_operand(0, Some(*ptr), None, 1, 0);
+                        if let Some(rex) = compute_rex(true, None, None, Some(*ptr)) {
+                            bytes.push(rex);
+                        } else {
+                            bytes.push(rex_byte(true, false, false, false));
+                        }
+                        bytes.push(0xC7);
+                        bytes.push(mem_enc.modrm);
+                        if let Some(s) = mem_enc.sib {
+                            bytes.push(s);
+                        }
+                        bytes.extend_from_slice(&mem_enc.displacement);
+                        bytes.extend_from_slice(&encode_immediate(*imm, 4));
+                        EncodedInstruction::new(bytes)
+                    }
+                    _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
                 }
             }
             // Catch-all
@@ -972,7 +1028,19 @@ impl X86_64Encoder {
         rm_reg_opc: u8,
         reg_rm_opc: u8,
     ) -> EncodedInstruction {
-        let ops = &inst.operands;
+        // Handle 3-operand normalised form: [dst, dst_dup, src] → [dst, src]
+        // The codegen emits mk_inst(Op, Some(dst), &[dst, src]) and the
+        // normaliser prepends `result` to get [dst, dst, src].  The x86 ALU
+        // encoding needs [dst, src] where dst is both source and destination.
+        let ops: &[MachineOperand] = if inst.operands.len() >= 3 {
+            // Skip the duplicate dst at index 1.
+            &[inst.operands[0].clone(), inst.operands[2].clone()]
+        } else {
+            &inst.operands
+        };
+        // Re-borrow as a slice for the match below.
+        let ops_ref: Vec<MachineOperand> = ops.to_vec();
+        let ops = &ops_ref;
         let opsz = Self::infer_operand_size(inst);
         match (ops.first(), ops.get(1)) {
             (Some(MachineOperand::Register(dst)), Some(MachineOperand::Register(src))) => {
@@ -1377,14 +1445,24 @@ impl X86_64Encoder {
         match (ops.first(), ops.get(1)) {
             (Some(MachineOperand::Register(dst)), Some(MachineOperand::Register(src))) => {
                 let mut bytes = Vec::with_capacity(5);
-                if let Some(rex) = compute_rex(false, Some(*dst), None, Some(*src)) {
+                // MOVZBL/MOVSBL read a byte register in the r/m field.
+                // Without REX, hw encodings 4-7 address AH/CH/DH/BH.
+                // With REX, they address SPL/BPL/SIL/DIL.  We must emit
+                // a plain REX (0x40) when the source byte register is in
+                // this range so the correct low-byte register is read,
+                // matching what SETcc already does for byte destinations.
+                let rex_from_ext = compute_rex(false, Some(*dst), None, Some(*src));
+                let src_hw = hw_encoding(*src);
+                if let Some(rex) = rex_from_ext {
                     bytes.push(rex);
+                } else if (4..=7).contains(&src_hw) {
+                    bytes.push(0x40); // plain REX to access SPL/BPL/SIL/DIL
                 }
                 bytes.extend_from_slice(byte_opc);
                 bytes.push(modrm_byte(
                     0b11,
                     hw_encoding(*dst) & 0x7,
-                    hw_encoding(*src) & 0x7,
+                    src_hw & 0x7,
                 ));
                 EncodedInstruction::new(bytes)
             }

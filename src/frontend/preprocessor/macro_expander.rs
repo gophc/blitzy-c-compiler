@@ -213,21 +213,55 @@ impl<'a> MacroExpander<'a> {
                     // Prepare replacement tokens (with ## processing).
                     let replacement = self.prepare_object_replacement(&macro_def, token.span);
 
-                    // C11 §6.10.3.4: rescan replacement WITH remaining source
-                    // tokens.  Build a combined list and recurse.
-                    let mut rescan_input = replacement;
-                    rescan_input.extend_from_slice(&tokens[i + 1..]);
-
+                    // C11 §6.10.3.4: rescan replacement tokens with paint
+                    // active (suppress self-referential re-expansion), then
+                    // unpaint before processing remaining source tokens.
                     self.paint_marker.paint(&macro_def.name);
                     self.depth += 1;
 
-                    let rescanned = self.expand_tokens(&rescan_input);
+                    let rescanned_sub = self.expand_tokens(&replacement);
 
                     self.depth -= 1;
                     self.paint_marker.unpaint(&macro_def.name);
 
-                    result.extend(rescanned);
-                    return result; // All remaining tokens processed via rescan.
+                    let remaining = &tokens[i + 1..];
+
+                    // C11 §6.10.3.4 cross-boundary check: if the last
+                    // token of the rescanned replacement is a function-like
+                    // macro name (unexpanded because its argument '(' is
+                    // in the remaining source tokens), combine them so the
+                    // invocation spans the replacement/source boundary.
+                    if !remaining.is_empty() {
+                        if let Some(last) = rescanned_sub.last() {
+                            if last.kind == PPTokenKind::Identifier
+                                && !last.painted
+                            {
+                                let cross = self
+                                    .macro_defs
+                                    .get(&last.text)
+                                    .map(|md| {
+                                        matches!(md.kind, MacroKind::FunctionLike { .. })
+                                    })
+                                    .unwrap_or(false);
+                                if cross && find_lparen(remaining, 0).is_some() {
+                                    let mut tail = rescanned_sub;
+                                    let func_tok = tail.pop().unwrap();
+                                    result.extend(tail);
+                                    let mut combined = vec![func_tok];
+                                    combined.extend_from_slice(remaining);
+                                    let expanded = self.expand_tokens(&combined);
+                                    result.extend(expanded);
+                                    return result;
+                                }
+                            }
+                        }
+                    }
+
+                    // No cross-boundary invocation — process normally.
+                    result.extend(rescanned_sub);
+                    let rest = self.expand_tokens(remaining);
+                    result.extend(rest);
+                    return result;
                 }
 
                 MacroKind::FunctionLike { .. } => {
@@ -241,19 +275,63 @@ impl<'a> MacroExpander<'a> {
                                         &macro_def, args, token.span,
                                     );
 
-                                    // Rescan substituted + remaining tokens.
-                                    let mut rescan_input = substituted;
-                                    rescan_input.extend_from_slice(&tokens[end_idx..]);
-
+                                    // C11 §6.10.3.4: Rescan the replacement
+                                    // tokens with paint active to suppress
+                                    // self-referential re-expansion.  Then
+                                    // UNPAINT before processing remaining
+                                    // source tokens so that subsequent
+                                    // invocations of the same macro (e.g.
+                                    // `C(1) || C(2)`) are expanded normally.
                                     self.paint_marker.paint(&macro_def.name);
                                     self.depth += 1;
 
-                                    let rescanned = self.expand_tokens(&rescan_input);
+                                    let rescanned_sub = self.expand_tokens(&substituted);
 
                                     self.depth -= 1;
                                     self.paint_marker.unpaint(&macro_def.name);
 
-                                    result.extend(rescanned);
+                                    let remaining = &tokens[end_idx..];
+
+                                    // C11 §6.10.3.4 cross-boundary check
+                                    // (same as object-like case above).
+                                    if !remaining.is_empty() {
+                                        if let Some(last) = rescanned_sub.last() {
+                                            if last.kind == PPTokenKind::Identifier
+                                                && !last.painted
+                                            {
+                                                let cross = self
+                                                    .macro_defs
+                                                    .get(&last.text)
+                                                    .map(|md| {
+                                                        matches!(
+                                                            md.kind,
+                                                            MacroKind::FunctionLike { .. }
+                                                        )
+                                                    })
+                                                    .unwrap_or(false);
+                                                if cross
+                                                    && find_lparen(remaining, 0).is_some()
+                                                {
+                                                    let mut tail = rescanned_sub;
+                                                    let func_tok = tail.pop().unwrap();
+                                                    result.extend(tail);
+                                                    let mut combined = vec![func_tok];
+                                                    combined.extend_from_slice(remaining);
+                                                    let expanded =
+                                                        self.expand_tokens(&combined);
+                                                    result.extend(expanded);
+                                                    return result;
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    result.extend(rescanned_sub);
+
+                                    // Continue expanding remaining source
+                                    // tokens from after the macro invocation.
+                                    let rest = self.expand_tokens(remaining);
+                                    result.extend(rest);
                                     return result;
                                 }
                                 Err(()) => {

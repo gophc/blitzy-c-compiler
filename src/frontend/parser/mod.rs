@@ -167,7 +167,7 @@ impl<'src> Parser<'src> {
         // Create a dummy "previous" token (before any real tokens).
         let previous = Token::new(TokenKind::Eof, Span::dummy());
 
-        Parser {
+        let mut parser = Parser {
             lexer,
             current,
             previous,
@@ -176,7 +176,19 @@ impl<'src> Parser<'src> {
             max_recursion_depth: MAX_RECURSION_DEPTH,
             panic_mode: false,
             typedef_names: std::collections::HashSet::new(),
+        };
+
+        // Pre-register GCC builtin type names as typedefs so the parser
+        // recognises them as type specifiers in declaration contexts.
+        let builtin_type_names = [
+            "__builtin_va_list",
+        ];
+        for name in &builtin_type_names {
+            let sym = parser.intern(name);
+            parser.register_typedef(sym);
         }
+
+        parser
     }
 
     // -----------------------------------------------------------------------
@@ -478,6 +490,55 @@ impl<'src> Parser<'src> {
         self.typedef_names.insert(sym.as_u32());
     }
 
+    /// Skip an optional GCC `__asm__("symbol_name")` label on a declaration.
+    ///
+    /// This construct appears after a declarator to specify the assembly-level
+    /// symbol name.  It is used extensively in glibc headers (e.g. to redirect
+    /// `fscanf` to `__isoc99_fscanf`).
+    pub fn skip_asm_label(&mut self) {
+        if self.check(&TokenKind::Asm) {
+            self.advance(); // consume `__asm__` / `asm`
+            if self.match_token(&TokenKind::LeftParen) {
+                let mut depth: u32 = 1;
+                while depth > 0 && !self.check(&TokenKind::Eof) {
+                    if self.check(&TokenKind::LeftParen) {
+                        depth += 1;
+                    } else if self.check(&TokenKind::RightParen) {
+                        depth -= 1;
+                        if depth == 0 {
+                            self.advance(); // consume closing ')'
+                            break;
+                        }
+                    }
+                    self.advance();
+                }
+            }
+        }
+    }
+
+    /// Skip optional trailing `__attribute__((...))` lists that appear after
+    /// a declarator/initializer but before `;` or `,`.
+    pub fn skip_trailing_attributes(&mut self) {
+        while self.check(&TokenKind::Attribute) {
+            self.advance(); // consume `__attribute__`
+            if self.match_token(&TokenKind::LeftParen) {
+                let mut depth: u32 = 1;
+                while depth > 0 && !self.check(&TokenKind::Eof) {
+                    if self.check(&TokenKind::LeftParen) {
+                        depth += 1;
+                    } else if self.check(&TokenKind::RightParen) {
+                        depth -= 1;
+                        if depth == 0 {
+                            self.advance(); // consume closing ')'
+                            break;
+                        }
+                    }
+                    self.advance();
+                }
+            }
+        }
+    }
+
     /// Check if the current token is an identifier (any identifier).
     pub fn is_at_identifier(&self) -> bool {
         matches!(self.current.kind, TokenKind::Identifier(_))
@@ -716,12 +777,29 @@ impl<'src> Parser<'src> {
     ) -> Result<ExternalDeclaration, ()> {
         let mut init_declarators = Vec::new();
 
+        // If this is a typedef declaration, register the first declarator's
+        // name as a typedef name so the parser can recognize it as a type
+        // name in subsequent declarations.
+        let is_typedef = matches!(
+            specifiers.storage_class,
+            Some(crate::frontend::parser::ast::StorageClass::Typedef)
+        );
+        if is_typedef {
+            declarations::register_declarator_name_pub(self, &first_declarator);
+        }
+
+        // Skip optional GCC asm label: `__asm__("symbol_name")`
+        self.skip_asm_label();
+
         // Parse optional initializer for the first declarator.
         let first_init = if self.match_token(&TokenKind::Equal) {
             Some(self.parse_initializer()?)
         } else {
             None
         };
+
+        // Skip optional trailing GCC __attribute__ after declarator
+        self.skip_trailing_attributes();
 
         let first_span = self.make_span(start_span);
         init_declarators.push(InitDeclarator {
@@ -734,11 +812,19 @@ impl<'src> Parser<'src> {
         while self.match_token(&TokenKind::Comma) {
             let decl_start = self.current_span();
             let decl = declarations::parse_declarator(self)?;
+
+            // Skip optional GCC asm label
+            self.skip_asm_label();
+
             let init = if self.match_token(&TokenKind::Equal) {
                 Some(self.parse_initializer()?)
             } else {
                 None
             };
+
+            // Skip optional trailing GCC __attribute__
+            self.skip_trailing_attributes();
+
             let decl_span = self.make_span(decl_start);
             init_declarators.push(InitDeclarator {
                 declarator: decl,

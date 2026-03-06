@@ -875,7 +875,7 @@ impl DefaultLinkerScript {
                         paddr: self.base_address + elf_header_size,
                         filesz: phdr_size,
                         memsz: phdr_size,
-                        alignment: phdr_entry_size,
+                        alignment: seg_def.alignment,
                     });
                 }
 

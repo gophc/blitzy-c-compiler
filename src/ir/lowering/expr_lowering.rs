@@ -82,6 +82,16 @@ pub struct ExprLoweringContext<'a> {
     /// Used to determine signedness and pointee type for correct instruction
     /// selection (signed vs unsigned division, arithmetic shift vs logical, etc.).
     pub local_types: &'a FxHashMap<String, CType>,
+    /// Enum constant name → integer value mapping.
+    /// Populated by the lowering driver from the semantic analysis results
+    /// so that enum constant identifiers can be resolved to immediate values.
+    pub enum_constants: &'a FxHashMap<String, i128>,
+    /// Static local variable name → mangled global name mapping.
+    /// When a `static` local variable `x` inside function `foo` is
+    /// encountered, its storage is a global variable named `foo.x`.
+    /// This map allows `lower_identifier` to redirect the access to the
+    /// corresponding global variable.
+    pub static_locals: &'a FxHashMap<String, String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -840,21 +850,53 @@ fn lower_identifier(ctx: &mut ExprLoweringContext<'_>, sym_idx: u32, span: Span)
     }
 
     // Global variables.
-    if let Some(gv) = ctx.module.get_global(name) {
-        let gt = gv.ty.clone();
-        let ptr_val = ctx.builder.fresh_value();
-        let (loaded, li) = ctx.builder.build_load(ptr_val, gt, span);
-        emit_inst(ctx, li);
-        return TypedValue::new(loaded, var_cty);
+    {
+        let global_ty = ctx.module.get_global(name).map(|gv| gv.ty.clone());
+        if let Some(gt) = global_ty {
+            let global_name = name.to_string();
+            let ptr_val = ctx.builder.fresh_value();
+            // Record the mapping from this Value to the global variable name
+            // so the backend can emit architecture-specific global addressing
+            // (e.g., RIP-relative on x86-64, ADRP/LDR on AArch64).
+            ctx.module.global_var_refs.insert(ptr_val, global_name);
+            let (loaded, li) = ctx.builder.build_load(ptr_val, gt, span);
+            emit_inst(ctx, li);
+            return TypedValue::new(loaded, var_cty);
+        }
     }
 
     // Function references (decay to function pointer).
-    if ctx.module.get_function(name).is_some() {
+    if ctx.module.get_function(name).is_some()
+        || ctx.module.declarations().iter().any(|d| d.name == *name)
+    {
+        let func_name = name.to_string();
         let fptr = ctx.builder.fresh_value();
+        ctx.module
+            .func_ref_map
+            .insert(fptr, func_name);
         return TypedValue::new(
             fptr,
             CType::Pointer(Box::new(CType::Void), TypeQualifiers::default()),
         );
+    }
+
+    // Enum constants — compile-time integer values.
+    if let Some(&enum_val) = ctx.enum_constants.get(name) {
+        let val = emit_int_const(ctx, enum_val, IrType::I32, span);
+        return TypedValue::new(val, CType::Int);
+    }
+
+    // Static local variables — redirected to their mangled global name.
+    if let Some(mangled) = ctx.static_locals.get(name) {
+        let global_ty = ctx.module.get_global(mangled.as_str()).map(|gv| gv.ty.clone());
+        if let Some(gt) = global_ty {
+            let mangled_name = mangled.clone();
+            let ptr_val = ctx.builder.fresh_value();
+            ctx.module.global_var_refs.insert(ptr_val, mangled_name);
+            let (loaded, li) = ctx.builder.build_load(ptr_val, gt, span);
+            emit_inst(ctx, li);
+            return TypedValue::new(loaded, var_cty);
+        }
     }
 
     ctx.diagnostics

@@ -330,6 +330,22 @@ impl ScopeStack {
     /// Returns the [`SymbolId`] of the first (innermost) match, implementing
     /// C's lexical scoping with shadowing semantics. If the identifier is
     /// not declared in any visible scope, returns `None`.
+    /// Return the current scope nesting depth (0 = file scope).
+    pub fn scope_depth(&self) -> usize {
+        self.scopes.len().saturating_sub(1)
+    }
+
+    /// Debug dump all scopes and their ordinary identifiers.
+    pub fn debug_dump(&self, interner: &crate::common::string_interner::Interner) {
+        for (i, scope) in self.scopes.iter().enumerate() {
+            eprintln!("  Scope {}: kind={:?}, ordinary names:", i, scope.kind);
+            for (sym, id) in &scope.ordinary {
+                let name = interner.resolve(*sym);
+                eprintln!("    '{}' (Symbol({})) -> {:?}", name, sym.as_u32(), id);
+            }
+        }
+    }
+
     pub fn lookup_ordinary(&self, name: Symbol) -> Option<SymbolId> {
         for scope in self.scopes.iter().rev() {
             if let Some(&id) = scope.ordinary.get(&name) {

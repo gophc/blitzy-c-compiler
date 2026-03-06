@@ -1026,53 +1026,89 @@ impl<'a> Preprocessor<'a> {
             }
 
             // Active region — collect and macro-expand the line.
+            //
+            // C11 §6.10.3.4: After substitution, replacement tokens are
+            // rescanned together with subsequent source tokens for further
+            // macro names to replace.  We collect all non-directive tokens on
+            // this line, then run them through the full MacroExpander which
+            // handles multi-level expansion and paint-marker recursion
+            // protection correctly.
             let restore_pos = line_start;
             pos = restore_pos;
 
-            while pos < len
-                && tokens[pos].kind != PPTokenKind::Newline
-                && tokens[pos].kind != PPTokenKind::EndOfFile
-            {
+            // Collect raw tokens for the current line.  In C preprocessing,
+            // function-like macro invocations may span multiple source lines
+            // (after line-splicing).  We must collect tokens across newlines
+            // when a function-like macro argument list is open (unbalanced
+            // parentheses).
+            let mut line_tokens: Vec<PPToken> = Vec::new();
+            let mut paren_depth: i32 = 0;
+            let mut in_macro_args = false;
+            while pos < len && tokens[pos].kind != PPTokenKind::EndOfFile {
                 let tok = &tokens[pos];
 
-                // Check if this identifier should be macro-expanded.
-                if tok.kind == PPTokenKind::Identifier && !tok.painted {
-                    if let Some(macro_def) = self.macro_defs.get(&tok.text).cloned() {
-                        if matches!(macro_def.kind, MacroKind::FunctionLike { .. }) {
-                            // Function-like: look ahead for `(`.
-                            let mut lookahead = pos + 1;
-                            while lookahead < len
-                                && tokens[lookahead].kind == PPTokenKind::Whitespace
-                            {
-                                lookahead += 1;
+                // If we hit a newline and we're NOT inside macro arguments,
+                // the line ends here.
+                if tok.kind == PPTokenKind::Newline && !in_macro_args {
+                    break;
+                }
+
+                // Skip newlines that occur inside macro argument lists (treat
+                // them as whitespace — C11 §5.1.1.2 translation phases).
+                if tok.kind == PPTokenKind::Newline && in_macro_args {
+                    pos += 1;
+                    continue;
+                }
+
+                // Track parenthesis depth for macro argument spanning.
+                if tok.kind == PPTokenKind::Punctuator {
+                    match tok.text.as_str() {
+                        "(" => {
+                            paren_depth += 1;
+                            if !in_macro_args && paren_depth == 1 {
+                                // Check if the preceding non-whitespace token
+                                // is a function-like macro name.
+                                let last_ident = line_tokens.iter().rev()
+                                    .find(|t| t.kind != PPTokenKind::Whitespace);
+                                if let Some(prev) = last_ident {
+                                    if prev.kind == PPTokenKind::Identifier {
+                                        if let Some(md) = self.macro_defs.get(&prev.text) {
+                                            if matches!(md.kind, MacroKind::FunctionLike { .. }) {
+                                                in_macro_args = true;
+                                            }
+                                        }
+                                    }
+                                }
                             }
-                            if lookahead < len
-                                && tokens[lookahead].kind == PPTokenKind::Punctuator
-                                && tokens[lookahead].text == "("
-                            {
-                                // Collect arguments and expand.
-                                let (expanded, new_pos) =
-                                    self.expand_function_macro(&macro_def, tokens, pos, lookahead);
-                                output.extend(expanded);
-                                pos = new_pos;
-                                continue;
-                            }
-                            // No `(` — not a function-like invocation; emit as-is.
-                        } else {
-                            // Object-like macro: expand.
-                            let expanded = self.expand_object_macro(&macro_def, tok.span);
-                            output.extend(expanded);
-                            pos += 1;
-                            continue;
                         }
+                        ")" => {
+                            paren_depth -= 1;
+                            if in_macro_args && paren_depth == 0 {
+                                in_macro_args = false;
+                            }
+                        }
+                        _ => {}
                     }
                 }
 
-                // Non-macro token or non-expandable — pass through.
-                if tok.kind != PPTokenKind::Whitespace || !output.is_empty() {
-                    output.push(tok.clone());
+                if tok.kind != PPTokenKind::Whitespace || !line_tokens.is_empty() {
+                    line_tokens.push(tok.clone());
                 }
                 pos += 1;
+            }
+
+            // Expand all macros (including multi-level rescanning) using
+            // the full MacroExpander.
+            if !line_tokens.is_empty() {
+                let expanded = {
+                    let mut expander = macro_expander::MacroExpander::new(
+                        &self.macro_defs,
+                        &mut *self.diagnostics,
+                        self.max_recursion_depth,
+                    );
+                    expander.expand_tokens(&line_tokens)
+                };
+                output.extend(expanded);
             }
 
             // Skip newline.

@@ -706,6 +706,8 @@ pub struct RiscV64InstructionSelector {
     block_labels: std::collections::HashMap<usize, String>,
     /// Whether the current function makes any calls.
     has_calls: bool,
+    /// Constant value cache: maps IR Value index to integer constant value.
+    constant_values: crate::common::fx_hash::FxHashMap<u32, i64>,
 }
 
 impl RiscV64InstructionSelector {
@@ -728,7 +730,13 @@ impl RiscV64InstructionSelector {
             used_callee_saved_fprs: Vec::new(),
             block_labels: std::collections::HashMap::new(),
             has_calls: false,
+            constant_values: crate::common::fx_hash::FxHashMap::default(),
         }
+    }
+
+    /// Set the constant value cache (called before `select_function`).
+    pub fn set_constant_values(&mut self, cv: crate::common::fx_hash::FxHashMap<u32, i64>) {
+        self.constant_values = cv;
     }
 
     /// Reset selector state for a new function.
@@ -743,6 +751,8 @@ impl RiscV64InstructionSelector {
         self.used_callee_saved_fprs.clear();
         self.block_labels.clear();
         self.has_calls = false;
+        // NOTE: constant_values is NOT cleared here — it is set before
+        // select_function and must survive the reset.
     }
 
     // -----------------------------------------------------------------------
@@ -2071,10 +2081,25 @@ impl RiscV64InstructionSelector {
                 ty,
                 span: _,
             } => {
-                let lhs_reg = self.src_reg(*lhs);
-                let rhs_reg = self.src_reg(*rhs);
-                let rd = self.dest_reg(*result, ty);
-                self.select_binop(rd, lhs_reg, rhs_reg, op, ty);
+                // Handle constant sentinel: BinOp(Add, result, result, UNDEF)
+                if *lhs == *result && *rhs == Value::UNDEF {
+                    let rd = self.dest_reg(*result, ty);
+                    if let Some(&imm) = self.constant_values.get(&result.index()) {
+                        // Use LI (LUI+ADDI) to materialize the constant.
+                        let insts = self.materialize_immediate(rd, imm);
+                        for inst in insts {
+                            self.emit(inst);
+                        }
+                    } else {
+                        // Fallback: load 0.
+                        self.emit(RvInstruction::i_type(RvOpcode::ADDI, rd, ZERO, 0));
+                    }
+                } else {
+                    let lhs_reg = self.src_reg(*lhs);
+                    let rhs_reg = self.src_reg(*rhs);
+                    let rd = self.dest_reg(*result, ty);
+                    self.select_binop(rd, lhs_reg, rhs_reg, op, ty);
+                }
             }
 
             Instruction::ICmp {
@@ -2190,7 +2215,9 @@ impl RiscV64InstructionSelector {
                         self.emit_i(RvOpcode::ADDI, A0, val_reg, 0); // MV
                     }
                 }
-                // Epilogue will be emitted at function level
+                // Emit RET as terminator — generation.rs will insert the
+                // trait-generated epilogue (frame teardown) before this.
+                self.emit(RvInstruction::no_op(RvOpcode::RET));
             }
 
             Instruction::Phi {
@@ -2454,16 +2481,10 @@ impl RiscV64InstructionSelector {
         self.frame_size =
             (self.frame_size + (STACK_ALIGNMENT as i64) - 1) & !((STACK_ALIGNMENT as i64) - 1);
 
-        // Phase 5: Generate prologue and epilogue
-        // Insert prologue at the beginning
-        let body_instructions = std::mem::take(&mut self.instructions);
-        self.emit_prologue();
-        let mut result = std::mem::take(&mut self.instructions);
-        result.extend(body_instructions);
-
-        // Add epilogue at the end (before any existing RET)
-        self.instructions = result;
-        self.emit_epilogue();
+        // Prologue/epilogue are generated externally by the ArchCodegen
+        // trait methods (emit_prologue/emit_epilogue) in mod.rs, which are
+        // called by generation.rs after register allocation.  We do NOT
+        // emit them here to avoid duplication.
 
         std::mem::take(&mut self.instructions)
     }

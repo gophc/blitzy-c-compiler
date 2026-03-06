@@ -65,6 +65,7 @@ use super::Parser;
 use crate::common::diagnostics::Span;
 use crate::common::string_interner::Symbol;
 use crate::frontend::lexer::token as token_types;
+use crate::common::encoding::decode_string_to_bytes;
 use crate::frontend::lexer::token::TokenKind;
 
 // ===========================================================================
@@ -930,7 +931,9 @@ fn parse_primary_expression(parser: &mut Parser<'_>) -> Result<Expression, ()> {
         // String literal (with adjacent string concatenation)
         TokenKind::StringLiteral { value, prefix } => {
             let seg = StringSegment {
-                value: value.as_bytes().to_vec(),
+                // Decode PUA code points back to raw bytes for byte-exact
+                // fidelity (§0.7.9 PUA Encoding Fidelity).
+                value: decode_string_to_bytes(value),
                 span: parser.current_span(),
             };
             let pfx = convert_string_prefix(*prefix);
@@ -940,7 +943,7 @@ fn parse_primary_expression(parser: &mut Parser<'_>) -> Result<Expression, ()> {
             let mut segments = vec![seg];
             while let TokenKind::StringLiteral { value, .. } = &parser.current.kind {
                 segments.push(StringSegment {
-                    value: value.as_bytes().to_vec(),
+                    value: decode_string_to_bytes(value),
                     span: parser.current_span(),
                 });
                 parser.advance();

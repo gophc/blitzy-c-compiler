@@ -507,6 +507,8 @@ impl ArchCodegen for I686Codegen {
         func: &IrFunction,
         diag: &mut DiagnosticEngine,
         _globals: &[crate::ir::module::GlobalVariable],
+        _func_ref_map: &crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>,
+        _global_var_refs: &crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>,
     ) -> Result<MachineFunction, String> {
         let mut mf = MachineFunction::new(func.name.clone());
         let target = Target::I686;
@@ -516,6 +518,36 @@ impl ArchCodegen for I686Codegen {
 
         // Value-to-operand mapping for IR SSA values.
         let mut value_map: FxHashMap<u32, MachineOperand> = FxHashMap::default();
+
+        // Build constant cache from globals (same mechanism as x86-64).
+        // Integer constants are stored as globals named `.Lconst.i.N` with
+        // Constant::Integer initializer. Match them to BinOp sentinels.
+        let mut constant_cache: FxHashMap<u32, i64> = FxHashMap::default();
+        {
+            // Collect constant values from globals.
+            let mut const_values: Vec<i64> = Vec::new();
+            for gv in _globals {
+                if gv.name.starts_with(".Lconst.i.") {
+                    if let Some(crate::ir::module::Constant::Integer(v)) = &gv.initializer {
+                        const_values.push(*v as i64);
+                    }
+                }
+            }
+            // Match BinOp sentinels: BinOp where lhs == result && rhs == UNDEF
+            let mut const_idx = 0;
+            for block in &func.blocks {
+                for inst in block.instructions() {
+                    if let Instruction::BinOp { result, lhs, rhs, .. } = inst {
+                        if *lhs == *result && *rhs == Value::UNDEF
+                            && const_idx < const_values.len()
+                        {
+                            constant_cache.insert(result.index(), const_values[const_idx]);
+                            const_idx += 1;
+                        }
+                    }
+                }
+            }
+        }
 
         // Stack slot tracking for alloca instructions.
         let mut stack_offset: i32 = 0;
@@ -577,6 +609,7 @@ impl ArchCodegen for I686Codegen {
                     &mut mf,
                     &target,
                     diag,
+                    &constant_cache,
                 );
 
                 if mbb_idx < mf.blocks.len() {
@@ -594,10 +627,20 @@ impl ArchCodegen for I686Codegen {
             return Err("i686 instruction selection encountered errors".to_string());
         }
 
+        // Build the reverse mapping (vreg → IR Value) so that
+        // apply_allocation_result can correctly resolve VirtualRegister
+        // operands to physical registers.
+        for (&val_idx, operand) in &value_map {
+            if let MachineOperand::VirtualRegister(vreg) = operand {
+                mf.vreg_to_ir_value
+                    .insert(*vreg, crate::ir::instructions::Value(val_idx));
+            }
+        }
+
         Ok(mf)
     }
 
-    fn emit_assembly(&self, mf: &MachineFunction) -> Result<Vec<u8>, String> {
+    fn emit_assembly(&self, mf: &MachineFunction) -> Result<crate::backend::traits::AssembledFunction, String> {
         // Encode machine instructions to raw bytes by delegating to the
         // built-in i686 assembler encoder.  Instructions that already carry
         // pre-encoded bytes (e.g. from inline assembly) are emitted directly.
@@ -652,7 +695,10 @@ impl ArchCodegen for I686Codegen {
             }
         }
 
-        Ok(code)
+        Ok(crate::backend::traits::AssembledFunction {
+            bytes: code,
+            relocations: Vec::new(),
+        })
     }
 
     fn emit_prologue(&self, mf: &MachineFunction) -> Vec<MachineInstruction> {
@@ -772,6 +818,7 @@ impl I686Codegen {
         mf: &mut MachineFunction,
         target: &Target,
         _diag: &mut DiagnosticEngine,
+        constant_cache: &FxHashMap<u32, i64>,
     ) -> Vec<MachineInstruction> {
         let mut out = Vec::new();
 
@@ -852,6 +899,20 @@ impl I686Codegen {
                 ty,
                 ..
             } => {
+                // Handle constant sentinels: BinOp(Add, result, result, UNDEF)
+                // These are placeholders for compile-time constants.
+                if *lhs == *result && *rhs == Value::UNDEF {
+                    if let Some(&imm) = constant_cache.get(&result.index()) {
+                        let vreg = vregs.alloc();
+                        let mov = MachineInstruction::new(I686_MOV)
+                            .with_operand(MachineOperand::Immediate(imm))
+                            .with_result(MachineOperand::VirtualRegister(vreg));
+                        out.push(mov);
+                        value_map.insert(result.index(), MachineOperand::VirtualRegister(vreg));
+                        return out;
+                    }
+                }
+
                 if *ty == IrType::I64 {
                     let insts =
                         self.lower_64bit_op(result, op, lhs, rhs, value_map, alloca_offsets, vregs);
@@ -1179,6 +1240,9 @@ impl I686Codegen {
                 out.push(MachineInstruction::new(I686_NOP));
                 value_map.insert(result.index(), MachineOperand::VirtualRegister(vreg));
             }
+
+            // Catch-all for unhandled instructions (e.g., Nop).
+            _ => {}
         }
 
         out
@@ -1897,7 +1961,7 @@ mod tests {
             span: Span::dummy(),
         });
 
-        let result = cg.lower_function(&func, &mut diag, &[]);
+        let result = cg.lower_function(&func, &mut diag, &[], &crate::common::fx_hash::FxHashMap::default(), &crate::common::fx_hash::FxHashMap::default());
         assert!(result.is_ok());
         let mf = result.unwrap();
         assert_eq!(mf.name, "empty");
@@ -1928,7 +1992,7 @@ mod tests {
         });
         func.value_count = 3;
 
-        let result = cg.lower_function(&func, &mut diag, &[]);
+        let result = cg.lower_function(&func, &mut diag, &[], &crate::common::fx_hash::FxHashMap::default(), &crate::common::fx_hash::FxHashMap::default());
         assert!(result.is_ok());
         let mf = result.unwrap();
         assert_eq!(mf.name, "add");
@@ -1944,10 +2008,10 @@ mod tests {
 
         let result = cg.emit_assembly(&mf);
         assert!(result.is_ok());
-        let bytes = result.unwrap();
-        assert!(!bytes.is_empty());
-        assert_eq!(bytes[0], 0x90);
-        assert_eq!(bytes[1], 0xC3);
+        let asm_fn = result.unwrap();
+        assert!(!asm_fn.bytes.is_empty());
+        assert_eq!(asm_fn.bytes[0], 0x90);
+        assert_eq!(asm_fn.bytes[1], 0xC3);
     }
 
     #[test]

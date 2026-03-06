@@ -41,6 +41,7 @@ use crate::ir::module::IrModule;
 use crate::ir::types::IrType;
 
 use super::asm_lowering;
+use super::decl_lowering;
 #[allow(unused_imports)]
 use super::expr_lowering;
 
@@ -134,6 +135,10 @@ pub struct StmtLoweringContext<'a> {
     pub name_table: &'a [String],
     /// Local variable name → declared C type.
     pub local_types: &'a FxHashMap<String, CType>,
+    /// Enum constant name → integer value mapping.
+    pub enum_constants: &'a FxHashMap<String, i128>,
+    /// Static local variable name → mangled global name mapping.
+    pub static_locals: &'a FxHashMap<String, String>,
 }
 
 // ===========================================================================
@@ -262,13 +267,10 @@ pub fn lower_statement(
             ctx.builder.get_insert_block()
         }
 
-        ast::Statement::Declaration(_decl) => {
-            // Declaration lowering is handled by the decl_lowering module
-            // via the parent lowering driver. When we encounter a declaration
-            // inside a compound statement's block items we handle it there.
-            // A bare Declaration statement inside a non-compound context is
-            // unusual but we treat it as a no-op here since the driver should
-            // have processed it.
+        ast::Statement::Declaration(decl) => {
+            // Process declaration initializers: emit Store instructions
+            // for each declarator with an initializer.
+            lower_declaration_initializers(ctx, decl);
             ctx.builder.get_insert_block()
         }
     };
@@ -305,19 +307,129 @@ fn lower_compound_statement(
             ast::BlockItem::Statement(stmt) => {
                 current_block = lower_statement(ctx, stmt);
             }
-            ast::BlockItem::Declaration(_decl) => {
-                // Declaration lowering creates allocas in the entry block
-                // and optionally stores initial values. This is handled by
-                // the parent lowering driver (decl_lowering). Within the
-                // statement lowering context we treat declarations as no-ops
-                // since the driver is responsible for coordinating decl
-                // lowering before/during compound statement traversal.
-                // The current block remains active.
+            ast::BlockItem::Declaration(decl) => {
+                // Allocas are already created in the entry block by the
+                // parent lowering driver. Here we emit Store instructions
+                // for each declarator's initializer so that the initial
+                // values are recorded in the alloca slots. The subsequent
+                // mem2reg pass (Phase 7) promotes these to SSA registers.
+                lower_declaration_initializers(ctx, decl);
             }
         }
     }
 
     current_block
+}
+
+// ===========================================================================
+// Declaration Initializer Lowering
+// ===========================================================================
+
+/// Process a declaration's initializers, emitting Store instructions for each
+/// declarator that has an initializer.
+///
+/// This bridges the gap between the alloca-first pattern (where all allocas
+/// are pre-created in the entry block by `decl_lowering::allocate_local_variables`)
+/// and the actual initialization that must happen at the point of declaration.
+///
+/// For each declarator in the declaration:
+/// 1. Extract the variable name from the declarator
+/// 2. Look up its alloca in `ctx.local_vars`
+/// 3. If an initializer is present, call `decl_lowering::lower_local_initializer`
+///    to emit the Store instruction(s)
+///
+/// Declarations without initializers (e.g., `int x;`) are no-ops — the alloca
+/// already exists and the value is undefined until a later assignment.
+fn lower_declaration_initializers(ctx: &mut StmtLoweringContext<'_>, decl: &ast::Declaration) {
+    // Skip extern declarations — they don't allocate stack storage.
+    if matches!(
+        decl.specifiers.storage_class,
+        Some(ast::StorageClass::Extern)
+    ) {
+        return;
+    }
+    // Skip static declarations — they were lowered as globals.
+    if matches!(
+        decl.specifiers.storage_class,
+        Some(ast::StorageClass::Static) | Some(ast::StorageClass::ThreadLocal)
+    ) {
+        return;
+    }
+    // Skip typedef declarations.
+    if matches!(
+        decl.specifiers.storage_class,
+        Some(ast::StorageClass::Typedef)
+    ) {
+        return;
+    }
+
+    for init_decl in &decl.declarators {
+        // Only process declarators with initializers.
+        let initializer = match &init_decl.initializer {
+            Some(init) => init,
+            None => continue,
+        };
+
+        // Extract the variable name from the declarator.
+        let var_name = match extract_decl_name(&init_decl.declarator, ctx.name_table) {
+            Some(name) => name,
+            None => continue,
+        };
+
+        // Look up the alloca Value for this variable.
+        let alloca_val = match ctx.local_vars.get(&var_name) {
+            Some(&val) => val,
+            None => continue, // Variable not found — possibly a redeclaration or error.
+        };
+
+        // Determine the C type for this variable (needed for aggregate initializers).
+        let var_type = ctx
+            .local_types
+            .get(&var_name)
+            .cloned()
+            .unwrap_or(CType::Int);
+
+        // Build an ExprLoweringContext and call decl_lowering::lower_local_initializer
+        // to emit the Store instruction(s).
+        let mut expr_ctx = ExprLoweringContext {
+            builder: ctx.builder,
+            function: ctx.function,
+            module: ctx.module,
+            target: ctx.target,
+            type_builder: ctx.type_builder,
+            diagnostics: ctx.diagnostics,
+            local_vars: ctx.local_vars,
+            param_values: ctx.param_values,
+            name_table: ctx.name_table,
+            local_types: ctx.local_types,
+            enum_constants: ctx.enum_constants,
+            static_locals: ctx.static_locals,
+        };
+        decl_lowering::lower_local_initializer(alloca_val, initializer, &var_type, &mut expr_ctx);
+    }
+}
+
+/// Extract the variable name from a declarator by walking into the
+/// DirectDeclarator tree. Returns `None` if no identifier is found.
+fn extract_decl_name(declarator: &ast::Declarator, name_table: &[String]) -> Option<String> {
+    extract_dd_name(&declarator.direct, name_table)
+}
+
+/// Recursively extract the identifier name from a DirectDeclarator.
+fn extract_dd_name(dd: &ast::DirectDeclarator, name_table: &[String]) -> Option<String> {
+    match dd {
+        ast::DirectDeclarator::Identifier(sym, _) => {
+            let idx = sym.as_u32() as usize;
+            if idx < name_table.len() {
+                Some(name_table[idx].clone())
+            } else {
+                None
+            }
+        }
+        ast::DirectDeclarator::Parenthesized(inner) => extract_decl_name(inner, name_table),
+        ast::DirectDeclarator::Array { base, .. } => extract_dd_name(base, name_table),
+        ast::DirectDeclarator::Function { base, .. } => extract_dd_name(base, name_table),
+    }
 }
 
 // ===========================================================================
@@ -590,10 +702,11 @@ fn lower_for_loop(
             ast::ForInit::Expression(expr) => {
                 let _val = lower_expr_via_context(ctx, expr);
             }
-            ast::ForInit::Declaration(_decl) => {
-                // Declaration init (e.g. `for (int i = 0; ...)`) is handled
-                // by the parent driver's decl_lowering. Here we treat it as
-                // already processed.
+            ast::ForInit::Declaration(decl) => {
+                // Emit Store instructions for for-loop init declarations
+                // (e.g., `for (int i = 0; ...)`). The alloca was already
+                // created in the entry block by the parent driver.
+                lower_declaration_initializers(ctx, decl);
             }
         }
     }
@@ -1349,6 +1462,8 @@ fn lower_expr_via_context(ctx: &mut StmtLoweringContext<'_>, expr: &ast::Express
         param_values: ctx.param_values,
         name_table: ctx.name_table,
         local_types: ctx.local_types,
+        enum_constants: ctx.enum_constants,
+        static_locals: ctx.static_locals,
     };
     lower_expression(&mut expr_ctx, expr)
 }
@@ -1356,26 +1471,56 @@ fn lower_expr_via_context(ctx: &mut StmtLoweringContext<'_>, expr: &ast::Express
 /// Converts an expression result to an I1 (boolean) value for use as a
 /// branch condition.
 ///
-/// If the expression already produces an I1, it is returned as-is. Otherwise,
-/// a comparison `value != 0` is emitted to produce the boolean. This is the
-/// C truthiness rule: any non-zero value is true.
+/// Convert an expression to an I1 boolean value for use as a branch condition.
 ///
-/// In C, the condition type for `if`, `while`, `for`, `do-while` must be
-/// scalar (integer, floating-point, or pointer — matching `CType::Bool`,
-/// `CType::Int`, etc.). The `IrType::I1` is the target type for conditions.
+/// If the expression is already a comparison operator (==, !=, <, >, <=, >=,
+/// ||, &&, !) it naturally produces an I1, so the lowered result is returned
+/// directly.  Otherwise a `value != 0` comparison is emitted to produce the
+/// boolean (C truthiness rule: any non-zero scalar is true).
 fn lower_expr_to_i1(
     ctx: &mut StmtLoweringContext<'_>,
     expr: &ast::Expression,
     span: Span,
 ) -> Value {
+    // Detect expressions that already produce an I1 boolean.
+    let already_i1 = match expr {
+        ast::Expression::Binary { op, .. } => matches!(
+            op,
+            ast::BinaryOp::Equal
+                | ast::BinaryOp::NotEqual
+                | ast::BinaryOp::Less
+                | ast::BinaryOp::Greater
+                | ast::BinaryOp::LessEqual
+                | ast::BinaryOp::GreaterEqual
+                | ast::BinaryOp::LogicalAnd
+                | ast::BinaryOp::LogicalOr
+        ),
+        ast::Expression::UnaryOp { op, .. } => matches!(op, ast::UnaryOp::LogicalNot),
+        _ => false,
+    };
+
     // Lower the expression to get its SSA value.
     let val = lower_expr_via_context(ctx, expr);
 
-    // If the expression result is already I1 (e.g., a comparison), return directly.
-    // Otherwise emit `val != 0` to produce a boolean result (C truthiness rule).
-    // Since we do not yet track per-Value IR types within the statement lowering
-    // context, we conservatively emit the comparison. Constant folding will
-    // simplify trivial cases.
+    if already_i1 {
+        // Expression is a comparison/logical op — already produces 0 or 1.
+        return val;
+    }
+
+    // Non-comparison expression: emit `val != 0` to convert to boolean.
+    // We create a proper zero constant in the module's global pool so the
+    // backend can resolve it correctly during constant cache population.
+    let const_id = ctx.module.globals().len();
+    let gname = format!(".Lconst.i.{}", const_id);
+    let mut gv = crate::ir::module::GlobalVariable::new(
+        gname,
+        IrType::I32,
+        Some(crate::ir::module::Constant::Integer(0)),
+    );
+    gv.linkage = crate::ir::module::Linkage::Internal;
+    gv.is_constant = true;
+    ctx.module.add_global(gv);
+
     let zero = ctx.builder.fresh_value();
     let zero_inst = Instruction::BinOp {
         result: zero,

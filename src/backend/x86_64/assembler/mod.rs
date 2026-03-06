@@ -530,8 +530,13 @@ pub fn assemble(
     let mut enc = X86_64Encoder::new(ctx.current_offset);
 
     // Iterate over all basic blocks and their instructions.
-    for block in &mf.blocks {
-        // If the block has a label, define it at the current offset.
+    for (block_idx, block) in mf.blocks.iter().enumerate() {
+        // Define a .L{index} label for this block so that BlockLabel(idx)
+        // operands in branch instructions resolve correctly.
+        ctx.define_label(&format!(".L{}", block_idx));
+
+        // Also define the human-readable label if present (for debug output
+        // and any string-based references).
         if let Some(ref label) = block.label {
             ctx.define_label(label);
         }
@@ -562,6 +567,33 @@ pub fn assemble(
 
     // Resolve all pending label fixups (forward references).
     let _ = ctx.resolve_pending_fixups();
+
+    // Resolve local .L labels in the relocation list by patching the text
+    // section directly. The encoder emits RelocationEntry objects for
+    // BlockLabel operands, but .L labels are function-local and must be
+    // resolved during assembly rather than deferred to the linker.
+    let mut remaining_relocs = Vec::new();
+    for reloc in ctx.relocations.drain(..) {
+        if reloc.symbol.starts_with(".L") {
+            if let Some(&target_offset) = ctx.label_offsets.get(&reloc.symbol) {
+                let fixup_offset = reloc.offset as usize;
+                // Standard ELF R_X86_64_PC32 formula: S + A - P
+                // S = target_offset, A = reloc.addend (typically -4), P = fixup_offset
+                let value = (target_offset as i64) + reloc.addend - (fixup_offset as i64);
+                let bytes = (value as i32).to_le_bytes();
+                let end = fixup_offset + 4;
+                if end <= ctx.text_section.len() {
+                    ctx.text_section[fixup_offset..end].copy_from_slice(&bytes);
+                }
+            } else {
+                // Label not found — keep as relocation for the linker.
+                remaining_relocs.push(reloc);
+            }
+        } else {
+            remaining_relocs.push(reloc);
+        }
+    }
+    ctx.relocations = remaining_relocs;
 
     // Compute the function's total code size.
     let func_size = ctx.current_offset - func_start;
@@ -1025,6 +1057,7 @@ mod tests {
             spill_slots: Vec::new(),
             callee_saved_regs: Vec::new(),
             is_leaf: true,
+            vreg_to_ir_value: crate::common::fx_hash::FxHashMap::default(),
         }
     }
 

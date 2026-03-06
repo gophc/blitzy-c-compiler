@@ -42,8 +42,8 @@ use crate::backend::elf_writer_common::{
     SHT_NOBITS, SHT_PROGBITS, SHT_RELA, STB_GLOBAL, STT_FUNC, STT_NOTYPE, STV_DEFAULT,
 };
 use crate::backend::traits::{
-    ArchCodegen, ArgLocation, MachineFunction, MachineInstruction, MachineOperand, RegisterInfo,
-    RelocationTypeInfo,
+    ArchCodegen, ArgLocation, AssembledFunction, MachineFunction, MachineInstruction,
+    MachineOperand, RegisterInfo, RelocationTypeInfo,
 };
 use crate::common::target::Target;
 use crate::ir::function::IrFunction;
@@ -101,11 +101,17 @@ pub const PAGE_SIZE: u64 = 4096;
 // STP/LDP Opcode Constants for Prologue/Epilogue
 // ============================================================================
 
-/// Opcode identifier for STP (Store Pair) — used in prologue generation.
+/// Opcode identifier for STP (Store Pair, signed offset) — used in prologue generation.
 const OPCODE_STP: u32 = 0xA9_00_00_00;
 
-/// Opcode identifier for LDP (Load Pair) — used in epilogue generation.
+/// Opcode identifier for STP pre-index — `STP Rt, Rt2, [Rn, #imm]!`
+const OPCODE_STP_PRE: u32 = 0xA9_80_00_00;
+
+/// Opcode identifier for LDP (Load Pair, signed offset) — used in epilogue generation.
 const OPCODE_LDP: u32 = 0xA9_40_00_00;
+
+/// Opcode identifier for LDP post-index — `LDP Rt, Rt2, [Rn], #imm`
+const OPCODE_LDP_POST: u32 = 0xA9_C0_00_00;
 
 /// Opcode identifier for MOV (register) — used for setting frame pointer.
 const OPCODE_MOV_REG: u32 = 0xAA_00_00_00;
@@ -648,6 +654,8 @@ impl ArchCodegen for AArch64Codegen {
         func: &IrFunction,
         _diag: &mut DiagnosticEngine,
         _globals: &[crate::ir::module::GlobalVariable],
+        _func_ref_map: &crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>,
+        _global_var_refs: &crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>,
     ) -> Result<MachineFunction, String> {
         if !func.is_definition {
             return Err(format!(
@@ -656,8 +664,35 @@ impl ArchCodegen for AArch64Codegen {
             ));
         }
 
+        // Build constant cache from globals (same mechanism as x86-64/i686).
+        let mut constant_values = crate::common::fx_hash::FxHashMap::default();
+        {
+            let mut const_vals: Vec<i64> = Vec::new();
+            for gv in _globals {
+                if gv.name.starts_with(".Lconst.i.") {
+                    if let Some(crate::ir::module::Constant::Integer(v)) = &gv.initializer {
+                        const_vals.push(*v as i64);
+                    }
+                }
+            }
+            let mut ci = 0;
+            for block in &func.blocks {
+                for inst in block.instructions() {
+                    if let crate::ir::instructions::Instruction::BinOp { result, lhs, rhs, .. } = inst {
+                        if *lhs == *result && *rhs == crate::ir::instructions::Value::UNDEF
+                            && ci < const_vals.len()
+                        {
+                            constant_values.insert(result.index(), const_vals[ci]);
+                            ci += 1;
+                        }
+                    }
+                }
+            }
+        }
+
         // Perform instruction selection: IR → A64 instructions.
         let mut selector = codegen::AArch64InstructionSelector::new(self.target, self.pic_mode);
+        selector.set_constant_values(constant_values);
         let a64_instructions = selector.select_function(func, &self.abi);
 
         // Convert to common MachineInstructions.
@@ -684,7 +719,7 @@ impl ArchCodegen for AArch64Codegen {
     }
 
     /// Encode a machine function's instructions to raw AArch64 binary bytes.
-    fn emit_assembly(&self, mf: &MachineFunction) -> Result<Vec<u8>, String> {
+    fn emit_assembly(&self, mf: &MachineFunction) -> Result<AssembledFunction, String> {
         let mut asm = assembler::AArch64Assembler::new(self.pic_mode);
 
         // Collect all instructions from all basic blocks and convert
@@ -698,7 +733,10 @@ impl ArchCodegen for AArch64Codegen {
         }
 
         let result = asm.assemble_function(&all_instructions)?;
-        Ok(result.code)
+        Ok(AssembledFunction {
+            bytes: result.code,
+            relocations: Vec::new(),
+        })
     }
 
     /// Returns the target architecture: `Target::AArch64`.
@@ -735,8 +773,20 @@ impl ArchCodegen for AArch64Codegen {
 
         let frame_size = Self::align_up(mf.frame_size.max(16), 16);
 
-        // Step 1: STP X29, X30, [SP, #-frame_size]! (pre-decrement)
-        prologue.push(Self::make_stp(fp, lr, sp, -(frame_size as i64), false));
+        // Step 1: STP X29, X30, [SP, #-frame_size]! (pre-index, decrements SP)
+        {
+            let mut mi = MachineInstruction::new(OPCODE_STP_PRE);
+            mi.operands.push(MachineOperand::Register(fp));
+            mi.operands.push(MachineOperand::Register(lr));
+            mi.operands.push(MachineOperand::Memory {
+                base: Some(sp),
+                index: None,
+                scale: 1,
+                displacement: -(frame_size as i64),
+            });
+            mi.operand_size = 8;
+            prologue.push(mi);
+        }
 
         // Step 2: MOV X29, SP (establish frame pointer)
         prologue.push(Self::make_mov_reg(fp, sp));
@@ -887,8 +937,20 @@ impl ArchCodegen for AArch64Codegen {
             }
         }
 
-        // Restore FP and LR, post-increment SP.
-        epilogue.push(Self::make_ldp(fp, lr, sp, frame_size as i64, false));
+        // Restore FP and LR, post-index: LDP x29, x30, [SP], #frame_size
+        {
+            let mut mi = MachineInstruction::new(OPCODE_LDP_POST);
+            mi.result = Some(MachineOperand::Register(fp));
+            mi.operands.push(MachineOperand::Register(lr));
+            mi.operands.push(MachineOperand::Memory {
+                base: Some(sp),
+                index: None,
+                scale: 1,
+                displacement: frame_size as i64,
+            });
+            mi.operand_size = 8;
+            epilogue.push(mi);
+        }
 
         // Return via X30 (LR).
         epilogue.push(Self::make_ret());
@@ -960,6 +1022,43 @@ impl AArch64Codegen {
         // Map the opcode back to an A64Opcode.
         inst.opcode = Self::u32_to_a64_opcode(mi.opcode);
 
+        // --- Special handling for STP/LDP family -------------------------
+        // The encoder expects: rd=Rt, rm=Rt2, rn=Rn(base), imm=offset.
+        // Our MachineInstruction stores them as:
+        //   operands = [Register(rt1), Register(rt2), Memory{base, displacement}]
+        // We must map: rd=rt1, rm=rt2, rn=base, imm=displacement.
+        match mi.opcode {
+            x if x == OPCODE_STP
+                || x == OPCODE_STP_PRE
+                || x == OPCODE_STP_FP
+                || x == OPCODE_LDP_FP => {
+                // STP / STP_pre: operands[0]=Rt1, operands[1]=Rt2, operands[2]=Memory
+                let rt1 = mi.operands.first().and_then(|o| o.as_register()).unwrap_or(0) as u8;
+                let rt2 = mi.operands.get(1).and_then(|o| o.as_register()).unwrap_or(0) as u8;
+                let (base, disp) = Self::extract_memory_operand(&mi.operands);
+                inst.rd = Some(rt1);
+                inst.rm = Some(rt2);
+                inst.rn = Some(base);
+                inst.imm = disp;
+                inst.is_32bit = mi.operand_size == 4;
+                return inst;
+            }
+            x if x == OPCODE_LDP || x == OPCODE_LDP_POST => {
+                // LDP / LDP_post: result=Rt1, operands[0]=Rt2, operands[1]=Memory
+                let rt1 = mi.result.as_ref().and_then(|o| o.as_register()).unwrap_or(0) as u8;
+                let rt2 = mi.operands.first().and_then(|o| o.as_register()).unwrap_or(0) as u8;
+                let (base, disp) = Self::extract_memory_operand(&mi.operands);
+                inst.rd = Some(rt1);
+                inst.rm = Some(rt2);
+                inst.rn = Some(base);
+                inst.imm = disp;
+                inst.is_32bit = mi.operand_size == 4;
+                return inst;
+            }
+            _ => {}
+        }
+
+        // --- Generic operand mapping for non-STP/LDP instructions --------
         // Map result as destination register.
         if let Some(ref result) = mi.result {
             if let Some(reg) = result.as_register() {
@@ -1006,11 +1105,27 @@ impl AArch64Codegen {
         inst
     }
 
+    /// Extract base register and displacement from an operand list containing
+    /// a `Memory` operand.
+    fn extract_memory_operand(operands: &[MachineOperand]) -> (u8, i64) {
+        for op in operands {
+            if let MachineOperand::Memory {
+                base, displacement, ..
+            } = op
+            {
+                return (base.unwrap_or(31) as u8, *displacement);
+            }
+        }
+        (31, 0) // default: SP, offset 0
+    }
+
     /// Map a `u32` opcode back to an `A64Opcode`.
     fn u32_to_a64_opcode(opcode: u32) -> A64Opcode {
         match opcode {
             x if x == OPCODE_STP => A64Opcode::STP,
+            x if x == OPCODE_STP_PRE => A64Opcode::STP_pre,
             x if x == OPCODE_LDP => A64Opcode::LDP,
+            x if x == OPCODE_LDP_POST => A64Opcode::LDP_post,
             x if x == OPCODE_MOV_REG => A64Opcode::ORR_reg,
             x if x == OPCODE_RET => A64Opcode::RET,
             x if x == OPCODE_SUB_IMM => A64Opcode::SUB_imm,
@@ -1090,6 +1205,7 @@ impl AArch64Codegen {
             A64Opcode::LDR_reg,
             A64Opcode::LDR_literal,
             A64Opcode::LDP,
+            A64Opcode::LDP_post,
             A64Opcode::LDPSW,
             A64Opcode::LDR_pre,
             A64Opcode::LDR_post,
@@ -1098,6 +1214,7 @@ impl AArch64Codegen {
             A64Opcode::STRH_imm,
             A64Opcode::STR_reg,
             A64Opcode::STP,
+            A64Opcode::STP_pre,
             A64Opcode::STR_pre,
             A64Opcode::STR_post,
             A64Opcode::LDR_fp_imm,

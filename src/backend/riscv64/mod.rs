@@ -53,8 +53,8 @@ use crate::backend::elf_writer_common::{
     SHT_NOBITS, SHT_PROGBITS, STB_GLOBAL, STB_LOCAL,
 };
 use crate::backend::traits::{
-    ArchCodegen, ArgLocation, MachineBasicBlock, MachineFunction, MachineInstruction,
-    MachineOperand, RegisterInfo, RelocationTypeInfo,
+    ArchCodegen, ArgLocation, AssembledFunction, MachineBasicBlock, MachineFunction,
+    MachineInstruction, MachineOperand, RegisterInfo, RelocationTypeInfo,
 };
 use crate::common::diagnostics::DiagnosticEngine;
 use crate::common::target::Target;
@@ -510,7 +510,9 @@ impl RiscV64Codegen {
             }
 
             // Step 1: Instruction selection (IR → machine instructions).
-            let mf = match self.lower_function(func, diagnostics, module.globals()) {
+            let empty_refs = crate::common::fx_hash::FxHashMap::default();
+            let empty_gvar_refs = crate::common::fx_hash::FxHashMap::default();
+            let mf = match self.lower_function(func, diagnostics, module.globals(), &empty_refs, &empty_gvar_refs) {
                 Ok(mf) => mf,
                 Err(msg) => {
                     diagnostics.emit_error(
@@ -794,9 +796,38 @@ impl ArchCodegen for RiscV64Codegen {
         func: &IrFunction,
         _diag: &mut DiagnosticEngine,
         _globals: &[crate::ir::module::GlobalVariable],
+        _func_ref_map: &crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>,
+        _global_var_refs: &crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>,
     ) -> Result<MachineFunction, String> {
+        // Build constant cache from globals (same mechanism as x86-64/i686/aarch64).
+        let mut constant_values = crate::common::fx_hash::FxHashMap::default();
+        {
+            let mut const_vals: Vec<i64> = Vec::new();
+            for gv in _globals {
+                if gv.name.starts_with(".Lconst.i.") {
+                    if let Some(crate::ir::module::Constant::Integer(v)) = &gv.initializer {
+                        const_vals.push(*v as i64);
+                    }
+                }
+            }
+            let mut ci = 0;
+            for block in &func.blocks {
+                for inst in block.instructions() {
+                    if let crate::ir::instructions::Instruction::BinOp { result, lhs, rhs, .. } = inst {
+                        if *lhs == *result && *rhs == crate::ir::instructions::Value::UNDEF
+                            && ci < const_vals.len()
+                        {
+                            constant_values.insert(result.index(), const_vals[ci]);
+                            ci += 1;
+                        }
+                    }
+                }
+            }
+        }
+
         // Create the instruction selector for this function.
         let mut selector = RiscV64InstructionSelector::new(self.target, self.pic_mode);
+        selector.set_constant_values(constant_values);
 
         // Run instruction selection over the entire function.
         let rv_instructions = selector.select_function(func, &self.abi);
@@ -853,7 +884,7 @@ impl ArchCodegen for RiscV64Codegen {
     /// function and produces the encoded binary representation.  Branch
     /// targets within the function are resolved; cross-function references
     /// produce relocation entries.
-    fn emit_assembly(&self, mf: &MachineFunction) -> Result<Vec<u8>, String> {
+    fn emit_assembly(&self, mf: &MachineFunction) -> Result<AssembledFunction, String> {
         use crate::backend::riscv64::assembler::encoder::RiscV64Encoder;
 
         let mut output: Vec<u8> = Vec::new();
@@ -868,8 +899,6 @@ impl ArchCodegen for RiscV64Codegen {
                         // Collect relocations if present — the relocation's
                         // offset must be adjusted by the current output position.
                         if let Some(ref reloc) = encoded.relocation {
-                            // Store the relocation info in the MachineFunction's
-                            // encoded_bytes (will be collected by compile_to_object).
                             let _ = reloc; // Relocations are tracked at the object level
                         }
                         output.extend_from_slice(&encoded.bytes);
@@ -882,7 +911,10 @@ impl ArchCodegen for RiscV64Codegen {
             }
         }
 
-        Ok(output)
+        Ok(AssembledFunction {
+            bytes: output,
+            relocations: Vec::new(),
+        })
     }
 
     /// Returns [`Target::RiscV64`].
@@ -971,29 +1003,22 @@ impl ArchCodegen for RiscV64Codegen {
         }
 
         // sd ra, frame_size-8(sp)
+        // S-type store: rs1=base, rs2=value, imm=displacement
         let ra_offset = (aligned_frame as i64) - 8;
         let mut save_ra = MachineInstruction::new(codegen::RvOpcode::SD as u32);
         save_ra = save_ra
+            .with_operand(MachineOperand::Register(SP as u16))
             .with_operand(MachineOperand::Register(RA as u16))
-            .with_operand(MachineOperand::Memory {
-                base: Some(SP as u16),
-                index: None,
-                scale: 1,
-                displacement: ra_offset,
-            });
+            .with_operand(MachineOperand::Immediate(ra_offset));
         prologue.push(save_ra);
 
         // sd s0, frame_size-16(sp)
         let fp_offset = (aligned_frame as i64) - 16;
         let mut save_fp = MachineInstruction::new(codegen::RvOpcode::SD as u32);
         save_fp = save_fp
+            .with_operand(MachineOperand::Register(SP as u16))
             .with_operand(MachineOperand::Register(FP as u16))
-            .with_operand(MachineOperand::Memory {
-                base: Some(SP as u16),
-                index: None,
-                scale: 1,
-                displacement: fp_offset,
-            });
+            .with_operand(MachineOperand::Immediate(fp_offset));
         prologue.push(save_fp);
 
         // addi s0, sp, frame_size  (set frame pointer)
@@ -1005,6 +1030,7 @@ impl ArchCodegen for RiscV64Codegen {
         prologue.push(set_fp);
 
         // Save callee-saved registers.
+        // S-type store: rs1=base, rs2=value, imm=displacement
         let mut save_offset = -24i64; // Start below FP save area
         for &reg in &mf.callee_saved_regs {
             // Skip FP (s0) and RA — already saved above.
@@ -1020,13 +1046,9 @@ impl ArchCodegen for RiscV64Codegen {
 
             let mut save = MachineInstruction::new(opcode as u32);
             save = save
+                .with_operand(MachineOperand::Register(FP as u16))
                 .with_operand(MachineOperand::Register(reg))
-                .with_operand(MachineOperand::Memory {
-                    base: Some(FP as u16),
-                    index: None,
-                    scale: 1,
-                    displacement: save_offset,
-                });
+                .with_operand(MachineOperand::Immediate(save_offset));
             prologue.push(save);
             save_offset -= 8;
         }
@@ -1085,30 +1107,24 @@ impl ArchCodegen for RiscV64Codegen {
                 codegen::RvOpcode::LD
             };
 
+            // I-type load: rd=dest, rs1=base, imm=displacement
             let mut restore = MachineInstruction::new(opcode as u32);
             restore = restore
                 .with_result(MachineOperand::Register(reg))
-                .with_operand(MachineOperand::Memory {
-                    base: Some(FP as u16),
-                    index: None,
-                    scale: 1,
-                    displacement: current_offset,
-                });
+                .with_operand(MachineOperand::Register(FP as u16))
+                .with_operand(MachineOperand::Immediate(current_offset));
             epilogue.push(restore);
             current_offset += 8;
         }
 
         // ld s0, frame_size-16(sp) — restore frame pointer.
+        // I-type load: rd=dest, rs1=base, imm=displacement
         let fp_offset = (aligned_frame as i64) - 16;
         let mut restore_fp = MachineInstruction::new(codegen::RvOpcode::LD as u32);
         restore_fp = restore_fp
             .with_result(MachineOperand::Register(FP as u16))
-            .with_operand(MachineOperand::Memory {
-                base: Some(SP as u16),
-                index: None,
-                scale: 1,
-                displacement: fp_offset,
-            });
+            .with_operand(MachineOperand::Register(SP as u16))
+            .with_operand(MachineOperand::Immediate(fp_offset));
         epilogue.push(restore_fp);
 
         // ld ra, frame_size-8(sp) — restore return address.
@@ -1116,12 +1132,8 @@ impl ArchCodegen for RiscV64Codegen {
         let mut restore_ra = MachineInstruction::new(codegen::RvOpcode::LD as u32);
         restore_ra = restore_ra
             .with_result(MachineOperand::Register(RA as u16))
-            .with_operand(MachineOperand::Memory {
-                base: Some(SP as u16),
-                index: None,
-                scale: 1,
-                displacement: ra_offset,
-            });
+            .with_operand(MachineOperand::Register(SP as u16))
+            .with_operand(MachineOperand::Immediate(ra_offset));
         epilogue.push(restore_ra);
 
         // addi sp, sp, frame_size — deallocate frame.
@@ -1237,7 +1249,7 @@ impl RiscV64Codegen {
         // forward conversion.  RvOpcode is #[repr(u32)] so the transmute
         // is well-defined for discriminant values [0, NUM_RV_OPCODES).
         // We validate the range to avoid UB on corrupted data.
-        const NUM_RV_OPCODES: u32 = 158;
+        const NUM_RV_OPCODES: u32 = 256;
         let opcode = if mi.opcode < NUM_RV_OPCODES {
             // SAFETY: RvOpcode is #[repr(u32)] with 158 variants numbered
             // 0..157.  We verified mi.opcode is in range.
@@ -1277,6 +1289,22 @@ impl RiscV64Codegen {
                 }
                 MachineOperand::GlobalSymbol(s) => {
                     symbol = Some(s.clone());
+                }
+                MachineOperand::Memory {
+                    base, displacement, ..
+                } => {
+                    // Extract base register and displacement from Memory
+                    // operand — used when MachineInstructions are built
+                    // directly (e.g., prologue/epilogue) with Memory
+                    // operands.  Map base → rs1, displacement → imm.
+                    if let Some(b) = base {
+                        if rs1.is_none() {
+                            rs1 = Some(*b as u8);
+                        } else if rs2.is_none() {
+                            rs2 = Some(*b as u8);
+                        }
+                    }
+                    imm = *displacement;
                 }
                 _ => {}
             }

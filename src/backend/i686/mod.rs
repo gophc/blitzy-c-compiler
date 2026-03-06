@@ -110,7 +110,8 @@ pub use self::abi::I686Abi;
 // ===========================================================================
 
 use crate::backend::traits::{
-    ArchCodegen, ArgLocation, MachineFunction, MachineInstruction, RegisterInfo, RelocationTypeInfo,
+    ArchCodegen, ArgLocation, AssembledFunction, MachineFunction, MachineInstruction, RegisterInfo,
+    RelocationTypeInfo,
 };
 use crate::common::diagnostics::DiagnosticEngine;
 use crate::common::target::Target;
@@ -296,10 +297,12 @@ impl ArchCodegen for I686Codegen {
         func: &IrFunction,
         diag: &mut DiagnosticEngine,
         _globals: &[crate::ir::module::GlobalVariable],
+        _func_ref_map: &crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>,
+        _global_var_refs: &crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>,
     ) -> Result<MachineFunction, String> {
         // Delegate to the inner codegen::I686Codegen which has the full
         // instruction selection implementation.
-        self.inner.lower_function(func, diag, _globals)
+        self.inner.lower_function(func, diag, _globals, _func_ref_map, _global_var_refs)
     }
 
     /// Encode i686 machine instructions to raw bytes using the built-in
@@ -320,7 +323,7 @@ impl ArchCodegen for I686Codegen {
     ///
     /// `Ok(Vec<u8>)` containing the encoded function body, or `Err(String)`
     /// on encoding failure (e.g., immediate value out of range).
-    fn emit_assembly(&self, mf: &MachineFunction) -> Result<Vec<u8>, String> {
+    fn emit_assembly(&self, mf: &MachineFunction) -> Result<AssembledFunction, String> {
         self.inner.emit_assembly(mf)
     }
 

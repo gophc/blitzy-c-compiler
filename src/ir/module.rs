@@ -53,6 +53,7 @@
 //! crates are used.
 
 use crate::common::fx_hash::FxHashMap;
+use crate::ir::instructions::Value;
 use crate::ir::function::IrFunction;
 use crate::ir::types::IrType;
 
@@ -705,6 +706,17 @@ pub struct IrModule {
     /// Fast lookup: string byte content → index in `string_pool`.
     /// Used by [`intern_string`](IrModule::intern_string) for deduplication.
     string_map: FxHashMap<Vec<u8>, usize>,
+
+    /// Map from IR `Value` to the function name it references.
+    /// Populated during IR lowering when `lower_identifier` resolves
+    /// a name to a known function definition or declaration.
+    pub func_ref_map: FxHashMap<Value, String>,
+
+    /// Maps IR `Value`s that represent the *address* of a global variable
+    /// to the corresponding global variable name.  Populated during IR
+    /// lowering so the backend can emit RIP-relative (x86-64) or
+    /// ADRP/LDR (AArch64) or LUI/LD (RISC-V) global accesses.
+    pub global_var_refs: FxHashMap<Value, String>,
 }
 
 // ===========================================================================
@@ -742,6 +754,8 @@ impl IrModule {
             global_map: FxHashMap::default(),
             function_map: FxHashMap::default(),
             string_map: FxHashMap::default(),
+            func_ref_map: FxHashMap::default(),
+            global_var_refs: FxHashMap::default(),
         }
     }
 }

@@ -379,6 +379,7 @@ fn generate_for_arch<A: ArchCodegen>(
     let mut compiled_functions: Vec<CompiledFunction> = Vec::new();
     let mut text_section_data: Vec<u8> = Vec::new();
     let mut text_section_offsets: Vec<(String, u64, u64)> = Vec::new();
+    let mut text_relocations: Vec<crate::backend::traits::FunctionRelocation> = Vec::new();
 
     let functions: &[IrFunction] = module.functions();
     for func in functions {
@@ -388,7 +389,7 @@ fn generate_for_arch<A: ArchCodegen>(
         }
 
         // Step 1: Instruction selection — IR → MachineFunction
-        let mut mf = match arch.lower_function(func, diagnostics, module.globals()) {
+        let mut mf = match arch.lower_function(func, diagnostics, module.globals(), &module.func_ref_map, &module.global_var_refs) {
             Ok(mf) => mf,
             Err(e) => {
                 diagnostics.emit_error(
@@ -433,9 +434,9 @@ fn generate_for_arch<A: ArchCodegen>(
         let epilogue = arch.emit_epilogue(&mf);
         insert_prologue_epilogue(&mut mf, prologue, epilogue);
 
-        // Step 4: Assembly encoding — machine instructions → raw bytes
-        let func_bytes = match arch.emit_assembly(&mf) {
-            Ok(bytes) => bytes,
+        // Step 4: Assembly encoding — machine instructions → raw bytes + relocations
+        let asm_result = match arch.emit_assembly(&mf) {
+            Ok(asm) => asm,
             Err(e) => {
                 diagnostics.emit_error(
                     Span::dummy(),
@@ -454,9 +455,18 @@ fn generate_for_arch<A: ArchCodegen>(
             }
         };
 
+        let func_bytes = asm_result.bytes;
+
         // Track the function's position within the .text section.
         let func_offset = text_section_data.len() as u64;
         let func_size = func_bytes.len() as u64;
+
+        // Collect relocations, adjusting offsets to be relative to the
+        // combined .text section rather than this individual function.
+        for mut reloc in asm_result.relocations {
+            reloc.offset += func_offset;
+            text_relocations.push(reloc);
+        }
         text_section_offsets.push((func.name.clone(), func_offset, func_size));
 
         compiled_functions.push(CompiledFunction {
@@ -474,6 +484,40 @@ fn generate_for_arch<A: ArchCodegen>(
     // Check for errors after function compilation.
     if diagnostics.has_errors() {
         return Err("code generation aborted due to errors".to_string());
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase A.5: Resolve intra-module text relocations
+    // -----------------------------------------------------------------------
+    // Build a map from function name → offset in combined .text section.
+    // For relocations targeting defined functions, patch the .text bytes
+    // directly (PC-relative CALL/JMP).  Remaining relocations (external
+    // symbols) are carried forward to the ELF object for the linker.
+    {
+        let mut func_offset_map = crate::common::fx_hash::FxHashMap::default();
+        for (fname, foff, _fsz) in &text_section_offsets {
+            func_offset_map.insert(fname.as_str(), *foff);
+        }
+        let mut unresolved = Vec::new();
+        for reloc in text_relocations.drain(..) {
+            if let Some(&target_offset) = func_offset_map.get(reloc.symbol.as_str()) {
+                // Intra-module relocation — patch text_section_data directly.
+                // Standard ELF PC-relative formula: S + A - P
+                let s = target_offset as i64;
+                let a = reloc.addend;
+                let p = reloc.offset as i64;
+                let value = s + a - p;
+                let fixup_off = reloc.offset as usize;
+                if fixup_off + 4 <= text_section_data.len() {
+                    let bytes = (value as i32).to_le_bytes();
+                    text_section_data[fixup_off..fixup_off + 4].copy_from_slice(&bytes);
+                }
+            } else {
+                // External symbol — keep for the linker.
+                unresolved.push(reloc);
+            }
+        }
+        text_relocations = unresolved;
     }
 
     // -----------------------------------------------------------------------
@@ -575,6 +619,7 @@ fn generate_for_arch<A: ArchCodegen>(
         bss_size,
         &compiled_functions,
         &global_symbols,
+        &text_relocations,
         &dwarf_sections,
         module,
         ctx,
@@ -590,7 +635,7 @@ fn generate_for_arch<A: ArchCodegen>(
     // Phase F: Linking Orchestration
     // -----------------------------------------------------------------------
 
-    link_to_final_output(&object_bytes, ctx, diagnostics)
+    link_to_final_output(&object_bytes, &text_relocations, ctx, diagnostics)
 }
 
 // ===========================================================================
@@ -675,24 +720,38 @@ fn apply_allocation_result(mf: &mut MachineFunction, alloc: &AllocationResult) {
     // Update frame size with spill slot requirements.
     mf.frame_size = mf.frame_size.max(alloc.frame_size);
 
+    // Build a complete vreg → physical register lookup table upfront.
+    // This avoids borrow conflicts between vreg_to_ir_value and blocks.
+    let mut vreg_phys: crate::common::fx_hash::FxHashMap<u32, u16> =
+        crate::common::fx_hash::FxHashMap::default();
+    for (&vreg, ir_val) in &mf.vreg_to_ir_value {
+        if let Some(phys) = alloc.assignments.get(ir_val) {
+            vreg_phys.insert(vreg, phys.0);
+        }
+    }
+    // Also populate from direct Value(vreg) interpretation for backends
+    // that don't populate vreg_to_ir_value (fallback).
+    for (val, phys) in &alloc.assignments {
+        let vreg = val.index();
+        vreg_phys.entry(vreg).or_insert(phys.0);
+    }
+
     // Replace virtual registers with physical registers in all instructions.
     for block in &mut mf.blocks {
         for inst in &mut block.instructions {
             // Replace operands.
             for operand in &mut inst.operands {
-                if let MachineOperand::VirtualRegister(vreg) = operand {
-                    let value = crate::ir::instructions::Value(*vreg);
-                    if let Some(phys) = alloc.assignments.get(&value) {
-                        *operand = MachineOperand::Register(phys.0);
+                if let MachineOperand::VirtualRegister(vreg) = *operand {
+                    if let Some(&phys_reg) = vreg_phys.get(&vreg) {
+                        *operand = MachineOperand::Register(phys_reg);
                     }
                 }
             }
             // Replace result operand.
             if let Some(ref mut result) = inst.result {
-                if let MachineOperand::VirtualRegister(vreg) = result {
-                    let value = crate::ir::instructions::Value(*vreg);
-                    if let Some(phys) = alloc.assignments.get(&value) {
-                        *result = MachineOperand::Register(phys.0);
+                if let MachineOperand::VirtualRegister(vreg) = *result {
+                    if let Some(&phys_reg) = vreg_phys.get(&vreg) {
+                        *result = MachineOperand::Register(phys_reg);
                     }
                 }
             }
@@ -891,6 +950,7 @@ fn write_relocatable_object(
     bss_size: u64,
     functions: &[CompiledFunction],
     globals: &[GlobalSymbolInfo],
+    _text_relocs: &[crate::backend::traits::FunctionRelocation],
     dwarf: &Option<DwarfSections>,
     module: &IrModule,
     ctx: &CodegenContext,
@@ -903,8 +963,18 @@ fn write_relocatable_object(
     let _elf_machine = target.elf_machine();
     let _is_64 = target.is_64bit();
 
+    // Track section indices dynamically — index 0 is the NULL section, so
+    // user sections start at index 1.
+    let mut next_section_index: u16 = 1;
+    let mut text_section_index: u16 = 0;
+    let mut data_section_index: u16 = 0;
+    let mut rodata_section_index: u16 = 0;
+    let mut bss_section_index: u16 = 0;
+
     // --- .text section ---
     if !text_data.is_empty() {
+        text_section_index = next_section_index;
+        next_section_index += 1;
         let text_section = Section {
             name: ".text".to_string(),
             sh_type: SHT_PROGBITS,
@@ -923,6 +993,8 @@ fn write_relocatable_object(
 
     // --- .data section ---
     if !data_data.is_empty() {
+        data_section_index = next_section_index;
+        next_section_index += 1;
         let data_sec = Section {
             name: ".data".to_string(),
             sh_type: SHT_PROGBITS,
@@ -941,6 +1013,8 @@ fn write_relocatable_object(
 
     // --- .rodata section ---
     if !rodata_data.is_empty() {
+        rodata_section_index = next_section_index;
+        next_section_index += 1;
         let rodata_sec = Section {
             name: ".rodata".to_string(),
             sh_type: SHT_PROGBITS,
@@ -959,6 +1033,8 @@ fn write_relocatable_object(
 
     // --- .bss section ---
     if bss_size > 0 {
+        bss_section_index = next_section_index;
+        next_section_index += 1;
         let bss_sec = Section {
             name: ".bss".to_string(),
             sh_type: SHT_NOBITS,
@@ -974,6 +1050,7 @@ fn write_relocatable_object(
         };
         writer.add_section(bss_sec);
     }
+    let _ = next_section_index; // suppress unused warning
 
     // --- DWARF debug sections (conditional on -g) ---
     if let Some(ref dwarf_data) = dwarf {
@@ -996,7 +1073,7 @@ fn write_relocatable_object(
             binding,
             sym_type: STT_FUNC,
             visibility: STV_DEFAULT,
-            section_index: 1, // .text section (index determined by writer)
+            section_index: text_section_index,
         };
         writer.add_symbol(sym);
     }
@@ -1014,9 +1091,9 @@ fn write_relocatable_object(
             STT_OBJECT
         };
         let section_index = match gsym.section {
-            SectionPlacement::Data => 2,   // .data
-            SectionPlacement::Rodata => 3, // .rodata
-            SectionPlacement::Bss => 4,    // .bss
+            SectionPlacement::Data => data_section_index,
+            SectionPlacement::Rodata => rodata_section_index,
+            SectionPlacement::Bss => bss_section_index,
         };
         let sym = ElfSymbol {
             name: gsym.name.clone(),
@@ -1099,6 +1176,7 @@ fn add_dwarf_sections(writer: &mut ElfWriter, dwarf: &DwarfSections) {
 /// No external linker is invoked — this is the standalone backend mode.
 fn link_to_final_output(
     object_bytes: &[u8],
+    text_relocations: &[crate::backend::traits::FunctionRelocation],
     ctx: &CodegenContext,
     diagnostics: &mut DiagnosticEngine,
 ) -> Result<Vec<u8>, String> {
@@ -1122,6 +1200,24 @@ fn link_to_final_output(
     // Parse the relocatable ELF object bytes back into linker internal
     // representation: sections, symbols, and relocations.
     let mut input = parse_elf_object_to_linker_input(0, "input.o", object_bytes);
+
+    // Convert unresolved text relocations (e.g. global variable references)
+    // from the code generator into linker-format Relocation entries so the
+    // linker can resolve cross-section references (.text → .data/.rodata/.bss).
+    for func_reloc in text_relocations {
+        input.relocations.push(
+            crate::backend::linker_common::relocation::Relocation {
+                offset: func_reloc.offset,
+                symbol_name: func_reloc.symbol.clone(),
+                sym_index: 0, // resolved by name, not index
+                rel_type: func_reloc.rel_type_id,
+                addend: func_reloc.addend,
+                object_id: 0,
+                section_index: 1, // .text section index in our .o files
+                output_section_name: Some(".text".to_string()),
+            },
+        );
+    }
 
     // For executables (not shared libs), inject a CRT `_start` stub that
     // calls `main` and invokes the exit syscall — but only if the user
@@ -1199,8 +1295,15 @@ fn inject_crt_start(input: &mut LinkerInput, target: Target) {
     input.sections[text_idx].data.resize(aligned, nop_byte);
 
     let start_offset = input.sections[text_idx].data.len();
-    // main is at offset 0 in .text (the first function).
-    let main_offset = 0u64;
+    // Find the actual offset of `main` in .text by looking up its symbol.
+    // The symbol's section_index is the ELF section header index (1-based,
+    // with 0 = SHN_UNDEF), so we filter for any defined (non-zero) section.
+    let main_offset = input
+        .symbols
+        .iter()
+        .find(|s| s.name == "main" && s.section_index != 0)
+        .map(|s| s.value)
+        .unwrap_or(0);
 
     match target {
         Target::X86_64 => {
@@ -1765,7 +1868,7 @@ fn emit_assembly_text<A: ArchCodegen>(
         output.push_str(&format!("{}:\n", func.name));
 
         // Perform instruction selection for assembly text output.
-        let mf = match arch.lower_function(func, diagnostics, module.globals()) {
+        let mf = match arch.lower_function(func, diagnostics, module.globals(), &module.func_ref_map, &module.global_var_refs) {
             Ok(mf) => mf,
             Err(e) => {
                 diagnostics.emit_error(

@@ -767,6 +767,68 @@ pub fn lower_translation_unit(
     }
 
     // ====================================================================
+    // Pass 1.5 — Collect enum constants from the AST
+    // ====================================================================
+    // Enum constants are file-scope integer constants that must be
+    // resolvable during expression lowering (e.g., `return RED;`).
+    // We scan all top-level declarations for enum definitions and
+    // build a name → value map.
+    let enum_constants: FxHashMap<String, i128> = {
+        let mut map = FxHashMap::default();
+        for ext_decl in &translation_unit.declarations {
+            match ext_decl {
+                ast::ExternalDeclaration::Declaration(decl) => {
+                    collect_enum_constants_from_specifiers(
+                        &decl.specifiers.type_specifiers,
+                        &name_table,
+                        &mut map,
+                    );
+                }
+                ast::ExternalDeclaration::FunctionDefinition(func_def) => {
+                    collect_enum_constants_from_specifiers(
+                        &func_def.specifiers.type_specifiers,
+                        &name_table,
+                        &mut map,
+                    );
+                }
+                _ => {}
+            }
+        }
+        map
+    };
+
+    // ====================================================================
+    // Pass 1.6 — Collect struct/union type definitions from the AST
+    // ====================================================================
+    // Struct/union definitions at file scope (or embedded in declarations)
+    // populate a registry mapping tag name → CType. This allows references
+    // like `struct S s;` inside function bodies to resolve the full struct
+    // layout, even when the AST specifier only contains the tag name.
+    let struct_defs: FxHashMap<String, CType> = {
+        let mut map = FxHashMap::default();
+        for ext_decl in &translation_unit.declarations {
+            match ext_decl {
+                ast::ExternalDeclaration::Declaration(decl) => {
+                    collect_struct_defs_from_specifiers(
+                        &decl.specifiers.type_specifiers,
+                        &name_table,
+                        &mut map,
+                    );
+                }
+                ast::ExternalDeclaration::FunctionDefinition(func_def) => {
+                    collect_struct_defs_from_specifiers(
+                        &func_def.specifiers.type_specifiers,
+                        &name_table,
+                        &mut map,
+                    );
+                }
+                _ => {}
+            }
+        }
+        map
+    };
+
+    // ====================================================================
     // Pass 2 — Function definitions (alloca-first pattern)
     // ====================================================================
     for ext_decl in &translation_unit.declarations {
@@ -778,6 +840,8 @@ pub fn lower_translation_unit(
                 type_builder,
                 diagnostics,
                 &name_table,
+                &enum_constants,
+                &struct_defs,
             );
 
             // Check if a fatal error was emitted during function lowering.
@@ -937,3 +1001,135 @@ fn extract_asm_template(asm_stmt: &ast::AsmStatement) -> String {
 
 // Dead functions removed: extract_declarator_name and extract_direct_declarator_name
 // were superseded by the versions in decl_lowering.rs that accept a name_table parameter.
+
+/// Scan type specifiers for `enum { ... }` definitions and collect
+/// all enumerator name → integer value mappings into `out`.
+///
+/// This handles both explicit values (`RED = 5`) and implicit auto-
+/// incrementing values.  If an enumerator has a constant expression,
+/// we attempt simple integer literal evaluation; otherwise we fall
+/// back to sequential assignment.
+fn collect_enum_constants_from_specifiers(
+    specs: &[ast::TypeSpecifier],
+    name_table: &[String],
+    out: &mut FxHashMap<String, i128>,
+) {
+    for spec in specs {
+        if let ast::TypeSpecifier::Enum(enum_spec) = spec {
+            if let Some(ref enumerators) = enum_spec.enumerators {
+                let mut next_val: i128 = 0;
+                for enumerator in enumerators {
+                    // Try to evaluate the explicit value expression.
+                    if let Some(ref val_expr) = enumerator.value {
+                        if let Some(v) = try_eval_const_int_expr(val_expr) {
+                            next_val = v;
+                        }
+                    }
+                    // Resolve the enumerator name from the symbol.
+                    let idx = enumerator.name.as_u32() as usize;
+                    if idx < name_table.len() {
+                        out.insert(name_table[idx].clone(), next_val);
+                    }
+                    next_val += 1;
+                }
+            }
+        }
+    }
+}
+
+/// Attempt to evaluate a simple integer constant expression from the AST.
+///
+/// Handles:
+/// - Integer literals
+/// - Unary minus on integer literals
+/// - Simple binary arithmetic (+, -, *, /) on integer literals
+///
+/// Returns `None` if the expression is too complex for static evaluation.
+/// Collect struct/union type definitions from type specifiers.
+///
+/// Scans top-level declaration specifiers for `struct` or `union`
+/// definitions (those with a tag name AND member list) and registers
+/// the full `CType` (with populated fields) in the output map, keyed
+/// by tag name. This allows forward references like `struct S s;` in
+/// function bodies to resolve the full struct layout.
+fn collect_struct_defs_from_specifiers(
+    specs: &[ast::TypeSpecifier],
+    name_table: &[String],
+    out: &mut FxHashMap<String, CType>,
+) {
+    for spec in specs {
+        match spec {
+            ast::TypeSpecifier::Struct(s) => {
+                if let (Some(ref tag), Some(ref _members)) = (&s.tag, &s.members) {
+                    let tag_name_idx = tag.as_u32() as usize;
+                    if tag_name_idx < name_table.len() {
+                        let tag_name = name_table[tag_name_idx].clone();
+                        let fields = decl_lowering::extract_struct_union_fields(s);
+                        let ctype = CType::Struct {
+                            name: Some(tag_name.clone()),
+                            fields,
+                            packed: false,
+                            aligned: None,
+                        };
+                        out.insert(tag_name, ctype);
+                    }
+                }
+            }
+            ast::TypeSpecifier::Union(u) => {
+                if let (Some(ref tag), Some(ref _members)) = (&u.tag, &u.members) {
+                    let tag_name_idx = tag.as_u32() as usize;
+                    if tag_name_idx < name_table.len() {
+                        let tag_name = name_table[tag_name_idx].clone();
+                        let fields = decl_lowering::extract_struct_union_fields(u);
+                        let ctype = CType::Union {
+                            name: Some(tag_name.clone()),
+                            fields,
+                            packed: false,
+                            aligned: None,
+                        };
+                        out.insert(tag_name, ctype);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn try_eval_const_int_expr(expr: &ast::Expression) -> Option<i128> {
+    match expr {
+        ast::Expression::IntegerLiteral { value, .. } => Some(*value as i128),
+        ast::Expression::UnaryOp { op, operand, .. } => {
+            match op {
+                ast::UnaryOp::Negate => try_eval_const_int_expr(operand).map(|v| -v),
+                ast::UnaryOp::Plus => try_eval_const_int_expr(operand),
+                ast::UnaryOp::BitwiseNot => try_eval_const_int_expr(operand).map(|v| !v),
+                _ => None,
+            }
+        }
+        ast::Expression::Binary { op, left, right, .. } => {
+            let l = try_eval_const_int_expr(left)?;
+            let r = try_eval_const_int_expr(right)?;
+            match op {
+                ast::BinaryOp::Add => Some(l + r),
+                ast::BinaryOp::Sub => Some(l - r),
+                ast::BinaryOp::Mul => Some(l * r),
+                ast::BinaryOp::Div => {
+                    if r != 0 { Some(l / r) } else { None }
+                }
+                ast::BinaryOp::Mod => {
+                    if r != 0 { Some(l % r) } else { None }
+                }
+                ast::BinaryOp::ShiftLeft => Some(l << (r as u32)),
+                ast::BinaryOp::ShiftRight => Some(l >> (r as u32)),
+                ast::BinaryOp::BitwiseAnd => Some(l & r),
+                ast::BinaryOp::BitwiseOr => Some(l | r),
+                ast::BinaryOp::BitwiseXor => Some(l ^ r),
+                _ => None,
+            }
+        }
+        // Parenthesized expression — just unwrap.
+        ast::Expression::Parenthesized { inner, .. } => try_eval_const_int_expr(inner),
+        _ => None,
+    }
+}

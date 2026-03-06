@@ -1074,19 +1074,16 @@ fn compile_single_file(
         return Err(format!("IR lowering failed for '{}'", input));
     }
 
-    // ========================================================================
     // Phase 7: SSA Construction (mem2reg — alloca promotion)
     // ========================================================================
 
     run_mem2reg(&mut ir_module);
 
-    // ========================================================================
     // Phase 8: Optimization (constant folding, DCE, CFG simplification)
     // ========================================================================
 
     let _optimized = run_optimization_pipeline(&mut ir_module, ctx.optimization_level);
 
-    // ========================================================================
     // Phase 9: Phi Elimination (SSA → register-friendly form)
     // ========================================================================
 
@@ -1096,7 +1093,6 @@ fn compile_single_file(
         }
     }
 
-    // ========================================================================
     // Phase 10-12: Code Generation, Assembly, Linking
     // ========================================================================
 

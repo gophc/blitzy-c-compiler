@@ -1155,6 +1155,14 @@ pub fn lookup_keyword(s: &str) -> Option<TokenKind> {
         "__inline__" => Some(TokenKind::Inline),
         "__label__" => Some(TokenKind::Label),
         "__auto_type" => Some(TokenKind::AutoType),
+        // GCC alternate spellings for C keywords used in system headers
+        "__const" => Some(TokenKind::Const),
+        "__const__" => Some(TokenKind::Const),
+        "__restrict" => Some(TokenKind::Restrict),
+        "__restrict__" => Some(TokenKind::Restrict),
+        "__volatile" => Some(TokenKind::Volatile),
+        "__signed__" => Some(TokenKind::Signed),
+        "__inline" => Some(TokenKind::Inline),
 
         // =================================================================
         // GCC builtins (29 total)

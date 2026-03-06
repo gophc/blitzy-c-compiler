@@ -66,8 +66,8 @@ pub use self::security::SecurityConfig;
 // ===========================================================================
 
 use crate::backend::traits::{
-    ArchCodegen, ArgLocation as TraitsArgLocation, MachineFunction, MachineInstruction,
-    MachineOperand, RegisterInfo, RelocationTypeInfo,
+    ArchCodegen, ArgLocation as TraitsArgLocation, AssembledFunction, FunctionRelocation,
+    MachineFunction, MachineInstruction, MachineOperand, RegisterInfo, RelocationTypeInfo,
 };
 use crate::common::diagnostics::DiagnosticEngine;
 use crate::common::target::Target;
@@ -280,8 +280,12 @@ impl ArchCodegen for X86_64Backend {
         func: &IrFunction,
         diag: &mut DiagnosticEngine,
         globals: &[crate::ir::module::GlobalVariable],
+        func_ref_map: &crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>,
+        global_var_refs: &crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>,
     ) -> Result<MachineFunction, String> {
         let mut codegen = X86_64CodeGen::new(self.target);
+        codegen.set_func_ref_names(func_ref_map.clone());
+        codegen.set_global_var_refs(global_var_refs.clone());
         codegen.lower(func, diag, globals)
     }
 
@@ -292,9 +296,23 @@ impl ArchCodegen for X86_64Backend {
     /// [`MachineInstruction`] into bytes, producing relocatable object code.
     /// Security-related bytes (retpoline thunks, CET note section) are also
     /// handled by the assembler when the corresponding flags are active.
-    fn emit_assembly(&self, mf: &MachineFunction) -> Result<Vec<u8>, String> {
+    fn emit_assembly(&self, mf: &MachineFunction) -> Result<AssembledFunction, String> {
         let result = assembler::assemble(mf, &self.security_config, self.pic_enabled);
-        Ok(result.text)
+        let relocations = result
+            .relocations
+            .iter()
+            .map(|r| FunctionRelocation {
+                offset: r.offset,
+                symbol: r.symbol.clone(),
+                rel_type_id: r.rel_type.as_u32(),
+                addend: r.addend,
+                section: r.section.clone(),
+            })
+            .collect();
+        Ok(AssembledFunction {
+            bytes: result.text,
+            relocations,
+        })
     }
 
     /// Return the target architecture.
