@@ -1009,6 +1009,7 @@ impl RiscV64Linker {
                 sh_info: 0,
                 sh_addralign: sec_layout.alignment,
                 sh_entsize: 0,
+                logical_size: 0,
             };
             writer.add_section(section);
         }
@@ -1038,6 +1039,7 @@ impl RiscV64Linker {
                     data: dyn_secs.dynsym_section.clone(),
                     sh_addralign: 8,
                     sh_entsize: 24, // sizeof(Elf64_Sym)
+                    logical_size: 0,
                     ..Section::default()
                 });
             }
@@ -1076,6 +1078,7 @@ impl RiscV64Linker {
                     data: dyn_secs.rela_dyn_section.clone(),
                     sh_addralign: 8,
                     sh_entsize: 24, // sizeof(Elf64_Rela)
+                    logical_size: 0,
                     ..Section::default()
                 });
             }
@@ -1089,6 +1092,7 @@ impl RiscV64Linker {
                     data: dyn_secs.rela_plt_section.clone(),
                     sh_addralign: 8,
                     sh_entsize: 24,
+                    logical_size: 0,
                     ..Section::default()
                 });
             }
@@ -1102,6 +1106,7 @@ impl RiscV64Linker {
                     data: dyn_secs.got_section.clone(),
                     sh_addralign: 8,
                     sh_entsize: GOT_ENTRY_SIZE as u64,
+                    logical_size: 0,
                     ..Section::default()
                 });
             }
@@ -1115,6 +1120,7 @@ impl RiscV64Linker {
                     data: dyn_secs.got_plt_section.clone(),
                     sh_addralign: 8,
                     sh_entsize: GOT_ENTRY_SIZE as u64,
+                    logical_size: 0,
                     ..Section::default()
                 });
             }
@@ -1128,6 +1134,7 @@ impl RiscV64Linker {
                     data: dyn_secs.plt_section.clone(),
                     sh_addralign: 16,
                     sh_entsize: PLTN_SIZE as u64,
+                    logical_size: 0,
                     ..Section::default()
                 });
             }
@@ -1142,6 +1149,7 @@ impl RiscV64Linker {
                     data: dyn_secs.dynamic_section.clone(),
                     sh_addralign: 8,
                     sh_entsize: 16, // sizeof(Elf64_Dyn)
+                    logical_size: 0,
                     ..Section::default()
                 });
             }

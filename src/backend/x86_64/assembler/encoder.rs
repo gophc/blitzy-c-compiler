@@ -349,14 +349,62 @@ fn encode_memory_operand(
 // ===========================================================================
 
 /// Map an X86Opcode conditional variant to its x86-64 condition code (cc).
+///
+/// All 16 x86 condition codes are covered (Intel SDM Vol. 2, Appendix B):
+///
+/// | cc   | Code | Mnemonic | Condition                                |
+/// |------|------|----------|------------------------------------------|
+/// | 0x00 | O    | JO/SETO  | Overflow (OF=1)                          |
+/// | 0x01 | NO   | JNO      | Not overflow (OF=0)                      |
+/// | 0x02 | B/C  | JB/SETB  | Below / Carry (CF=1)                     |
+/// | 0x03 | AE/NC| JAE      | Above or equal / No carry (CF=0)         |
+/// | 0x04 | E/Z  | JE/SETE  | Equal / Zero (ZF=1)                      |
+/// | 0x05 | NE/NZ| JNE/SETNE| Not equal / Not zero (ZF=0)              |
+/// | 0x06 | BE/NA| JBE/SETBE| Below or equal (CF=1 OR ZF=1)            |
+/// | 0x07 | A/NBE| JA/SETA  | Above (CF=0 AND ZF=0)                    |
+/// | 0x08 | S    | JS/SETS  | Sign (SF=1)                              |
+/// | 0x09 | NS   | JNS/SETNS| Not sign (SF=0)                          |
+/// | 0x0A | P/PE | JP/SETP  | Parity even (PF=1) — also used for NaN   |
+/// | 0x0B | NP/PO| JNP/SETNP| Parity odd (PF=0) — used for ordered cmp |
+/// | 0x0C | L/NGE| JL/SETL  | Less (SF≠OF)                             |
+/// | 0x0D | GE/NL| JGE/SETGE| Greater or equal (SF=OF)                 |
+/// | 0x0E | LE/NG| JLE/SETLE| Less or equal (ZF=1 OR SF≠OF)           |
+/// | 0x0F | G/NLE| JG/SETG  | Greater (ZF=0 AND SF=OF)                 |
 fn condition_code(op: &X86Opcode) -> u8 {
     match op {
+        // 0x00 — Overflow
+        X86Opcode::Jo | X86Opcode::Cmovo | X86Opcode::Seto => 0x00,
+        // 0x01 — Not overflow
+        X86Opcode::Jno | X86Opcode::Cmovno | X86Opcode::Setno => 0x01,
+        // 0x02 — Below / Carry (unsigned <)
+        X86Opcode::Jb | X86Opcode::Cmovb | X86Opcode::Setb => 0x02,
+        // 0x03 — Above or equal / No carry (unsigned >=)
+        X86Opcode::Jae | X86Opcode::Cmovae | X86Opcode::Setae => 0x03,
+        // 0x04 — Equal / Zero
         X86Opcode::Je | X86Opcode::Cmove | X86Opcode::Sete => 0x04,
+        // 0x05 — Not equal / Not zero
         X86Opcode::Jne | X86Opcode::Cmovne | X86Opcode::Setne => 0x05,
-        X86Opcode::Jl => 0x0C,
-        X86Opcode::Jle => 0x0E,
-        X86Opcode::Jg => 0x0F,
-        X86Opcode::Jge => 0x0D,
+        // 0x06 — Below or equal (unsigned <=)
+        X86Opcode::Jbe | X86Opcode::Cmovbe | X86Opcode::Setbe => 0x06,
+        // 0x07 — Above (unsigned >)
+        X86Opcode::Ja | X86Opcode::Cmova | X86Opcode::Seta => 0x07,
+        // 0x08 — Sign
+        X86Opcode::Js | X86Opcode::Cmovs | X86Opcode::Sets => 0x08,
+        // 0x09 — Not sign
+        X86Opcode::Jns | X86Opcode::Cmovns | X86Opcode::Setns => 0x09,
+        // 0x0A — Parity even (PF=1)
+        X86Opcode::Jp | X86Opcode::Cmovp | X86Opcode::Setp => 0x0A,
+        // 0x0B — Parity odd / not parity (PF=0)
+        X86Opcode::Jnp | X86Opcode::Cmovnp | X86Opcode::Setnp => 0x0B,
+        // 0x0C — Less (signed)
+        X86Opcode::Jl | X86Opcode::Cmovl | X86Opcode::Setl => 0x0C,
+        // 0x0D — Greater or equal (signed)
+        X86Opcode::Jge | X86Opcode::Cmovge | X86Opcode::Setge => 0x0D,
+        // 0x0E — Less or equal (signed)
+        X86Opcode::Jle | X86Opcode::Cmovle | X86Opcode::Setle => 0x0E,
+        // 0x0F — Greater (signed)
+        X86Opcode::Jg | X86Opcode::Cmovg | X86Opcode::Setg => 0x0F,
+        // Fallback for any opcode passed incorrectly — Equal as safe default.
         _ => 0x04,
     }
 }
@@ -566,7 +614,12 @@ impl X86_64Encoder {
         let opcode = match X86Opcode::from_u32(inst.opcode) {
             Some(op) => op,
             None => {
-                let result = EncodedInstruction::new(vec![0x90]);
+                // Unknown opcode — emit a UD2 (0F 0B) fault instruction to
+                // make encoding failures immediately visible rather than
+                // silently producing NOPs that mask miscompilation.  This
+                // matches the i686 encoder's policy of surfacing errors for
+                // unrecognised opcodes.
+                let result = EncodedInstruction::new(vec![0x0F, 0x0B]);
                 self.current_offset += result.bytes.len();
                 return result;
             }
@@ -660,11 +713,11 @@ impl X86_64Encoder {
                     bytes.extend_from_slice(entry.opcode);
                     EncodedInstruction::new(bytes)
                 } else {
-                    EncodedInstruction::new(vec![0x90])
+                    EncodedInstruction::new(vec![0x0F, 0x0B])
                 }
             }
             // Catch-all
-            _ => EncodedInstruction::new(vec![0x90]),
+            _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
         };
 
         self.current_offset += result.bytes.len();
@@ -876,6 +929,21 @@ impl X86_64Encoder {
     }
 
     /// Encode an ALU binary operation (ADD, SUB, AND, OR, XOR, CMP).
+    /// Infer the operand size (in bytes) from a MachineInstruction.
+    ///
+    /// Uses `operand_size` if explicitly set (non-zero), otherwise defaults
+    /// to 8 (64-bit) for x86-64.  This allows the instruction selector to
+    /// emit 32-bit, 16-bit, or 8-bit operations by setting the field on
+    /// the MachineInstruction.
+    #[inline]
+    fn infer_operand_size(inst: &MachineInstruction) -> u8 {
+        if inst.operand_size > 0 {
+            inst.operand_size
+        } else {
+            8 // x86-64 default: 64-bit operations
+        }
+    }
+
     fn encode_alu_op(
         &mut self,
         inst: &MachineInstruction,
@@ -884,16 +952,17 @@ impl X86_64Encoder {
         reg_rm_opc: u8,
     ) -> EncodedInstruction {
         let ops = &inst.operands;
+        let opsz = Self::infer_operand_size(inst);
         match (ops.first(), ops.get(1)) {
             (Some(MachineOperand::Register(dst)), Some(MachineOperand::Register(src))) => {
-                self.encode_reg_reg_op(&[rm_reg_opc], *dst, *src, 8)
+                self.encode_reg_reg_op(&[rm_reg_opc], *dst, *src, opsz)
             }
             (Some(MachineOperand::Register(dst)), Some(MachineOperand::Immediate(imm))) => {
                 let imm = *imm;
                 if (-128..=127).contains(&imm) {
-                    self.encode_reg_imm_op(&[0x83], opext, *dst, imm, 8)
+                    self.encode_reg_imm_op(&[0x83], opext, *dst, imm, opsz)
                 } else {
-                    self.encode_reg_imm_op(&[0x81], opext, *dst, imm, 8)
+                    self.encode_reg_imm_op(&[0x81], opext, *dst, imm, opsz)
                 }
             }
             (
@@ -904,12 +973,25 @@ impl X86_64Encoder {
                     scale,
                     displacement,
                 }),
-            ) => {
-                self.encode_reg_mem_op(&[reg_rm_opc], *reg, *base, *index, *scale, *displacement, 8)
-            }
-            (Some(MachineOperand::Register(reg)), Some(MachineOperand::FrameSlot(offset))) => {
-                self.encode_reg_mem_op(&[reg_rm_opc], *reg, Some(RBP), None, 1, *offset as i64, 8)
-            }
+            ) => self.encode_reg_mem_op(
+                &[reg_rm_opc],
+                *reg,
+                *base,
+                *index,
+                *scale,
+                *displacement,
+                opsz,
+            ),
+            (Some(MachineOperand::Register(reg)), Some(MachineOperand::FrameSlot(offset))) => self
+                .encode_reg_mem_op(
+                    &[reg_rm_opc],
+                    *reg,
+                    Some(RBP),
+                    None,
+                    1,
+                    *offset as i64,
+                    opsz,
+                ),
             (
                 Some(MachineOperand::Memory {
                     base,
@@ -918,9 +1000,15 @@ impl X86_64Encoder {
                     displacement,
                 }),
                 Some(MachineOperand::Register(reg)),
-            ) => {
-                self.encode_mem_reg_op(&[rm_reg_opc], *base, *index, *scale, *displacement, *reg, 8)
-            }
+            ) => self.encode_mem_reg_op(
+                &[rm_reg_opc],
+                *base,
+                *index,
+                *scale,
+                *displacement,
+                *reg,
+                opsz,
+            ),
             (
                 Some(MachineOperand::Memory {
                     base,
@@ -952,7 +1040,7 @@ impl X86_64Encoder {
                 bytes.extend_from_slice(&encode_immediate(imm, imm_size));
                 EncodedInstruction::new(bytes)
             }
-            _ => EncodedInstruction::new(vec![0x90]),
+            _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
         }
     }
 
@@ -966,7 +1054,7 @@ impl X86_64Encoder {
             (Some(MachineOperand::Register(dst)), Some(MachineOperand::Immediate(imm))) => {
                 self.encode_reg_imm_op(&[0xF7], 0, *dst, *imm, 8)
             }
-            _ => EncodedInstruction::new(vec![0x90]),
+            _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
         }
     }
 
@@ -1065,7 +1153,7 @@ impl X86_64Encoder {
                 );
                 EncodedInstruction::with_relocations(bytes, vec![reloc])
             }
-            _ => EncodedInstruction::new(vec![0x90]),
+            _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
         }
     }
 
@@ -1088,7 +1176,7 @@ impl X86_64Encoder {
             (Some(MachineOperand::Register(reg)), Some(MachineOperand::GlobalSymbol(sym))) => {
                 self.encode_rip_relative(&[0x8D], *reg, sym, 0)
             }
-            _ => EncodedInstruction::new(vec![0x90]),
+            _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
         }
     }
 
@@ -1127,7 +1215,7 @@ impl X86_64Encoder {
                 }
                 EncodedInstruction::new(bytes)
             }
-            _ => EncodedInstruction::new(vec![0x90]),
+            _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
         }
     }
 
@@ -1172,7 +1260,7 @@ impl X86_64Encoder {
                 bytes.extend_from_slice(&mem_enc.displacement);
                 EncodedInstruction::new(bytes)
             }
-            _ => EncodedInstruction::new(vec![0x90]),
+            _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
         }
     }
 
@@ -1253,7 +1341,7 @@ impl X86_64Encoder {
                 bytes.extend_from_slice(&mem_enc.displacement);
                 EncodedInstruction::new(bytes)
             }
-            _ => EncodedInstruction::new(vec![0x90]),
+            _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
         }
     }
 
@@ -1307,7 +1395,7 @@ impl X86_64Encoder {
                 bytes.extend_from_slice(&mem_enc.displacement);
                 EncodedInstruction::new(bytes)
             }
-            _ => EncodedInstruction::new(vec![0x90]),
+            _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
         }
     }
 
@@ -1356,7 +1444,7 @@ impl X86_64Encoder {
                 bytes.extend_from_slice(&mem_enc.displacement);
                 EncodedInstruction::new(bytes)
             }
-            _ => EncodedInstruction::new(vec![0x90]),
+            _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
         }
     }
 
@@ -1402,7 +1490,7 @@ impl X86_64Encoder {
                 );
                 EncodedInstruction::with_relocations(bytes, vec![reloc])
             }
-            _ => EncodedInstruction::new(vec![0x90]),
+            _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
         }
     }
 
@@ -1454,7 +1542,7 @@ impl X86_64Encoder {
                 bytes.push(modrm_byte(0b11, 4, hw_encoding(*reg) & 0x7));
                 EncodedInstruction::new(bytes)
             }
-            _ => EncodedInstruction::new(vec![0x90]),
+            _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
         }
     }
 
@@ -1513,7 +1601,7 @@ impl X86_64Encoder {
                 bytes.extend_from_slice(&mem_enc.displacement);
                 EncodedInstruction::new(bytes)
             }
-            _ => EncodedInstruction::new(vec![0x90]),
+            _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
         }
     }
 
@@ -1564,7 +1652,7 @@ impl X86_64Encoder {
                 bytes.extend_from_slice(&mem_enc.displacement);
                 EncodedInstruction::new(bytes)
             }
-            _ => EncodedInstruction::new(vec![0x90]),
+            _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
         }
     }
 
@@ -1696,7 +1784,7 @@ impl X86_64Encoder {
                 bytes.extend_from_slice(&mem_enc.displacement);
                 EncodedInstruction::new(bytes)
             }
-            _ => EncodedInstruction::new(vec![0x90]),
+            _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
         }
     }
 
@@ -1769,7 +1857,7 @@ impl X86_64Encoder {
                 bytes.extend_from_slice(&mem_enc.displacement);
                 EncodedInstruction::new(bytes)
             }
-            _ => EncodedInstruction::new(vec![0x90]),
+            _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
         }
     }
 
@@ -1817,7 +1905,7 @@ impl X86_64Encoder {
                 bytes.extend_from_slice(&mem_enc.displacement);
                 EncodedInstruction::new(bytes)
             }
-            _ => EncodedInstruction::new(vec![0x90]),
+            _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
         }
     }
 
@@ -1872,7 +1960,7 @@ impl X86_64Encoder {
                 bytes.extend_from_slice(&mem_enc.displacement);
                 EncodedInstruction::new(bytes)
             }
-            _ => EncodedInstruction::new(vec![0x90]),
+            _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
         }
     }
 
@@ -1897,7 +1985,7 @@ impl X86_64Encoder {
                 ));
                 EncodedInstruction::new(bytes)
             }
-            _ => EncodedInstruction::new(vec![0x90]),
+            _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
         }
     }
 
@@ -1922,7 +2010,7 @@ impl X86_64Encoder {
                 ));
                 EncodedInstruction::new(bytes)
             }
-            _ => EncodedInstruction::new(vec![0x90]),
+            _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
         }
     }
 } // end impl X86_64Encoder

@@ -20,7 +20,9 @@
 //! - 32 SIMD/FP registers: V0–V31 (128-bit), D0–D31 (64-bit double), S0–S31 (32-bit float)
 //! - NZCV condition flags register
 
-use crate::backend::aarch64::abi::{AArch64Abi, FrameLayout, INT_ARG_REGS, NUM_INT_ARG_REGS};
+use crate::backend::aarch64::abi::{
+    AArch64Abi, FrameLayout, FP_ARG_REGS, INT_ARG_REGS, NUM_FP_ARG_REGS, NUM_INT_ARG_REGS,
+};
 use crate::backend::aarch64::registers::*;
 use crate::backend::traits::ArgLocation;
 use crate::common::diagnostics::Span;
@@ -33,9 +35,7 @@ use crate::ir::types::IrType;
 
 // Re-import items used only in test verification module to avoid unused import warnings.
 #[cfg(test)]
-use crate::backend::aarch64::abi::{
-    ArgClass, FP_ARG_REGS, INDIRECT_RESULT_REG, INT_RET_REGS, NUM_FP_ARG_REGS, STACK_ALIGNMENT,
-};
+use crate::backend::aarch64::abi::{ArgClass, INDIRECT_RESULT_REG, INT_RET_REGS, STACK_ALIGNMENT};
 #[cfg(test)]
 use crate::backend::traits::{
     MachineBasicBlock, MachineFunction, MachineInstruction, MachineOperand, RegisterInfo,
@@ -710,6 +710,10 @@ pub struct AArch64InstructionSelector {
     next_vreg: u32,
     block_labels: Vec<String>,
     used_callee_saved: Vec<u8>,
+    /// Maps IR Values to their IrType, populated during lower_function.
+    /// Used by select_call to classify arguments as integer (X0–X7) vs
+    /// floating-point (V0–V7) per AAPCS64.
+    value_types: crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, IrType>,
 }
 
 impl AArch64InstructionSelector {
@@ -725,6 +729,7 @@ impl AArch64InstructionSelector {
             next_vreg: 0,
             block_labels: Vec::new(),
             used_callee_saved: Vec::new(),
+            value_types: crate::common::fx_hash::FxHashMap::default(),
         }
     }
 
@@ -737,6 +742,7 @@ impl AArch64InstructionSelector {
         self.next_vreg = 0;
         self.block_labels.clear();
         self.used_callee_saved.clear();
+        self.value_types.clear();
     }
 
     /// Allocate the next virtual register number.
@@ -967,6 +973,64 @@ impl AArch64InstructionSelector {
             self.block_labels.push(label);
         }
 
+        // Populate value_types from function parameters and IR instructions
+        // so that select_call can distinguish integer vs FP arguments per AAPCS64.
+        for param in &func.params {
+            self.value_types.insert(param.value, param.ty.clone());
+        }
+        for ir_block in func.blocks().iter() {
+            for ir_inst in ir_block.instructions() {
+                match ir_inst {
+                    Instruction::Load { result, ty, .. } => {
+                        self.value_types.insert(*result, ty.clone());
+                    }
+                    Instruction::BinOp { result, ty, .. } => {
+                        self.value_types.insert(*result, ty.clone());
+                    }
+                    Instruction::BitCast {
+                        result, to_type, ..
+                    }
+                    | Instruction::Trunc {
+                        result, to_type, ..
+                    }
+                    | Instruction::ZExt {
+                        result, to_type, ..
+                    }
+                    | Instruction::SExt {
+                        result, to_type, ..
+                    }
+                    | Instruction::PtrToInt {
+                        result, to_type, ..
+                    } => {
+                        self.value_types.insert(*result, to_type.clone());
+                    }
+                    Instruction::IntToPtr { result, .. } => {
+                        self.value_types.insert(*result, IrType::Ptr);
+                    }
+                    Instruction::Call {
+                        result,
+                        return_type,
+                        ..
+                    } => {
+                        self.value_types.insert(*result, return_type.clone());
+                    }
+                    Instruction::Alloca { result, .. } => {
+                        self.value_types.insert(*result, IrType::Ptr);
+                    }
+                    Instruction::ICmp { result, .. } | Instruction::FCmp { result, .. } => {
+                        self.value_types.insert(*result, IrType::I1);
+                    }
+                    Instruction::Phi { result, ty, .. } => {
+                        self.value_types.insert(*result, ty.clone());
+                    }
+                    Instruction::GetElementPtr { result, .. } => {
+                        self.value_types.insert(*result, IrType::Ptr);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         // Compute frame layout.
         let callee_gprs: Vec<u8> = CALLEE_SAVED_GPRS.to_vec();
         let callee_fprs: Vec<u8> = CALLEE_SAVED_FPRS.to_vec();
@@ -1182,6 +1246,11 @@ impl AArch64InstructionSelector {
 
     /// Emit argument setup: copy from ABI register/stack locations to vregs.
     fn emit_arg_setup(&mut self, func: &IrFunction, _abi: &AArch64Abi) {
+        // Uses ABI-classified register assignments per AAPCS64 — integer
+        // parameters go to X0–X7 and FP parameters go to V0–V7.  The ABI
+        // classifier handles the separate register bank allocation, so
+        // we do NOT use the sequential parameter index as a physical register
+        // number.
         let mut abi_state = AArch64Abi::new();
         abi_state.reset();
         for (i, param) in func.params.iter().enumerate() {
@@ -1193,13 +1262,18 @@ impl AArch64InstructionSelector {
             };
             match loc {
                 ArgLocation::Register(reg) => {
-                    // Argument is already in the correct register; emit
-                    // a NOP placeholder tracking the location.
-                    self.emit(A64Instruction::new(A64Opcode::NOP).with_comment(format!(
-                        "arg {} in reg {}",
-                        i,
-                        gpr_name(reg as u8)
-                    )));
+                    // Argument is in an ABI register (X0-X7 for int, V0-V7 for FP).
+                    // The register number comes from ABI classification, not arg index.
+                    let is_fp = matches!(param.ty, IrType::F32 | IrType::F64 | IrType::F80);
+                    let reg_name = if is_fp {
+                        format!("v{}", reg)
+                    } else {
+                        gpr_name(reg as u8).to_string()
+                    };
+                    self.emit(
+                        A64Instruction::new(A64Opcode::NOP)
+                            .with_comment(format!("arg {} in reg {}", i, reg_name)),
+                    );
                 }
                 ArgLocation::RegisterPair(r1, r2) => {
                     self.emit(A64Instruction::new(A64Opcode::NOP).with_comment(format!(
@@ -1888,22 +1962,55 @@ impl AArch64InstructionSelector {
         let mut insts = Vec::new();
 
         // Place arguments in registers per AAPCS64 convention.
+        // Integer arguments go to X0–X7 (separate counter), FP arguments
+        // go to V0–V7 (separate counter).  This is a fundamental AAPCS64
+        // requirement: the two register banks are allocated independently.
         let mut int_reg_idx = 0usize;
+        let mut fp_reg_idx = 0usize;
         let mut stack_offset: i64 = 0;
         for (i, arg) in args.iter().enumerate() {
             let src = arg.index() as u8;
-            // Simple classification: first 8 int args in X0-X7.
-            if int_reg_idx < NUM_INT_ARG_REGS {
+            // Classify argument as FP if its IrType is F32/F64/F80.
+            let is_fp_arg = self
+                .value_types
+                .get(arg)
+                .map(|ty| matches!(ty, IrType::F32 | IrType::F64 | IrType::F80))
+                .unwrap_or(false);
+
+            if is_fp_arg {
+                if fp_reg_idx < NUM_FP_ARG_REGS {
+                    let dest = FP_ARG_REGS[fp_reg_idx];
+                    insts.push(
+                        A64Instruction::new(A64Opcode::FMOV_d)
+                            .with_rd(dest)
+                            .with_rn(src)
+                            .set_fp()
+                            .with_comment(format!("FP arg {} -> v{}", i, fp_reg_idx)),
+                    );
+                    fp_reg_idx += 1;
+                } else {
+                    // Spill FP arg to stack.
+                    insts.push(
+                        A64Instruction::new(A64Opcode::STR_imm)
+                            .with_rd(src)
+                            .with_rn(SP_REG)
+                            .with_imm(stack_offset)
+                            .set_fp()
+                            .with_comment(format!("FP stack arg {} at sp+{}", i, stack_offset)),
+                    );
+                    stack_offset += 8;
+                }
+            } else if int_reg_idx < NUM_INT_ARG_REGS {
                 let dest = INT_ARG_REGS[int_reg_idx];
                 insts.push(
                     A64Instruction::new(A64Opcode::MOV_reg)
                         .with_rd(dest)
                         .with_rn(src)
-                        .with_comment(format!("arg {} -> {}", i, gpr_name(dest))),
+                        .with_comment(format!("int arg {} -> {}", i, gpr_name(dest))),
                 );
                 int_reg_idx += 1;
             } else {
-                // Spill to stack.
+                // Spill integer arg to stack.
                 insts.push(
                     A64Instruction::new(A64Opcode::STR_imm)
                         .with_rd(src)

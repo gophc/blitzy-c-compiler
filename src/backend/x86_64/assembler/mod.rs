@@ -723,6 +723,7 @@ pub fn assemble_to_object(
         sh_info: 0,
         sh_addralign: 16,
         sh_entsize: 0,
+        logical_size: 0,
     });
 
     let mut data_idx: Option<usize> = None;
@@ -736,23 +737,25 @@ pub fn assemble_to_object(
             sh_info: 0,
             sh_addralign: 8,
             sh_entsize: 0,
+            logical_size: 0,
         }));
     }
 
     let mut bss_idx: Option<usize> = None;
     if bss_size > 0 {
-        // SHT_NOBITS sections occupy no file space but carry sh_size.
-        // The ELF writer derives sh_size from data.len().
-        let bss_placeholder = vec![0u8; bss_size];
+        // SHT_NOBITS sections occupy no file space — use empty data vec
+        // and set logical_size to the actual BSS size.  This avoids
+        // wastefully allocating `bss_size` bytes of zeroes in memory.
         bss_idx = Some(elf.add_section(Section {
             name: ".bss".to_string(),
             sh_type: SHT_NOBITS,
             sh_flags: SHF_ALLOC | SHF_WRITE,
-            data: bss_placeholder,
+            data: Vec::new(),
             sh_link: 0,
             sh_info: 0,
             sh_addralign: 8,
             sh_entsize: 0,
+            logical_size: bss_size as u64,
         }));
     }
 
@@ -767,16 +770,41 @@ pub fn assemble_to_object(
             sh_info: 0,
             sh_addralign: 8,
             sh_entsize: 0,
+            logical_size: 0,
         }));
+    }
+
+    // Pre-build a name→ELF-symbol-index map for relocations.
+    //
+    // We compute the base symbol index by counting how many section symbols
+    // will be emitted before the assembled symbols.  ELF symbol indices are:
+    //   0         = null symbol
+    //   1         = .text section symbol (always present)
+    //   +1 if .data present
+    //   +1 if .rodata present
+    //   then assembled symbols in order.
+    let section_sym_count: u32 = 1 // .text
+        + if data_idx.is_some() { 1 } else { 0 }
+        + if rodata_idx.is_some() { 1 } else { 0 };
+    let base_sym_index = 1 + section_sym_count; // +1 for null symbol at index 0
+    let mut symbol_name_to_index: FxHashMap<String, u32> = FxHashMap::default();
+    for (i, sym) in combined_symbols.iter().enumerate() {
+        symbol_name_to_index.insert(sym.name.clone(), base_sym_index + i as u32);
     }
 
     // Add .rela.text section with all collected relocations.
     if !combined_relocs.is_empty() {
         let mut rela_data = Vec::with_capacity(combined_relocs.len() * 24);
         for reloc in &combined_relocs {
-            // For ET_REL, sym_index=0 is a placeholder — actual symbol
-            // indices are resolved by the ELF writer or linker.
-            let elf_reloc = reloc.to_elf_relocation(0);
+            // Look up the actual symbol table index from the name→index map
+            // built during symbol emission.  If the symbol is not found (e.g.,
+            // an external/undefined symbol that hasn't been added yet), fall
+            // back to 0 (the null symbol) — the linker will resolve it.
+            let sym_idx = symbol_name_to_index
+                .get(&reloc.symbol)
+                .copied()
+                .unwrap_or(0);
+            let elf_reloc = reloc.to_elf_relocation(sym_idx);
             // Elf64_Rela: r_offset (8 bytes) + r_info (8 bytes) + r_addend (8 bytes)
             rela_data.extend_from_slice(&elf_reloc.offset.to_le_bytes());
             let r_info = ((elf_reloc.sym_index as u64) << 32) | (elf_reloc.rel_type as u64);
@@ -792,6 +820,7 @@ pub fn assemble_to_object(
             sh_info: 0,
             sh_addralign: 8,
             sh_entsize: 24, // sizeof(Elf64_Rela)
+            logical_size: 0,
         });
     }
 
@@ -807,6 +836,7 @@ pub fn assemble_to_object(
             sh_info: 0,
             sh_addralign: 8,
             sh_entsize: 0,
+            logical_size: 0,
         });
     }
 
@@ -820,6 +850,7 @@ pub fn assemble_to_object(
         sh_info: 0,
         sh_addralign: 1,
         sh_entsize: 0,
+        logical_size: 0,
     });
 
     // -- Section symbols --------------------------------------------------
@@ -859,8 +890,9 @@ pub fn assemble_to_object(
     }
 
     // -- Assembled symbols ------------------------------------------------
-
-    for sym in &combined_symbols {
+    // Add all assembled symbols to the ELF symbol table.  The name→index
+    // map (`symbol_name_to_index`) was already built above for relocations.
+    for sym in combined_symbols.iter() {
         let section_index = match sym.section {
             SymbolSection::Text => text_idx as u16,
             SymbolSection::Data => data_idx.unwrap_or(0) as u16,

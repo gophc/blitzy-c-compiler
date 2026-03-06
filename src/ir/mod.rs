@@ -105,3 +105,5 @@ pub use function::IrFunction;
 pub use module::{Constant, GlobalVariable, IrModule, Linkage, Visibility};
 
 pub use builder::IrBuilder;
+
+pub use function::{CallingConvention, FunctionParam};

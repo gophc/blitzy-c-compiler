@@ -323,6 +323,14 @@ pub struct MachineInstruction {
     /// dispatches set this flag.
     pub is_branch: bool,
 
+    /// Operand size in bytes for this instruction (0 = use architecture default).
+    ///
+    /// When non-zero, the assembler encoder uses this to select the correct
+    /// encoding width (e.g., 1=8-bit, 2=16-bit, 4=32-bit, 8=64-bit on x86).
+    /// When zero, the architecture's default operand size is used (typically
+    /// 8 bytes on x86-64, 4 bytes on i686/AArch64/RISC-V).
+    pub operand_size: u8,
+
     /// Final encoded machine code bytes produced by the assembler.
     ///
     /// This vector is empty after instruction selection and register
@@ -344,6 +352,7 @@ impl MachineInstruction {
             is_terminator: false,
             is_call: false,
             is_branch: false,
+            operand_size: 0,
             encoded_bytes: Vec::new(),
         }
     }
@@ -550,6 +559,14 @@ pub struct MachineBasicBlock {
     /// A successor is a block to which this block's terminator can
     /// transfer control.
     pub successors: Vec<usize>,
+
+    /// Whether this block is the target of an indirect branch.
+    ///
+    /// Set to `true` when the block is reached via computed goto, switch
+    /// table indirect jump, `asm goto`, or any other indirect control
+    /// transfer.  Used by CET/IBT (x86-64) to insert `endbr64` at the
+    /// correct locations.
+    pub is_indirect_target: bool,
 }
 
 impl MachineBasicBlock {
@@ -560,6 +577,7 @@ impl MachineBasicBlock {
             instructions: Vec::new(),
             predecessors: Vec::new(),
             successors: Vec::new(),
+            is_indirect_target: false,
         }
     }
 

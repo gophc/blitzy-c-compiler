@@ -29,6 +29,23 @@
 //! - Pointer: **4 bytes** (32-bit addressing)
 //! - `long double`: **12 bytes** (80-bit x87 + 2 bytes padding, 4-byte aligned)
 //!
+//! ## Integration with `crate::backend::traits::ArgLocation`
+//!
+//! This module defines its **own** [`ArgLocation`] enum with i686-specific
+//! variants (`StackSlot`, `RegisterReturn`, `RegisterPairReturn`,
+//! `X87Return`, `StructReturn`) that are richer than the trait-level
+//! `crate::backend::traits::ArgLocation` (which only has `Register`,
+//! `RegisterPair`, `Stack`).  This is intentional:
+//!
+//! - The i686-specific `ArgLocation` captures the full ABI detail needed for
+//!   accurate codegen (hidden struct-return pointer, x87 FPU returns, etc.).
+//! - The `ArchCodegen` trait methods `classify_argument()` and
+//!   `classify_return()` in `i686/codegen.rs` bridge between this
+//!   module's detailed classification and the trait-level enum, translating
+//!   i686-specific variants into the corresponding `traits::ArgLocation`
+//!   value.  This keeps the trait interface uniform across all four
+//!   architectures while preserving i686-specific ABI detail internally.
+//!
 //! ## Exports
 //!
 //! | Type             | Kind   | Purpose                                      |
@@ -153,6 +170,14 @@ pub enum ArgLocation {
 /// - All floating-point types → ST(0) (x87 FPU top-of-stack)
 /// - Structs and unions → hidden first pointer parameter (struct return)
 /// - `void` → no return value
+///
+/// **Design Decision — Struct Return:**
+/// All struct and union types are unconditionally returned via hidden pointer
+/// (StructReturn), even for small structs (e.g., 4-byte structs that could
+/// theoretically fit in EAX on some System V i386 ABI implementations).
+/// This is an intentional simplification for the initial implementation that
+/// matches GCC's default behavior for the `-m32` target.  Optimizing small
+/// struct returns to EAX is a future enhancement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReturnLocation {
     /// Integer return value in EAX (≤ 32 bits).

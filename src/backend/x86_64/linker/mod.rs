@@ -686,6 +686,7 @@ impl X86_64Linker {
                     data: got_data,
                     sh_addralign: 8,
                     sh_entsize: GOT_ENTRY_SIZE as u64,
+                    logical_size: 0,
                     ..Section::default()
                 });
             }
@@ -701,6 +702,7 @@ impl X86_64Linker {
                     data: got_plt_data,
                     sh_addralign: 8,
                     sh_entsize: GOT_ENTRY_SIZE as u64,
+                    logical_size: 0,
                     ..Section::default()
                 });
             }
@@ -716,6 +718,7 @@ impl X86_64Linker {
                     data: plt_data,
                     sh_addralign: 16,
                     sh_entsize: PLT_ENTRY_SIZE as u64,
+                    logical_size: 0,
                     ..Section::default()
                 });
             }
@@ -730,6 +733,7 @@ impl X86_64Linker {
                     data: dynsym_data,
                     sh_addralign: 8,
                     sh_entsize: 24, // Elf64Sym size
+                    logical_size: 0,
                     ..Section::default()
                 });
             }
@@ -770,6 +774,7 @@ impl X86_64Linker {
                     data: rela_dyn_data,
                     sh_addralign: 8,
                     sh_entsize: 24, // Elf64Rela size
+                    logical_size: 0,
                     ..Section::default()
                 });
             }
@@ -784,6 +789,7 @@ impl X86_64Linker {
                     data: rela_plt_data,
                     sh_addralign: 8,
                     sh_entsize: 24,
+                    logical_size: 0,
                     ..Section::default()
                 });
             }
@@ -798,6 +804,7 @@ impl X86_64Linker {
                     data: dynamic_data,
                     sh_addralign: 8,
                     sh_entsize: 16, // Elf64Dyn size
+                    logical_size: 0,
                     ..Section::default()
                 });
 

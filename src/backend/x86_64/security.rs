@@ -374,14 +374,24 @@ pub fn insert_endbr64(func: &mut MachineFunction, enabled: bool) {
     }
 
     // Phase 2: Insert at indirect branch targets.
-    // A block is considered a potential indirect branch target if it has
-    // multiple predecessors or if any predecessor contains an indirect
-    // branch/call targeting it.
+    //
+    // A block is considered an indirect branch target if it has the
+    // `is_indirect_target` flag set.  This flag should be set by the
+    // code generator when processing computed gotos, switch tables,
+    // `asm goto` targets, or any other indirect control transfer.
+    //
+    // As a conservative fallback, blocks with multiple predecessors
+    // also receive endbr64 — this may over-insert at normal merge
+    // points but guarantees no indirect target is left unprotected.
+    // The codegen driver (generation.rs) should refine this by setting
+    // `is_indirect_target` precisely for blocks reachable via indirect
+    // branches so the multi-predecessor heuristic can be removed.
     let block_count = func.blocks.len();
     for idx in 1..block_count {
-        let is_indirect_target = func.blocks[idx].predecessors.len() > 1;
+        let needs_endbr =
+            func.blocks[idx].is_indirect_target || func.blocks[idx].predecessors.len() > 1;
 
-        if is_indirect_target {
+        if needs_endbr {
             let already_has = !func.blocks[idx].instructions.is_empty()
                 && X86Opcode::from_u32(func.blocks[idx].instructions[0].opcode)
                     == Some(X86Opcode::Endbr64);
@@ -475,6 +485,23 @@ pub fn needs_stack_probe(frame_size: usize) -> bool {
 /// cmp  rsp, rax                    ; 48 39 C4
 /// ja   .Lprobe_loop                ; 77 F0
 /// mov  rsp, rax                    ; 48 89 C4
+/// ```
+/// # Integration Requirement
+///
+/// This function is a standalone probe generator that returns raw bytes.
+/// The codegen driver (`generation.rs`) or the x86-64 `emit_prologue()`
+/// must call `generate_stack_probe(frame_size)` during prologue emission
+/// for any function whose stack frame exceeds 4096 bytes, and prepend the
+/// returned bytes before the main `sub rsp, <frame_size>` instruction.
+///
+/// Typical integration point:
+///
+/// ```ignore
+/// let probe_bytes = generate_stack_probe(mf.frame_size);
+/// if !probe_bytes.is_empty() {
+///     // Insert probe at the start of the prologue code
+///     prologue_code.extend_from_slice(&probe_bytes);
+/// }
 /// ```
 pub fn generate_stack_probe(frame_size: usize) -> Vec<u8> {
     if frame_size <= PAGE_SIZE {

@@ -313,6 +313,18 @@ impl RiscV64Encoder {
     /// For pseudo-instructions that expand to multiple real instructions
     /// (e.g., CALL → AUIPC + JALR), the `continuation` field contains
     /// the second instruction.
+    ///
+    /// # Match Block Organization
+    ///
+    /// The main match block is organized by instruction category:
+    /// 1. **Pseudo-instructions** — NOP, MV, LI, LA, CALL, J, etc.
+    /// 2. **RV64I Base Integer** — ALU, load/store, branch, jump
+    /// 3. **RV64M Multiply/Divide** — MUL, DIV, REM variants
+    /// 4. **RV64A Atomics** — LR, SC, AMO operations
+    /// 5. **RV64F Single-Precision FP** — FLW, FSW, FADD.S, etc.
+    /// 6. **RV64D Double-Precision FP** — FLD, FSD, FADD.D, etc.
+    /// 7. **RV64C Compressed** — 16-bit compressed instructions
+    /// 8. **Pseudo-ops** — Labels, directives, inline asm
     pub fn encode(&self, inst: &RvInstruction) -> Result<EncodedInstruction, String> {
         // Extract register hardware encodings (5-bit values 0–31).
         let rd = registers::hw_encoding(inst.rd.unwrap_or(0));

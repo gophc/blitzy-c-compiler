@@ -396,13 +396,85 @@ impl ArchCodegen for I686Codegen {
     }
 
     fn relocation_types(&self) -> &[RelocationTypeInfo] {
-        // Relocations are defined in the i686 assembler/relocations module.
-        // Return an empty slice here; the assembler handles relocation details.
-        &[]
+        // i686 ELF relocation types per the System V i386 ABI.
+        static TABLE: &[RelocationTypeInfo] = &[
+            RelocationTypeInfo {
+                type_id: 0,
+                name: "R_386_NONE",
+                size: 0,
+                is_pc_relative: false,
+            },
+            RelocationTypeInfo {
+                type_id: 1,
+                name: "R_386_32",
+                size: 4,
+                is_pc_relative: false,
+            },
+            RelocationTypeInfo {
+                type_id: 2,
+                name: "R_386_PC32",
+                size: 4,
+                is_pc_relative: true,
+            },
+            RelocationTypeInfo {
+                type_id: 3,
+                name: "R_386_GOT32",
+                size: 4,
+                is_pc_relative: false,
+            },
+            RelocationTypeInfo {
+                type_id: 4,
+                name: "R_386_PLT32",
+                size: 4,
+                is_pc_relative: true,
+            },
+            RelocationTypeInfo {
+                type_id: 5,
+                name: "R_386_COPY",
+                size: 4,
+                is_pc_relative: false,
+            },
+            RelocationTypeInfo {
+                type_id: 6,
+                name: "R_386_GLOB_DAT",
+                size: 4,
+                is_pc_relative: false,
+            },
+            RelocationTypeInfo {
+                type_id: 7,
+                name: "R_386_JMP_SLOT",
+                size: 4,
+                is_pc_relative: false,
+            },
+            RelocationTypeInfo {
+                type_id: 8,
+                name: "R_386_RELATIVE",
+                size: 4,
+                is_pc_relative: false,
+            },
+            RelocationTypeInfo {
+                type_id: 9,
+                name: "R_386_GOTOFF",
+                size: 4,
+                is_pc_relative: false,
+            },
+            RelocationTypeInfo {
+                type_id: 10,
+                name: "R_386_GOTPC",
+                size: 4,
+                is_pc_relative: true,
+            },
+        ];
+        TABLE
     }
 
     fn classify_argument(&self, ty: &IrType) -> crate::backend::traits::ArgLocation {
         // cdecl: ALL arguments go on the stack. No register arguments.
+        // The offset returned represents the argument's slot size (in bytes),
+        // rounded up to a 4-byte boundary.  Callers that need cumulative
+        // offsets (e.g., the instruction selector) must accumulate across all
+        // arguments; here we return per-argument slot size since the trait
+        // method classifies a single argument in isolation.
         let size = ty.size_bytes(&Target::I686);
         // Round up to 4-byte stack slot minimum.
         let slot_size = if size < 4 { 4 } else { (size + 3) & !3 };
@@ -525,50 +597,54 @@ impl ArchCodegen for I686Codegen {
     }
 
     fn emit_assembly(&self, mf: &MachineFunction) -> Result<Vec<u8>, String> {
-        // Encode machine instructions to raw bytes.
-        // The actual full encoding is delegated to the built-in i686 assembler
-        // (src/backend/i686/assembler/). Here we collect pre-encoded bytes
-        // or produce minimal encodings for simple instructions.
-        let mut code = Vec::new();
+        // Encode machine instructions to raw bytes by delegating to the
+        // built-in i686 assembler encoder.  Instructions that already carry
+        // pre-encoded bytes (e.g. from inline assembly) are emitted directly.
+        //
+        // Two-pass assembly:
+        // Pass 1: estimate label offsets (each instruction assumed to be up
+        //         to 15 bytes for conservative offset estimation).
+        // Pass 2: encode with resolved offsets.
+        use crate::common::fx_hash::FxHashMap;
 
+        // Build label→offset map from block labels.
+        let mut label_offsets: FxHashMap<String, usize> = FxHashMap::default();
+        let mut offset_estimate: usize = 0;
+        for block in &mf.blocks {
+            if let Some(ref lbl) = block.label {
+                label_offsets.insert(lbl.clone(), offset_estimate);
+            }
+            for inst in &block.instructions {
+                if !inst.encoded_bytes.is_empty() {
+                    offset_estimate += inst.encoded_bytes.len();
+                } else {
+                    offset_estimate += 8; // conservative estimate for i686
+                }
+            }
+        }
+
+        // Pass 2: encode with label offsets.
+        let mut code = Vec::new();
         for block in &mf.blocks {
             for inst in &block.instructions {
                 if !inst.encoded_bytes.is_empty() {
                     code.extend_from_slice(&inst.encoded_bytes);
                 } else {
-                    // Generate minimal encodings for well-known opcodes.
-                    // Full instruction encoding is handled by the assembler module.
-                    match inst.opcode {
-                        I686_NOP => code.push(0x90),
-                        I686_RET => code.push(0xC3),
-                        I686_INT3 => code.push(0xCC),
-                        I686_UD2 => {
+                    match crate::backend::i686::assembler::encoder::encode_instruction(
+                        inst,
+                        &label_offsets,
+                        code.len(),
+                    ) {
+                        Ok(encoded) => {
+                            code.extend_from_slice(&encoded.bytes);
+                        }
+                        Err(e) => {
+                            // For unrecognised opcodes, emit UD2 (0F 0B) as a
+                            // visible crash-on-execution marker rather than a
+                            // silent NOP that would mask bugs.
+                            eprintln!("i686 encoder warning: {} — emitting UD2", e);
                             code.push(0x0F);
                             code.push(0x0B);
-                        }
-                        I686_LEAVE => code.push(0xC9),
-                        I686_CDQ => code.push(0x99),
-                        I686_PUSH => {
-                            // PUSH reg: 0x50 + reg
-                            if let Some(MachineOperand::Register(r)) = inst.operands.first() {
-                                code.push(0x50 + (*r as u8));
-                            } else {
-                                code.push(0x90); // fallback NOP
-                            }
-                        }
-                        I686_POP => {
-                            // POP reg: 0x58 + reg
-                            if let Some(MachineOperand::Register(r)) = &inst.result {
-                                code.push(0x58 + (*r as u8));
-                            } else {
-                                code.push(0x90); // fallback NOP
-                            }
-                        }
-                        _ => {
-                            // The assembler encoder handles full instruction
-                            // encoding with ModR/M, SIB, displacement, etc.
-                            // Emit a placeholder NOP byte.
-                            code.push(0x90);
                         }
                     }
                 }

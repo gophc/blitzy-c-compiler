@@ -107,46 +107,60 @@ pub enum X86Opcode {
     /// `TEST a, b` — bitwise AND; sets EFLAGS; result discarded.
     Test,
 
-    // -- Conditional move (CMOV) --
+    // -- Conditional move (CMOV) — all 16 conditions --
+    Cmovo,
+    Cmovno,
+    Cmovb,
+    Cmovae,
     Cmove,
     Cmovne,
-    Cmovl,
-    Cmovle,
-    Cmovg,
-    Cmovge,
-    Cmovb,
     Cmovbe,
     Cmova,
-    Cmovae,
     Cmovs,
     Cmovns,
+    Cmovp,
+    Cmovnp,
+    Cmovl,
+    Cmovge,
+    Cmovle,
+    Cmovg,
 
-    // -- SETcc — set byte on condition --
+    // -- SETcc — set byte on condition — all 16 conditions --
+    Seto,
+    Setno,
+    Setb,
+    Setae,
     Sete,
     Setne,
-    Setl,
-    Setle,
-    Setg,
-    Setge,
-    Setb,
     Setbe,
     Seta,
-    Setae,
+    Sets,
+    Setns,
+    Setp,
+    Setnp,
+    Setl,
+    Setge,
+    Setle,
+    Setg,
 
-    // -- Control flow / branches --
+    // -- Control flow / branches — all 16 conditions + JMP --
     Jmp,
+    Jo,
+    Jno,
+    Jb,
+    Jae,
     Je,
     Jne,
-    Jl,
-    Jle,
-    Jg,
-    Jge,
-    Jb,
     Jbe,
     Ja,
-    Jae,
     Js,
     Jns,
+    Jp,
+    Jnp,
+    Jl,
+    Jge,
+    Jle,
+    Jg,
     /// `CALL target`
     Call,
     /// `RET`
@@ -234,41 +248,55 @@ impl X86Opcode {
             X86Opcode::Ror,
             X86Opcode::Cmp,
             X86Opcode::Test,
+            X86Opcode::Cmovo,
+            X86Opcode::Cmovno,
+            X86Opcode::Cmovb,
+            X86Opcode::Cmovae,
             X86Opcode::Cmove,
             X86Opcode::Cmovne,
-            X86Opcode::Cmovl,
-            X86Opcode::Cmovle,
-            X86Opcode::Cmovg,
-            X86Opcode::Cmovge,
-            X86Opcode::Cmovb,
             X86Opcode::Cmovbe,
             X86Opcode::Cmova,
-            X86Opcode::Cmovae,
             X86Opcode::Cmovs,
             X86Opcode::Cmovns,
+            X86Opcode::Cmovp,
+            X86Opcode::Cmovnp,
+            X86Opcode::Cmovl,
+            X86Opcode::Cmovge,
+            X86Opcode::Cmovle,
+            X86Opcode::Cmovg,
+            X86Opcode::Seto,
+            X86Opcode::Setno,
+            X86Opcode::Setb,
+            X86Opcode::Setae,
             X86Opcode::Sete,
             X86Opcode::Setne,
-            X86Opcode::Setl,
-            X86Opcode::Setle,
-            X86Opcode::Setg,
-            X86Opcode::Setge,
-            X86Opcode::Setb,
             X86Opcode::Setbe,
             X86Opcode::Seta,
-            X86Opcode::Setae,
+            X86Opcode::Sets,
+            X86Opcode::Setns,
+            X86Opcode::Setp,
+            X86Opcode::Setnp,
+            X86Opcode::Setl,
+            X86Opcode::Setge,
+            X86Opcode::Setle,
+            X86Opcode::Setg,
             X86Opcode::Jmp,
+            X86Opcode::Jo,
+            X86Opcode::Jno,
+            X86Opcode::Jb,
+            X86Opcode::Jae,
             X86Opcode::Je,
             X86Opcode::Jne,
-            X86Opcode::Jl,
-            X86Opcode::Jle,
-            X86Opcode::Jg,
-            X86Opcode::Jge,
-            X86Opcode::Jb,
             X86Opcode::Jbe,
             X86Opcode::Ja,
-            X86Opcode::Jae,
             X86Opcode::Js,
             X86Opcode::Jns,
+            X86Opcode::Jp,
+            X86Opcode::Jnp,
+            X86Opcode::Jl,
+            X86Opcode::Jge,
+            X86Opcode::Jle,
+            X86Opcode::Jg,
             X86Opcode::Call,
             X86Opcode::Ret,
             X86Opcode::Nop,
@@ -390,6 +418,10 @@ pub struct X86_64CodeGen {
     next_vreg: u32,
     /// Map from IR `Value` to the `MachineOperand` holding its result.
     value_map: FxHashMap<Value, MachineOperand>,
+    /// Map from IR `Value` to its `IrType` — used for ABI classification
+    /// during call instruction selection so FP arguments are routed to
+    /// SSE registers (XMM0-7) rather than integer registers.
+    value_types: FxHashMap<Value, IrType>,
     /// Map from IR block index to machine block index.
     block_map: FxHashMap<usize, usize>,
     /// Current frame layout (populated during `compute_frame_layout`).
@@ -413,6 +445,7 @@ impl X86_64CodeGen {
             abi,
             next_vreg: 0,
             value_map: FxHashMap::default(),
+            value_types: FxHashMap::default(),
             block_map: FxHashMap::default(),
             frame: None,
         }
@@ -762,6 +795,7 @@ impl X86_64CodeGen {
         // Reset per-function state.
         self.next_vreg = 0;
         self.value_map = FxHashMap::default();
+        self.value_types = FxHashMap::default();
         self.block_map = FxHashMap::default();
         self.frame = None;
 
@@ -779,9 +813,12 @@ impl X86_64CodeGen {
         let _arg_locations = self.abi.classify_arguments(&param_types);
 
         // Create virtual registers for each parameter and record in value_map.
+        // Also populate value_types so call-site ABI classification can route
+        // FP arguments to SSE registers (XMM0–XMM7) rather than GPRs.
         for param in &func.params {
             let vreg = self.new_vreg();
             self.set_value(param.value, vreg);
+            self.value_types.insert(param.value, param.ty.clone());
         }
 
         // 3. Create MachineFunction and build block map.
@@ -798,6 +835,68 @@ impl X86_64CodeGen {
             let mbb = MachineBasicBlock::with_label(label);
             let idx = mf.add_block(mbb);
             self.block_map.insert(i, idx);
+        }
+
+        // 3.5  Pre-populate value_types for all IR instructions that carry a
+        //       result type.  This allows `select_call()` to look up the
+        //       IrType of each argument value and route F32/F64/F80 arguments
+        //       to SSE registers (XMM0–XMM7) instead of integer GPRs.
+        for ir_block in func.blocks().iter() {
+            for ir_inst in ir_block.instructions() {
+                match ir_inst {
+                    Instruction::Load { result, ty, .. } => {
+                        self.value_types.insert(*result, ty.clone());
+                    }
+                    Instruction::BinOp { result, ty, .. } => {
+                        self.value_types.insert(*result, ty.clone());
+                    }
+                    Instruction::BitCast {
+                        result, to_type, ..
+                    }
+                    | Instruction::Trunc {
+                        result, to_type, ..
+                    }
+                    | Instruction::ZExt {
+                        result, to_type, ..
+                    }
+                    | Instruction::SExt {
+                        result, to_type, ..
+                    }
+                    | Instruction::PtrToInt {
+                        result, to_type, ..
+                    } => {
+                        self.value_types.insert(*result, to_type.clone());
+                    }
+                    Instruction::IntToPtr { result, .. } => {
+                        // IntToPtr always produces a pointer type.
+                        self.value_types.insert(*result, IrType::Ptr);
+                    }
+                    Instruction::Call {
+                        result,
+                        return_type,
+                        ..
+                    } => {
+                        self.value_types.insert(*result, return_type.clone());
+                    }
+                    Instruction::Alloca { result, ty, .. } => {
+                        self.value_types.insert(*result, IrType::Ptr);
+                        let _ = ty;
+                    }
+                    Instruction::ICmp { result, .. } => {
+                        self.value_types.insert(*result, IrType::I1);
+                    }
+                    Instruction::FCmp { result, .. } => {
+                        self.value_types.insert(*result, IrType::I1);
+                    }
+                    Instruction::Phi { result, ty, .. } => {
+                        self.value_types.insert(*result, ty.clone());
+                    }
+                    Instruction::GetElementPtr { result, .. } => {
+                        self.value_types.insert(*result, IrType::Ptr);
+                    }
+                    _ => {}
+                }
+            }
         }
 
         // 4. Lower each IR basic block.
@@ -1112,7 +1211,7 @@ impl X86_64CodeGen {
                 result,
                 base,
                 indices,
-                result_type: _,
+                result_type,
                 ..
             } => {
                 let base_op = self.get_value(*base);
@@ -1120,21 +1219,107 @@ impl X86_64CodeGen {
                 self.set_value(*result, dst.clone());
 
                 let mut out = Vec::new();
-                // Simple case: single index → LEA dst, [base + index * elem_size]
-                // For the general case, compute the offset with ADD/LEA chains.
                 if indices.is_empty() {
                     out.push(Self::mk_inst(X86Opcode::Mov, Some(dst), &[base_op]));
                 } else {
-                    // Accumulate offset into dst.
+                    // Compute the element size from the result type.
+                    // result_type is the pointed-to element type; its size_bytes
+                    // gives us the stride for each index.
+                    let elem_size = result_type.size_bytes(&Target::X86_64).max(1) as i64;
+
+                    // Start with the base pointer.
                     out.push(Self::mk_inst(X86Opcode::Mov, Some(dst.clone()), &[base_op]));
+
                     for idx_val in indices {
                         let idx_op = self.get_value(*idx_val);
-                        // add dst, idx  (simplified — real GEP would scale by element size)
-                        out.push(Self::mk_inst(
-                            X86Opcode::Add,
-                            Some(dst.clone()),
-                            &[dst.clone(), idx_op],
-                        ));
+
+                        if elem_size == 1 {
+                            // Element size is 1 byte — no scaling needed.
+                            out.push(Self::mk_inst(
+                                X86Opcode::Add,
+                                Some(dst.clone()),
+                                &[dst.clone(), idx_op],
+                            ));
+                        } else if (elem_size > 0)
+                            && (elem_size == 2 || elem_size == 4 || elem_size == 8)
+                        {
+                            // Use LEA with scale factor for power-of-2 sizes
+                            // that fit in the SIB byte (1, 2, 4, 8).
+                            let idx_reg = match &idx_op {
+                                MachineOperand::Register(r) => Some(*r),
+                                MachineOperand::VirtualRegister(v) => Some(*v as u16),
+                                _ => None,
+                            };
+                            if let Some(index_r) = idx_reg {
+                                let base_r = match &dst {
+                                    MachineOperand::Register(r) => Some(*r),
+                                    MachineOperand::VirtualRegister(v) => Some(*v as u16),
+                                    _ => None,
+                                };
+                                if let Some(base_reg) = base_r {
+                                    out.push(Self::mk_inst(
+                                        X86Opcode::Lea,
+                                        Some(dst.clone()),
+                                        &[MachineOperand::Memory {
+                                            base: Some(base_reg),
+                                            index: Some(index_r),
+                                            scale: elem_size as u8,
+                                            displacement: 0,
+                                        }],
+                                    ));
+                                } else {
+                                    // Fallback: IMUL + ADD
+                                    let scaled = self.new_vreg();
+                                    out.push(Self::mk_inst(
+                                        X86Opcode::Imul,
+                                        Some(scaled.clone()),
+                                        &[idx_op, MachineOperand::Immediate(elem_size)],
+                                    ));
+                                    out.push(Self::mk_inst(
+                                        X86Opcode::Add,
+                                        Some(dst.clone()),
+                                        &[dst.clone(), scaled],
+                                    ));
+                                }
+                            } else {
+                                // Index is an immediate — multiply at compile time.
+                                if let MachineOperand::Immediate(imm) = &idx_op {
+                                    let byte_offset = imm * elem_size;
+                                    out.push(Self::mk_inst(
+                                        X86Opcode::Add,
+                                        Some(dst.clone()),
+                                        &[dst.clone(), MachineOperand::Immediate(byte_offset)],
+                                    ));
+                                } else {
+                                    // Unexpected operand — scale with IMUL.
+                                    let scaled = self.new_vreg();
+                                    out.push(Self::mk_inst(
+                                        X86Opcode::Imul,
+                                        Some(scaled.clone()),
+                                        &[idx_op, MachineOperand::Immediate(elem_size)],
+                                    ));
+                                    out.push(Self::mk_inst(
+                                        X86Opcode::Add,
+                                        Some(dst.clone()),
+                                        &[dst.clone(), scaled],
+                                    ));
+                                }
+                            }
+                        } else {
+                            // Non-power-of-2 element size: IMUL index by elem_size,
+                            // then ADD to base.
+                            let scaled = self.new_vreg();
+                            out.push(Self::mk_inst(
+                                X86Opcode::Imul,
+                                Some(scaled.clone()),
+                                &[idx_op, MachineOperand::Immediate(elem_size)],
+                            ));
+                            out.push(Self::mk_inst(
+                                X86Opcode::Add,
+                                Some(dst.clone()),
+                                &[dst.clone(), scaled],
+                            ));
+                        }
                     }
                 }
                 out
@@ -1300,21 +1485,26 @@ impl X86_64CodeGen {
         match op {
             // -- Integer arithmetic --
             BinOp::Add => {
-                // LEA optimisation: lea dst, [lhs + rhs]
+                // x86 two-address form: dst = lhs + rhs
+                // 1. MOV dst, lhs     (dst now holds the lhs value)
+                // 2. ADD dst, rhs     (dst += rhs)
+                // Operand convention: Some(dst) is the destination (modified
+                // in place), the first input is dst itself, the second is rhs.
+                out.push(Self::mk_inst(X86Opcode::Mov, Some(dst.clone()), &[lhs_op]));
                 out.push(Self::mk_inst(
-                    X86Opcode::Mov,
+                    X86Opcode::Add,
                     Some(dst.clone()),
-                    &[lhs_op.clone()],
+                    &[dst.clone(), rhs_op],
                 ));
-                out.push(Self::mk_inst(X86Opcode::Add, Some(dst), &[lhs_op, rhs_op]));
             }
             BinOp::Sub => {
+                // x86 two-address form: dst = lhs - rhs
+                out.push(Self::mk_inst(X86Opcode::Mov, Some(dst.clone()), &[lhs_op]));
                 out.push(Self::mk_inst(
-                    X86Opcode::Mov,
+                    X86Opcode::Sub,
                     Some(dst.clone()),
-                    &[lhs_op.clone()],
+                    &[dst.clone(), rhs_op],
                 ));
-                out.push(Self::mk_inst(X86Opcode::Sub, Some(dst), &[lhs_op, rhs_op]));
             }
             BinOp::Mul => {
                 // IMUL dst, lhs, rhs (three-operand form)
@@ -1397,7 +1587,7 @@ impl X86_64CodeGen {
                 out.push(Self::mk_inst(
                     X86Opcode::Mov,
                     Some(dst.clone()),
-                    &[lhs_op.clone()],
+                    std::slice::from_ref(&lhs_op),
                 ));
                 out.push(Self::mk_inst(X86Opcode::And, Some(dst), &[lhs_op, rhs_op]));
             }
@@ -1405,7 +1595,7 @@ impl X86_64CodeGen {
                 out.push(Self::mk_inst(
                     X86Opcode::Mov,
                     Some(dst.clone()),
-                    &[lhs_op.clone()],
+                    std::slice::from_ref(&lhs_op),
                 ));
                 out.push(Self::mk_inst(X86Opcode::Or, Some(dst), &[lhs_op, rhs_op]));
             }
@@ -1413,7 +1603,7 @@ impl X86_64CodeGen {
                 out.push(Self::mk_inst(
                     X86Opcode::Mov,
                     Some(dst.clone()),
-                    &[lhs_op.clone()],
+                    std::slice::from_ref(&lhs_op),
                 ));
                 out.push(Self::mk_inst(X86Opcode::Xor, Some(dst), &[lhs_op, rhs_op]));
             }
@@ -1596,27 +1786,78 @@ impl X86_64CodeGen {
         let dst = self.new_vreg();
         self.set_value(result, dst.clone());
 
-        // ucomisd sets ZF, PF, CF (not SF, OF) per x86 conventions:
-        //   CF=0, ZF=0 → a > b (ordered)
-        //   CF=1, ZF=0 → a < b (ordered)
-        //   CF=0, ZF=1 → a == b
-        //   CF=1, ZF=1 → unordered (NaN)
-        let setcc = match op {
-            FCmpOp::Oeq => X86Opcode::Sete,  // ZF=1 and PF=0
-            FCmpOp::One => X86Opcode::Setne, // ZF=0 and PF=0
-            FCmpOp::Olt => X86Opcode::Setb,  // CF=1
-            FCmpOp::Ole => X86Opcode::Setbe, // CF=1 or ZF=1
-            FCmpOp::Ogt => X86Opcode::Seta,  // CF=0 and ZF=0
-            FCmpOp::Oge => X86Opcode::Setae, // CF=0
-            FCmpOp::Uno => X86Opcode::Sete,  // PF=1 (parity flag set for NaN)
-            FCmpOp::Ord => X86Opcode::Setne, // PF=0 (no NaN)
-        };
+        // x86 UCOMISD/UCOMISS sets CF, ZF, PF per the following table:
+        //   a > b  (ordered)   → CF=0, ZF=0, PF=0
+        //   a < b  (ordered)   → CF=1, ZF=0, PF=0
+        //   a == b (ordered)   → CF=0, ZF=1, PF=0
+        //   unordered (NaN)    → CF=1, ZF=1, PF=1
+        //
+        // For **ordered** comparisons, NaN must produce false.
+        // For **unordered** comparisons, NaN must produce true.
+        //
+        // Simple SETcc alone is WRONG for ordered comparisons because the
+        // NaN case (PF=1) may coincidentally satisfy the condition flags.
+        //
+        // Strategy:
+        //   Ordered (Oeq, One, Olt, Ole, Ogt, Oge):
+        //     UCOMISD lhs, rhs
+        //     SETcc   tmp1          (primary condition)
+        //     SETNP   tmp2          (PF=0 → not NaN)
+        //     AND     dst, tmp1, tmp2  → result is true only if both hold
+        //
+        //   Unordered NaN checks (Uno, Ord):
+        //     UCOMISD lhs, rhs
+        //     SETP    dst   (Uno: PF=1 → NaN)
+        //     SETNP   dst   (Ord: PF=0 → both are numbers)
+        //
+        //   For simplicity the "ordered" cases emit a 5-instruction sequence;
+        //   the NaN-only checks emit a 3-instruction sequence.
 
-        vec![
-            Self::mk_inst(X86Opcode::Ucomisd, None, &[lhs_op, rhs_op]),
-            Self::mk_inst(setcc, Some(dst.clone()), &[]),
-            Self::mk_inst(X86Opcode::MovZX, Some(dst.clone()), &[dst]),
-        ]
+        let mut out = vec![Self::mk_inst(X86Opcode::Ucomisd, None, &[lhs_op, rhs_op])];
+
+        match op {
+            FCmpOp::Uno => {
+                // Result = PF (NaN → PF=1)
+                out.push(Self::mk_inst(X86Opcode::Setp, Some(dst.clone()), &[]));
+                out.push(Self::mk_inst(X86Opcode::MovZX, Some(dst.clone()), &[dst]));
+            }
+            FCmpOp::Ord => {
+                // Result = !PF (both ordered → PF=0)
+                out.push(Self::mk_inst(X86Opcode::Setnp, Some(dst.clone()), &[]));
+                out.push(Self::mk_inst(X86Opcode::MovZX, Some(dst.clone()), &[dst]));
+            }
+            _ => {
+                // Ordered comparisons: need (condition) AND (not-NaN).
+                let primary_cc = match op {
+                    FCmpOp::Oeq => X86Opcode::Sete,  // ZF=1
+                    FCmpOp::One => X86Opcode::Setne, // ZF=0
+                    FCmpOp::Olt => X86Opcode::Setb,  // CF=1
+                    FCmpOp::Ole => X86Opcode::Setbe, // CF=1 OR ZF=1
+                    FCmpOp::Ogt => X86Opcode::Seta,  // CF=0 AND ZF=0
+                    FCmpOp::Oge => X86Opcode::Setae, // CF=0
+                    FCmpOp::Uno | FCmpOp::Ord => unreachable!(),
+                };
+                let tmp_parity = self.new_vreg();
+                // SETcc  dst  ← primary condition flag
+                out.push(Self::mk_inst(primary_cc, Some(dst.clone()), &[]));
+                // SETNP  tmp  ← PF=0 means NOT NaN
+                out.push(Self::mk_inst(
+                    X86Opcode::Setnp,
+                    Some(tmp_parity.clone()),
+                    &[],
+                ));
+                // AND dst, tmp  ← result is true only if (condition AND !NaN)
+                out.push(Self::mk_inst(
+                    X86Opcode::And,
+                    Some(dst.clone()),
+                    &[dst.clone(), tmp_parity],
+                ));
+                // Zero-extend to full register width
+                out.push(Self::mk_inst(X86Opcode::MovZX, Some(dst.clone()), &[dst]));
+            }
+        }
+
+        out
     }
 
     // ===================================================================
@@ -1640,11 +1881,15 @@ impl X86_64CodeGen {
         for arg_val in args {
             let arg_op = self.get_value(*arg_val);
 
-            // Simple classification: check if the value maps to an SSE vreg
-            // or an integer vreg.  For now, we heuristically classify based on
-            // whether the argument was produced by an FP instruction.
-            // A more complete implementation would consult the callee's parameter types.
-            let is_fp = false; // Simplified — real impl would check types.
+            // Classify the argument as FP or integer by consulting the
+            // value_types map (populated from IR instruction result types).
+            // F32, F64, and F80 arguments are routed to XMM0–XMM7 per the
+            // System V AMD64 ABI; all other types use integer GPRs.
+            let is_fp = self
+                .value_types
+                .get(arg_val)
+                .map(|ty| matches!(ty, IrType::F32 | IrType::F64 | IrType::F80))
+                .unwrap_or(false);
 
             if is_fp && sse_idx < SSE_ARG_REGS.len() {
                 let reg = SSE_ARG_REGS[sse_idx];
@@ -1747,10 +1992,15 @@ impl ArchCodegen for X86_64CodeGen {
 
     /// Emit machine code bytes from a MachineFunction.
     fn emit_assembly(&self, mf: &MachineFunction) -> Result<Vec<u8>, String> {
+        use crate::backend::x86_64::assembler::encoder::X86_64Encoder;
+
+        let mut encoder = X86_64Encoder::new(0);
         let mut bytes = Vec::new();
+
         for block in &mf.blocks {
             for inst in &block.instructions {
-                bytes.extend_from_slice(&inst.opcode.to_le_bytes());
+                let encoded = encoder.encode_instruction(inst);
+                bytes.extend_from_slice(&encoded.bytes);
             }
         }
         Ok(bytes)
@@ -1766,9 +2016,47 @@ impl ArchCodegen for X86_64CodeGen {
         self.abi.x86_64_register_info()
     }
 
-    /// Return supported relocation types.
+    /// Return supported x86-64 relocation types.
+    ///
+    /// These match the ELF AMD64 ABI supplement relocation types used by
+    /// the built-in assembler and linker for symbol references, PIC/PLT
+    /// indirection, and GOT access patterns.
     fn relocation_types(&self) -> &'static [RelocationTypeInfo] {
-        &[]
+        static TABLE: &[RelocationTypeInfo] = &[
+            // R_X86_64_NONE = 0 — no relocation
+            RelocationTypeInfo::new("R_X86_64_NONE", 0, 0, false),
+            // R_X86_64_64 = 1 — absolute 64-bit address
+            RelocationTypeInfo::new("R_X86_64_64", 1, 8, false),
+            // R_X86_64_PC32 = 2 — 32-bit PC-relative (RIP-relative)
+            RelocationTypeInfo::new("R_X86_64_PC32", 2, 4, true),
+            // R_X86_64_GOT32 = 3 — 32-bit GOT entry offset
+            RelocationTypeInfo::new("R_X86_64_GOT32", 3, 4, false),
+            // R_X86_64_PLT32 = 4 — 32-bit PLT-relative
+            RelocationTypeInfo::new("R_X86_64_PLT32", 4, 4, true),
+            // R_X86_64_GLOB_DAT = 6 — GOT entry for dynamic symbol
+            RelocationTypeInfo::new("R_X86_64_GLOB_DAT", 6, 8, false),
+            // R_X86_64_JUMP_SLOT = 7 — PLT jump slot
+            RelocationTypeInfo::new("R_X86_64_JUMP_SLOT", 7, 8, false),
+            // R_X86_64_RELATIVE = 8 — base-relative (for PIC data)
+            RelocationTypeInfo::new("R_X86_64_RELATIVE", 8, 8, false),
+            // R_X86_64_GOTPCREL = 9 — 32-bit PC-relative GOT access
+            RelocationTypeInfo::new("R_X86_64_GOTPCREL", 9, 4, true),
+            // R_X86_64_32 = 10 — absolute 32-bit (zero-extended)
+            RelocationTypeInfo::new("R_X86_64_32", 10, 4, false),
+            // R_X86_64_32S = 11 — absolute 32-bit (sign-extended)
+            RelocationTypeInfo::new("R_X86_64_32S", 11, 4, false),
+            // R_X86_64_16 = 12 — absolute 16-bit
+            RelocationTypeInfo::new("R_X86_64_16", 12, 2, false),
+            // R_X86_64_PC16 = 13 — 16-bit PC-relative
+            RelocationTypeInfo::new("R_X86_64_PC16", 13, 2, true),
+            // R_X86_64_PC64 = 24 — 64-bit PC-relative
+            RelocationTypeInfo::new("R_X86_64_PC64", 24, 8, true),
+            // R_X86_64_GOTPCRELX = 41 — relaxable GOT PC-relative
+            RelocationTypeInfo::new("R_X86_64_GOTPCRELX", 41, 4, true),
+            // R_X86_64_REX_GOTPCRELX = 42 — relaxable REX GOT PC-relative
+            RelocationTypeInfo::new("R_X86_64_REX_GOTPCRELX", 42, 4, true),
+        ];
+        TABLE
     }
 
     /// Emit function prologue instructions.
@@ -1964,41 +2252,55 @@ impl std::fmt::Display for X86Opcode {
             X86Opcode::Ror => "ror",
             X86Opcode::Cmp => "cmp",
             X86Opcode::Test => "test",
+            X86Opcode::Cmovo => "cmovo",
+            X86Opcode::Cmovno => "cmovno",
+            X86Opcode::Cmovb => "cmovb",
+            X86Opcode::Cmovae => "cmovae",
             X86Opcode::Cmove => "cmove",
             X86Opcode::Cmovne => "cmovne",
-            X86Opcode::Cmovl => "cmovl",
-            X86Opcode::Cmovle => "cmovle",
-            X86Opcode::Cmovg => "cmovg",
-            X86Opcode::Cmovge => "cmovge",
-            X86Opcode::Cmovb => "cmovb",
             X86Opcode::Cmovbe => "cmovbe",
             X86Opcode::Cmova => "cmova",
-            X86Opcode::Cmovae => "cmovae",
             X86Opcode::Cmovs => "cmovs",
             X86Opcode::Cmovns => "cmovns",
+            X86Opcode::Cmovp => "cmovp",
+            X86Opcode::Cmovnp => "cmovnp",
+            X86Opcode::Cmovl => "cmovl",
+            X86Opcode::Cmovge => "cmovge",
+            X86Opcode::Cmovle => "cmovle",
+            X86Opcode::Cmovg => "cmovg",
+            X86Opcode::Seto => "seto",
+            X86Opcode::Setno => "setno",
+            X86Opcode::Setb => "setb",
+            X86Opcode::Setae => "setae",
             X86Opcode::Sete => "sete",
             X86Opcode::Setne => "setne",
-            X86Opcode::Setl => "setl",
-            X86Opcode::Setle => "setle",
-            X86Opcode::Setg => "setg",
-            X86Opcode::Setge => "setge",
-            X86Opcode::Setb => "setb",
             X86Opcode::Setbe => "setbe",
             X86Opcode::Seta => "seta",
-            X86Opcode::Setae => "setae",
+            X86Opcode::Sets => "sets",
+            X86Opcode::Setns => "setns",
+            X86Opcode::Setp => "setp",
+            X86Opcode::Setnp => "setnp",
+            X86Opcode::Setl => "setl",
+            X86Opcode::Setge => "setge",
+            X86Opcode::Setle => "setle",
+            X86Opcode::Setg => "setg",
             X86Opcode::Jmp => "jmp",
+            X86Opcode::Jo => "jo",
+            X86Opcode::Jno => "jno",
+            X86Opcode::Jb => "jb",
+            X86Opcode::Jae => "jae",
             X86Opcode::Je => "je",
             X86Opcode::Jne => "jne",
-            X86Opcode::Jl => "jl",
-            X86Opcode::Jle => "jle",
-            X86Opcode::Jg => "jg",
-            X86Opcode::Jge => "jge",
-            X86Opcode::Jb => "jb",
             X86Opcode::Jbe => "jbe",
             X86Opcode::Ja => "ja",
-            X86Opcode::Jae => "jae",
             X86Opcode::Js => "js",
             X86Opcode::Jns => "jns",
+            X86Opcode::Jp => "jp",
+            X86Opcode::Jnp => "jnp",
+            X86Opcode::Jl => "jl",
+            X86Opcode::Jge => "jge",
+            X86Opcode::Jle => "jle",
+            X86Opcode::Jg => "jg",
             X86Opcode::Call => "call",
             X86Opcode::Ret => "ret",
             X86Opcode::Nop => "nop",

@@ -967,8 +967,9 @@ pub struct Section {
     pub sh_type: u32,
     /// Section attribute flags (SHF_ALLOC, SHF_WRITE, SHF_EXECINSTR, etc.).
     pub sh_flags: u64,
-    /// Section content bytes. For SHT_NOBITS, `data.len()` gives the
-    /// logical (in-memory) size but no bytes are written to the file.
+    /// Section content bytes. For SHT_NOBITS, this can be an empty `Vec`
+    /// since no bytes are written to the file — use `logical_size` to set
+    /// the in-memory size instead.
     pub data: Vec<u8>,
     /// Associated section index (meaning depends on sh_type).
     pub sh_link: u32,
@@ -978,6 +979,12 @@ pub struct Section {
     pub sh_addralign: u64,
     /// Entry size for fixed-size entry tables (0 for variable-size).
     pub sh_entsize: u64,
+    /// Explicit logical (in-memory) size override.  When non-zero, this
+    /// value is used as `sh_size` instead of `data.len()`.  This is useful
+    /// for `SHT_NOBITS` sections (e.g., `.bss`) where the in-memory size
+    /// is non-zero but no bytes need to be stored in the data vector.
+    /// When zero, `data.len()` is used as the logical size.
+    pub logical_size: u64,
 }
 
 impl Default for Section {
@@ -991,6 +998,7 @@ impl Default for Section {
             sh_info: 0,
             sh_addralign: 1,
             sh_entsize: 0,
+            logical_size: 0,
         }
     }
 }
@@ -1245,7 +1253,12 @@ impl ElfWriter {
         for sec in &self.sections {
             let align = (sec.sh_addralign as usize).max(1);
             current_offset = align_up(current_offset, align);
-            let logical_size = sec.data.len() as u64;
+            // Use the explicit logical_size if non-zero, otherwise data.len().
+            let logical_size = if sec.logical_size > 0 {
+                sec.logical_size
+            } else {
+                sec.data.len() as u64
+            };
             section_file_offsets.push((current_offset as u64, logical_size));
             // NOBITS sections take no file space.
             if sec.sh_type != SHT_NOBITS {

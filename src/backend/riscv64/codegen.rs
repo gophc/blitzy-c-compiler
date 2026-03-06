@@ -56,6 +56,7 @@ use crate::ir::instructions::BlockId;
 /// instruction selection. Each variant maps to one or more hardware
 /// instruction encodings resolved by the assembler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u32)]
 #[allow(non_camel_case_types)]
 pub enum RvOpcode {
     // RV64I Base Integer Instructions
@@ -1359,28 +1360,38 @@ impl RiscV64InstructionSelector {
     ) {
         self.has_calls = true;
 
-        // Move arguments into ABI registers
-        for (i, &(reg, is_fp)) in args.iter().enumerate() {
+        // Move arguments into ABI registers using separate counters for
+        // integer and floating-point register banks per LP64D calling convention.
+        // Integer args go to a0–a7, FP args go to fa0–fa7; each bank maintains
+        // its own allocation counter.
+        let mut int_idx: usize = 0;
+        let mut fp_idx: usize = 0;
+        let mut stack_offset: i64 = 0;
+
+        for &(reg, is_fp) in args.iter() {
             if is_fp {
-                if i < 8 {
-                    let fa = FA0 + i as u8;
+                if fp_idx < 8 {
+                    let fa = FA0 + fp_idx as u8;
+                    fp_idx += 1;
                     if reg != fa {
                         // FSGNJ.D fa_i, reg, reg  (FP MV)
                         self.emit_fp_r(RvOpcode::FSGNJ_D, fa, reg, reg);
                     }
                 } else {
-                    // Spill to stack
-                    let offset = ((i - 8) * 8) as i64;
-                    self.emit_store(reg, SP, offset, &IrType::F64);
+                    // FP spill to stack
+                    self.emit_store(reg, SP, stack_offset, &IrType::F64);
+                    stack_offset += 8;
                 }
-            } else if i < 8 {
-                let ai = A0 + i as u8;
+            } else if int_idx < 8 {
+                let ai = A0 + int_idx as u8;
+                int_idx += 1;
                 if reg != ai {
                     self.emit_i(RvOpcode::ADDI, ai, reg, 0); // MV
                 }
             } else {
-                let offset = ((i - 8) * 8) as i64;
-                self.emit_s(RvOpcode::SD, SP, reg, offset);
+                // Integer spill to stack
+                self.emit_s(RvOpcode::SD, SP, reg, stack_offset);
+                stack_offset += 8;
             }
         }
 
@@ -1868,7 +1879,9 @@ impl RiscV64InstructionSelector {
                 }
             }
             BinOp::FRem => {
-                // RISC-V has no FREM instruction; implement via call to fmod/fmodf
+                // RISC-V has no FREM instruction; implement via call to fmod/fmodf.
+                // This requires the target binary to be linked against libm (-lm).
+                // The linker must add -lm to resolve fmod/fmodf symbols.
                 // Store operands in fa0/fa1, call fmod, result in fa0
                 if matches!(ty, IrType::F32) {
                     if lhs_reg != FA0 {

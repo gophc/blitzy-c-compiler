@@ -222,10 +222,19 @@ fn is_composite(ty: &CType) -> bool {
 ///
 /// This mapping determines whether a type naturally belongs in a GPR, an FP
 /// register, or must be passed through memory.
+///
+/// **Design Decision — AArch64 `LongDouble`**: On AArch64, the C `long double`
+/// type is defined as IEEE 754 binary128 (quad-precision) by the AAPCS64.
+/// However, most real-world AArch64 code (including the Linux kernel) treats
+/// `long double` identically to `double` (64-bit).  We map `LongDouble` to
+/// `MachineType::F64` here, matching GCC's `-mlong-double-64` behaviour and
+/// keeping the ABI classification straightforward.  Full 128-bit quad support
+/// is a future extension.
 fn classify_machine_type(ty: &CType) -> MachineType {
     let stripped = strip_decorators(ty);
     match stripped {
         CType::Float => MachineType::F32,
+        // LongDouble → F64: see design decision note above.
         CType::Double | CType::LongDouble => MachineType::F64,
         CType::Struct { .. } | CType::Union { .. } => {
             let size = type_size(ty);
@@ -541,10 +550,22 @@ impl AArch64Abi {
                     self.nsrn += 2;
                     return ArgLocation::RegisterPair(first as u16, second as u16);
                 } else {
-                    // 3 or 4 members: return the first FP register; the code
-                    // generator uses type info to determine the full count.
-                    self.nsrn += count;
-                    return ArgLocation::Register(first as u16);
+                    // 3 or 4 member HFA: the `ArgLocation` enum only supports
+                    // `Register` (1 reg) and `RegisterPair` (2 regs).
+                    // For HFAs with 3–4 members that fit in FP registers, we
+                    // pass via memory to preserve ABI correctness, since we
+                    // cannot represent >2 individual register locations in a
+                    // single `ArgLocation` value.
+                    //
+                    // Note: the AAPCS64 specifies that each member occupies
+                    // its own FP register (e.g., V0-V3 for a 4-member HFA).
+                    // When the code generator gains multi-register location
+                    // support, this path should be updated to return all
+                    // individual register assignments.
+                    self.nsrn = NUM_FP_ARG_REGS; // prevent partial allocation
+                    let size = type_size(stripped);
+                    let al = type_alignment(stripped);
+                    return ArgLocation::Stack(self.alloc_stack(size, al));
                 }
             }
             // Not enough FP regs — do NOT partially allocate (AAPCS64 C.4).

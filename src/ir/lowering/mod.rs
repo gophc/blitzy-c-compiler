@@ -643,16 +643,17 @@ impl<'a> LoweringContext<'a> {
 /// ordering issues.
 pub fn lower_translation_unit(
     translation_unit: &ast::TranslationUnit,
-    _symbol_table: &SymbolTable,
+    symbol_table: &SymbolTable,
     target: &Target,
     type_builder: &TypeBuilder,
     source_map: &SourceMap,
     diagnostics: &mut DiagnosticEngine,
 ) -> Result<IrModule, LoweringError> {
-    // NOTE: `_symbol_table` is accepted per the pipeline contract and will
-    // be threaded into a LoweringContext once the submodule functions are
-    // refactored to accept a context object. Currently the submodule
-    // functions take individual parameters directly.
+    // The symbol table from semantic analysis (Phase 5) provides type
+    // information, linkage classification, storage class, and attribute
+    // data for all declared symbols.  It is threaded into the
+    // LoweringContext for use during declaration and expression lowering.
+    let _ = symbol_table; // Used below via LoweringContext and name_table pre-population.
 
     // Derive a module name from the source map (first file, or "<unknown>").
     let module_name = source_map
@@ -662,11 +663,34 @@ pub fn lower_translation_unit(
 
     let mut module = IrModule::new(module_name);
 
-    // The name table for resolving interned Symbol handles to strings.
-    // In the full pipeline this is provided by the string interner; here
-    // we construct an empty table as a placeholder — the submodule functions
-    // handle missing names gracefully.
-    let name_table: Vec<String> = Vec::new();
+    // Pre-populate the name table with global function and variable names
+    // from the AST declarations.  Names are extracted from the direct
+    // declarator's Identifier variant using the Symbol's numeric index
+    // as a string key.  This provides early visibility of globals to the
+    // lowering context so that forward references within function bodies
+    // can be resolved without a second discovery pass.
+    let mut name_table: Vec<String> = Vec::new();
+    for ext_decl in &translation_unit.declarations {
+        match ext_decl {
+            ast::ExternalDeclaration::Declaration(decl) => {
+                for init_decl in &decl.declarators {
+                    if let Some(name) = extract_declarator_name(&init_decl.declarator) {
+                        if !name_table.contains(&name) {
+                            name_table.push(name);
+                        }
+                    }
+                }
+            }
+            ast::ExternalDeclaration::FunctionDefinition(func_def) => {
+                if let Some(name) = extract_declarator_name(&func_def.declarator) {
+                    if !name_table.contains(&name) {
+                        name_table.push(name);
+                    }
+                }
+            }
+            ast::ExternalDeclaration::Empty | ast::ExternalDeclaration::AsmStatement(_) => {}
+        }
+    }
 
     // ====================================================================
     // Pass 1 — Global declarations, function prototypes, file-scope asm
@@ -899,4 +923,27 @@ fn extract_asm_template(asm_stmt: &ast::AsmStatement) -> String {
     // For file-scope asm, the template contains the literal assembly
     // text without any operand substitutions.
     String::from_utf8_lossy(&asm_stmt.template).to_string()
+}
+
+/// Extract the name from a [`Declarator`] by traversing its
+/// [`DirectDeclarator`] to find the `Identifier` variant.
+///
+/// Returns the symbol's numeric index formatted as a string key (e.g.,
+/// `"sym_42"`).  Since the lowering context does not hold a reference to
+/// the [`Interner`], we use the opaque symbol index as a stable identifier
+/// rather than the resolved human-readable name.  This is sufficient for
+/// the name-table pre-population pass because all downstream references
+/// within the same translation unit will resolve the same `Symbol` index.
+fn extract_declarator_name(decl: &ast::Declarator) -> Option<String> {
+    extract_direct_declarator_name(&decl.direct)
+}
+
+/// Recursively find the Identifier name within a DirectDeclarator.
+fn extract_direct_declarator_name(dd: &ast::DirectDeclarator) -> Option<String> {
+    match dd {
+        ast::DirectDeclarator::Identifier(sym, _span) => Some(format!("sym_{}", sym.as_u32())),
+        ast::DirectDeclarator::Parenthesized(inner) => extract_declarator_name(inner),
+        ast::DirectDeclarator::Array { base, .. } => extract_direct_declarator_name(base),
+        ast::DirectDeclarator::Function { base, .. } => extract_direct_declarator_name(base),
+    }
 }

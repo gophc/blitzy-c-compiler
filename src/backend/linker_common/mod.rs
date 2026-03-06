@@ -644,6 +644,7 @@ fn link_relocatable(
                 sh_info: 0,
                 sh_addralign: section.alignment,
                 sh_entsize: 0,
+                logical_size: 0,
             };
             writer.add_section(elf_section);
         }
@@ -820,6 +821,7 @@ fn write_elf_output(
             sh_info: 0,
             sh_addralign: output_section.alignment,
             sh_entsize: 0,
+            logical_size: 0,
         };
         writer.add_section(elf_section);
     }
@@ -858,6 +860,7 @@ fn write_elf_output(
                     sh_info: 0,
                     sh_addralign: if config.target.is_64bit() { 8 } else { 4 },
                     sh_entsize,
+                    logical_size: 0,
                 };
                 writer.add_section(elf_section);
             }

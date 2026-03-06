@@ -69,8 +69,11 @@ pub struct AArch64Encoder;
 /// If the instruction references an unresolved symbol, a relocation entry
 /// is attached for the linker.
 pub struct EncodedInstruction {
-    /// The 4 encoded bytes (always exactly 4 for AArch64), little-endian.
-    pub bytes: [u8; 4],
+    /// Encoded bytes — typically exactly 4 for a single AArch64 instruction
+    /// (little-endian), but may be longer for multi-instruction expansions
+    /// such as `MOV_imm` which emits a MOVZ + up to 3 MOVK instructions
+    /// (4–16 bytes).
+    pub bytes: Vec<u8>,
     /// Optional relocation if instruction references an unresolved symbol.
     pub relocation: Option<EncoderRelocation>,
 }
@@ -103,7 +106,7 @@ impl AArch64Encoder {
 #[inline]
 fn ok(word: u32) -> Result<EncodedInstruction, String> {
     Ok(EncodedInstruction {
-        bytes: word.to_le_bytes(),
+        bytes: word.to_le_bytes().to_vec(),
         relocation: None,
     })
 }
@@ -116,7 +119,7 @@ fn ok_reloc(
     addend: i64,
 ) -> Result<EncodedInstruction, String> {
     Ok(EncodedInstruction {
-        bytes: word.to_le_bytes(),
+        bytes: word.to_le_bytes().to_vec(),
         relocation: Some(EncoderRelocation {
             reloc_type: rtype.to_raw(),
             addend,
@@ -1593,9 +1596,22 @@ impl AArch64Encoder {
                 let val = imm as u64;
                 let seq = encode_mov_imm64(rd as u8, val);
                 if seq.is_empty() {
+                    // Zero value — emit MOVZ Xd, #0
                     ok(enc_mov_wide(sf, 0b10, 0, 0, rd))
                 } else {
-                    ok(seq[0])
+                    // Emit the COMPLETE MOVZ + MOVK sequence for the full
+                    // 64-bit immediate.  `encode_mov_imm64` returns 1–4
+                    // instructions depending on how many 16-bit halfwords
+                    // are non-zero.  We must emit ALL of them — dropping
+                    // MOVK instructions would silently truncate the value.
+                    let mut bytes = Vec::with_capacity(seq.len() * 4);
+                    for instr_word in &seq {
+                        bytes.extend_from_slice(&instr_word.to_le_bytes());
+                    }
+                    Ok(EncodedInstruction {
+                        bytes,
+                        relocation: None,
+                    })
                 }
             }
             A64Opcode::NEG_reg => {

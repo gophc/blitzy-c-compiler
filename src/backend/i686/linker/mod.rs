@@ -436,7 +436,7 @@ impl I686Linker {
         }
 
         // Add synthetic sections for GOT/PLT if they were generated.
-        if let Some(ref ctx) = self.dynamic_ctx {
+        if let Some(ref mut ctx) = self.dynamic_ctx {
             let got_size = ctx.got.encode_got().len() as u64;
             if got_size > 0 {
                 layout_input.push(InputSectionInfo {
@@ -464,6 +464,86 @@ impl I686Linker {
                     size: plt_size,
                     alignment: 16,
                     flags: (SHF_ALLOC | SHF_EXECINSTR) as u32,
+                });
+            }
+
+            // Early-finalize dynamic context so we can compute section sizes.
+            // finalize() builds .gnu.hash and .dynamic from accumulated state;
+            // it does NOT depend on layout addresses and is safe to call now.
+            // The Phase 9 finalize() call is idempotent and will re-run harmlessly.
+            ctx.finalize();
+
+            // Add synthetic dynamic-linking sections to layout so they get
+            // proper virtual addresses.  Without these, PT_DYNAMIC and other
+            // program headers that reference these sections would be silently
+            // skipped because their names wouldn't appear in layout.sections.
+            let dynsym_size = ctx.dynsym.encode_dynsym(&Target::I686).len() as u64;
+            if dynsym_size > 0 {
+                layout_input.push(InputSectionInfo {
+                    name: ".dynsym".to_string(),
+                    size: dynsym_size,
+                    alignment: 4,
+                    flags: SHF_ALLOC as u32,
+                });
+            }
+
+            let dynstr_size = ctx.dynsym.encode_dynstr().len() as u64;
+            if dynstr_size > 1 {
+                layout_input.push(InputSectionInfo {
+                    name: ".dynstr".to_string(),
+                    size: dynstr_size,
+                    alignment: 1,
+                    flags: SHF_ALLOC as u32,
+                });
+            }
+
+            let gnu_hash_size = ctx.gnu_hash.encode().len() as u64;
+            if gnu_hash_size > 0 {
+                layout_input.push(InputSectionInfo {
+                    name: ".gnu.hash".to_string(),
+                    size: gnu_hash_size,
+                    alignment: 4,
+                    flags: SHF_ALLOC as u32,
+                });
+            }
+
+            let rel_dyn_size = ctx.rela.encode_rela_dyn(false).len() as u64;
+            if rel_dyn_size > 0 {
+                layout_input.push(InputSectionInfo {
+                    name: ".rel.dyn".to_string(),
+                    size: rel_dyn_size,
+                    alignment: 4,
+                    flags: SHF_ALLOC as u32,
+                });
+            }
+
+            let rel_plt_size = ctx.rela.encode_rela_plt(false).len() as u64;
+            if rel_plt_size > 0 {
+                layout_input.push(InputSectionInfo {
+                    name: ".rel.plt".to_string(),
+                    size: rel_plt_size,
+                    alignment: 4,
+                    flags: SHF_ALLOC as u32,
+                });
+            }
+
+            let dynamic_size = ctx.dynamic.encode(false).len() as u64;
+            if dynamic_size > 0 {
+                layout_input.push(InputSectionInfo {
+                    name: ".dynamic".to_string(),
+                    size: dynamic_size,
+                    alignment: 4,
+                    flags: (SHF_ALLOC | SHF_WRITE) as u32,
+                });
+            }
+
+            // Add .interp if needed.
+            if let Some(interp_bytes) = ctx.get_interp_bytes() {
+                layout_input.push(InputSectionInfo {
+                    name: ".interp".to_string(),
+                    size: interp_bytes.len() as u64,
+                    alignment: 1,
+                    flags: SHF_ALLOC as u32,
                 });
             }
         }
@@ -710,6 +790,7 @@ impl I686Linker {
                     data: got_data,
                     sh_addralign: 4,
                     sh_entsize: GOT_ENTRY_SIZE as u64,
+                    logical_size: 0,
                     ..Section::default()
                 });
             }
@@ -725,6 +806,7 @@ impl I686Linker {
                     data: got_plt_data,
                     sh_addralign: 4,
                     sh_entsize: GOT_ENTRY_SIZE as u64,
+                    logical_size: 0,
                     ..Section::default()
                 });
             }
@@ -740,6 +822,7 @@ impl I686Linker {
                     data: plt_data,
                     sh_addralign: 16,
                     sh_entsize: PLT_ENTRY_SIZE as u64,
+                    logical_size: 0,
                     ..Section::default()
                 });
             }
@@ -754,6 +837,7 @@ impl I686Linker {
                     data: dynsym_data,
                     sh_addralign: 4,
                     sh_entsize: ELF32_SYM_SIZE as u64, // 16 bytes for Elf32_Sym
+                    logical_size: 0,
                     ..Section::default()
                 });
             }
@@ -794,6 +878,7 @@ impl I686Linker {
                     data: rel_dyn_data,
                     sh_addralign: 4,
                     sh_entsize: ELF32_REL_SIZE as u64, // 8 bytes for Elf32_Rel
+                    logical_size: 0,
                     ..Section::default()
                 });
             }
@@ -808,6 +893,7 @@ impl I686Linker {
                     data: rel_plt_data,
                     sh_addralign: 4,
                     sh_entsize: ELF32_REL_SIZE as u64, // 8 bytes for Elf32_Rel
+                    logical_size: 0,
                     ..Section::default()
                 });
             }
@@ -822,6 +908,7 @@ impl I686Linker {
                     data: dynamic_data,
                     sh_addralign: 4,
                     sh_entsize: 8, // Each Elf32_Dyn is 8 bytes (d_tag: i32 + d_val: u32)
+                    logical_size: 0,
                     ..Section::default()
                 });
 
@@ -928,6 +1015,11 @@ impl I686Linker {
     /// - `e_ehsize = 52`
     /// - `e_phentsize = 32`
     /// - `e_shentsize = 40`
+    ///
+    /// Helper for direct ELF32 header construction. Currently unused because
+    /// `link()` delegates to `ElfWriter` for header generation. Retained for
+    /// the code generation driver's multi-object linking flows.
+    #[allow(dead_code)]
     pub fn build_elf32_header(
         &self,
         elf_type: u16,
@@ -955,6 +1047,11 @@ impl I686Linker {
     ///
     /// Each `Elf32_Phdr` is 32 bytes (not 56 like ELF64).
     /// Converts layout segments to `Elf32ProgramHeader` structures.
+    ///
+    /// Currently unused — `link()` builds program headers inline from
+    /// `layout.segments`.  Retained for future use by the code generation
+    /// driver.
+    #[allow(dead_code)]
     pub fn build_program_headers(
         &self,
         layout: &crate::backend::linker_common::linker_script::LayoutResult,

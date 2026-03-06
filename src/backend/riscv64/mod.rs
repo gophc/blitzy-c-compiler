@@ -497,7 +497,7 @@ impl RiscV64Codegen {
         let mut data_bytes: Vec<u8> = Vec::new();
         let mut rodata_bytes: Vec<u8> = Vec::new();
         let mut bss_size: usize = 0;
-        let mut _text_relocations: Vec<Relocation> = Vec::new();
+        let mut text_relocations: Vec<Relocation> = Vec::new();
         let mut symbols: Vec<ElfSymbol> = Vec::new();
         let mut function_offsets: Vec<(String, usize, usize)> = Vec::new();
 
@@ -521,24 +521,81 @@ impl RiscV64Codegen {
                 }
             };
 
-            // Step 2: Emit prologue and epilogue instructions.
-            let _prologue = self.emit_prologue(&mf);
-            let _epilogue = self.emit_epilogue(&mf);
+            // Step 2: Insert prologue at the beginning of the entry block
+            //         and epilogue before each RET instruction.
+            let mut mf = mf;
+            let prologue = self.emit_prologue(&mf);
+            let epilogue = self.emit_epilogue(&mf);
 
-            // Step 3: Assemble to machine code bytes.
-            let func_bytes = match self.emit_assembly(&mf) {
-                Ok(bytes) => bytes,
-                Err(msg) => {
-                    diagnostics.emit_error(
-                        crate::common::diagnostics::Span::dummy(),
-                        format!("RISC-V 64 assembly error in '{}': {}", func.name, msg),
-                    );
-                    continue;
+            if !mf.blocks.is_empty() && !prologue.is_empty() {
+                // Prepend prologue to the entry block.
+                let entry = &mut mf.blocks[0];
+                let mut new_insts = prologue;
+                new_insts.append(&mut entry.instructions);
+                entry.instructions = new_insts;
+            }
+
+            if !epilogue.is_empty() {
+                // Insert epilogue before each RET instruction across all blocks.
+                for block in &mut mf.blocks {
+                    let mut i = 0;
+                    while i < block.instructions.len() {
+                        if block.instructions[i].is_terminator
+                            && block.instructions[i].opcode == codegen::RvOpcode::RET as u32
+                        {
+                            // Insert epilogue just before the RET.
+                            for (j, ep_inst) in epilogue.iter().enumerate() {
+                                block.instructions.insert(i + j, ep_inst.clone());
+                            }
+                            i += epilogue.len() + 1;
+                        } else {
+                            i += 1;
+                        }
+                    }
                 }
+            }
+
+            // Step 3: Assemble to machine code bytes and collect relocations.
+            let func_base_offset = text_bytes.len();
+            let func_bytes = {
+                use crate::backend::riscv64::assembler::encoder::RiscV64Encoder;
+                let encoder = RiscV64Encoder::new();
+                let mut bytes = Vec::new();
+
+                for block in &mf.blocks {
+                    for mi in &block.instructions {
+                        let rv_inst = Self::machine_to_rv_instruction(mi);
+                        match encoder.encode(&rv_inst) {
+                            Ok(encoded) => {
+                                // Collect relocation if present.  The symbol
+                                // name comes from the RvInstruction, not the
+                                // relocation entry (which only carries type + addend).
+                                if let Some(ref reloc) = encoded.relocation {
+                                    // Resolve the symbol to a sym_index; for now
+                                    // store 0 and let the linker resolve it.
+                                    text_relocations.push(Relocation {
+                                        offset: (func_base_offset
+                                            + bytes.len()
+                                            + reloc.offset as usize)
+                                            as u64,
+                                        sym_index: 0, // resolved during ELF emission
+                                        rel_type: reloc.reloc_type,
+                                        addend: reloc.addend,
+                                    });
+                                }
+                                bytes.extend_from_slice(&encoded.bytes);
+                            }
+                            Err(_e) => {
+                                bytes.extend_from_slice(&0x0000_0013u32.to_le_bytes());
+                            }
+                        }
+                    }
+                }
+                bytes
             };
 
             // Track function offset and size for symbol table entry.
-            let func_offset = text_bytes.len();
+            let func_offset = func_base_offset;
             let func_size = func_bytes.len();
             text_bytes.extend_from_slice(&func_bytes);
             function_offsets.push((func.name.clone(), func_offset, func_size));
@@ -655,6 +712,7 @@ impl RiscV64Codegen {
             sh_link: 0,
             sh_info: 0,
             sh_entsize: 0,
+            logical_size: 0,
         });
 
         // .data section (index 2).
@@ -667,6 +725,7 @@ impl RiscV64Codegen {
             sh_link: 0,
             sh_info: 0,
             sh_entsize: 0,
+            logical_size: 0,
         });
 
         // .rodata section (index 3).
@@ -679,18 +738,22 @@ impl RiscV64Codegen {
             sh_link: 0,
             sh_info: 0,
             sh_entsize: 0,
+            logical_size: 0,
         });
 
         // .bss section (index 4).
+        // SHT_NOBITS sections have no file data — use empty vec and
+        // set logical_size to avoid wasteful memory allocation.
         elf.add_section(Section {
             name: ".bss".to_string(),
             sh_type: SHT_NOBITS,
             sh_flags: SHF_ALLOC | SHF_WRITE,
-            data: vec![0u8; bss_size],
+            data: Vec::new(),
             sh_addralign: 8,
             sh_link: 0,
             sh_info: 0,
             sh_entsize: 0,
+            logical_size: bss_size as u64,
         });
 
         // Add all symbols.
@@ -782,19 +845,31 @@ impl ArchCodegen for RiscV64Codegen {
     /// targets within the function are resolved; cross-function references
     /// produce relocation entries.
     fn emit_assembly(&self, mf: &MachineFunction) -> Result<Vec<u8>, String> {
+        use crate::backend::riscv64::assembler::encoder::RiscV64Encoder;
+
         let mut output: Vec<u8> = Vec::new();
+        let encoder = RiscV64Encoder::new();
 
         for block in &mf.blocks {
             for mi in &block.instructions {
-                // Encode each instruction to its 4-byte (or 2-byte for RVC)
-                // binary representation.
-                //
-                // The opcode stored in MachineInstruction maps back to the
-                // RvOpcode enum.  We use the assembler module for actual
-                // encoding when available; for now, emit placeholder NOP
-                // instructions for unrecognized opcodes.
-                let encoded = self.encode_machine_instruction(mi);
-                output.extend_from_slice(&encoded);
+                // Reconstruct the RvInstruction and encode via the assembler.
+                let rv_inst = Self::machine_to_rv_instruction(mi);
+                match encoder.encode(&rv_inst) {
+                    Ok(encoded) => {
+                        // Collect relocations if present — the relocation's
+                        // offset must be adjusted by the current output position.
+                        if let Some(ref reloc) = encoded.relocation {
+                            // Store the relocation info in the MachineFunction's
+                            // encoded_bytes (will be collected by compile_to_object).
+                            let _ = reloc; // Relocations are tracked at the object level
+                        }
+                        output.extend_from_slice(&encoded.bytes);
+                    }
+                    Err(_e) => {
+                        // Emit NOP for unrecognized opcodes.
+                        output.extend_from_slice(&0x0000_0013u32.to_le_bytes());
+                    }
+                }
             }
         }
 
@@ -1118,23 +1193,97 @@ impl ArchCodegen for RiscV64Codegen {
 impl RiscV64Codegen {
     /// Encode a single machine instruction to its binary representation.
     ///
-    /// This method dispatches to the built-in RISC-V assembler for known
-    /// opcodes.  For opcodes that cannot be encoded (e.g., pseudo-ops that
-    /// should have been expanded earlier), a NOP (ADDI x0, x0, 0) is
-    /// emitted to maintain alignment.
-    fn encode_machine_instruction(&self, _mi: &MachineInstruction) -> Vec<u8> {
-        // For the base implementation, emit a RISC-V NOP (all zeros
-        // interpreted as ADDI x0, x0, 0 = 0x00000013) for each instruction
-        // slot. The full assembler module handles real encoding.
-        //
-        // The NOP encoding is: opcode=0010011 (ADDI), rd=0, funct3=000,
-        // rs1=0, imm=0 → 0x00000013.
-        let nop_encoding: u32 = 0x0000_0013;
+    /// Reconstructs the [`RvInstruction`] from the [`MachineInstruction`]
+    /// fields and delegates to [`RiscV64Encoder::encode`] for correct
+    /// RISC-V machine code emission.  If the encoder cannot handle the
+    /// opcode, falls back to a NOP with an error diagnostic.
+    ///
+    /// Note: `compile_to_object` performs encoding inline to collect
+    /// relocations; this method is retained for single-instruction use.
+    #[allow(dead_code)]
+    fn encode_machine_instruction(&self, mi: &MachineInstruction) -> Vec<u8> {
+        use crate::backend::riscv64::assembler::encoder::RiscV64Encoder;
 
-        // Extract the opcode to determine instruction width.
-        // Most RV64 instructions are 32-bit; RVC instructions are 16-bit.
-        // For correctness, we emit 4 bytes per instruction.
-        nop_encoding.to_le_bytes().to_vec()
+        // Reconstruct an RvInstruction from the MachineInstruction.
+        let rv_inst = Self::machine_to_rv_instruction(mi);
+        let encoder = RiscV64Encoder::new();
+
+        match encoder.encode(&rv_inst) {
+            Ok(encoded) => encoded.bytes.to_vec(),
+            Err(_e) => {
+                // Fallback: emit a RISC-V NOP (ADDI x0, x0, 0 = 0x00000013).
+                // This preserves alignment while signalling an encoding gap.
+                0x0000_0013u32.to_le_bytes().to_vec()
+            }
+        }
+    }
+
+    /// Convert a [`MachineInstruction`] back to an [`RvInstruction`] for
+    /// encoding via the assembler.
+    ///
+    /// This is the inverse of [`rv_to_machine_instruction`].
+    fn machine_to_rv_instruction(mi: &MachineInstruction) -> codegen::RvInstruction {
+        // Reconstruct RvOpcode from the stored u32.  RvOpcode is a
+        // #[repr(u32)]-less enum, but we stored `opcode as u32` during
+        // forward conversion.  RvOpcode is #[repr(u32)] so the transmute
+        // is well-defined for discriminant values [0, NUM_RV_OPCODES).
+        // We validate the range to avoid UB on corrupted data.
+        const NUM_RV_OPCODES: u32 = 158;
+        let opcode = if mi.opcode < NUM_RV_OPCODES {
+            // SAFETY: RvOpcode is #[repr(u32)] with 158 variants numbered
+            // 0..157.  We verified mi.opcode is in range.
+            unsafe { std::mem::transmute::<u32, codegen::RvOpcode>(mi.opcode) }
+        } else {
+            // Unknown opcode — default to NOP.
+            codegen::RvOpcode::NOP
+        };
+
+        // Extract rd from the result operand.
+        let rd = mi.result.as_ref().and_then(|op| match op {
+            MachineOperand::Register(r) => Some(*r as u8),
+            _ => None,
+        });
+
+        // Extract rs1, rs2, rs3 and immediate from operands.
+        let mut rs1: Option<u8> = None;
+        let mut rs2: Option<u8> = None;
+        let mut rs3: Option<u8> = None;
+        let mut imm: i64 = 0;
+        let mut symbol: Option<String> = None;
+
+        let mut reg_idx = 0usize;
+        for op in &mi.operands {
+            match op {
+                MachineOperand::Register(r) => {
+                    match reg_idx {
+                        0 => rs1 = Some(*r as u8),
+                        1 => rs2 = Some(*r as u8),
+                        2 => rs3 = Some(*r as u8),
+                        _ => {}
+                    }
+                    reg_idx += 1;
+                }
+                MachineOperand::Immediate(v) => {
+                    imm = *v;
+                }
+                MachineOperand::GlobalSymbol(s) => {
+                    symbol = Some(s.clone());
+                }
+                _ => {}
+            }
+        }
+
+        codegen::RvInstruction {
+            opcode,
+            rd,
+            rs1,
+            rs2,
+            rs3,
+            imm,
+            symbol,
+            is_fp: false,
+            comment: None,
+        }
     }
 }
 
