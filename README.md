@@ -104,12 +104,77 @@ BCC accepts GCC-compatible flags for drop-in compatibility (e.g., `make CC=./bcc
 | `-L<dir>` | Add `<dir>` to the library search path |
 | `-l<lib>` | Link against library `<lib>` |
 
+### Current Status
+
+BCC is under active development. The compiler pipeline (preprocessing, lexing, parsing, semantic
+analysis, IR construction, optimization, code generation, and object file assembly) is functional
+for all four target architectures. The following capabilities are **fully operational**:
+
+- **Compile to object file** (`-c`): Produces valid ELF relocatable (`.o`) files with correct
+  sections, symbols, and relocations
+- **Preprocess** (`-E`): Full macro expansion, `#include` resolution, conditional compilation
+- **Emit assembly** (`-S`): Produces target-architecture assembly output (AT&T syntax for x86)
+- **DWARF debug info** (`-g`): Emits DWARF v4 debug sections at `-O0`
+- **Security mitigations** (x86-64): Retpoline, CET/IBT, stack probes all functional
+- **PIC code generation** (`-fPIC`): Position-independent code with GOT-relative addressing
+- **Cross-architecture compilation** (`--target=`): Produces correct ELF object files for all 4
+  architectures (when compiling files that do not depend on system headers)
+
+**Known limitation — system library linking:** The built-in linker does not yet search or link
+against system libraries (e.g., libc). The `-l` and `-L` flags are accepted but library file
+resolution is not yet implemented. Programs that reference libc symbols (`printf`, `puts`,
+`malloc`, etc.) will fail at the link stage with undefined symbol errors. Freestanding programs
+(those that do not depend on libc) can be linked into ELF executables successfully.
+
+**Known limitation — cross-architecture system headers:** Cross-compilation with `--target=`
+requires the target architecture's system headers (sysroot) to be installed on the host. For
+example, compiling for AArch64 requires `libc6-dev-arm64-cross` (or equivalent) to be installed.
+Files that do not use system `#include` directives (e.g., `#include <stdio.h>`) can be compiled
+for any target without additional packages.
+
 ### Examples
 
-**Hello World — compile and run:**
+**Compile to object file (all architectures):**
 
 ```bash
-# Write a simple C program
+# Compile a C file to a relocatable object file
+./bcc -c -o main.o main.c
+
+# Cross-compile to object file for AArch64 (no system headers needed for header-free files)
+./bcc --target=aarch64 -c -o main.o main.c
+```
+
+**Preprocess only:**
+
+```bash
+# Output preprocessed source to stdout
+./bcc -E main.c
+```
+
+**Compile with debug information:**
+
+```bash
+# Produces .o with DWARF v4 debug sections
+./bcc -g -c -o myprogram.o myprogram.c
+```
+
+**Compile with security mitigations (x86-64):**
+
+```bash
+# Object file with retpoline + CET/IBT protections
+./bcc -mretpoline -fcf-protection -c -o secure.o secure.c
+```
+
+**Produce a PIC object file for shared library use:**
+
+```bash
+./bcc -fPIC -c -o foo.o foo.c
+```
+
+**Hello World — full compilation target (requires libc linking support):**
+
+```bash
+# This is the target workflow once system library linking is implemented:
 cat > hello.c << 'EOF'
 #include <stdio.h>
 int main(void) {
@@ -118,41 +183,11 @@ int main(void) {
 }
 EOF
 
-# Compile and run
-./bcc -o hello hello.c && ./hello
-# Output: Hello, World!
-```
+# Currently, compile-to-object works:
+./bcc -c -o hello.o hello.c
 
-**Cross-compilation for AArch64:**
-
-```bash
-./bcc --target=aarch64 -o hello hello.c
-# Run under QEMU user-mode emulation
-qemu-aarch64 ./hello
-```
-
-**Compile to object file only:**
-
-```bash
-./bcc -c -o main.o main.c
-```
-
-**Produce a shared library with PIC:**
-
-```bash
-./bcc -fPIC -shared -o libfoo.so foo.c
-```
-
-**Compile with debug information:**
-
-```bash
-./bcc -g -o myprogram myprogram.c
-```
-
-**Compile with security mitigations (x86-64):**
-
-```bash
-./bcc -mretpoline -fcf-protection -o secure secure.c
+# Full linking (./bcc -o hello hello.c && ./hello) requires system library
+# resolution which is under development.
 ```
 
 ---

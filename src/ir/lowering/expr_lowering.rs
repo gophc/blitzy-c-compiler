@@ -871,9 +871,7 @@ fn lower_identifier(ctx: &mut ExprLoweringContext<'_>, sym_idx: u32, span: Span)
     {
         let func_name = name.to_string();
         let fptr = ctx.builder.fresh_value();
-        ctx.module
-            .func_ref_map
-            .insert(fptr, func_name);
+        ctx.module.func_ref_map.insert(fptr, func_name);
         return TypedValue::new(
             fptr,
             CType::Pointer(Box::new(CType::Void), TypeQualifiers::default()),
@@ -888,7 +886,10 @@ fn lower_identifier(ctx: &mut ExprLoweringContext<'_>, sym_idx: u32, span: Span)
 
     // Static local variables — redirected to their mangled global name.
     if let Some(mangled) = ctx.static_locals.get(name) {
-        let global_ty = ctx.module.get_global(mangled.as_str()).map(|gv| gv.ty.clone());
+        let global_ty = ctx
+            .module
+            .get_global(mangled.as_str())
+            .map(|gv| gv.ty.clone());
         if let Some(gt) = global_ty {
             let mangled_name = mangled.clone();
             let ptr_val = ctx.builder.fresh_value();
@@ -942,13 +943,117 @@ fn lower_binary(
     let rhs = lower_expr_inner(ctx, rhs_expr);
 
     if is_pointer_type(&lhs.ty) && is_integer_type(&rhs.ty) {
-        return lower_ptr_arith(ctx, op, &lhs, &rhs, span);
+        // Pointer-integer comparisons: convert integer to pointer and use ptr-ptr comparison.
+        match op {
+            ast::BinaryOp::Equal
+            | ast::BinaryOp::NotEqual
+            | ast::BinaryOp::Less
+            | ast::BinaryOp::LessEqual
+            | ast::BinaryOp::Greater
+            | ast::BinaryOp::GreaterEqual => {
+                let pi = size_ir_type(ctx.target);
+                let (li, lic) = ctx.builder.build_ptr_to_int(lhs.value, pi.clone(), span);
+                emit_inst(ctx, lic);
+                let rv = insert_implicit_conversion(
+                    ctx,
+                    rhs.value,
+                    &rhs.ty,
+                    &size_ctype(ctx.target),
+                    span,
+                );
+                let cmp_op = match op {
+                    ast::BinaryOp::Equal => ICmpOp::Eq,
+                    ast::BinaryOp::NotEqual => ICmpOp::Ne,
+                    ast::BinaryOp::Less => ICmpOp::Ult,
+                    ast::BinaryOp::LessEqual => ICmpOp::Ule,
+                    ast::BinaryOp::Greater => ICmpOp::Ugt,
+                    ast::BinaryOp::GreaterEqual => ICmpOp::Uge,
+                    _ => unreachable!(),
+                };
+                let (v, ci) = ctx.builder.build_icmp(cmp_op, li, rv, span);
+                emit_inst(ctx, ci);
+                return TypedValue::new(v, CType::Bool);
+            }
+            _ => {
+                return lower_ptr_arith(ctx, op, &lhs, &rhs, span);
+            }
+        }
     }
-    if is_integer_type(&lhs.ty) && is_pointer_type(&rhs.ty) && matches!(op, ast::BinaryOp::Add) {
-        return lower_ptr_arith(ctx, op, &rhs, &lhs, span);
+    if is_integer_type(&lhs.ty) && is_pointer_type(&rhs.ty) {
+        match op {
+            ast::BinaryOp::Add => {
+                return lower_ptr_arith(ctx, op, &rhs, &lhs, span);
+            }
+            ast::BinaryOp::Equal
+            | ast::BinaryOp::NotEqual
+            | ast::BinaryOp::Less
+            | ast::BinaryOp::LessEqual
+            | ast::BinaryOp::Greater
+            | ast::BinaryOp::GreaterEqual => {
+                let pi = size_ir_type(ctx.target);
+                let lv = insert_implicit_conversion(
+                    ctx,
+                    lhs.value,
+                    &lhs.ty,
+                    &size_ctype(ctx.target),
+                    span,
+                );
+                let (ri, ric) = ctx.builder.build_ptr_to_int(rhs.value, pi.clone(), span);
+                emit_inst(ctx, ric);
+                let cmp_op = match op {
+                    ast::BinaryOp::Equal => ICmpOp::Eq,
+                    ast::BinaryOp::NotEqual => ICmpOp::Ne,
+                    ast::BinaryOp::Less => ICmpOp::Ult,
+                    ast::BinaryOp::LessEqual => ICmpOp::Ule,
+                    ast::BinaryOp::Greater => ICmpOp::Ugt,
+                    ast::BinaryOp::GreaterEqual => ICmpOp::Uge,
+                    _ => unreachable!(),
+                };
+                let (v, ci) = ctx.builder.build_icmp(cmp_op, lv, ri, span);
+                emit_inst(ctx, ci);
+                return TypedValue::new(v, CType::Bool);
+            }
+            _ => {}
+        }
     }
     if is_pointer_type(&lhs.ty) && is_pointer_type(&rhs.ty) && matches!(op, ast::BinaryOp::Sub) {
         return lower_ptr_diff(ctx, &lhs, &rhs, span);
+    }
+    // Pointer-pointer comparisons (==, !=, <, >, <=, >=): convert both to
+    // integers (ptrdiff_t-sized) and perform an unsigned integer comparison.
+    if is_pointer_type(&lhs.ty) && is_pointer_type(&rhs.ty) {
+        match op {
+            ast::BinaryOp::Equal
+            | ast::BinaryOp::NotEqual
+            | ast::BinaryOp::Less
+            | ast::BinaryOp::LessEqual
+            | ast::BinaryOp::Greater
+            | ast::BinaryOp::GreaterEqual => {
+                let pi = size_ir_type(ctx.target);
+                let (li, lic) = ctx.builder.build_ptr_to_int(lhs.value, pi.clone(), span);
+                emit_inst(ctx, lic);
+                let (ri, ric) = ctx.builder.build_ptr_to_int(rhs.value, pi.clone(), span);
+                emit_inst(ctx, ric);
+                let cmp_op = match op {
+                    ast::BinaryOp::Equal => ICmpOp::Eq,
+                    ast::BinaryOp::NotEqual => ICmpOp::Ne,
+                    ast::BinaryOp::Less => ICmpOp::Ult,
+                    ast::BinaryOp::LessEqual => ICmpOp::Ule,
+                    ast::BinaryOp::Greater => ICmpOp::Ugt,
+                    ast::BinaryOp::GreaterEqual => ICmpOp::Uge,
+                    _ => unreachable!(),
+                };
+                let (v, ci) = ctx.builder.build_icmp(cmp_op, li, ri, span);
+                emit_inst(ctx, ci);
+                return TypedValue::new(v, CType::Bool);
+            }
+            _ => {
+                // Pointer + pointer is only valid for sub (handled above)
+                // and comparisons (handled above). Other ops fall through
+                // to the pointer arithmetic handler which will error.
+                return lower_ptr_arith(ctx, op, &lhs, &rhs, span);
+            }
+        }
     }
 
     // Apply usual arithmetic conversions; also check integer rank for
@@ -1997,35 +2102,120 @@ fn lower_compound_literal(
 fn lower_statement_expression(
     ctx: &mut ExprLoweringContext<'_>,
     compound: &ast::CompoundStatement,
-    _span: Span,
+    span: Span,
 ) -> TypedValue {
-    // Lower each block item in the compound statement.
-    // The value of a statement expression is the value of the last
-    // expression-statement. If the last item is not an expression-statement,
-    // the result is void.
-    let mut last = TypedValue::void();
+    // GCC statement expressions: `({ decls; stmts; expr; })`.
+    // Variables declared inside the compound are scoped to this expression.
+    // We clone the local variable maps, pre-allocate all declared variables,
+    // then process each block item using the full statement + expression
+    // lowering infrastructure.
+
+    // Clone local maps so that statement-expression-scoped variables can be
+    // added without affecting the enclosing scope.
+    let mut stmt_local_vars = ctx.local_vars.clone();
+    let mut stmt_local_types = ctx.local_types.clone();
+
+    // First pass: pre-allocate all variables declared in this compound
+    // by creating alloca instructions in the function entry block.
     for item in &compound.items {
-        match item {
-            ast::BlockItem::Statement(stmt) => {
-                match stmt {
-                    ast::Statement::Expression(Some(expr)) => {
-                        last = lower_expr_inner(ctx, expr);
-                    }
-                    _ => {
-                        // Non-expression statements: dispatch to stmt_lowering.
-                        // In the full pipeline this calls lower_statement(), but
-                        // expression lowering doesn't own statement lowering so
-                        // we emit a diagnostic and produce void.
-                        last = TypedValue::void();
-                    }
-                }
+        if let ast::BlockItem::Declaration(decl) = item {
+            // Skip storage classes that don't need local allocation.
+            if matches!(
+                decl.specifiers.storage_class,
+                Some(ast::StorageClass::Extern)
+                    | Some(ast::StorageClass::Static)
+                    | Some(ast::StorageClass::ThreadLocal)
+                    | Some(ast::StorageClass::Typedef)
+            ) {
+                continue;
             }
-            ast::BlockItem::Declaration(_) => {
-                last = TypedValue::void();
+            for init_decl in &decl.declarators {
+                let var_name = match super::stmt_lowering::extract_decl_name(
+                    &init_decl.declarator,
+                    ctx.name_table,
+                ) {
+                    Some(name) => name,
+                    None => continue,
+                };
+                let c_type = super::decl_lowering::resolve_declaration_type(
+                    &decl.specifiers,
+                    &init_decl.declarator,
+                    ctx.target,
+                    ctx.name_table,
+                );
+                let ir_type = IrType::from_ctype(&c_type, ctx.target);
+                let (alloca_val, alloca_inst) = ctx.builder.build_alloca(ir_type, span);
+                ctx.function.entry_block_mut().push_instruction(alloca_inst);
+                stmt_local_vars.insert(var_name.clone(), alloca_val);
+                stmt_local_types.insert(var_name, c_type);
             }
         }
     }
-    last
+
+    // Build a StmtLoweringContext so we can lower declarations (initialiser
+    // stores), non-expression statements (if/else, for, while), and
+    // expression statements using the augmented variable maps.
+    let mut label_blocks = FxHashMap::default();
+    let mut stmt_ctx = super::stmt_lowering::StmtLoweringContext {
+        builder: ctx.builder,
+        function: ctx.function,
+        module: ctx.module,
+        target: ctx.target,
+        diagnostics: ctx.diagnostics,
+        local_vars: &mut stmt_local_vars,
+        label_blocks: &mut label_blocks,
+        loop_stack: Vec::new(),
+        switch_ctx: None,
+        recursion_depth: 0,
+        type_builder: ctx.type_builder,
+        param_values: ctx.param_values,
+        name_table: ctx.name_table,
+        local_types: &stmt_local_types,
+        enum_constants: ctx.enum_constants,
+        static_locals: ctx.static_locals,
+    };
+
+    // Second pass: lower each block item. Track the value of the last
+    // expression-statement as the result of the whole statement expression.
+    let mut last_val = Value::UNDEF;
+    for item in &compound.items {
+        match item {
+            ast::BlockItem::Declaration(decl) => {
+                super::stmt_lowering::lower_declaration_initializers(&mut stmt_ctx, decl);
+                last_val = Value::UNDEF;
+            }
+            ast::BlockItem::Statement(stmt) => {
+                if let ast::Statement::Expression(Some(expr)) = stmt {
+                    // Expression statement — evaluate and keep the value
+                    // (the last one becomes the result).
+                    let mut inner_expr_ctx = ExprLoweringContext {
+                        builder: stmt_ctx.builder,
+                        function: stmt_ctx.function,
+                        module: stmt_ctx.module,
+                        target: stmt_ctx.target,
+                        type_builder: stmt_ctx.type_builder,
+                        diagnostics: stmt_ctx.diagnostics,
+                        local_vars: stmt_ctx.local_vars,
+                        param_values: stmt_ctx.param_values,
+                        name_table: stmt_ctx.name_table,
+                        local_types: &stmt_local_types,
+                        enum_constants: stmt_ctx.enum_constants,
+                        static_locals: stmt_ctx.static_locals,
+                    };
+                    let tv = lower_expr_inner(&mut inner_expr_ctx, expr);
+                    last_val = tv.value;
+                } else if let ast::Statement::Expression(None) = stmt {
+                    // Empty expression statement — no-op.
+                } else {
+                    // Non-expression statements: if/else, for, while, etc.
+                    super::stmt_lowering::lower_statement(&mut stmt_ctx, stmt);
+                    last_val = Value::UNDEF;
+                }
+            }
+        }
+    }
+
+    TypedValue::new(last_val, CType::Int)
 }
 
 // =========================================================================
@@ -2122,6 +2312,7 @@ fn lower_builtin(
         ast::BuiltinKind::Ctz => lower_bit_builtin(ctx, args, "ctz", span),
         ast::BuiltinKind::Popcount => lower_bit_builtin(ctx, args, "popcount", span),
         ast::BuiltinKind::Ffs => lower_bit_builtin(ctx, args, "ffs", span),
+        ast::BuiltinKind::Ffsll => lower_bit_builtin(ctx, args, "ffsll", span),
 
         // ----- Byte-swap builtins -----
         ast::BuiltinKind::Bswap16 => lower_bswap(ctx, args, 16, span),

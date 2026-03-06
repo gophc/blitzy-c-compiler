@@ -327,6 +327,8 @@ pub enum TokenKind {
     BuiltinBswap64,
     /// `__builtin_ffs`
     BuiltinFfs,
+    /// `__builtin_ffsll`
+    BuiltinFfsll,
     /// `__builtin_frame_address`
     BuiltinFrameAddress,
     /// `__builtin_return_address`
@@ -631,6 +633,7 @@ impl TokenKind {
             | TokenKind::BuiltinBswap32
             | TokenKind::BuiltinBswap64
             | TokenKind::BuiltinFfs
+            | TokenKind::BuiltinFfsll
             | TokenKind::BuiltinFrameAddress
             | TokenKind::BuiltinReturnAddress
             | TokenKind::BuiltinAssumeAligned
@@ -841,6 +844,7 @@ impl TokenKind {
             TokenKind::BuiltinBswap32 => Some("__builtin_bswap32"),
             TokenKind::BuiltinBswap64 => Some("__builtin_bswap64"),
             TokenKind::BuiltinFfs => Some("__builtin_ffs"),
+            TokenKind::BuiltinFfsll => Some("__builtin_ffsll"),
             TokenKind::BuiltinFrameAddress => Some("__builtin_frame_address"),
             TokenKind::BuiltinReturnAddress => Some("__builtin_return_address"),
             TokenKind::BuiltinAssumeAligned => Some("__builtin_assume_aligned"),
@@ -1191,6 +1195,7 @@ pub fn lookup_keyword(s: &str) -> Option<TokenKind> {
         "__builtin_bswap32" => Some(TokenKind::BuiltinBswap32),
         "__builtin_bswap64" => Some(TokenKind::BuiltinBswap64),
         "__builtin_ffs" => Some(TokenKind::BuiltinFfs),
+        "__builtin_ffsll" => Some(TokenKind::BuiltinFfsll),
         "__builtin_frame_address" => Some(TokenKind::BuiltinFrameAddress),
         "__builtin_return_address" => Some(TokenKind::BuiltinReturnAddress),
         "__builtin_assume_aligned" => Some(TokenKind::BuiltinAssumeAligned),

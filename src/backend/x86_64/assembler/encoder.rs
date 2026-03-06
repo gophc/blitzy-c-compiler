@@ -579,6 +579,11 @@ pub struct X86_64Encoder {
     pub current_offset: usize,
     /// Opcode table for O(1) lookup of encoding metadata.
     opcode_table: FxHashMap<u32, OpcodeEntry>,
+    /// Whether position-independent code generation is active (`-fPIC`).
+    /// When true, global data references use GOT-relative relocations
+    /// (R_X86_64_REX_GOTPCRELX) instead of direct PC-relative
+    /// (R_X86_64_PC32).
+    pub pic_enabled: bool,
 }
 
 impl X86_64Encoder {
@@ -597,6 +602,7 @@ impl X86_64Encoder {
         Self {
             current_offset,
             opcode_table: build_opcode_table(),
+            pic_enabled: false,
         }
     }
 
@@ -706,21 +712,33 @@ impl X86_64Encoder {
             }
             X86Opcode::Jmp => self.encode_jmp(inst),
             X86Opcode::Call => self.encode_call(inst),
-            X86Opcode::Cmove | X86Opcode::Cmovne
-            | X86Opcode::Cmovl | X86Opcode::Cmovle
-            | X86Opcode::Cmovg | X86Opcode::Cmovge
-            | X86Opcode::Cmovb | X86Opcode::Cmovbe
-            | X86Opcode::Cmova | X86Opcode::Cmovae
-            | X86Opcode::Cmovp | X86Opcode::Cmovnp => {
+            X86Opcode::Cmove
+            | X86Opcode::Cmovne
+            | X86Opcode::Cmovl
+            | X86Opcode::Cmovle
+            | X86Opcode::Cmovg
+            | X86Opcode::Cmovge
+            | X86Opcode::Cmovb
+            | X86Opcode::Cmovbe
+            | X86Opcode::Cmova
+            | X86Opcode::Cmovae
+            | X86Opcode::Cmovp
+            | X86Opcode::Cmovnp => {
                 let cc = condition_code(&opcode);
                 self.encode_cmovcc(inst, cc)
             }
-            X86Opcode::Sete | X86Opcode::Setne
-            | X86Opcode::Setl | X86Opcode::Setle
-            | X86Opcode::Setg | X86Opcode::Setge
-            | X86Opcode::Setb | X86Opcode::Setbe
-            | X86Opcode::Seta | X86Opcode::Setae
-            | X86Opcode::Setp | X86Opcode::Setnp => {
+            X86Opcode::Sete
+            | X86Opcode::Setne
+            | X86Opcode::Setl
+            | X86Opcode::Setle
+            | X86Opcode::Setg
+            | X86Opcode::Setge
+            | X86Opcode::Setb
+            | X86Opcode::Setbe
+            | X86Opcode::Seta
+            | X86Opcode::Setae
+            | X86Opcode::Setp
+            | X86Opcode::Setnp => {
                 let cc = condition_code(&opcode);
                 let dst = self.extract_register(&inst.operands, 0);
                 self.encode_setcc(inst, cc, dst)
@@ -950,10 +968,19 @@ impl X86_64Encoder {
         bytes.push(modrm_byte(0b00, reg_enc, 0b101));
         let reloc_offset = self.current_offset + bytes.len();
         bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        // In PIC mode, global data references use GOT-relative relocations
+        // (R_X86_64_REX_GOTPCRELX) so the linker creates GOT entries for
+        // external symbols.  In non-PIC mode, use direct PC-relative
+        // (R_X86_64_PC32) addressing.
+        let reloc_type = if self.pic_enabled {
+            X86_64RelocationType::RexGotPcRelX
+        } else {
+            X86_64RelocationType::Pc32
+        };
         let reloc = RelocationEntry::new(
             reloc_offset as u64,
             symbol.to_string(),
-            X86_64RelocationType::Pc32,
+            reloc_type,
             addend - 4,
             ".text".to_string(),
         );
@@ -1475,6 +1502,67 @@ impl X86_64Encoder {
                 bytes.extend_from_slice(&mem_enc.displacement);
                 EncodedInstruction::new(bytes)
             }
+            // Two-operand IMUL with spilled source (FrameSlot → [RBP+disp]).
+            (
+                Some(MachineOperand::Register(dst)),
+                Some(MachineOperand::FrameSlot(offset)),
+                None,
+            ) => {
+                let mut bytes = Vec::with_capacity(10);
+                let mem_enc = encode_memory_operand(
+                    hw_encoding(*dst) & 0x7,
+                    Some(RBP),
+                    None,
+                    1,
+                    *offset as i64,
+                );
+                if let Some(rex) = compute_rex(true, Some(*dst), None, Some(RBP)) {
+                    bytes.push(rex);
+                }
+                bytes.push(0x0F);
+                bytes.push(0xAF);
+                bytes.push(mem_enc.modrm);
+                if let Some(s) = mem_enc.sib {
+                    bytes.push(s);
+                }
+                bytes.extend_from_slice(&mem_enc.displacement);
+                EncodedInstruction::new(bytes)
+            }
+            // Three-operand IMUL with spilled source: IMUL dst, [RBP+disp], imm
+            (
+                Some(MachineOperand::Register(dst)),
+                Some(MachineOperand::FrameSlot(offset)),
+                Some(MachineOperand::Immediate(imm)),
+            ) => {
+                let imm = *imm;
+                let mut bytes = Vec::with_capacity(12);
+                let mem_enc = encode_memory_operand(
+                    hw_encoding(*dst) & 0x7,
+                    Some(RBP),
+                    None,
+                    1,
+                    *offset as i64,
+                );
+                if let Some(rex) = compute_rex(true, Some(*dst), None, Some(RBP)) {
+                    bytes.push(rex);
+                }
+                if (-128..=127).contains(&imm) {
+                    bytes.push(0x6B);
+                } else {
+                    bytes.push(0x69);
+                }
+                bytes.push(mem_enc.modrm);
+                if let Some(s) = mem_enc.sib {
+                    bytes.push(s);
+                }
+                bytes.extend_from_slice(&mem_enc.displacement);
+                if (-128..=127).contains(&imm) {
+                    bytes.push(imm as u8);
+                } else {
+                    bytes.extend_from_slice(&(imm as i32).to_le_bytes());
+                }
+                EncodedInstruction::new(bytes)
+            }
             _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
         }
     }
@@ -1504,11 +1592,7 @@ impl X86_64Encoder {
                     bytes.push(0x40); // plain REX to access SPL/BPL/SIL/DIL
                 }
                 bytes.extend_from_slice(byte_opc);
-                bytes.push(modrm_byte(
-                    0b11,
-                    hw_encoding(*dst) & 0x7,
-                    src_hw & 0x7,
-                ));
+                bytes.push(modrm_byte(0b11, hw_encoding(*dst) & 0x7, src_hw & 0x7));
                 EncodedInstruction::new(bytes)
             }
             (

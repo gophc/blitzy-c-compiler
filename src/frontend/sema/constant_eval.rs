@@ -216,6 +216,16 @@ pub struct ConstantEvaluator<'a> {
     /// analyser before constant expression evaluation. Maps interned
     /// enum constant names to their integer values.
     enum_values: HashMap<Symbol, i128>,
+    /// Registry of known struct/union tag types with complete field
+    /// information, populated by the semantic analyser. Maps tag Symbol
+    /// to the fully-resolved CType (with fields), enabling correct sizeof
+    /// computation for struct/union types in constant expressions.
+    tag_types: HashMap<Symbol, CType>,
+    /// Registry of known variable types, populated by the semantic
+    /// analyser before evaluating block-scope constant expressions.
+    /// Maps variable name Symbol to its CType, enabling correct sizeof
+    /// computation for `sizeof(arr)` where `arr` is a local array.
+    variable_types: HashMap<Symbol, CType>,
 }
 
 impl<'a> ConstantEvaluator<'a> {
@@ -232,6 +242,8 @@ impl<'a> ConstantEvaluator<'a> {
             diagnostics,
             target,
             enum_values: HashMap::new(),
+            tag_types: HashMap::new(),
+            variable_types: HashMap::new(),
         }
     }
 
@@ -241,6 +253,23 @@ impl<'a> ConstantEvaluator<'a> {
     /// before evaluating expressions that may reference them.
     pub fn register_enum_value(&mut self, name: Symbol, value: i128) {
         self.enum_values.insert(name, value);
+    }
+
+    /// Register a known struct/union tag type for sizeof/alignof lookups.
+    ///
+    /// This allows the constant evaluator to correctly compute
+    /// `sizeof(struct tag)` for previously-defined struct/union types.
+    pub fn register_tag_type(&mut self, tag: Symbol, ty: CType) {
+        self.tag_types.insert(tag, ty);
+    }
+
+    /// Register a known variable type for sizeof/typeof lookups.
+    ///
+    /// This allows the constant evaluator to correctly compute
+    /// `sizeof(var)` for local variables (e.g., arrays) in block-scope
+    /// `_Static_assert` expressions.
+    pub fn register_variable_type(&mut self, name: Symbol, ty: CType) {
+        self.variable_types.insert(name, ty);
     }
 
     // ===================================================================
@@ -1245,8 +1274,15 @@ impl<'a> ConstantEvaluator<'a> {
                 TypeSpecifier::Bool => has_bool = true,
                 TypeSpecifier::Complex => has_complex = true,
 
-                // Struct/Union/Enum — use the type directly
+                // Struct/Union/Enum — look up the tag type from the
+                // registered tag map if available, otherwise fall back to
+                // an empty struct (forward declaration).
                 TypeSpecifier::Struct(s) => {
+                    if let Some(tag_sym) = s.tag {
+                        if let Some(resolved) = self.tag_types.get(&tag_sym) {
+                            return Ok(resolved.clone());
+                        }
+                    }
                     return Ok(CType::Struct {
                         name: s.tag.map(|sym| format!("struct_{}", sym.as_u32())),
                         fields: Vec::new(),
@@ -1255,6 +1291,11 @@ impl<'a> ConstantEvaluator<'a> {
                     });
                 }
                 TypeSpecifier::Union(u) => {
+                    if let Some(tag_sym) = u.tag {
+                        if let Some(resolved) = self.tag_types.get(&tag_sym) {
+                            return Ok(resolved.clone());
+                        }
+                    }
                     return Ok(CType::Union {
                         name: u.tag.map(|sym| format!("union_{}", sym.as_u32())),
                         fields: Vec::new(),
@@ -1506,6 +1547,22 @@ impl<'a> ConstantEvaluator<'a> {
                     }
                     _ => self.infer_expr_type(operand, span),
                 }
+            }
+            Expression::Identifier { name, .. } => {
+                // Look up variable type from the registry (populated by sema
+                // for block-scope _Static_assert evaluation).
+                if let Some(ty) = self.variable_types.get(name) {
+                    Ok(ty.clone())
+                } else {
+                    // Unknown identifier — fallback to int
+                    Ok(CType::Int)
+                }
+            }
+            Expression::Binary { left, right, .. } => {
+                // Binary ops: infer type from left operand
+                let lt = self.infer_expr_type(left, span)?;
+                let _rt = self.infer_expr_type(right, span)?;
+                Ok(lt)
             }
             _ => {
                 // Default: assume int for expressions we can't easily type

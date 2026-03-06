@@ -1068,7 +1068,9 @@ impl<'a> Preprocessor<'a> {
                             if !in_macro_args && paren_depth == 1 {
                                 // Check if the preceding non-whitespace token
                                 // is a function-like macro name.
-                                let last_ident = line_tokens.iter().rev()
+                                let last_ident = line_tokens
+                                    .iter()
+                                    .rev()
                                     .find(|t| t.kind != PPTokenKind::Whitespace);
                                 if let Some(prev) = last_ident {
                                     if prev.kind == PPTokenKind::Identifier {

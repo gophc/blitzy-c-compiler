@@ -198,8 +198,10 @@ impl<'a> SemanticAnalyzer<'a> {
         // Pre-register GCC builtin type names as typedefs at global scope.
         // __builtin_va_list is the underlying type behind va_list in <stdarg.h>
         // and is represented internally as a pointer to void (char *).
-        analyzer.register_builtin_typedef("__builtin_va_list",
-            CType::Pointer(Box::new(CType::Void), TypeQualifiers::default()));
+        analyzer.register_builtin_typedef(
+            "__builtin_va_list",
+            CType::Pointer(Box::new(CType::Void), TypeQualifiers::default()),
+        );
 
         analyzer
     }
@@ -1507,9 +1509,11 @@ impl<'a> SemanticAnalyzer<'a> {
                 Ok(CType::Long)
             }
             BuiltinKind::Unreachable | BuiltinKind::Trap => Ok(CType::Void),
-            BuiltinKind::Clz | BuiltinKind::Ctz | BuiltinKind::Popcount | BuiltinKind::Ffs => {
-                Ok(CType::Int)
-            }
+            BuiltinKind::Clz
+            | BuiltinKind::Ctz
+            | BuiltinKind::Popcount
+            | BuiltinKind::Ffs
+            | BuiltinKind::Ffsll => Ok(CType::Int),
             BuiltinKind::Bswap16 => Ok(CType::UShort),
             BuiltinKind::Bswap32 => Ok(CType::UInt),
             BuiltinKind::Bswap64 => Ok(CType::ULongLong),
@@ -1570,6 +1574,166 @@ impl<'a> SemanticAnalyzer<'a> {
     /// Resolve type from specifier-qualifier list.
     fn resolve_type_from_spec_qualifier_list(&self, sql: &SpecifierQualifierList) -> CType {
         self.resolve_type_from_type_specifiers(&sql.type_specifiers, &sql.type_qualifiers)
+    }
+
+    /// Infer the C type of an expression for `typeof(expr)` / `__typeof__(expr)`.
+    ///
+    /// This performs read-only type inference on the expression without
+    /// modifying it. For most common patterns used in kernel macros
+    /// (identifiers, member access, pointer dereference, arithmetic),
+    /// the correct type is returned. Falls back to `CType::Int` for
+    /// expressions that cannot be resolved statically.
+    fn infer_typeof_expr_type(&self, expr: &Expression) -> CType {
+        match expr {
+            // Identifier — look up in symbol table.
+            Expression::Identifier { name, .. } => {
+                if let Some(id) = self.scopes.lookup_ordinary(*name) {
+                    let entry = self.symbols.get(id);
+                    entry.ty.clone()
+                } else {
+                    CType::Int
+                }
+            }
+            // Integer literals.
+            Expression::IntegerLiteral { suffix, .. } => match suffix {
+                IntegerSuffix::None => CType::Int,
+                IntegerSuffix::U => CType::UInt,
+                IntegerSuffix::L => CType::Long,
+                IntegerSuffix::UL => CType::ULong,
+                IntegerSuffix::LL => CType::LongLong,
+                IntegerSuffix::ULL => CType::ULongLong,
+            },
+            // Float literals.
+            Expression::FloatLiteral { .. } => CType::Double,
+            // Char literals.
+            Expression::CharLiteral { .. } => CType::Int,
+            // String literals.
+            Expression::StringLiteral { .. } => {
+                CType::Pointer(Box::new(CType::Char), TypeQualifiers::default())
+            }
+            // Dereference: *ptr → pointee type.
+            Expression::UnaryOp {
+                op: ast::UnaryOp::Deref,
+                operand,
+                ..
+            } => {
+                let inner = self.infer_typeof_expr_type(operand);
+                match inner {
+                    CType::Pointer(pointee, _) => *pointee,
+                    CType::Array(elem, _) => *elem,
+                    _ => CType::Int,
+                }
+            }
+            // Address-of: &x → pointer to x's type.
+            Expression::UnaryOp {
+                op: ast::UnaryOp::AddressOf,
+                operand,
+                ..
+            } => {
+                let inner = self.infer_typeof_expr_type(operand);
+                CType::Pointer(Box::new(inner), TypeQualifiers::default())
+            }
+            // Other unary ops: +x, -x, ~x, !x — same type as operand.
+            Expression::UnaryOp { operand, op, .. } => {
+                if matches!(op, ast::UnaryOp::LogicalNot) {
+                    CType::Int
+                } else {
+                    self.infer_typeof_expr_type(operand)
+                }
+            }
+            // Member access: obj.member.
+            Expression::MemberAccess { object, member, .. } => {
+                let obj_ty = self.infer_typeof_expr_type(object);
+                self.lookup_member_type(&obj_ty, *member)
+            }
+            // Pointer member access: ptr->member.
+            Expression::PointerMemberAccess { object, member, .. } => {
+                let obj_ty = self.infer_typeof_expr_type(object);
+                match obj_ty {
+                    CType::Pointer(inner, _) => self.lookup_member_type(&inner, *member),
+                    _ => CType::Int,
+                }
+            }
+            // Array subscript: arr[i] → element type.
+            Expression::ArraySubscript { base, .. } => {
+                let arr_ty = self.infer_typeof_expr_type(base);
+                match arr_ty {
+                    CType::Array(elem, _) => *elem,
+                    CType::Pointer(pointee, _) => *pointee,
+                    _ => CType::Int,
+                }
+            }
+            // Binary arithmetic preserves the "wider" type; simplify to Int
+            // for most cases. This covers `a + b`, `a * b`, etc.
+            Expression::Binary { left, .. } => self.infer_typeof_expr_type(left),
+            // Conditional: a ? b : c → type of b (or c if omitted).
+            Expression::Conditional {
+                then_expr,
+                else_expr,
+                ..
+            } => {
+                if let Some(then_e) = then_expr {
+                    self.infer_typeof_expr_type(then_e)
+                } else {
+                    self.infer_typeof_expr_type(else_expr)
+                }
+            }
+            // Cast: (type)expr → cast target type.
+            Expression::Cast { type_name, .. } => {
+                self.resolve_type_from_spec_qualifier_list(&type_name.specifier_qualifiers)
+            }
+            // Parenthesized.
+            Expression::Parenthesized { inner, .. } => self.infer_typeof_expr_type(inner),
+            // Statement expression.
+            Expression::StatementExpression { .. } => CType::Int,
+            // Post/pre increment/decrement — same type as operand.
+            Expression::PostIncrement { operand, .. }
+            | Expression::PostDecrement { operand, .. }
+            | Expression::PreIncrement { operand, .. }
+            | Expression::PreDecrement { operand, .. } => self.infer_typeof_expr_type(operand),
+            // Comma: value is the last expression in the list.
+            Expression::Comma { exprs, .. } => {
+                if let Some(last) = exprs.last() {
+                    self.infer_typeof_expr_type(last)
+                } else {
+                    CType::Void
+                }
+            }
+            // sizeof always produces size_t (unsigned long).
+            Expression::SizeofExpr { .. } | Expression::SizeofType { .. } => CType::ULong,
+            // Compound literal.
+            Expression::CompoundLiteral { type_name, .. } => {
+                self.resolve_type_from_spec_qualifier_list(&type_name.specifier_qualifiers)
+            }
+            // Function call: we'd need the return type. Default to Int.
+            Expression::FunctionCall { callee, .. } => {
+                let func_ty = self.infer_typeof_expr_type(callee);
+                if let CType::Function { return_type, .. } = func_ty {
+                    *return_type
+                } else {
+                    CType::Int
+                }
+            }
+            // Default fallback.
+            _ => CType::Int,
+        }
+    }
+
+    /// Look up the type of a struct/union member by name.
+    fn lookup_member_type(&self, ty: &CType, member: Symbol) -> CType {
+        let member_str = self.interner.resolve(member);
+        match ty {
+            CType::Struct { fields, .. } | CType::Union { fields, .. } => {
+                for f in fields {
+                    if f.name.as_deref() == Some(member_str) {
+                        return f.ty.clone();
+                    }
+                }
+                CType::Int
+            }
+            CType::Typedef { underlying, .. } => self.lookup_member_type(underlying, member),
+            _ => CType::Int,
+        }
     }
 
     /// Resolve the base C type from a list of type specifiers and qualifiers.
@@ -1638,10 +1802,8 @@ impl<'a> SemanticAnalyzer<'a> {
                             return self
                                 .resolve_type_from_spec_qualifier_list(&tn.specifier_qualifiers);
                         }
-                        TypeofArg::Expression(_) => {
-                            // Would need to analyze the expression to get its type.
-                            // For now return Int as placeholder.
-                            return CType::Int;
+                        TypeofArg::Expression(expr) => {
+                            return self.infer_typeof_expr_type(expr);
                         }
                     }
                 }
@@ -2007,6 +2169,17 @@ impl<'a> SemanticAnalyzer<'a> {
                 self.diagnostics,
                 target,
             );
+            // Populate the evaluator with known struct/union tag types so
+            // that sizeof(struct tag) works in constant expressions.
+            for (tag_sym, tag_entry) in self.scopes.all_tags() {
+                evaluator.register_tag_type(tag_sym, tag_entry.ty.clone());
+            }
+            // Populate with known variable types so that sizeof(var)
+            // works for local arrays in block-scope _Static_assert.
+            for (var_sym, sym_id) in self.scopes.all_ordinary_symbols() {
+                let entry = self.symbols.get(sym_id);
+                evaluator.register_variable_type(var_sym, entry.ty.clone());
+            }
             evaluator.evaluate_static_assert_node(sa)
         } else {
             Ok(())

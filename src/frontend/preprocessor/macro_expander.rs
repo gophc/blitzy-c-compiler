@@ -233,15 +233,11 @@ impl<'a> MacroExpander<'a> {
                     // invocation spans the replacement/source boundary.
                     if !remaining.is_empty() {
                         if let Some(last) = rescanned_sub.last() {
-                            if last.kind == PPTokenKind::Identifier
-                                && !last.painted
-                            {
+                            if last.kind == PPTokenKind::Identifier && !last.painted {
                                 let cross = self
                                     .macro_defs
                                     .get(&last.text)
-                                    .map(|md| {
-                                        matches!(md.kind, MacroKind::FunctionLike { .. })
-                                    })
+                                    .map(|md| matches!(md.kind, MacroKind::FunctionLike { .. }))
                                     .unwrap_or(false);
                                 if cross && find_lparen(remaining, 0).is_some() {
                                     let mut tail = rescanned_sub;
@@ -296,8 +292,7 @@ impl<'a> MacroExpander<'a> {
                                     // (same as object-like case above).
                                     if !remaining.is_empty() {
                                         if let Some(last) = rescanned_sub.last() {
-                                            if last.kind == PPTokenKind::Identifier
-                                                && !last.painted
+                                            if last.kind == PPTokenKind::Identifier && !last.painted
                                             {
                                                 let cross = self
                                                     .macro_defs
@@ -309,16 +304,13 @@ impl<'a> MacroExpander<'a> {
                                                         )
                                                     })
                                                     .unwrap_or(false);
-                                                if cross
-                                                    && find_lparen(remaining, 0).is_some()
-                                                {
+                                                if cross && find_lparen(remaining, 0).is_some() {
                                                     let mut tail = rescanned_sub;
                                                     let func_tok = tail.pop().unwrap();
                                                     result.extend(tail);
                                                     let mut combined = vec![func_tok];
                                                     combined.extend_from_slice(remaining);
-                                                    let expanded =
-                                                        self.expand_tokens(&combined);
+                                                    let expanded = self.expand_tokens(&combined);
                                                     result.extend(expanded);
                                                     return result;
                                                 }

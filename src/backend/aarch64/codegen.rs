@@ -1587,14 +1587,16 @@ impl AArch64InstructionSelector {
                 let mut inst = A64Instruction::new(A64Opcode::MOVZ)
                     .with_rd(rd)
                     .with_imm(imm);
-                if is_32 { inst = inst.set_32bit(); }
+                if is_32 {
+                    inst = inst.set_32bit();
+                }
                 return vec![inst];
             }
             // Fallback: load 0.
-            let mut inst = A64Instruction::new(A64Opcode::MOVZ)
-                .with_rd(rd)
-                .with_imm(0);
-            if is_32 { inst = inst.set_32bit(); }
+            let mut inst = A64Instruction::new(A64Opcode::MOVZ).with_rd(rd).with_imm(0);
+            if is_32 {
+                inst = inst.set_32bit();
+            }
             return vec![inst];
         }
 

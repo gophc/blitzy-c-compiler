@@ -180,9 +180,7 @@ impl<'src> Parser<'src> {
 
         // Pre-register GCC builtin type names as typedefs so the parser
         // recognises them as type specifiers in declaration contexts.
-        let builtin_type_names = [
-            "__builtin_va_list",
-        ];
+        let builtin_type_names = ["__builtin_va_list"];
         for name in &builtin_type_names {
             let sym = parser.intern(name);
             parser.register_typedef(sym);

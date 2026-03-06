@@ -619,9 +619,11 @@ impl<'a> TypeChecker<'a> {
             BuiltinKind::ConstantP | BuiltinKind::TypesCompatibleP => Ok(CType::Int),
             BuiltinKind::Offsetof => Ok(self.size_t_type()),
             BuiltinKind::ChooseExpr => Err(()),
-            BuiltinKind::Clz | BuiltinKind::Ctz | BuiltinKind::Popcount | BuiltinKind::Ffs => {
-                Ok(CType::Int)
-            }
+            BuiltinKind::Clz
+            | BuiltinKind::Ctz
+            | BuiltinKind::Popcount
+            | BuiltinKind::Ffs
+            | BuiltinKind::Ffsll => Ok(CType::Int),
             BuiltinKind::Bswap16 => Ok(CType::UShort),
             BuiltinKind::Bswap32 => Ok(CType::UInt),
             BuiltinKind::Bswap64 => Ok(CType::ULongLong),

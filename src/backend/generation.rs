@@ -40,9 +40,9 @@ use crate::backend::dwarf::{
     dwarf_address_size, generate_dwarf_sections, should_emit_dwarf, DwarfSections, DWARF_VERSION,
 };
 use crate::backend::elf_writer_common::{
-    ElfSymbol, ElfWriter, Section, ET_REL, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHT_NOBITS,
-    SHT_PROGBITS, STB_GLOBAL, STB_LOCAL, STT_FUNC, STT_NOTYPE, STT_OBJECT, STV_DEFAULT,
-    STV_HIDDEN, STV_PROTECTED,
+    Elf32Rel, Elf64Rela, ElfSymbol, ElfWriter, Section, ET_REL, SHF_ALLOC, SHF_EXECINSTR,
+    SHF_INFO_LINK, SHF_WRITE, SHT_NOBITS, SHT_PROGBITS, SHT_REL, SHT_RELA, STB_GLOBAL, STB_LOCAL,
+    STT_FUNC, STT_NOTYPE, STT_OBJECT, STV_DEFAULT, STV_HIDDEN, STV_PROTECTED,
 };
 use crate::backend::linker_common::relocation::RelocationHandler;
 use crate::backend::linker_common::{link, LinkerConfig, LinkerInput, LinkerOutput, OutputType};
@@ -54,6 +54,7 @@ use crate::backend::traits::{
     RegisterInfo as TraitsRegisterInfo,
 };
 use crate::common::diagnostics::{DiagnosticEngine, Span};
+use crate::common::fx_hash::FxHashMap;
 use crate::common::source_map::SourceMap;
 use crate::common::target::Target;
 use crate::ir::function::{IrFunction, Linkage as FunctionLinkage, Visibility};
@@ -267,6 +268,7 @@ pub fn generate_code(
     module: &IrModule,
     ctx: &CodegenContext,
     diagnostics: &mut DiagnosticEngine,
+    source_map: &SourceMap,
 ) -> Result<Vec<u8>, String> {
     // Dispatch to the appropriate architecture backend.
     match ctx.target {
@@ -283,19 +285,19 @@ pub fn generate_code(
                 ctx.shared,
                 ctx.debug_info,
             );
-            generate_for_arch(&codegen, module, ctx, diagnostics)
+            generate_for_arch(&codegen, module, ctx, diagnostics, source_map)
         }
         Target::I686 => {
             let codegen = crate::backend::i686::I686Codegen::new(ctx.pic, ctx.debug_info);
-            generate_for_arch(&codegen, module, ctx, diagnostics)
+            generate_for_arch(&codegen, module, ctx, diagnostics, source_map)
         }
         Target::AArch64 => {
             let codegen = crate::backend::aarch64::AArch64Codegen::new(ctx.pic, ctx.debug_info);
-            generate_for_arch(&codegen, module, ctx, diagnostics)
+            generate_for_arch(&codegen, module, ctx, diagnostics, source_map)
         }
         Target::RiscV64 => {
             let codegen = crate::backend::riscv64::RiscV64Codegen::new(ctx.pic, ctx.debug_info);
-            generate_for_arch(&codegen, module, ctx, diagnostics)
+            generate_for_arch(&codegen, module, ctx, diagnostics, source_map)
         }
     }
 }
@@ -335,6 +337,7 @@ fn generate_for_arch<A: ArchCodegen>(
     module: &IrModule,
     ctx: &CodegenContext,
     diagnostics: &mut DiagnosticEngine,
+    source_map: &SourceMap,
 ) -> Result<Vec<u8>, String> {
     // If `-S` is specified, emit assembly text instead of binary.
     if ctx.emit_assembly {
@@ -390,7 +393,13 @@ fn generate_for_arch<A: ArchCodegen>(
         }
 
         // Step 1: Instruction selection — IR → MachineFunction
-        let mut mf = match arch.lower_function(func, diagnostics, module.globals(), &module.func_ref_map, &module.global_var_refs) {
+        let mut mf = match arch.lower_function(
+            func,
+            diagnostics,
+            module.globals(),
+            &module.func_ref_map,
+            &module.global_var_refs,
+        ) {
             Ok(mf) => mf,
             Err(e) => {
                 diagnostics.emit_error(
@@ -601,10 +610,8 @@ fn generate_for_arch<A: ArchCodegen>(
     // -----------------------------------------------------------------------
 
     let dwarf_sections = if ctx.should_emit_dwarf() {
-        // Create a minimal SourceMap for DWARF generation.
-        // In a full pipeline, the SourceMap would be passed from the frontend.
-        // Here we pass a reference to generate debug info from function/module metadata.
-        let source_map = SourceMap::new();
+        // Use the source_map passed from the frontend, which contains all files
+        // registered during preprocessing (file ID 0 = the primary source file).
 
         // Verify DWARF parameters for this target:
         // - Address size is 4 bytes on 32-bit targets, 8 bytes on 64-bit targets
@@ -616,23 +623,9 @@ fn generate_for_arch<A: ArchCodegen>(
         );
         debug_assert_eq!(DWARF_VERSION, 4, "BCC targets DWARF v4");
 
-        // Use SourceMap API to resolve file information for the module's source.
-        // In a full pipeline, the SourceMap would be pre-populated with file
-        // entries from the frontend; here we probe the API to ensure it's
-        // connected for DWARF generation.
-        if let Some(file) = source_map.get_file(0) {
-            let _ = file; // File entry available for DWARF compilation unit DIE
-        }
-        if let Some(loc) = source_map.lookup_location(0, 0) {
-            let _ = loc; // Location available for DWARF line mapping
-        }
-        if let Some(filename) = source_map.get_filename(0) {
-            let _ = filename; // Filename for DWARF DW_AT_name attribute
-        }
-
         let dwarf = generate_dwarf_sections(
             module,
-            &source_map,
+            source_map,
             &ctx.target,
             &text_section_offsets,
             diagnostics,
@@ -988,7 +981,7 @@ fn write_relocatable_object(
     bss_size: u64,
     functions: &[CompiledFunction],
     globals: &[GlobalSymbolInfo],
-    _text_relocs: &[crate::backend::traits::FunctionRelocation],
+    text_relocs: &[crate::backend::traits::FunctionRelocation],
     dwarf: &Option<DwarfSections>,
     module: &IrModule,
     ctx: &CodegenContext,
@@ -1180,6 +1173,149 @@ fn write_relocatable_object(
         writer.add_symbol(sym);
     }
 
+    // --- .rela.text section (relocations for the .text section) ---
+    // Encode the assembler-generated relocations into a proper ELF RELA section
+    // so that the linker can patch up cross-section and external symbol references.
+    if !text_relocs.is_empty() && text_section_index > 0 {
+        let is_64 = ctx.target.is_64bit();
+
+        // For any symbol referenced by a relocation that isn't already in the
+        // symbol table (functions, globals, declarations), add it as an
+        // undefined (SHN_UNDEF) global symbol.
+        let mut extra_undef_symbols: Vec<String> = Vec::new();
+        {
+            let mut known: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for func in functions.iter() {
+                known.insert(func.name.clone());
+            }
+            for gsym in globals.iter() {
+                known.insert(gsym.name.clone());
+            }
+            for decl in module.declarations() {
+                known.insert(decl.name.clone());
+            }
+            for reloc in text_relocs {
+                if !known.contains(&reloc.symbol) {
+                    known.insert(reloc.symbol.clone());
+                    extra_undef_symbols.push(reloc.symbol.clone());
+                }
+            }
+        }
+        for name in &extra_undef_symbols {
+            let sym = ElfSymbol {
+                name: name.clone(),
+                value: 0,
+                size: 0,
+                binding: STB_GLOBAL,
+                sym_type: STT_NOTYPE,
+                visibility: STV_DEFAULT,
+                section_index: 0, // SHN_UNDEF
+            };
+            writer.add_symbol(sym);
+        }
+
+        // Build a name→ELF-symbol-index map that matches the writer's
+        // internal ordering: locals first (index 1..), then globals.
+        // This mirrors the partitioning in SymbolTable::build_bytes().
+        struct SymEntry {
+            name: String,
+            binding: u8,
+        }
+        let mut all_syms: Vec<SymEntry> = Vec::new();
+        for func in functions.iter() {
+            let b = if func.is_global {
+                STB_GLOBAL
+            } else {
+                STB_LOCAL
+            };
+            all_syms.push(SymEntry {
+                name: func.name.clone(),
+                binding: b,
+            });
+        }
+        for gsym in globals.iter() {
+            let b = if gsym.is_global {
+                STB_GLOBAL
+            } else {
+                STB_LOCAL
+            };
+            all_syms.push(SymEntry {
+                name: gsym.name.clone(),
+                binding: b,
+            });
+        }
+        for decl in module.declarations() {
+            all_syms.push(SymEntry {
+                name: decl.name.clone(),
+                binding: STB_GLOBAL,
+            });
+        }
+        for name in &extra_undef_symbols {
+            all_syms.push(SymEntry {
+                name: name.clone(),
+                binding: STB_GLOBAL,
+            });
+        }
+
+        // Separate into locals and globals, maintaining relative order.
+        let locals: Vec<&SymEntry> = all_syms.iter().filter(|s| s.binding == STB_LOCAL).collect();
+        let globals_list: Vec<&SymEntry> =
+            all_syms.iter().filter(|s| s.binding != STB_LOCAL).collect();
+
+        let mut sym_name_to_idx: FxHashMap<String, u32> = FxHashMap::default();
+        // Index 0 = null symbol.  Locals start at index 1.
+        for (i, sym) in locals.iter().enumerate() {
+            sym_name_to_idx.insert(sym.name.clone(), (i as u32) + 1);
+        }
+        // Globals start after all locals.
+        let global_base = (locals.len() as u32) + 1;
+        for (i, sym) in globals_list.iter().enumerate() {
+            sym_name_to_idx.insert(sym.name.clone(), global_base + (i as u32));
+        }
+
+        // Encode relocation entries into binary RELA format.
+        let mut rela_data: Vec<u8> = Vec::new();
+        for reloc in text_relocs {
+            let sym_idx = sym_name_to_idx.get(&reloc.symbol).copied().unwrap_or(0);
+
+            if is_64 {
+                let rela = Elf64Rela::new(reloc.offset, sym_idx, reloc.rel_type_id, reloc.addend);
+                rela_data.extend_from_slice(&rela.to_bytes());
+            } else {
+                // For 32-bit targets, use Elf32Rel format.
+                let rel = Elf32Rel::new(reloc.offset as u32, sym_idx, reloc.rel_type_id as u8);
+                rela_data.extend_from_slice(&rel.to_bytes());
+            }
+        }
+
+        if !rela_data.is_empty() {
+            // The .symtab section is generated automatically by ElfWriter::write()
+            // at index (num_user_sections + 1).  After adding .rela.text, the
+            // total user section count determines the .symtab index.
+            let num_user_after = writer.sections_count() + 1; // +1 for the section we're about to add
+            let symtab_section_idx = (num_user_after + 1) as u32;
+
+            let rela_section = Section {
+                name: if is_64 {
+                    ".rela.text".to_string()
+                } else {
+                    ".rel.text".to_string()
+                },
+                sh_type: if is_64 { SHT_RELA } else { SHT_REL },
+                sh_flags: SHF_INFO_LINK,
+                data: rela_data,
+                sh_addralign: if is_64 { 8 } else { 4 },
+                sh_entsize: if is_64 { 24 } else { 8 }, // sizeof(Elf64_Rela) or sizeof(Elf32_Rel)
+                sh_link: symtab_section_idx,            // Points to .symtab
+                sh_info: text_section_index as u32,     // Section being relocated (.text)
+                logical_size: 0,
+                virtual_address: 0,
+                file_offset_hint: 0,
+            };
+            writer.add_section(rela_section);
+        }
+    }
+
     // Serialize the ELF object.
     let elf_bytes = writer.write();
     Ok(elf_bytes)
@@ -1264,8 +1400,9 @@ fn link_to_final_output(
     // from the code generator into linker-format Relocation entries so the
     // linker can resolve cross-section references (.text → .data/.rodata/.bss).
     for func_reloc in text_relocations {
-        input.relocations.push(
-            crate::backend::linker_common::relocation::Relocation {
+        input
+            .relocations
+            .push(crate::backend::linker_common::relocation::Relocation {
                 offset: func_reloc.offset,
                 symbol_name: func_reloc.symbol.clone(),
                 sym_index: 0, // resolved by name, not index
@@ -1274,8 +1411,7 @@ fn link_to_final_output(
                 object_id: 0,
                 section_index: 1, // .text section index in our .o files
                 output_section_name: Some(".text".to_string()),
-            },
-        );
+            });
     }
 
     // For executables (not shared libs), inject a CRT `_start` stub that
@@ -1927,7 +2063,13 @@ fn emit_assembly_text<A: ArchCodegen>(
         output.push_str(&format!("{}:\n", func.name));
 
         // Perform instruction selection for assembly text output.
-        let mf = match arch.lower_function(func, diagnostics, module.globals(), &module.func_ref_map, &module.global_var_refs) {
+        let mut mf = match arch.lower_function(
+            func,
+            diagnostics,
+            module.globals(),
+            &module.func_ref_map,
+            &module.global_var_refs,
+        ) {
             Ok(mf) => mf,
             Err(e) => {
                 diagnostics.emit_error(
@@ -1941,6 +2083,21 @@ fn emit_assembly_text<A: ArchCodegen>(
             }
         };
 
+        // Register allocation — resolve virtual registers to physical regs.
+        {
+            let reg_info: TraitsRegisterInfo = arch.register_info();
+            let alloc_reg_info: register_allocator::RegisterInfo = reg_info.into();
+            let mut intervals = compute_live_intervals(func);
+            let alloc_result = allocate_registers(&mut intervals, &alloc_reg_info, &ctx.target);
+            insert_spill_code_from_result(&mut mf, &alloc_result);
+            apply_allocation_result(&mut mf, &alloc_result);
+
+            // Insert prologue/epilogue.
+            let prologue = arch.emit_prologue(&mf);
+            let epilogue = arch.emit_epilogue(&mf);
+            insert_prologue_epilogue(&mut mf, prologue, epilogue);
+        }
+
         // Emit machine instructions as text.
         for (i, block) in mf.blocks.iter().enumerate() {
             if i > 0 {
@@ -1951,7 +2108,7 @@ fn emit_assembly_text<A: ArchCodegen>(
                 }
             }
             for inst in &block.instructions {
-                output.push_str(&format!("\t{}\n", inst));
+                output.push_str(&format!("\t{}\n", arch.format_instruction(inst)));
             }
         }
 

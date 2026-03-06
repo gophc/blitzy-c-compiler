@@ -508,7 +508,10 @@ impl ArchCodegen for I686Codegen {
         diag: &mut DiagnosticEngine,
         _globals: &[crate::ir::module::GlobalVariable],
         _func_ref_map: &crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>,
-        _global_var_refs: &crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>,
+        _global_var_refs: &crate::common::fx_hash::FxHashMap<
+            crate::ir::instructions::Value,
+            String,
+        >,
     ) -> Result<MachineFunction, String> {
         let mut mf = MachineFunction::new(func.name.clone());
         let target = Target::I686;
@@ -537,9 +540,11 @@ impl ArchCodegen for I686Codegen {
             let mut const_idx = 0;
             for block in &func.blocks {
                 for inst in block.instructions() {
-                    if let Instruction::BinOp { result, lhs, rhs, .. } = inst {
-                        if *lhs == *result && *rhs == Value::UNDEF
-                            && const_idx < const_values.len()
+                    if let Instruction::BinOp {
+                        result, lhs, rhs, ..
+                    } = inst
+                    {
+                        if *lhs == *result && *rhs == Value::UNDEF && const_idx < const_values.len()
                         {
                             constant_cache.insert(result.index(), const_values[const_idx]);
                             const_idx += 1;
@@ -640,7 +645,10 @@ impl ArchCodegen for I686Codegen {
         Ok(mf)
     }
 
-    fn emit_assembly(&self, mf: &MachineFunction) -> Result<crate::backend::traits::AssembledFunction, String> {
+    fn emit_assembly(
+        &self,
+        mf: &MachineFunction,
+    ) -> Result<crate::backend::traits::AssembledFunction, String> {
         // Encode machine instructions to raw bytes by delegating to the
         // built-in i686 assembler encoder.  Instructions that already carry
         // pre-encoded bytes (e.g. from inline assembly) are emitted directly.
@@ -1961,7 +1969,13 @@ mod tests {
             span: Span::dummy(),
         });
 
-        let result = cg.lower_function(&func, &mut diag, &[], &crate::common::fx_hash::FxHashMap::default(), &crate::common::fx_hash::FxHashMap::default());
+        let result = cg.lower_function(
+            &func,
+            &mut diag,
+            &[],
+            &crate::common::fx_hash::FxHashMap::default(),
+            &crate::common::fx_hash::FxHashMap::default(),
+        );
         assert!(result.is_ok());
         let mf = result.unwrap();
         assert_eq!(mf.name, "empty");
@@ -1992,7 +2006,13 @@ mod tests {
         });
         func.value_count = 3;
 
-        let result = cg.lower_function(&func, &mut diag, &[], &crate::common::fx_hash::FxHashMap::default(), &crate::common::fx_hash::FxHashMap::default());
+        let result = cg.lower_function(
+            &func,
+            &mut diag,
+            &[],
+            &crate::common::fx_hash::FxHashMap::default(),
+            &crate::common::fx_hash::FxHashMap::default(),
+        );
         assert!(result.is_ok());
         let mf = result.unwrap();
         assert_eq!(mf.name, "add");

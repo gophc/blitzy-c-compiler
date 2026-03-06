@@ -136,6 +136,9 @@ impl<'a> BuiltinEvaluator<'a> {
                 self.eval_single_arg_int("__builtin_popcount", args, CType::Int, span)
             }
             BuiltinKind::Ffs => self.eval_single_arg_int("__builtin_ffs", args, CType::Int, span),
+            BuiltinKind::Ffsll => {
+                self.eval_single_arg_int("__builtin_ffsll", args, CType::Int, span)
+            }
             BuiltinKind::Bswap16 => {
                 self.eval_single_arg_int("__builtin_bswap16", args, CType::UShort, span)
             }
@@ -236,9 +239,11 @@ impl<'a> BuiltinEvaluator<'a> {
             BuiltinKind::Offsetof => self.size_t_type(),
 
             // Bit manipulation — int result.
-            BuiltinKind::Clz | BuiltinKind::Ctz | BuiltinKind::Popcount | BuiltinKind::Ffs => {
-                CType::Int
-            }
+            BuiltinKind::Clz
+            | BuiltinKind::Ctz
+            | BuiltinKind::Popcount
+            | BuiltinKind::Ffs
+            | BuiltinKind::Ffsll => CType::Int,
 
             // Byte swaps — same-width unsigned result.
             BuiltinKind::Bswap16 => CType::UShort,
@@ -1401,6 +1406,7 @@ impl<'a> BuiltinEvaluator<'a> {
             "__builtin_bswap32" => Some(BuiltinKind::Bswap32),
             "__builtin_bswap64" => Some(BuiltinKind::Bswap64),
             "__builtin_ffs" => Some(BuiltinKind::Ffs),
+            "__builtin_ffsll" => Some(BuiltinKind::Ffsll),
             "__builtin_va_start" => Some(BuiltinKind::VaStart),
             "__builtin_va_end" => Some(BuiltinKind::VaEnd),
             "__builtin_va_arg" => Some(BuiltinKind::VaArg),

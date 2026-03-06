@@ -517,10 +517,8 @@ pub fn allocate_registers(
     // Active list: indices into `intervals`, maintained sorted by end point.
     let mut active: Vec<usize> = Vec::new();
 
-
     for i in 0..intervals.len() {
         let cur_start = intervals[i].start;
-
 
         // --- Expire old intervals whose endpoints are before cur_start ---
         let mut expired: Vec<usize> = Vec::new();

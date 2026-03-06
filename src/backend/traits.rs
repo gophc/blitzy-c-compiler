@@ -1369,6 +1369,16 @@ pub trait ArchCodegen {
     ///
     /// An [`ArgLocation`] describing where the return value is placed.
     fn classify_return(&self, ty: &IrType) -> ArgLocation;
+
+    /// Format a machine instruction as human-readable assembly text.
+    ///
+    /// The default implementation uses the generic `Display` format
+    /// (`op{n} operand1, operand2, ...`). Architecture backends should
+    /// override this to produce valid AT&T-syntax (x86-64/i686) or
+    /// standard assembly (AArch64/RISC-V 64).
+    fn format_instruction(&self, inst: &MachineInstruction) -> String {
+        format!("{}", inst)
+    }
 }
 
 // ===========================================================================

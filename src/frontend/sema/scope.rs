@@ -451,6 +451,39 @@ impl ScopeStack {
         }
     }
 
+    /// Collect all visible tag entries across all scope levels.
+    ///
+    /// Returns a vector of `(Symbol, TagEntry)` pairs representing every
+    /// tag currently in scope, from outermost to innermost. When a tag
+    /// name is shadowed, the innermost (most recent) entry wins.
+    /// Used by the constant evaluator to resolve `sizeof(struct foo)`.
+    pub fn all_tags(&self) -> Vec<(Symbol, TagEntry)> {
+        let mut merged: FxHashMap<Symbol, TagEntry> = FxHashMap::default();
+        // Walk from outermost to innermost; inner scopes overwrite outer
+        for scope in self.scopes.iter() {
+            for (name, entry) in &scope.tags {
+                merged.insert(*name, entry.clone());
+            }
+        }
+        merged.into_iter().collect()
+    }
+
+    /// Collect all visible ordinary symbol IDs across all scope levels.
+    ///
+    /// Returns a vector of `(Symbol, SymbolId)` pairs representing every
+    /// ordinary identifier currently in scope. When a name is shadowed,
+    /// the innermost binding wins.
+    /// Used by the constant evaluator to resolve `sizeof(variable)`.
+    pub fn all_ordinary_symbols(&self) -> Vec<(Symbol, SymbolId)> {
+        let mut merged: FxHashMap<Symbol, SymbolId> = FxHashMap::default();
+        for scope in self.scopes.iter() {
+            for (name, &id) in &scope.ordinary {
+                merged.insert(*name, id);
+            }
+        }
+        merged.into_iter().collect()
+    }
+
     // ===================================================================
     // Label Namespace Management
     // ===================================================================

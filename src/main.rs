@@ -1121,10 +1121,11 @@ fn compile_single_file(
         emit_assembly: args.emit_assembly,
     };
 
-    let output_bytes = generate_code(&ir_module, &codegen_ctx, &mut diagnostics).map_err(|e| {
-        diagnostics.print_all(&source_map);
-        format!("code generation failed for '{}': {}", input, e)
-    })?;
+    let output_bytes = generate_code(&ir_module, &codegen_ctx, &mut diagnostics, &source_map)
+        .map_err(|e| {
+            diagnostics.print_all(&source_map);
+            format!("code generation failed for '{}': {}", input, e)
+        })?;
 
     if diagnostics.has_errors() {
         diagnostics.print_all(&source_map);

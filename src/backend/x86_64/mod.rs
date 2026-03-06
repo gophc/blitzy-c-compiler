@@ -508,6 +508,252 @@ impl ArchCodegen for X86_64Backend {
         let ret_loc = self.abi.classify_return(ty);
         convert_ret_location(ret_loc)
     }
+
+    /// Format a machine instruction as valid AT&T-syntax x86-64 assembly.
+    ///
+    /// Overrides the default `op{n}` format to produce mnemonics recognized
+    /// by standard assemblers (e.g., `movq`, `addq`, `imulq`, etc.).
+    fn format_instruction(&self, inst: &MachineInstruction) -> String {
+        format_x86_instruction(inst)
+    }
+}
+
+// ===========================================================================
+// AT&T-syntax x86-64 assembly formatting for -S output
+// ===========================================================================
+
+/// Map a physical register index to its AT&T-syntax 64-bit name.
+fn reg_name_64(reg: u16) -> &'static str {
+    match reg {
+        0 => "%rax",
+        1 => "%rcx",
+        2 => "%rdx",
+        3 => "%rbx",
+        4 => "%rsp",
+        5 => "%rbp",
+        6 => "%rsi",
+        7 => "%rdi",
+        8 => "%r8",
+        9 => "%r9",
+        10 => "%r10",
+        11 => "%r11",
+        12 => "%r12",
+        13 => "%r13",
+        14 => "%r14",
+        15 => "%r15",
+        // XMM registers
+        16..=31 => {
+            const XMM: [&str; 16] = [
+                "%xmm0", "%xmm1", "%xmm2", "%xmm3", "%xmm4", "%xmm5", "%xmm6", "%xmm7", "%xmm8",
+                "%xmm9", "%xmm10", "%xmm11", "%xmm12", "%xmm13", "%xmm14", "%xmm15",
+            ];
+            XMM[(reg - 16) as usize]
+        }
+        _ => "%???",
+    }
+}
+
+/// Format a `MachineOperand` in AT&T syntax.
+fn format_operand_att(op: &MachineOperand) -> String {
+    match op {
+        MachineOperand::Register(r) => reg_name_64(*r).to_string(),
+        MachineOperand::VirtualRegister(v) => format!("%vr{}", v),
+        MachineOperand::Immediate(imm) => format!("${}", imm),
+        MachineOperand::Memory {
+            base,
+            index,
+            scale,
+            displacement,
+        } => {
+            let mut s = String::new();
+            if *displacement != 0 {
+                s.push_str(&format!("{}", displacement));
+            }
+            s.push('(');
+            if let Some(b) = base {
+                s.push_str(reg_name_64(*b));
+            }
+            if let Some(idx) = index {
+                s.push(',');
+                s.push_str(reg_name_64(*idx));
+                if *scale > 1 {
+                    s.push_str(&format!(",{}", scale));
+                }
+            }
+            s.push(')');
+            s
+        }
+        MachineOperand::FrameSlot(offset) => {
+            format!("{}(%rbp)", offset)
+        }
+        MachineOperand::GlobalSymbol(name) => name.clone(),
+        MachineOperand::BlockLabel(id) => format!(".LBB{}", id),
+    }
+}
+
+/// Map an X86Opcode to its AT&T-syntax mnemonic string.
+fn x86_opcode_mnemonic(opcode: u32) -> &'static str {
+    use codegen::X86Opcode;
+    match X86Opcode::from_u32(opcode) {
+        Some(X86Opcode::Mov) | Some(X86Opcode::LoadInd) | Some(X86Opcode::StoreInd) => "movq",
+        Some(X86Opcode::MovZX) => "movzbl",
+        Some(X86Opcode::MovSX) => "movsbl",
+        Some(X86Opcode::Lea) => "leaq",
+        Some(X86Opcode::Push) => "pushq",
+        Some(X86Opcode::Pop) => "popq",
+        Some(X86Opcode::Xchg) => "xchgq",
+        Some(X86Opcode::Add) => "addq",
+        Some(X86Opcode::Sub) => "subq",
+        Some(X86Opcode::Imul) => "imulq",
+        Some(X86Opcode::Idiv) => "idivq",
+        Some(X86Opcode::Div) => "divq",
+        Some(X86Opcode::Neg) => "negq",
+        Some(X86Opcode::Inc) => "incq",
+        Some(X86Opcode::Dec) => "decq",
+        Some(X86Opcode::And) => "andq",
+        Some(X86Opcode::Or) => "orq",
+        Some(X86Opcode::Xor) => "xorq",
+        Some(X86Opcode::Not) => "notq",
+        Some(X86Opcode::Shl) => "shlq",
+        Some(X86Opcode::Shr) => "shrq",
+        Some(X86Opcode::Sar) => "sarq",
+        Some(X86Opcode::Rol) => "rolq",
+        Some(X86Opcode::Ror) => "rorq",
+        Some(X86Opcode::Cmp) => "cmpq",
+        Some(X86Opcode::Test) => "testq",
+        Some(X86Opcode::Cmovo) => "cmovo",
+        Some(X86Opcode::Cmovno) => "cmovno",
+        Some(X86Opcode::Cmovb) => "cmovb",
+        Some(X86Opcode::Cmovae) => "cmovae",
+        Some(X86Opcode::Cmove) => "cmove",
+        Some(X86Opcode::Cmovne) => "cmovne",
+        Some(X86Opcode::Cmovbe) => "cmovbe",
+        Some(X86Opcode::Cmova) => "cmova",
+        Some(X86Opcode::Cmovs) => "cmovs",
+        Some(X86Opcode::Cmovns) => "cmovns",
+        Some(X86Opcode::Cmovp) => "cmovp",
+        Some(X86Opcode::Cmovnp) => "cmovnp",
+        Some(X86Opcode::Cmovl) => "cmovl",
+        Some(X86Opcode::Cmovge) => "cmovge",
+        Some(X86Opcode::Cmovle) => "cmovle",
+        Some(X86Opcode::Cmovg) => "cmovg",
+        Some(X86Opcode::Seto) => "seto",
+        Some(X86Opcode::Setno) => "setno",
+        Some(X86Opcode::Setb) => "setb",
+        Some(X86Opcode::Setae) => "setae",
+        Some(X86Opcode::Sete) => "sete",
+        Some(X86Opcode::Setne) => "setne",
+        Some(X86Opcode::Setbe) => "setbe",
+        Some(X86Opcode::Seta) => "seta",
+        Some(X86Opcode::Sets) => "sets",
+        Some(X86Opcode::Setns) => "setns",
+        Some(X86Opcode::Setp) => "setp",
+        Some(X86Opcode::Setnp) => "setnp",
+        Some(X86Opcode::Setl) => "setl",
+        Some(X86Opcode::Setge) => "setge",
+        Some(X86Opcode::Setle) => "setle",
+        Some(X86Opcode::Setg) => "setg",
+        Some(X86Opcode::Jmp) => "jmp",
+        Some(X86Opcode::Jo) => "jo",
+        Some(X86Opcode::Jno) => "jno",
+        Some(X86Opcode::Jb) => "jb",
+        Some(X86Opcode::Jae) => "jae",
+        Some(X86Opcode::Je) => "je",
+        Some(X86Opcode::Jne) => "jne",
+        Some(X86Opcode::Jbe) => "jbe",
+        Some(X86Opcode::Ja) => "ja",
+        Some(X86Opcode::Js) => "js",
+        Some(X86Opcode::Jns) => "jns",
+        Some(X86Opcode::Jp) => "jp",
+        Some(X86Opcode::Jnp) => "jnp",
+        Some(X86Opcode::Jl) => "jl",
+        Some(X86Opcode::Jge) => "jge",
+        Some(X86Opcode::Jle) => "jle",
+        Some(X86Opcode::Jg) => "jg",
+        Some(X86Opcode::Call) => "callq",
+        Some(X86Opcode::Ret) => "retq",
+        Some(X86Opcode::Nop) => "nop",
+        Some(X86Opcode::Movsd) => "movsd",
+        Some(X86Opcode::Movss) => "movss",
+        Some(X86Opcode::Addsd) => "addsd",
+        Some(X86Opcode::Addss) => "addss",
+        Some(X86Opcode::Subsd) => "subsd",
+        Some(X86Opcode::Subss) => "subss",
+        Some(X86Opcode::Mulsd) => "mulsd",
+        Some(X86Opcode::Mulss) => "mulss",
+        Some(X86Opcode::Divsd) => "divsd",
+        Some(X86Opcode::Divss) => "divss",
+        Some(X86Opcode::Ucomisd) => "ucomisd",
+        Some(X86Opcode::Ucomiss) => "ucomiss",
+        Some(X86Opcode::Cvtsi2sd) => "cvtsi2sdq",
+        Some(X86Opcode::Cvtsi2ss) => "cvtsi2ssq",
+        Some(X86Opcode::Cvtsd2si) => "cvtsd2siq",
+        Some(X86Opcode::Cvtss2si) => "cvtss2siq",
+        Some(X86Opcode::Cvtsd2ss) => "cvtsd2ss",
+        Some(X86Opcode::Cvtss2sd) => "cvtss2sd",
+        Some(X86Opcode::Enter) => "enter",
+        Some(X86Opcode::Leave) => "leaveq",
+        Some(X86Opcode::Cdq) => "cdq",
+        Some(X86Opcode::Cqo) => "cqo",
+        Some(X86Opcode::Endbr64) => "endbr64",
+        Some(X86Opcode::Pause) => "pause",
+        Some(X86Opcode::Lfence) => "lfence",
+        Some(X86Opcode::InlineAsm) => "# inline asm",
+        None => "ud2",
+    }
+}
+
+/// Format a complete machine instruction in AT&T syntax for -S output.
+///
+/// AT&T syntax uses `mnemonic src, dst` order. `MachineInstruction` stores
+/// `result` as the destination and `operands` as sources. We combine them
+/// in the correct AT&T order: sources first, destination last.
+fn format_x86_instruction(inst: &MachineInstruction) -> String {
+    let mnemonic = x86_opcode_mnemonic(inst.opcode);
+
+    // Inline assembly: emit template string verbatim.
+    if mnemonic == "# inline asm" {
+        if let Some(MachineOperand::GlobalSymbol(ref template)) = inst.operands.first() {
+            return template.clone();
+        }
+        return "# inline asm (no template)".to_string();
+    }
+
+    // Zero-operand instructions (ret, nop, leave, cqo, cdq, endbr64, pause, lfence).
+    let has_result = inst.result.is_some();
+    let num_ops = inst.operands.len();
+    if !has_result && num_ops == 0 {
+        return mnemonic.to_string();
+    }
+
+    // Build the full operand list in AT&T order: sources..., destination.
+    // In our MachineInstruction:
+    //   result = destination register (if present)
+    //   operands = source operands
+    // AT&T format: mnemonic src, dst
+    let mut all_parts: Vec<String> = Vec::new();
+
+    // Source operands first (in their original order).
+    for op in &inst.operands {
+        all_parts.push(format_operand_att(op));
+    }
+
+    // Destination (result) last in AT&T convention.
+    if let Some(ref result) = inst.result {
+        all_parts.push(format_operand_att(result));
+    }
+
+    if all_parts.is_empty() {
+        return mnemonic.to_string();
+    }
+
+    // For single-operand instructions (push, pop, call, jmp, neg, not, etc.)
+    if all_parts.len() == 1 {
+        return format!("{} {}", mnemonic, all_parts[0]);
+    }
+
+    // For two or more operands: join with comma separator.
+    format!("{} {}", mnemonic, all_parts.join(", "))
 }
 
 // ===========================================================================

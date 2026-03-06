@@ -512,7 +512,13 @@ impl RiscV64Codegen {
             // Step 1: Instruction selection (IR → machine instructions).
             let empty_refs = crate::common::fx_hash::FxHashMap::default();
             let empty_gvar_refs = crate::common::fx_hash::FxHashMap::default();
-            let mf = match self.lower_function(func, diagnostics, module.globals(), &empty_refs, &empty_gvar_refs) {
+            let mf = match self.lower_function(
+                func,
+                diagnostics,
+                module.globals(),
+                &empty_refs,
+                &empty_gvar_refs,
+            ) {
                 Ok(mf) => mf,
                 Err(msg) => {
                     diagnostics.emit_error(
@@ -797,7 +803,10 @@ impl ArchCodegen for RiscV64Codegen {
         _diag: &mut DiagnosticEngine,
         _globals: &[crate::ir::module::GlobalVariable],
         _func_ref_map: &crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>,
-        _global_var_refs: &crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>,
+        _global_var_refs: &crate::common::fx_hash::FxHashMap<
+            crate::ir::instructions::Value,
+            String,
+        >,
     ) -> Result<MachineFunction, String> {
         // Build constant cache from globals (same mechanism as x86-64/i686/aarch64).
         let mut constant_values = crate::common::fx_hash::FxHashMap::default();
@@ -813,8 +822,12 @@ impl ArchCodegen for RiscV64Codegen {
             let mut ci = 0;
             for block in &func.blocks {
                 for inst in block.instructions() {
-                    if let crate::ir::instructions::Instruction::BinOp { result, lhs, rhs, .. } = inst {
-                        if *lhs == *result && *rhs == crate::ir::instructions::Value::UNDEF
+                    if let crate::ir::instructions::Instruction::BinOp {
+                        result, lhs, rhs, ..
+                    } = inst
+                    {
+                        if *lhs == *result
+                            && *rhs == crate::ir::instructions::Value::UNDEF
                             && ci < const_vals.len()
                         {
                             constant_values.insert(result.index(), const_vals[ci]);

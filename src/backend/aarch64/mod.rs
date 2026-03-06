@@ -655,7 +655,10 @@ impl ArchCodegen for AArch64Codegen {
         _diag: &mut DiagnosticEngine,
         _globals: &[crate::ir::module::GlobalVariable],
         _func_ref_map: &crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>,
-        _global_var_refs: &crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>,
+        _global_var_refs: &crate::common::fx_hash::FxHashMap<
+            crate::ir::instructions::Value,
+            String,
+        >,
     ) -> Result<MachineFunction, String> {
         if !func.is_definition {
             return Err(format!(
@@ -678,8 +681,12 @@ impl ArchCodegen for AArch64Codegen {
             let mut ci = 0;
             for block in &func.blocks {
                 for inst in block.instructions() {
-                    if let crate::ir::instructions::Instruction::BinOp { result, lhs, rhs, .. } = inst {
-                        if *lhs == *result && *rhs == crate::ir::instructions::Value::UNDEF
+                    if let crate::ir::instructions::Instruction::BinOp {
+                        result, lhs, rhs, ..
+                    } = inst
+                    {
+                        if *lhs == *result
+                            && *rhs == crate::ir::instructions::Value::UNDEF
                             && ci < const_vals.len()
                         {
                             constant_values.insert(result.index(), const_vals[ci]);
@@ -1031,10 +1038,19 @@ impl AArch64Codegen {
             x if x == OPCODE_STP
                 || x == OPCODE_STP_PRE
                 || x == OPCODE_STP_FP
-                || x == OPCODE_LDP_FP => {
+                || x == OPCODE_LDP_FP =>
+            {
                 // STP / STP_pre: operands[0]=Rt1, operands[1]=Rt2, operands[2]=Memory
-                let rt1 = mi.operands.first().and_then(|o| o.as_register()).unwrap_or(0) as u8;
-                let rt2 = mi.operands.get(1).and_then(|o| o.as_register()).unwrap_or(0) as u8;
+                let rt1 = mi
+                    .operands
+                    .first()
+                    .and_then(|o| o.as_register())
+                    .unwrap_or(0) as u8;
+                let rt2 = mi
+                    .operands
+                    .get(1)
+                    .and_then(|o| o.as_register())
+                    .unwrap_or(0) as u8;
                 let (base, disp) = Self::extract_memory_operand(&mi.operands);
                 inst.rd = Some(rt1);
                 inst.rm = Some(rt2);
@@ -1045,8 +1061,16 @@ impl AArch64Codegen {
             }
             x if x == OPCODE_LDP || x == OPCODE_LDP_POST => {
                 // LDP / LDP_post: result=Rt1, operands[0]=Rt2, operands[1]=Memory
-                let rt1 = mi.result.as_ref().and_then(|o| o.as_register()).unwrap_or(0) as u8;
-                let rt2 = mi.operands.first().and_then(|o| o.as_register()).unwrap_or(0) as u8;
+                let rt1 = mi
+                    .result
+                    .as_ref()
+                    .and_then(|o| o.as_register())
+                    .unwrap_or(0) as u8;
+                let rt2 = mi
+                    .operands
+                    .first()
+                    .and_then(|o| o.as_register())
+                    .unwrap_or(0) as u8;
                 let (base, disp) = Self::extract_memory_operand(&mi.operands);
                 inst.rd = Some(rt1);
                 inst.rm = Some(rt2);

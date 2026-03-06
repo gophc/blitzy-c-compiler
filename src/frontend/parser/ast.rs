@@ -1001,6 +1001,8 @@ pub enum BuiltinKind {
     Bswap64,
     /// `__builtin_ffs(x)` — find first set bit.
     Ffs,
+    /// `__builtin_ffsll(x)` — find first set bit (64-bit long long).
+    Ffsll,
     /// `__builtin_va_start(ap, last_named)` — initialize va_list.
     VaStart,
     /// `__builtin_va_end(ap)` — clean up va_list.

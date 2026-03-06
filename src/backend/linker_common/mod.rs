@@ -965,7 +965,7 @@ fn write_elf_output(
                     sh_type,
                     sh_flags,
                     data: data.clone(),
-                    sh_link: 0,   // Fixed up below after all sections are added.
+                    sh_link: 0, // Fixed up below after all sections are added.
                     sh_info: 0,
                     sh_addralign: align,
                     sh_entsize,
@@ -976,10 +976,8 @@ fn write_elf_output(
                 let idx = writer.add_section(elf_section);
                 dyn_section_indices.insert(sec_name.to_string(), idx as u32);
                 if is_linked {
-                    dyn_section_vaddrs.insert(
-                        sec_name.to_string(),
-                        (vaddr, foff, data.len() as u64),
-                    );
+                    dyn_section_vaddrs
+                        .insert(sec_name.to_string(), (vaddr, foff, data.len() as u64));
                 }
             }
         }
@@ -1027,6 +1025,72 @@ fn write_elf_output(
         }
     }
 
+    // ----- Patch .dynamic section entries with resolved virtual addresses -----
+    // The DynamicSection::build() initially sets DT_STRTAB, DT_SYMTAB,
+    // DT_GNU_HASH, DT_RELA, DT_JMPREL, DT_PLTGOT to zero as placeholders.
+    // Now that dyn_section_vaddrs has the final virtual addresses for each
+    // dynamic section, we patch the .dynamic section data in-place.
+    if is_linked && !dyn_section_vaddrs.is_empty() {
+        if let Some(&dyn_elf_idx) = dyn_section_indices.get(".dynamic") {
+            let vec_idx = (dyn_elf_idx as usize).saturating_sub(1);
+            let is64 = config.target.is_64bit();
+            let entry_size: usize = if is64 { 16 } else { 8 };
+            let sections = writer.sections_mut();
+            if vec_idx < sections.len() {
+                let data = &mut sections[vec_idx].data;
+                // Build a tag → vaddr map for the sections we need to patch.
+                let mut patch_map: Vec<(i64, u64)> = Vec::new();
+                if let Some(&(va, _, _)) = dyn_section_vaddrs.get(".dynstr") {
+                    patch_map.push((crate::backend::linker_common::dynamic::DT_STRTAB, va));
+                }
+                if let Some(&(va, _, _)) = dyn_section_vaddrs.get(".dynsym") {
+                    patch_map.push((crate::backend::linker_common::dynamic::DT_SYMTAB, va));
+                }
+                if let Some(&(va, _, _)) = dyn_section_vaddrs.get(".gnu.hash") {
+                    patch_map.push((crate::backend::linker_common::dynamic::DT_GNU_HASH, va));
+                }
+                if let Some(&(va, _, _)) = dyn_section_vaddrs.get(".rela.dyn") {
+                    patch_map.push((crate::backend::linker_common::dynamic::DT_RELA, va));
+                }
+                if let Some(&(va, _, _)) = dyn_section_vaddrs.get(".rela.plt") {
+                    patch_map.push((crate::backend::linker_common::dynamic::DT_JMPREL, va));
+                }
+                if let Some(&(va, _, _)) = dyn_section_vaddrs.get(".got.plt") {
+                    patch_map.push((crate::backend::linker_common::dynamic::DT_PLTGOT, va));
+                }
+                // Iterate over each .dynamic entry and patch matching tags.
+                let num_entries = data.len() / entry_size;
+                for i in 0..num_entries {
+                    let offset = i * entry_size;
+                    let tag = if is64 {
+                        i64::from_le_bytes(data[offset..offset + 8].try_into().unwrap_or([0; 8]))
+                    } else {
+                        i32::from_le_bytes(data[offset..offset + 4].try_into().unwrap_or([0; 4]))
+                            as i64
+                    };
+                    for &(patch_tag, patch_va) in &patch_map {
+                        if tag == patch_tag {
+                            if is64 {
+                                let val_offset = offset + 8;
+                                if val_offset + 8 <= data.len() {
+                                    data[val_offset..val_offset + 8]
+                                        .copy_from_slice(&patch_va.to_le_bytes());
+                                }
+                            } else {
+                                let val_offset = offset + 4;
+                                if val_offset + 4 <= data.len() {
+                                    data[val_offset..val_offset + 4]
+                                        .copy_from_slice(&(patch_va as u32).to_le_bytes());
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Add symbols to the output symbol table.
     for sym in &sym_table.symbols {
         let elf_sym = ElfSymbol {
@@ -1048,7 +1112,7 @@ fn write_elf_output(
         // ----- Add PT_DYNAMIC program header for the .dynamic section -----
         if let Some(&(dyn_vaddr, dyn_foff, dyn_size)) = dyn_section_vaddrs.get(".dynamic") {
             let pt_dynamic = crate::backend::elf_writer_common::Elf64ProgramHeader {
-                p_type: 2, // PT_DYNAMIC
+                p_type: 2,  // PT_DYNAMIC
                 p_flags: 6, // PF_R | PF_W
                 p_offset: dyn_foff,
                 p_vaddr: dyn_vaddr,
@@ -1087,7 +1151,7 @@ fn write_elf_output(
             let total_memsz = max_end_va - min_vaddr;
 
             let pt_load_dyn = crate::backend::elf_writer_common::Elf64ProgramHeader {
-                p_type: 1, // PT_LOAD
+                p_type: 1,  // PT_LOAD
                 p_flags: 6, // PF_R | PF_W (dynamic sections are readable + writable)
                 p_offset: min_foff,
                 p_vaddr: min_vaddr,

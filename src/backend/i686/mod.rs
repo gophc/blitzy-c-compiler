@@ -298,11 +298,15 @@ impl ArchCodegen for I686Codegen {
         diag: &mut DiagnosticEngine,
         _globals: &[crate::ir::module::GlobalVariable],
         _func_ref_map: &crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>,
-        _global_var_refs: &crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>,
+        _global_var_refs: &crate::common::fx_hash::FxHashMap<
+            crate::ir::instructions::Value,
+            String,
+        >,
     ) -> Result<MachineFunction, String> {
         // Delegate to the inner codegen::I686Codegen which has the full
         // instruction selection implementation.
-        self.inner.lower_function(func, diag, _globals, _func_ref_map, _global_var_refs)
+        self.inner
+            .lower_function(func, diag, _globals, _func_ref_map, _global_var_refs)
     }
 
     /// Encode i686 machine instructions to raw bytes using the built-in

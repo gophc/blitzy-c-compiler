@@ -528,6 +528,7 @@ pub fn assemble(
 
     // Create the encoder starting at the current text offset.
     let mut enc = X86_64Encoder::new(ctx.current_offset);
+    enc.pic_enabled = ctx.pic_enabled;
 
     // Iterate over all basic blocks and their instructions.
     for (block_idx, block) in mf.blocks.iter().enumerate() {

@@ -53,8 +53,8 @@
 //! crates are used.
 
 use crate::common::fx_hash::FxHashMap;
-use crate::ir::instructions::Value;
 use crate::ir::function::IrFunction;
+use crate::ir::instructions::Value;
 use crate::ir::types::IrType;
 
 // ===========================================================================

@@ -1099,15 +1099,15 @@ fn collect_struct_defs_from_specifiers(
 fn try_eval_const_int_expr(expr: &ast::Expression) -> Option<i128> {
     match expr {
         ast::Expression::IntegerLiteral { value, .. } => Some(*value as i128),
-        ast::Expression::UnaryOp { op, operand, .. } => {
-            match op {
-                ast::UnaryOp::Negate => try_eval_const_int_expr(operand).map(|v| -v),
-                ast::UnaryOp::Plus => try_eval_const_int_expr(operand),
-                ast::UnaryOp::BitwiseNot => try_eval_const_int_expr(operand).map(|v| !v),
-                _ => None,
-            }
-        }
-        ast::Expression::Binary { op, left, right, .. } => {
+        ast::Expression::UnaryOp { op, operand, .. } => match op {
+            ast::UnaryOp::Negate => try_eval_const_int_expr(operand).map(|v| -v),
+            ast::UnaryOp::Plus => try_eval_const_int_expr(operand),
+            ast::UnaryOp::BitwiseNot => try_eval_const_int_expr(operand).map(|v| !v),
+            _ => None,
+        },
+        ast::Expression::Binary {
+            op, left, right, ..
+        } => {
             let l = try_eval_const_int_expr(left)?;
             let r = try_eval_const_int_expr(right)?;
             match op {
@@ -1115,10 +1115,18 @@ fn try_eval_const_int_expr(expr: &ast::Expression) -> Option<i128> {
                 ast::BinaryOp::Sub => Some(l - r),
                 ast::BinaryOp::Mul => Some(l * r),
                 ast::BinaryOp::Div => {
-                    if r != 0 { Some(l / r) } else { None }
+                    if r != 0 {
+                        Some(l / r)
+                    } else {
+                        None
+                    }
                 }
                 ast::BinaryOp::Mod => {
-                    if r != 0 { Some(l % r) } else { None }
+                    if r != 0 {
+                        Some(l % r)
+                    } else {
+                        None
+                    }
                 }
                 ast::BinaryOp::ShiftLeft => Some(l << (r as u32)),
                 ast::BinaryOp::ShiftRight => Some(l >> (r as u32)),

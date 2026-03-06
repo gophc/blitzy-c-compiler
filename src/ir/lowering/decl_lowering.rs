@@ -1143,9 +1143,7 @@ fn lower_static_local(
 /// Evaluate a simple constant expression for static variable initialization.
 fn eval_static_init_expr(expr: &ast::Expression, _c_type: &CType) -> Option<Constant> {
     match expr {
-        ast::Expression::IntegerLiteral { value, .. } => {
-            Some(Constant::Integer(*value as i128))
-        }
+        ast::Expression::IntegerLiteral { value, .. } => Some(Constant::Integer(*value as i128)),
         ast::Expression::UnaryOp { op, operand, .. } => {
             if matches!(op, ast::UnaryOp::Negate) {
                 if let ast::Expression::IntegerLiteral { value, .. } = operand.as_ref() {
@@ -1292,9 +1290,8 @@ fn extract_section_attribute(
 /// `StructField` entries that can be used in `CType::Struct` / `CType::Union`.
 pub fn extract_struct_union_fields(spec: &ast::StructOrUnionSpecifier) -> Vec<StructField> {
     // Use thread-local name table for symbol resolution
-    let name_table = super::INTERNER_SNAPSHOT.with(|snap| {
-        snap.borrow().as_ref().cloned().unwrap_or_default()
-    });
+    let name_table =
+        super::INTERNER_SNAPSHOT.with(|snap| snap.borrow().as_ref().cloned().unwrap_or_default());
     let mut fields = Vec::new();
     if let Some(ref members) = spec.members {
         for member in members {
@@ -1309,13 +1306,15 @@ pub fn extract_struct_union_fields(spec: &ast::StructOrUnionSpecifier) -> Vec<St
                 });
             } else {
                 for sd in &member.declarators {
-                    let bit_width = sd.bit_width.as_ref().and_then(|e| {
-                        evaluate_const_int_expr(e).map(|v| v as u32)
-                    });
+                    let bit_width = sd
+                        .bit_width
+                        .as_ref()
+                        .and_then(|e| evaluate_const_int_expr(e).map(|v| v as u32));
                     if let Some(ref declarator) = sd.declarator {
                         let name = extract_declarator_name(declarator, &name_table);
                         // Apply pointer/array modifiers from declarator
-                        let member_type = apply_declarator_type(member_base.clone(), declarator, &name_table);
+                        let member_type =
+                            apply_declarator_type(member_base.clone(), declarator, &name_table);
                         fields.push(StructField {
                             name,
                             ty: member_type,
@@ -1436,9 +1435,8 @@ fn sym_to_string(sym: &crate::common::string_interner::Symbol, name_table: &[Str
 
 fn map_single_type_specifier(spec: &ast::TypeSpecifier) -> CType {
     // Use thread-local name table for symbol resolution
-    let name_table = super::INTERNER_SNAPSHOT.with(|snap| {
-        snap.borrow().as_ref().cloned().unwrap_or_default()
-    });
+    let name_table =
+        super::INTERNER_SNAPSHOT.with(|snap| snap.borrow().as_ref().cloned().unwrap_or_default());
     map_single_type_specifier_with_names(spec, &name_table)
 }
 
@@ -1462,7 +1460,7 @@ fn map_single_type_specifier_with_names(spec: &ast::TypeSpecifier, name_table: &
                 packed: false,
                 aligned: None,
             }
-        },
+        }
         ast::TypeSpecifier::Union(u) => {
             let fields = extract_struct_union_fields(u);
             CType::Union {
@@ -1471,7 +1469,7 @@ fn map_single_type_specifier_with_names(spec: &ast::TypeSpecifier, name_table: &
                 packed: false,
                 aligned: None,
             }
-        },
+        }
         ast::TypeSpecifier::Enum(e) => CType::Enum {
             name: e.tag.as_ref().map(|t| sym_to_string(t, name_table)),
             underlying_type: Box::new(CType::Int),
@@ -1567,7 +1565,7 @@ fn resolve_multi_word_type(specs: &[ast::TypeSpecifier]) -> CType {
     }
 }
 
-fn resolve_declaration_type(
+pub fn resolve_declaration_type(
     specifiers: &ast::DeclarationSpecifiers,
     declarator: &ast::Declarator,
     target: &Target,

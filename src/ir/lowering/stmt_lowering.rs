@@ -340,7 +340,7 @@ fn lower_compound_statement(
 ///
 /// Declarations without initializers (e.g., `int x;`) are no-ops — the alloca
 /// already exists and the value is undefined until a later assignment.
-fn lower_declaration_initializers(ctx: &mut StmtLoweringContext<'_>, decl: &ast::Declaration) {
+pub fn lower_declaration_initializers(ctx: &mut StmtLoweringContext<'_>, decl: &ast::Declaration) {
     // Skip extern declarations — they don't allocate stack storage.
     if matches!(
         decl.specifiers.storage_class,
@@ -411,7 +411,7 @@ fn lower_declaration_initializers(ctx: &mut StmtLoweringContext<'_>, decl: &ast:
 
 /// Extract the variable name from a declarator by walking into the
 /// DirectDeclarator tree. Returns `None` if no identifier is found.
-fn extract_decl_name(declarator: &ast::Declarator, name_table: &[String]) -> Option<String> {
+pub fn extract_decl_name(declarator: &ast::Declarator, name_table: &[String]) -> Option<String> {
     extract_dd_name(&declarator.direct, name_table)
 }
 

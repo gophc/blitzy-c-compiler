@@ -63,9 +63,9 @@ use super::gcc_extensions;
 use super::types;
 use super::Parser;
 use crate::common::diagnostics::Span;
+use crate::common::encoding::decode_string_to_bytes;
 use crate::common::string_interner::Symbol;
 use crate::frontend::lexer::token as token_types;
-use crate::common::encoding::decode_string_to_bytes;
 use crate::frontend::lexer::token::TokenKind;
 
 // ===========================================================================
@@ -1032,6 +1032,7 @@ fn parse_primary_expression(parser: &mut Parser<'_>) -> Result<Expression, ()> {
         TokenKind::BuiltinBswap32 => parse_builtin_simple(parser, BuiltinKind::Bswap32),
         TokenKind::BuiltinBswap64 => parse_builtin_simple(parser, BuiltinKind::Bswap64),
         TokenKind::BuiltinFfs => parse_builtin_simple(parser, BuiltinKind::Ffs),
+        TokenKind::BuiltinFfsll => parse_builtin_simple(parser, BuiltinKind::Ffsll),
         TokenKind::BuiltinFrameAddress => parse_builtin_simple(parser, BuiltinKind::FrameAddress),
         TokenKind::BuiltinReturnAddress => parse_builtin_simple(parser, BuiltinKind::ReturnAddress),
         TokenKind::BuiltinAssumeAligned => parse_builtin_simple(parser, BuiltinKind::AssumeAligned),

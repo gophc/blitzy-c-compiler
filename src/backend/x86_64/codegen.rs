@@ -571,8 +571,7 @@ impl X86_64CodeGen {
         // Pair orphaned values with constants in order.
         let mut used_const_indices: std::collections::HashSet<usize> =
             std::collections::HashSet::new();
-        for (pair_idx, (orphan, (_idx, value))) in
-            orphans.iter().zip(int_consts.iter()).enumerate()
+        for (pair_idx, (orphan, (_idx, value))) in orphans.iter().zip(int_consts.iter()).enumerate()
         {
             self.constant_cache.insert(Value(*orphan), *value);
             used_const_indices.insert(pair_idx);
@@ -1506,6 +1505,7 @@ impl X86_64CodeGen {
                 ..
             } => {
                 let base_op = self.get_value(*base);
+                let base_op_saved = base_op.clone();
                 let dst = self.new_vreg();
                 self.set_value(*result, dst.clone());
 
@@ -1560,19 +1560,39 @@ impl X86_64CodeGen {
                             ));
                         } else {
                             // Register index with non-unity element size.
-                            // Use IMUL + ADD to avoid embedding vregs in Memory operands
-                            // (the register allocator cannot see inside Memory base/index).
+                            // Use three-operand IMUL writing to the GEP
+                            // result vreg (which IS allocated by the
+                            // register allocator) to avoid creating
+                            // untracked intermediate virtual registers.
+                            //
+                            // Save the current base to a temp position,
+                            // compute scaled index into dst, then add
+                            // the saved base back.
+                            //
+                            // Pattern:
+                            //   IMUL dst, idx_op, elem_size  (3-op)
+                            //   ADD  dst, base_saved
+                            //
+                            // Here base_saved is the base that was
+                            // previously MOV'd into dst at the start
+                            // of the GEP expansion. We re-fetch it:
+                            // since base_op was set at the top, we can
+                            // use the original base_op which is still
+                            // live in its assigned register.
                             {
-                                let scaled = self.new_vreg();
+                                // Three-operand IMUL: dst = idx * size
+                                // This writes into the GEP result vreg.
                                 out.push(Self::mk_inst(
                                     X86Opcode::Imul,
-                                    Some(scaled.clone()),
+                                    Some(dst.clone()),
                                     &[idx_op, MachineOperand::Immediate(elem_size)],
                                 ));
+                                // ADD dst, base — add the original
+                                // base address (still in its register).
                                 out.push(Self::mk_inst(
                                     X86Opcode::Add,
                                     Some(dst.clone()),
-                                    &[dst.clone(), scaled],
+                                    &[dst.clone(), base_op_saved.clone()],
                                 ));
                             }
                         }
@@ -1747,24 +1767,19 @@ impl X86_64CodeGen {
                 // NOTE: The encoder normalizes result into operands[0],
                 // so we provide only rhs as the explicit operand.
                 out.push(Self::mk_inst(X86Opcode::Mov, Some(dst.clone()), &[lhs_op]));
-                out.push(Self::mk_inst(
-                    X86Opcode::Add,
-                    Some(dst.clone()),
-                    &[rhs_op],
-                ));
+                out.push(Self::mk_inst(X86Opcode::Add, Some(dst.clone()), &[rhs_op]));
             }
             BinOp::Sub => {
                 // x86 two-address form: dst = lhs - rhs
                 out.push(Self::mk_inst(X86Opcode::Mov, Some(dst.clone()), &[lhs_op]));
-                out.push(Self::mk_inst(
-                    X86Opcode::Sub,
-                    Some(dst.clone()),
-                    &[rhs_op],
-                ));
+                out.push(Self::mk_inst(X86Opcode::Sub, Some(dst.clone()), &[rhs_op]));
             }
             BinOp::Mul => {
-                // IMUL dst, lhs, rhs (three-operand form)
-                out.push(Self::mk_inst(X86Opcode::Imul, Some(dst), &[lhs_op, rhs_op]));
+                // x86 two-address form: dst = lhs * rhs
+                // 1. MOV dst, lhs     (dst now holds the lhs value)
+                // 2. IMUL dst, rhs    (dst *= rhs)
+                out.push(Self::mk_inst(X86Opcode::Mov, Some(dst.clone()), &[lhs_op]));
+                out.push(Self::mk_inst(X86Opcode::Imul, Some(dst), &[rhs_op]));
             }
             BinOp::SDiv => {
                 // CQO ; IDIV rhs → quotient in RAX
@@ -1844,27 +1859,15 @@ impl X86_64CodeGen {
             // NOTE: The encoder normalizes result into operands[0],
             // so we provide only rhs as the explicit operand.
             BinOp::And => {
-                out.push(Self::mk_inst(
-                    X86Opcode::Mov,
-                    Some(dst.clone()),
-                    &[lhs_op],
-                ));
+                out.push(Self::mk_inst(X86Opcode::Mov, Some(dst.clone()), &[lhs_op]));
                 out.push(Self::mk_inst(X86Opcode::And, Some(dst), &[rhs_op]));
             }
             BinOp::Or => {
-                out.push(Self::mk_inst(
-                    X86Opcode::Mov,
-                    Some(dst.clone()),
-                    &[lhs_op],
-                ));
+                out.push(Self::mk_inst(X86Opcode::Mov, Some(dst.clone()), &[lhs_op]));
                 out.push(Self::mk_inst(X86Opcode::Or, Some(dst), &[rhs_op]));
             }
             BinOp::Xor => {
-                out.push(Self::mk_inst(
-                    X86Opcode::Mov,
-                    Some(dst.clone()),
-                    &[lhs_op],
-                ));
+                out.push(Self::mk_inst(X86Opcode::Mov, Some(dst.clone()), &[lhs_op]));
                 out.push(Self::mk_inst(X86Opcode::Xor, Some(dst), &[rhs_op]));
             }
 
@@ -2261,7 +2264,10 @@ impl ArchCodegen for X86_64CodeGen {
     }
 
     /// Emit machine code bytes from a MachineFunction.
-    fn emit_assembly(&self, mf: &MachineFunction) -> Result<crate::backend::traits::AssembledFunction, String> {
+    fn emit_assembly(
+        &self,
+        mf: &MachineFunction,
+    ) -> Result<crate::backend::traits::AssembledFunction, String> {
         use crate::backend::x86_64::assembler::encoder::X86_64Encoder;
 
         let mut encoder = X86_64Encoder::new(0);

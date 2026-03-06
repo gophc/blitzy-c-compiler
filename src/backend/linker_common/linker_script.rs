@@ -937,8 +937,14 @@ impl DefaultLinkerScript {
                     let is_first_load = seg_def.seg_type == PT_LOAD
                         && !segment_layouts.iter().any(|s| s.seg_type == PT_LOAD);
 
-                    let (seg_offset, seg_vaddr) = if is_first_load && self.base_address > 0 {
-                        // Extend to cover from the start of the file.
+                    let (seg_offset, seg_vaddr) = if is_first_load {
+                        // Extend to cover from the start of the file
+                        // (ELF header + program header table).  This ensures
+                        // the PT_PHDR segment is covered by a PT_LOAD
+                        // segment, satisfying the ELF specification and
+                        // the kernel/dynamic linker loader.  For shared
+                        // objects (base_address == 0) we still extend to
+                        // offset 0 so the PHDR is covered.
                         (0u64, self.base_address)
                     } else {
                         (first_offset, first_vaddr)

@@ -364,6 +364,35 @@ pub fn register_predefined_macros(macro_defs: &mut FxHashMap<String, MacroDef>, 
     }
 
     // -------------------------------------------------------------------
+    // 7b. Standard C limit macros (provided directly since BCC does not
+    //     support #include_next and the system <limits.h> chain relies on it)
+    // -------------------------------------------------------------------
+    register_object_macro(macro_defs, "CHAR_BIT", "8");
+    register_object_macro(macro_defs, "SCHAR_MIN", "(-128)");
+    register_object_macro(macro_defs, "SCHAR_MAX", "127");
+    register_object_macro(macro_defs, "UCHAR_MAX", "255");
+    register_object_macro(macro_defs, "CHAR_MIN", "(-128)");
+    register_object_macro(macro_defs, "CHAR_MAX", "127");
+    register_object_macro(macro_defs, "SHRT_MIN", "(-32768)");
+    register_object_macro(macro_defs, "SHRT_MAX", "32767");
+    register_object_macro(macro_defs, "USHRT_MAX", "65535");
+    register_object_macro(macro_defs, "INT_MIN", "(-2147483647 - 1)");
+    register_object_macro(macro_defs, "INT_MAX", "2147483647");
+    register_object_macro(macro_defs, "UINT_MAX", "4294967295U");
+    register_object_macro(macro_defs, "LLONG_MIN", "(-9223372036854775807LL - 1)");
+    register_object_macro(macro_defs, "LLONG_MAX", "9223372036854775807LL");
+    register_object_macro(macro_defs, "ULLONG_MAX", "18446744073709551615ULL");
+    if target.is_64bit() {
+        register_object_macro(macro_defs, "LONG_MIN", "(-9223372036854775807L - 1)");
+        register_object_macro(macro_defs, "LONG_MAX", "9223372036854775807L");
+        register_object_macro(macro_defs, "ULONG_MAX", "18446744073709551615UL");
+    } else {
+        register_object_macro(macro_defs, "LONG_MIN", "(-2147483647L - 1)");
+        register_object_macro(macro_defs, "LONG_MAX", "2147483647L");
+        register_object_macro(macro_defs, "ULONG_MAX", "4294967295UL");
+    }
+
+    // -------------------------------------------------------------------
     // 8. Type definition macros — some target-dependent
     // -------------------------------------------------------------------
     register_object_macro(macro_defs, "__CHAR_UNSIGNED__", "0");
