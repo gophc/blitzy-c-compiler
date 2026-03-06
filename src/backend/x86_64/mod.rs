@@ -8,3 +8,4 @@ pub mod assembler;
 pub mod codegen;
 pub mod linker;
 pub mod registers;
+pub mod security;
