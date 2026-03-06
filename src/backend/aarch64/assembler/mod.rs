@@ -18,4 +18,5 @@
 //! No external assembler is invoked. This module, together with `encoder.rs` and
 //! `relocations.rs`, is entirely self-contained per BCC's zero-dependency mandate.
 
+pub mod encoder;
 pub mod relocations;

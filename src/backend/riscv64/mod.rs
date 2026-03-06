@@ -49,8 +49,8 @@ pub mod registers;
 // ===========================================================================
 
 use crate::backend::elf_writer_common::{
-    self, ElfSymbol, ElfWriter, Relocation, Section, ET_REL, SHF_ALLOC, SHF_EXECINSTR,
-    SHF_WRITE, SHT_NOBITS, SHT_PROGBITS, STB_GLOBAL, STB_LOCAL,
+    self, ElfSymbol, ElfWriter, Relocation, Section, ET_REL, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE,
+    SHT_NOBITS, SHT_PROGBITS, STB_GLOBAL, STB_LOCAL,
 };
 use crate::backend::traits::{
     ArchCodegen, ArgLocation, MachineBasicBlock, MachineFunction, MachineInstruction,
@@ -76,7 +76,9 @@ use self::registers::{RiscV64RegisterInfo, FP, RA, SP};
 // ===========================================================================
 
 pub use self::abi::{ArgClass, FrameLayout, RiscV64Abi as RiscV64AbiExport};
-pub use self::codegen::{RiscV64InstructionSelector as RiscV64InstructionSelectorExport, RvInstruction, RvOpcode};
+pub use self::codegen::{
+    RiscV64InstructionSelector as RiscV64InstructionSelectorExport, RvInstruction, RvOpcode,
+};
 pub use self::registers::{RegClass, RiscV64RegisterInfo as RiscV64RegisterInfoExport};
 
 // ===========================================================================
@@ -368,8 +370,7 @@ impl RiscV64Codegen {
             }
             IrType::Function(ret, params) => {
                 let ret_ctype = Self::ir_type_to_ctype(ret);
-                let param_ctypes: Vec<CType> =
-                    params.iter().map(Self::ir_type_to_ctype).collect();
+                let param_ctypes: Vec<CType> = params.iter().map(Self::ir_type_to_ctype).collect();
                 CType::Function {
                     return_type: Box::new(ret_ctype),
                     params: param_ctypes,

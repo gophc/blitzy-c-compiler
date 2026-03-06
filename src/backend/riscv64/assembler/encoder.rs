@@ -52,9 +52,9 @@
 //!
 //! ## Byte Order: Little-endian (LSB first)
 
+use super::relocations::RiscV64RelocationType;
 use crate::backend::riscv64::codegen::{RvInstruction, RvOpcode};
 use crate::backend::riscv64::registers;
-use super::relocations::RiscV64RelocationType;
 
 // ===========================================================================
 // RV32I/RV64I Base Opcode Constants (7-bit opcode field, bits 6:0)
@@ -326,7 +326,6 @@ impl RiscV64Encoder {
             // =============================================================
             // Pseudo-instructions — expanded to real instructions
             // =============================================================
-
             RvOpcode::NOP => {
                 // NOP → ADDI x0, x0, 0
                 Ok(make_std(encode_i_type(OP_OP_IMM, 0, FUNCT3_ADDI, 0, 0)))
@@ -337,17 +336,11 @@ impl RiscV64Encoder {
                 Ok(make_std(encode_i_type(OP_OP_IMM, rd, FUNCT3_ADDI, rs1, 0)))
             }
 
-            RvOpcode::LI => {
-                self.encode_li(rd, imm, &inst.symbol)
-            }
+            RvOpcode::LI => self.encode_li(rd, imm, &inst.symbol),
 
-            RvOpcode::LA => {
-                self.encode_la(rd, imm, &inst.symbol)
-            }
+            RvOpcode::LA => self.encode_la(rd, imm, &inst.symbol),
 
-            RvOpcode::CALL => {
-                self.encode_call(&inst.symbol, imm)
-            }
+            RvOpcode::CALL => self.encode_call(&inst.symbol, imm),
 
             RvOpcode::RET => {
                 // RET → JALR x0, ra, 0
@@ -359,7 +352,14 @@ impl RiscV64Encoder {
             RvOpcode::NEG => {
                 // NEG rd, rs2 → SUB rd, x0, rs2
                 let zero_hw = registers::hw_encoding(registers::ZERO);
-                Ok(make_std(encode_r_type(OP_OP, rd, FUNCT3_ADD_SUB, zero_hw, rs2, FUNCT7_SUB)))
+                Ok(make_std(encode_r_type(
+                    OP_OP,
+                    rd,
+                    FUNCT3_ADD_SUB,
+                    zero_hw,
+                    rs2,
+                    FUNCT7_SUB,
+                )))
             }
 
             RvOpcode::NOT => {
@@ -375,7 +375,14 @@ impl RiscV64Encoder {
             RvOpcode::SNEZ => {
                 // SNEZ rd, rs2 → SLTU rd, x0, rs2
                 let zero_hw = registers::hw_encoding(registers::ZERO);
-                Ok(make_std(encode_r_type(OP_OP, rd, FUNCT3_SLTU, zero_hw, rs2, FUNCT7_NORMAL)))
+                Ok(make_std(encode_r_type(
+                    OP_OP,
+                    rd,
+                    FUNCT3_SLTU,
+                    zero_hw,
+                    rs2,
+                    FUNCT7_NORMAL,
+                )))
             }
 
             RvOpcode::J => {
@@ -400,7 +407,6 @@ impl RiscV64Encoder {
             // =============================================================
             // U-type: LUI, AUIPC
             // =============================================================
-
             RvOpcode::LUI => {
                 if inst.symbol.is_some() {
                     let word = encode_u_type(OP_LUI, rd, 0);
@@ -440,7 +446,6 @@ impl RiscV64Encoder {
             // =============================================================
             // J-type: JAL
             // =============================================================
-
             RvOpcode::JAL => {
                 if inst.symbol.is_some() {
                     let word = encode_j_type(OP_JAL, rd, 0);
@@ -462,15 +467,11 @@ impl RiscV64Encoder {
             // =============================================================
             // I-type: JALR
             // =============================================================
-
-            RvOpcode::JALR => {
-                Ok(make_std(encode_i_type(OP_JALR, rd, 0, rs1, imm32)))
-            }
+            RvOpcode::JALR => Ok(make_std(encode_i_type(OP_JALR, rd, 0, rs1, imm32))),
 
             // =============================================================
             // B-type: Branch instructions
             // =============================================================
-
             RvOpcode::BEQ => self.encode_branch(FUNCT3_BEQ, rs1, rs2, imm, &inst.symbol),
             RvOpcode::BNE => self.encode_branch(FUNCT3_BNE, rs1, rs2, imm, &inst.symbol),
             RvOpcode::BLT => self.encode_branch(FUNCT3_BLT, rs1, rs2, imm, &inst.symbol),
@@ -481,11 +482,10 @@ impl RiscV64Encoder {
             // =============================================================
             // I-type: Load instructions
             // =============================================================
-
-            RvOpcode::LB  => Ok(make_std(encode_i_type(OP_LOAD, rd, FUNCT3_LB, rs1, imm32))),
-            RvOpcode::LH  => Ok(make_std(encode_i_type(OP_LOAD, rd, FUNCT3_LH, rs1, imm32))),
-            RvOpcode::LW  => Ok(make_std(encode_i_type(OP_LOAD, rd, FUNCT3_LW, rs1, imm32))),
-            RvOpcode::LD  => Ok(make_std(encode_i_type(OP_LOAD, rd, FUNCT3_LD, rs1, imm32))),
+            RvOpcode::LB => Ok(make_std(encode_i_type(OP_LOAD, rd, FUNCT3_LB, rs1, imm32))),
+            RvOpcode::LH => Ok(make_std(encode_i_type(OP_LOAD, rd, FUNCT3_LH, rs1, imm32))),
+            RvOpcode::LW => Ok(make_std(encode_i_type(OP_LOAD, rd, FUNCT3_LW, rs1, imm32))),
+            RvOpcode::LD => Ok(make_std(encode_i_type(OP_LOAD, rd, FUNCT3_LD, rs1, imm32))),
             RvOpcode::LBU => Ok(make_std(encode_i_type(OP_LOAD, rd, FUNCT3_LBU, rs1, imm32))),
             RvOpcode::LHU => Ok(make_std(encode_i_type(OP_LOAD, rd, FUNCT3_LHU, rs1, imm32))),
             RvOpcode::LWU => Ok(make_std(encode_i_type(OP_LOAD, rd, FUNCT3_LWU, rs1, imm32))),
@@ -493,232 +493,1060 @@ impl RiscV64Encoder {
             // =============================================================
             // S-type: Store instructions
             // =============================================================
-
-            RvOpcode::SB => Ok(make_std(encode_s_type(OP_STORE, FUNCT3_SB, rs1, rs2, imm32))),
-            RvOpcode::SH => Ok(make_std(encode_s_type(OP_STORE, FUNCT3_SH, rs1, rs2, imm32))),
-            RvOpcode::SW => Ok(make_std(encode_s_type(OP_STORE, FUNCT3_SW, rs1, rs2, imm32))),
-            RvOpcode::SD => Ok(make_std(encode_s_type(OP_STORE, FUNCT3_SD, rs1, rs2, imm32))),
+            RvOpcode::SB => Ok(make_std(encode_s_type(
+                OP_STORE, FUNCT3_SB, rs1, rs2, imm32,
+            ))),
+            RvOpcode::SH => Ok(make_std(encode_s_type(
+                OP_STORE, FUNCT3_SH, rs1, rs2, imm32,
+            ))),
+            RvOpcode::SW => Ok(make_std(encode_s_type(
+                OP_STORE, FUNCT3_SW, rs1, rs2, imm32,
+            ))),
+            RvOpcode::SD => Ok(make_std(encode_s_type(
+                OP_STORE, FUNCT3_SD, rs1, rs2, imm32,
+            ))),
 
             // =============================================================
             // I-type: ALU immediate
             // =============================================================
-
-            RvOpcode::ADDI  => Ok(make_std(encode_i_type(OP_OP_IMM, rd, FUNCT3_ADDI, rs1, imm32))),
-            RvOpcode::SLTI  => Ok(make_std(encode_i_type(OP_OP_IMM, rd, FUNCT3_SLTI, rs1, imm32))),
-            RvOpcode::SLTIU => Ok(make_std(encode_i_type(OP_OP_IMM, rd, FUNCT3_SLTIU, rs1, imm32))),
-            RvOpcode::XORI  => Ok(make_std(encode_i_type(OP_OP_IMM, rd, FUNCT3_XORI, rs1, imm32))),
-            RvOpcode::ORI   => Ok(make_std(encode_i_type(OP_OP_IMM, rd, FUNCT3_ORI, rs1, imm32))),
-            RvOpcode::ANDI  => Ok(make_std(encode_i_type(OP_OP_IMM, rd, FUNCT3_ANDI, rs1, imm32))),
+            RvOpcode::ADDI => Ok(make_std(encode_i_type(
+                OP_OP_IMM,
+                rd,
+                FUNCT3_ADDI,
+                rs1,
+                imm32,
+            ))),
+            RvOpcode::SLTI => Ok(make_std(encode_i_type(
+                OP_OP_IMM,
+                rd,
+                FUNCT3_SLTI,
+                rs1,
+                imm32,
+            ))),
+            RvOpcode::SLTIU => Ok(make_std(encode_i_type(
+                OP_OP_IMM,
+                rd,
+                FUNCT3_SLTIU,
+                rs1,
+                imm32,
+            ))),
+            RvOpcode::XORI => Ok(make_std(encode_i_type(
+                OP_OP_IMM,
+                rd,
+                FUNCT3_XORI,
+                rs1,
+                imm32,
+            ))),
+            RvOpcode::ORI => Ok(make_std(encode_i_type(
+                OP_OP_IMM, rd, FUNCT3_ORI, rs1, imm32,
+            ))),
+            RvOpcode::ANDI => Ok(make_std(encode_i_type(
+                OP_OP_IMM,
+                rd,
+                FUNCT3_ANDI,
+                rs1,
+                imm32,
+            ))),
 
             // Shift immediate (I-type with funct7 encoded in upper bits of imm)
             RvOpcode::SLLI => {
                 // RV64: shamt is 6 bits (imm[5:0]), funct6=000000 in bits [31:26]
                 let shamt = (imm as u32) & 0x3F;
                 let imm_field = shamt as i32; // upper bits are 0 for SLLI
-                Ok(make_std(encode_i_type(OP_OP_IMM, rd, FUNCT3_SLLI, rs1, imm_field)))
+                Ok(make_std(encode_i_type(
+                    OP_OP_IMM,
+                    rd,
+                    FUNCT3_SLLI,
+                    rs1,
+                    imm_field,
+                )))
             }
             RvOpcode::SRLI => {
                 // funct6=000000 in bits [31:26], shamt in [5:0]
                 let shamt = (imm as u32) & 0x3F;
                 let imm_field = shamt as i32;
-                Ok(make_std(encode_i_type(OP_OP_IMM, rd, FUNCT3_SRLI_SRAI, rs1, imm_field)))
+                Ok(make_std(encode_i_type(
+                    OP_OP_IMM,
+                    rd,
+                    FUNCT3_SRLI_SRAI,
+                    rs1,
+                    imm_field,
+                )))
             }
             RvOpcode::SRAI => {
                 // funct6=010000 in bits [31:26], shamt in [5:0]
                 let shamt = (imm as u32) & 0x3F;
                 let imm_field = (0b010000 << 6 | shamt) as i32;
-                Ok(make_std(encode_i_type(OP_OP_IMM, rd, FUNCT3_SRLI_SRAI, rs1, imm_field)))
+                Ok(make_std(encode_i_type(
+                    OP_OP_IMM,
+                    rd,
+                    FUNCT3_SRLI_SRAI,
+                    rs1,
+                    imm_field,
+                )))
             }
 
             // =============================================================
             // R-type: ALU register-register
             // =============================================================
-
-            RvOpcode::ADD  => Ok(make_std(encode_r_type(OP_OP, rd, FUNCT3_ADD_SUB, rs1, rs2, FUNCT7_NORMAL))),
-            RvOpcode::SUB  => Ok(make_std(encode_r_type(OP_OP, rd, FUNCT3_ADD_SUB, rs1, rs2, FUNCT7_SUB))),
-            RvOpcode::SLL  => Ok(make_std(encode_r_type(OP_OP, rd, FUNCT3_SLL, rs1, rs2, FUNCT7_NORMAL))),
-            RvOpcode::SLT  => Ok(make_std(encode_r_type(OP_OP, rd, FUNCT3_SLT, rs1, rs2, FUNCT7_NORMAL))),
-            RvOpcode::SLTU => Ok(make_std(encode_r_type(OP_OP, rd, FUNCT3_SLTU, rs1, rs2, FUNCT7_NORMAL))),
-            RvOpcode::XOR  => Ok(make_std(encode_r_type(OP_OP, rd, FUNCT3_XOR, rs1, rs2, FUNCT7_NORMAL))),
-            RvOpcode::SRL  => Ok(make_std(encode_r_type(OP_OP, rd, FUNCT3_SRL_SRA, rs1, rs2, FUNCT7_NORMAL))),
-            RvOpcode::SRA  => Ok(make_std(encode_r_type(OP_OP, rd, FUNCT3_SRL_SRA, rs1, rs2, FUNCT7_SUB))),
-            RvOpcode::OR   => Ok(make_std(encode_r_type(OP_OP, rd, FUNCT3_OR, rs1, rs2, FUNCT7_NORMAL))),
-            RvOpcode::AND  => Ok(make_std(encode_r_type(OP_OP, rd, FUNCT3_AND, rs1, rs2, FUNCT7_NORMAL))),
+            RvOpcode::ADD => Ok(make_std(encode_r_type(
+                OP_OP,
+                rd,
+                FUNCT3_ADD_SUB,
+                rs1,
+                rs2,
+                FUNCT7_NORMAL,
+            ))),
+            RvOpcode::SUB => Ok(make_std(encode_r_type(
+                OP_OP,
+                rd,
+                FUNCT3_ADD_SUB,
+                rs1,
+                rs2,
+                FUNCT7_SUB,
+            ))),
+            RvOpcode::SLL => Ok(make_std(encode_r_type(
+                OP_OP,
+                rd,
+                FUNCT3_SLL,
+                rs1,
+                rs2,
+                FUNCT7_NORMAL,
+            ))),
+            RvOpcode::SLT => Ok(make_std(encode_r_type(
+                OP_OP,
+                rd,
+                FUNCT3_SLT,
+                rs1,
+                rs2,
+                FUNCT7_NORMAL,
+            ))),
+            RvOpcode::SLTU => Ok(make_std(encode_r_type(
+                OP_OP,
+                rd,
+                FUNCT3_SLTU,
+                rs1,
+                rs2,
+                FUNCT7_NORMAL,
+            ))),
+            RvOpcode::XOR => Ok(make_std(encode_r_type(
+                OP_OP,
+                rd,
+                FUNCT3_XOR,
+                rs1,
+                rs2,
+                FUNCT7_NORMAL,
+            ))),
+            RvOpcode::SRL => Ok(make_std(encode_r_type(
+                OP_OP,
+                rd,
+                FUNCT3_SRL_SRA,
+                rs1,
+                rs2,
+                FUNCT7_NORMAL,
+            ))),
+            RvOpcode::SRA => Ok(make_std(encode_r_type(
+                OP_OP,
+                rd,
+                FUNCT3_SRL_SRA,
+                rs1,
+                rs2,
+                FUNCT7_SUB,
+            ))),
+            RvOpcode::OR => Ok(make_std(encode_r_type(
+                OP_OP,
+                rd,
+                FUNCT3_OR,
+                rs1,
+                rs2,
+                FUNCT7_NORMAL,
+            ))),
+            RvOpcode::AND => Ok(make_std(encode_r_type(
+                OP_OP,
+                rd,
+                FUNCT3_AND,
+                rs1,
+                rs2,
+                FUNCT7_NORMAL,
+            ))),
 
             // =============================================================
             // RV64I Word variants (32-bit ops, sign-extended result)
             // =============================================================
-
-            RvOpcode::ADDIW => Ok(make_std(encode_i_type(OP_OP_IMM_32, rd, FUNCT3_ADDI, rs1, imm32))),
+            RvOpcode::ADDIW => Ok(make_std(encode_i_type(
+                OP_OP_IMM_32,
+                rd,
+                FUNCT3_ADDI,
+                rs1,
+                imm32,
+            ))),
             RvOpcode::SLLIW => {
                 // 5-bit shamt, funct7=0000000
                 let shamt = (imm as u32) & 0x1F;
-                Ok(make_std(encode_i_type(OP_OP_IMM_32, rd, FUNCT3_SLLI, rs1, shamt as i32)))
+                Ok(make_std(encode_i_type(
+                    OP_OP_IMM_32,
+                    rd,
+                    FUNCT3_SLLI,
+                    rs1,
+                    shamt as i32,
+                )))
             }
             RvOpcode::SRLIW => {
                 let shamt = (imm as u32) & 0x1F;
-                Ok(make_std(encode_i_type(OP_OP_IMM_32, rd, FUNCT3_SRLI_SRAI, rs1, shamt as i32)))
+                Ok(make_std(encode_i_type(
+                    OP_OP_IMM_32,
+                    rd,
+                    FUNCT3_SRLI_SRAI,
+                    rs1,
+                    shamt as i32,
+                )))
             }
             RvOpcode::SRAIW => {
                 let shamt = (imm as u32) & 0x1F;
                 let imm_field = (0b0100000 << 5 | shamt) as i32;
-                Ok(make_std(encode_i_type(OP_OP_IMM_32, rd, FUNCT3_SRLI_SRAI, rs1, imm_field)))
+                Ok(make_std(encode_i_type(
+                    OP_OP_IMM_32,
+                    rd,
+                    FUNCT3_SRLI_SRAI,
+                    rs1,
+                    imm_field,
+                )))
             }
-            RvOpcode::ADDW => Ok(make_std(encode_r_type(OP_OP_32, rd, FUNCT3_ADD_SUB, rs1, rs2, FUNCT7_NORMAL))),
-            RvOpcode::SUBW => Ok(make_std(encode_r_type(OP_OP_32, rd, FUNCT3_ADD_SUB, rs1, rs2, FUNCT7_SUB))),
-            RvOpcode::SLLW => Ok(make_std(encode_r_type(OP_OP_32, rd, FUNCT3_SLL, rs1, rs2, FUNCT7_NORMAL))),
-            RvOpcode::SRLW => Ok(make_std(encode_r_type(OP_OP_32, rd, FUNCT3_SRL_SRA, rs1, rs2, FUNCT7_NORMAL))),
-            RvOpcode::SRAW => Ok(make_std(encode_r_type(OP_OP_32, rd, FUNCT3_SRL_SRA, rs1, rs2, FUNCT7_SUB))),
+            RvOpcode::ADDW => Ok(make_std(encode_r_type(
+                OP_OP_32,
+                rd,
+                FUNCT3_ADD_SUB,
+                rs1,
+                rs2,
+                FUNCT7_NORMAL,
+            ))),
+            RvOpcode::SUBW => Ok(make_std(encode_r_type(
+                OP_OP_32,
+                rd,
+                FUNCT3_ADD_SUB,
+                rs1,
+                rs2,
+                FUNCT7_SUB,
+            ))),
+            RvOpcode::SLLW => Ok(make_std(encode_r_type(
+                OP_OP_32,
+                rd,
+                FUNCT3_SLL,
+                rs1,
+                rs2,
+                FUNCT7_NORMAL,
+            ))),
+            RvOpcode::SRLW => Ok(make_std(encode_r_type(
+                OP_OP_32,
+                rd,
+                FUNCT3_SRL_SRA,
+                rs1,
+                rs2,
+                FUNCT7_NORMAL,
+            ))),
+            RvOpcode::SRAW => Ok(make_std(encode_r_type(
+                OP_OP_32,
+                rd,
+                FUNCT3_SRL_SRA,
+                rs1,
+                rs2,
+                FUNCT7_SUB,
+            ))),
 
             // =============================================================
             // RV64M: Multiply/Divide
             // =============================================================
-
-            RvOpcode::MUL    => Ok(make_std(encode_r_type(OP_OP, rd, FUNCT3_MUL, rs1, rs2, FUNCT7_MULDIV))),
-            RvOpcode::MULH   => Ok(make_std(encode_r_type(OP_OP, rd, FUNCT3_MULH, rs1, rs2, FUNCT7_MULDIV))),
-            RvOpcode::MULHSU => Ok(make_std(encode_r_type(OP_OP, rd, FUNCT3_MULHSU, rs1, rs2, FUNCT7_MULDIV))),
-            RvOpcode::MULHU  => Ok(make_std(encode_r_type(OP_OP, rd, FUNCT3_MULHU, rs1, rs2, FUNCT7_MULDIV))),
-            RvOpcode::DIV    => Ok(make_std(encode_r_type(OP_OP, rd, FUNCT3_DIV, rs1, rs2, FUNCT7_MULDIV))),
-            RvOpcode::DIVU   => Ok(make_std(encode_r_type(OP_OP, rd, FUNCT3_DIVU, rs1, rs2, FUNCT7_MULDIV))),
-            RvOpcode::REM    => Ok(make_std(encode_r_type(OP_OP, rd, FUNCT3_REM, rs1, rs2, FUNCT7_MULDIV))),
-            RvOpcode::REMU   => Ok(make_std(encode_r_type(OP_OP, rd, FUNCT3_REMU, rs1, rs2, FUNCT7_MULDIV))),
+            RvOpcode::MUL => Ok(make_std(encode_r_type(
+                OP_OP,
+                rd,
+                FUNCT3_MUL,
+                rs1,
+                rs2,
+                FUNCT7_MULDIV,
+            ))),
+            RvOpcode::MULH => Ok(make_std(encode_r_type(
+                OP_OP,
+                rd,
+                FUNCT3_MULH,
+                rs1,
+                rs2,
+                FUNCT7_MULDIV,
+            ))),
+            RvOpcode::MULHSU => Ok(make_std(encode_r_type(
+                OP_OP,
+                rd,
+                FUNCT3_MULHSU,
+                rs1,
+                rs2,
+                FUNCT7_MULDIV,
+            ))),
+            RvOpcode::MULHU => Ok(make_std(encode_r_type(
+                OP_OP,
+                rd,
+                FUNCT3_MULHU,
+                rs1,
+                rs2,
+                FUNCT7_MULDIV,
+            ))),
+            RvOpcode::DIV => Ok(make_std(encode_r_type(
+                OP_OP,
+                rd,
+                FUNCT3_DIV,
+                rs1,
+                rs2,
+                FUNCT7_MULDIV,
+            ))),
+            RvOpcode::DIVU => Ok(make_std(encode_r_type(
+                OP_OP,
+                rd,
+                FUNCT3_DIVU,
+                rs1,
+                rs2,
+                FUNCT7_MULDIV,
+            ))),
+            RvOpcode::REM => Ok(make_std(encode_r_type(
+                OP_OP,
+                rd,
+                FUNCT3_REM,
+                rs1,
+                rs2,
+                FUNCT7_MULDIV,
+            ))),
+            RvOpcode::REMU => Ok(make_std(encode_r_type(
+                OP_OP,
+                rd,
+                FUNCT3_REMU,
+                rs1,
+                rs2,
+                FUNCT7_MULDIV,
+            ))),
 
             // RV64M Word variants
-            RvOpcode::MULW  => Ok(make_std(encode_r_type(OP_OP_32, rd, FUNCT3_MUL, rs1, rs2, FUNCT7_MULDIV))),
-            RvOpcode::DIVW  => Ok(make_std(encode_r_type(OP_OP_32, rd, FUNCT3_DIV, rs1, rs2, FUNCT7_MULDIV))),
-            RvOpcode::DIVUW => Ok(make_std(encode_r_type(OP_OP_32, rd, FUNCT3_DIVU, rs1, rs2, FUNCT7_MULDIV))),
-            RvOpcode::REMW  => Ok(make_std(encode_r_type(OP_OP_32, rd, FUNCT3_REM, rs1, rs2, FUNCT7_MULDIV))),
-            RvOpcode::REMUW => Ok(make_std(encode_r_type(OP_OP_32, rd, FUNCT3_REMU, rs1, rs2, FUNCT7_MULDIV))),
+            RvOpcode::MULW => Ok(make_std(encode_r_type(
+                OP_OP_32,
+                rd,
+                FUNCT3_MUL,
+                rs1,
+                rs2,
+                FUNCT7_MULDIV,
+            ))),
+            RvOpcode::DIVW => Ok(make_std(encode_r_type(
+                OP_OP_32,
+                rd,
+                FUNCT3_DIV,
+                rs1,
+                rs2,
+                FUNCT7_MULDIV,
+            ))),
+            RvOpcode::DIVUW => Ok(make_std(encode_r_type(
+                OP_OP_32,
+                rd,
+                FUNCT3_DIVU,
+                rs1,
+                rs2,
+                FUNCT7_MULDIV,
+            ))),
+            RvOpcode::REMW => Ok(make_std(encode_r_type(
+                OP_OP_32,
+                rd,
+                FUNCT3_REM,
+                rs1,
+                rs2,
+                FUNCT7_MULDIV,
+            ))),
+            RvOpcode::REMUW => Ok(make_std(encode_r_type(
+                OP_OP_32,
+                rd,
+                FUNCT3_REMU,
+                rs1,
+                rs2,
+                FUNCT7_MULDIV,
+            ))),
 
             // =============================================================
             // RV64A: Atomic instructions
             // =============================================================
 
             // Atomic Word (32-bit) operations
-            RvOpcode::LR_W      => Ok(make_std(encode_amo(FUNCT5_LR, 0, 0, FUNCT3_AMO_W, rd, rs1, 0))),
-            RvOpcode::SC_W      => Ok(make_std(encode_amo(FUNCT5_SC, 0, 0, FUNCT3_AMO_W, rd, rs1, rs2))),
-            RvOpcode::AMOSWAP_W => Ok(make_std(encode_amo(FUNCT5_AMOSWAP, 0, 0, FUNCT3_AMO_W, rd, rs1, rs2))),
-            RvOpcode::AMOADD_W  => Ok(make_std(encode_amo(FUNCT5_AMOADD, 0, 0, FUNCT3_AMO_W, rd, rs1, rs2))),
-            RvOpcode::AMOAND_W  => Ok(make_std(encode_amo(FUNCT5_AMOAND, 0, 0, FUNCT3_AMO_W, rd, rs1, rs2))),
-            RvOpcode::AMOOR_W   => Ok(make_std(encode_amo(FUNCT5_AMOOR, 0, 0, FUNCT3_AMO_W, rd, rs1, rs2))),
-            RvOpcode::AMOXOR_W  => Ok(make_std(encode_amo(FUNCT5_AMOXOR, 0, 0, FUNCT3_AMO_W, rd, rs1, rs2))),
-            RvOpcode::AMOMAX_W  => Ok(make_std(encode_amo(FUNCT5_AMOMAX, 0, 0, FUNCT3_AMO_W, rd, rs1, rs2))),
-            RvOpcode::AMOMIN_W  => Ok(make_std(encode_amo(FUNCT5_AMOMIN, 0, 0, FUNCT3_AMO_W, rd, rs1, rs2))),
-            RvOpcode::AMOMAXU_W => Ok(make_std(encode_amo(FUNCT5_AMOMAXU, 0, 0, FUNCT3_AMO_W, rd, rs1, rs2))),
-            RvOpcode::AMOMINU_W => Ok(make_std(encode_amo(FUNCT5_AMOMINU, 0, 0, FUNCT3_AMO_W, rd, rs1, rs2))),
+            RvOpcode::LR_W => Ok(make_std(encode_amo(
+                FUNCT5_LR,
+                0,
+                0,
+                FUNCT3_AMO_W,
+                rd,
+                rs1,
+                0,
+            ))),
+            RvOpcode::SC_W => Ok(make_std(encode_amo(
+                FUNCT5_SC,
+                0,
+                0,
+                FUNCT3_AMO_W,
+                rd,
+                rs1,
+                rs2,
+            ))),
+            RvOpcode::AMOSWAP_W => Ok(make_std(encode_amo(
+                FUNCT5_AMOSWAP,
+                0,
+                0,
+                FUNCT3_AMO_W,
+                rd,
+                rs1,
+                rs2,
+            ))),
+            RvOpcode::AMOADD_W => Ok(make_std(encode_amo(
+                FUNCT5_AMOADD,
+                0,
+                0,
+                FUNCT3_AMO_W,
+                rd,
+                rs1,
+                rs2,
+            ))),
+            RvOpcode::AMOAND_W => Ok(make_std(encode_amo(
+                FUNCT5_AMOAND,
+                0,
+                0,
+                FUNCT3_AMO_W,
+                rd,
+                rs1,
+                rs2,
+            ))),
+            RvOpcode::AMOOR_W => Ok(make_std(encode_amo(
+                FUNCT5_AMOOR,
+                0,
+                0,
+                FUNCT3_AMO_W,
+                rd,
+                rs1,
+                rs2,
+            ))),
+            RvOpcode::AMOXOR_W => Ok(make_std(encode_amo(
+                FUNCT5_AMOXOR,
+                0,
+                0,
+                FUNCT3_AMO_W,
+                rd,
+                rs1,
+                rs2,
+            ))),
+            RvOpcode::AMOMAX_W => Ok(make_std(encode_amo(
+                FUNCT5_AMOMAX,
+                0,
+                0,
+                FUNCT3_AMO_W,
+                rd,
+                rs1,
+                rs2,
+            ))),
+            RvOpcode::AMOMIN_W => Ok(make_std(encode_amo(
+                FUNCT5_AMOMIN,
+                0,
+                0,
+                FUNCT3_AMO_W,
+                rd,
+                rs1,
+                rs2,
+            ))),
+            RvOpcode::AMOMAXU_W => Ok(make_std(encode_amo(
+                FUNCT5_AMOMAXU,
+                0,
+                0,
+                FUNCT3_AMO_W,
+                rd,
+                rs1,
+                rs2,
+            ))),
+            RvOpcode::AMOMINU_W => Ok(make_std(encode_amo(
+                FUNCT5_AMOMINU,
+                0,
+                0,
+                FUNCT3_AMO_W,
+                rd,
+                rs1,
+                rs2,
+            ))),
 
             // Atomic Doubleword (64-bit) operations
-            RvOpcode::LR_D      => Ok(make_std(encode_amo(FUNCT5_LR, 0, 0, FUNCT3_AMO_D, rd, rs1, 0))),
-            RvOpcode::SC_D      => Ok(make_std(encode_amo(FUNCT5_SC, 0, 0, FUNCT3_AMO_D, rd, rs1, rs2))),
-            RvOpcode::AMOSWAP_D => Ok(make_std(encode_amo(FUNCT5_AMOSWAP, 0, 0, FUNCT3_AMO_D, rd, rs1, rs2))),
-            RvOpcode::AMOADD_D  => Ok(make_std(encode_amo(FUNCT5_AMOADD, 0, 0, FUNCT3_AMO_D, rd, rs1, rs2))),
-            RvOpcode::AMOAND_D  => Ok(make_std(encode_amo(FUNCT5_AMOAND, 0, 0, FUNCT3_AMO_D, rd, rs1, rs2))),
-            RvOpcode::AMOOR_D   => Ok(make_std(encode_amo(FUNCT5_AMOOR, 0, 0, FUNCT3_AMO_D, rd, rs1, rs2))),
-            RvOpcode::AMOXOR_D  => Ok(make_std(encode_amo(FUNCT5_AMOXOR, 0, 0, FUNCT3_AMO_D, rd, rs1, rs2))),
-            RvOpcode::AMOMAX_D  => Ok(make_std(encode_amo(FUNCT5_AMOMAX, 0, 0, FUNCT3_AMO_D, rd, rs1, rs2))),
-            RvOpcode::AMOMIN_D  => Ok(make_std(encode_amo(FUNCT5_AMOMIN, 0, 0, FUNCT3_AMO_D, rd, rs1, rs2))),
-            RvOpcode::AMOMAXU_D => Ok(make_std(encode_amo(FUNCT5_AMOMAXU, 0, 0, FUNCT3_AMO_D, rd, rs1, rs2))),
-            RvOpcode::AMOMINU_D => Ok(make_std(encode_amo(FUNCT5_AMOMINU, 0, 0, FUNCT3_AMO_D, rd, rs1, rs2))),
+            RvOpcode::LR_D => Ok(make_std(encode_amo(
+                FUNCT5_LR,
+                0,
+                0,
+                FUNCT3_AMO_D,
+                rd,
+                rs1,
+                0,
+            ))),
+            RvOpcode::SC_D => Ok(make_std(encode_amo(
+                FUNCT5_SC,
+                0,
+                0,
+                FUNCT3_AMO_D,
+                rd,
+                rs1,
+                rs2,
+            ))),
+            RvOpcode::AMOSWAP_D => Ok(make_std(encode_amo(
+                FUNCT5_AMOSWAP,
+                0,
+                0,
+                FUNCT3_AMO_D,
+                rd,
+                rs1,
+                rs2,
+            ))),
+            RvOpcode::AMOADD_D => Ok(make_std(encode_amo(
+                FUNCT5_AMOADD,
+                0,
+                0,
+                FUNCT3_AMO_D,
+                rd,
+                rs1,
+                rs2,
+            ))),
+            RvOpcode::AMOAND_D => Ok(make_std(encode_amo(
+                FUNCT5_AMOAND,
+                0,
+                0,
+                FUNCT3_AMO_D,
+                rd,
+                rs1,
+                rs2,
+            ))),
+            RvOpcode::AMOOR_D => Ok(make_std(encode_amo(
+                FUNCT5_AMOOR,
+                0,
+                0,
+                FUNCT3_AMO_D,
+                rd,
+                rs1,
+                rs2,
+            ))),
+            RvOpcode::AMOXOR_D => Ok(make_std(encode_amo(
+                FUNCT5_AMOXOR,
+                0,
+                0,
+                FUNCT3_AMO_D,
+                rd,
+                rs1,
+                rs2,
+            ))),
+            RvOpcode::AMOMAX_D => Ok(make_std(encode_amo(
+                FUNCT5_AMOMAX,
+                0,
+                0,
+                FUNCT3_AMO_D,
+                rd,
+                rs1,
+                rs2,
+            ))),
+            RvOpcode::AMOMIN_D => Ok(make_std(encode_amo(
+                FUNCT5_AMOMIN,
+                0,
+                0,
+                FUNCT3_AMO_D,
+                rd,
+                rs1,
+                rs2,
+            ))),
+            RvOpcode::AMOMAXU_D => Ok(make_std(encode_amo(
+                FUNCT5_AMOMAXU,
+                0,
+                0,
+                FUNCT3_AMO_D,
+                rd,
+                rs1,
+                rs2,
+            ))),
+            RvOpcode::AMOMINU_D => Ok(make_std(encode_amo(
+                FUNCT5_AMOMINU,
+                0,
+                0,
+                FUNCT3_AMO_D,
+                rd,
+                rs1,
+                rs2,
+            ))),
 
             // =============================================================
             // RV64F: Single-precision floating-point
             // =============================================================
+            RvOpcode::FLW => Ok(make_std(encode_i_type(
+                OP_LOAD_FP, rd, FUNCT3_FLW, rs1, imm32,
+            ))),
+            RvOpcode::FSW => Ok(make_std(encode_s_type(
+                OP_STORE_FP,
+                FUNCT3_FSW,
+                rs1,
+                rs2,
+                imm32,
+            ))),
 
-            RvOpcode::FLW => Ok(make_std(encode_i_type(OP_LOAD_FP, rd, FUNCT3_FLW, rs1, imm32))),
-            RvOpcode::FSW => Ok(make_std(encode_s_type(OP_STORE_FP, FUNCT3_FSW, rs1, rs2, imm32))),
+            RvOpcode::FADD_S => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                RM_DYN,
+                rs1,
+                rs2,
+                FUNCT7_FADD_S,
+            ))),
+            RvOpcode::FSUB_S => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                RM_DYN,
+                rs1,
+                rs2,
+                FUNCT7_FSUB_S,
+            ))),
+            RvOpcode::FMUL_S => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                RM_DYN,
+                rs1,
+                rs2,
+                FUNCT7_FMUL_S,
+            ))),
+            RvOpcode::FDIV_S => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                RM_DYN,
+                rs1,
+                rs2,
+                FUNCT7_FDIV_S,
+            ))),
+            RvOpcode::FSQRT_S => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                RM_DYN,
+                rs1,
+                0,
+                FUNCT7_FSQRT_S,
+            ))),
 
-            RvOpcode::FADD_S  => Ok(make_std(encode_r_type(OP_OP_FP, rd, RM_DYN, rs1, rs2, FUNCT7_FADD_S))),
-            RvOpcode::FSUB_S  => Ok(make_std(encode_r_type(OP_OP_FP, rd, RM_DYN, rs1, rs2, FUNCT7_FSUB_S))),
-            RvOpcode::FMUL_S  => Ok(make_std(encode_r_type(OP_OP_FP, rd, RM_DYN, rs1, rs2, FUNCT7_FMUL_S))),
-            RvOpcode::FDIV_S  => Ok(make_std(encode_r_type(OP_OP_FP, rd, RM_DYN, rs1, rs2, FUNCT7_FDIV_S))),
-            RvOpcode::FSQRT_S => Ok(make_std(encode_r_type(OP_OP_FP, rd, RM_DYN, rs1, 0, FUNCT7_FSQRT_S))),
+            RvOpcode::FMIN_S => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                0b000,
+                rs1,
+                rs2,
+                FUNCT7_FMIN_S,
+            ))),
+            RvOpcode::FMAX_S => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                0b001,
+                rs1,
+                rs2,
+                FUNCT7_FMIN_S,
+            ))),
 
-            RvOpcode::FMIN_S => Ok(make_std(encode_r_type(OP_OP_FP, rd, 0b000, rs1, rs2, FUNCT7_FMIN_S))),
-            RvOpcode::FMAX_S => Ok(make_std(encode_r_type(OP_OP_FP, rd, 0b001, rs1, rs2, FUNCT7_FMIN_S))),
+            RvOpcode::FSGNJ_S => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                0b000,
+                rs1,
+                rs2,
+                FUNCT7_FSGNJ_S,
+            ))),
+            RvOpcode::FSGNJN_S => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                0b001,
+                rs1,
+                rs2,
+                FUNCT7_FSGNJ_S,
+            ))),
+            RvOpcode::FSGNJX_S => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                0b010,
+                rs1,
+                rs2,
+                FUNCT7_FSGNJ_S,
+            ))),
 
-            RvOpcode::FSGNJ_S  => Ok(make_std(encode_r_type(OP_OP_FP, rd, 0b000, rs1, rs2, FUNCT7_FSGNJ_S))),
-            RvOpcode::FSGNJN_S => Ok(make_std(encode_r_type(OP_OP_FP, rd, 0b001, rs1, rs2, FUNCT7_FSGNJ_S))),
-            RvOpcode::FSGNJX_S => Ok(make_std(encode_r_type(OP_OP_FP, rd, 0b010, rs1, rs2, FUNCT7_FSGNJ_S))),
+            RvOpcode::FCVT_W_S => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                RM_DYN,
+                rs1,
+                0,
+                FUNCT7_FCVT_W_S,
+            ))),
+            RvOpcode::FCVT_WU_S => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                RM_DYN,
+                rs1,
+                1,
+                FUNCT7_FCVT_W_S,
+            ))),
+            RvOpcode::FCVT_L_S => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                RM_DYN,
+                rs1,
+                2,
+                FUNCT7_FCVT_W_S,
+            ))),
+            RvOpcode::FCVT_LU_S => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                RM_DYN,
+                rs1,
+                3,
+                FUNCT7_FCVT_W_S,
+            ))),
 
-            RvOpcode::FCVT_W_S  => Ok(make_std(encode_r_type(OP_OP_FP, rd, RM_DYN, rs1, 0, FUNCT7_FCVT_W_S))),
-            RvOpcode::FCVT_WU_S => Ok(make_std(encode_r_type(OP_OP_FP, rd, RM_DYN, rs1, 1, FUNCT7_FCVT_W_S))),
-            RvOpcode::FCVT_L_S  => Ok(make_std(encode_r_type(OP_OP_FP, rd, RM_DYN, rs1, 2, FUNCT7_FCVT_W_S))),
-            RvOpcode::FCVT_LU_S => Ok(make_std(encode_r_type(OP_OP_FP, rd, RM_DYN, rs1, 3, FUNCT7_FCVT_W_S))),
+            RvOpcode::FCVT_S_W => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                RM_DYN,
+                rs1,
+                0,
+                FUNCT7_FCVT_S_W,
+            ))),
+            RvOpcode::FCVT_S_WU => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                RM_DYN,
+                rs1,
+                1,
+                FUNCT7_FCVT_S_W,
+            ))),
+            RvOpcode::FCVT_S_L => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                RM_DYN,
+                rs1,
+                2,
+                FUNCT7_FCVT_S_W,
+            ))),
+            RvOpcode::FCVT_S_LU => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                RM_DYN,
+                rs1,
+                3,
+                FUNCT7_FCVT_S_W,
+            ))),
 
-            RvOpcode::FCVT_S_W  => Ok(make_std(encode_r_type(OP_OP_FP, rd, RM_DYN, rs1, 0, FUNCT7_FCVT_S_W))),
-            RvOpcode::FCVT_S_WU => Ok(make_std(encode_r_type(OP_OP_FP, rd, RM_DYN, rs1, 1, FUNCT7_FCVT_S_W))),
-            RvOpcode::FCVT_S_L  => Ok(make_std(encode_r_type(OP_OP_FP, rd, RM_DYN, rs1, 2, FUNCT7_FCVT_S_W))),
-            RvOpcode::FCVT_S_LU => Ok(make_std(encode_r_type(OP_OP_FP, rd, RM_DYN, rs1, 3, FUNCT7_FCVT_S_W))),
+            RvOpcode::FMV_X_W => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                0b000,
+                rs1,
+                0,
+                FUNCT7_FMV_X_W,
+            ))),
+            RvOpcode::FMV_W_X => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                0b000,
+                rs1,
+                0,
+                FUNCT7_FMV_W_X,
+            ))),
 
-            RvOpcode::FMV_X_W => Ok(make_std(encode_r_type(OP_OP_FP, rd, 0b000, rs1, 0, FUNCT7_FMV_X_W))),
-            RvOpcode::FMV_W_X => Ok(make_std(encode_r_type(OP_OP_FP, rd, 0b000, rs1, 0, FUNCT7_FMV_W_X))),
+            RvOpcode::FEQ_S => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                0b010,
+                rs1,
+                rs2,
+                FUNCT7_FCMP_S,
+            ))),
+            RvOpcode::FLT_S => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                0b001,
+                rs1,
+                rs2,
+                FUNCT7_FCMP_S,
+            ))),
+            RvOpcode::FLE_S => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                0b000,
+                rs1,
+                rs2,
+                FUNCT7_FCMP_S,
+            ))),
 
-            RvOpcode::FEQ_S => Ok(make_std(encode_r_type(OP_OP_FP, rd, 0b010, rs1, rs2, FUNCT7_FCMP_S))),
-            RvOpcode::FLT_S => Ok(make_std(encode_r_type(OP_OP_FP, rd, 0b001, rs1, rs2, FUNCT7_FCMP_S))),
-            RvOpcode::FLE_S => Ok(make_std(encode_r_type(OP_OP_FP, rd, 0b000, rs1, rs2, FUNCT7_FCMP_S))),
-
-            RvOpcode::FCLASS_S => Ok(make_std(encode_r_type(OP_OP_FP, rd, 0b001, rs1, 0, FUNCT7_FMV_X_W))),
+            RvOpcode::FCLASS_S => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                0b001,
+                rs1,
+                0,
+                FUNCT7_FMV_X_W,
+            ))),
 
             // R4-type: Fused multiply-add (single)
-            RvOpcode::FMADD_S  => Ok(make_std(encode_r4_type(OP_FMADD, rd, RM_DYN, rs1, rs2, rs3, FMT_S))),
-            RvOpcode::FMSUB_S  => Ok(make_std(encode_r4_type(OP_FMSUB, rd, RM_DYN, rs1, rs2, rs3, FMT_S))),
-            RvOpcode::FNMSUB_S => Ok(make_std(encode_r4_type(OP_FNMSUB, rd, RM_DYN, rs1, rs2, rs3, FMT_S))),
-            RvOpcode::FNMADD_S => Ok(make_std(encode_r4_type(OP_FNMADD, rd, RM_DYN, rs1, rs2, rs3, FMT_S))),
+            RvOpcode::FMADD_S => Ok(make_std(encode_r4_type(
+                OP_FMADD, rd, RM_DYN, rs1, rs2, rs3, FMT_S,
+            ))),
+            RvOpcode::FMSUB_S => Ok(make_std(encode_r4_type(
+                OP_FMSUB, rd, RM_DYN, rs1, rs2, rs3, FMT_S,
+            ))),
+            RvOpcode::FNMSUB_S => Ok(make_std(encode_r4_type(
+                OP_FNMSUB, rd, RM_DYN, rs1, rs2, rs3, FMT_S,
+            ))),
+            RvOpcode::FNMADD_S => Ok(make_std(encode_r4_type(
+                OP_FNMADD, rd, RM_DYN, rs1, rs2, rs3, FMT_S,
+            ))),
 
             // =============================================================
             // RV64D: Double-precision floating-point
             // =============================================================
+            RvOpcode::FLD => Ok(make_std(encode_i_type(
+                OP_LOAD_FP, rd, FUNCT3_FLD, rs1, imm32,
+            ))),
+            RvOpcode::FSD => Ok(make_std(encode_s_type(
+                OP_STORE_FP,
+                FUNCT3_FSD,
+                rs1,
+                rs2,
+                imm32,
+            ))),
 
-            RvOpcode::FLD => Ok(make_std(encode_i_type(OP_LOAD_FP, rd, FUNCT3_FLD, rs1, imm32))),
-            RvOpcode::FSD => Ok(make_std(encode_s_type(OP_STORE_FP, FUNCT3_FSD, rs1, rs2, imm32))),
+            RvOpcode::FADD_D => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                RM_DYN,
+                rs1,
+                rs2,
+                FUNCT7_FADD_D,
+            ))),
+            RvOpcode::FSUB_D => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                RM_DYN,
+                rs1,
+                rs2,
+                FUNCT7_FSUB_D,
+            ))),
+            RvOpcode::FMUL_D => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                RM_DYN,
+                rs1,
+                rs2,
+                FUNCT7_FMUL_D,
+            ))),
+            RvOpcode::FDIV_D => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                RM_DYN,
+                rs1,
+                rs2,
+                FUNCT7_FDIV_D,
+            ))),
+            RvOpcode::FSQRT_D => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                RM_DYN,
+                rs1,
+                0,
+                FUNCT7_FSQRT_D,
+            ))),
 
-            RvOpcode::FADD_D  => Ok(make_std(encode_r_type(OP_OP_FP, rd, RM_DYN, rs1, rs2, FUNCT7_FADD_D))),
-            RvOpcode::FSUB_D  => Ok(make_std(encode_r_type(OP_OP_FP, rd, RM_DYN, rs1, rs2, FUNCT7_FSUB_D))),
-            RvOpcode::FMUL_D  => Ok(make_std(encode_r_type(OP_OP_FP, rd, RM_DYN, rs1, rs2, FUNCT7_FMUL_D))),
-            RvOpcode::FDIV_D  => Ok(make_std(encode_r_type(OP_OP_FP, rd, RM_DYN, rs1, rs2, FUNCT7_FDIV_D))),
-            RvOpcode::FSQRT_D => Ok(make_std(encode_r_type(OP_OP_FP, rd, RM_DYN, rs1, 0, FUNCT7_FSQRT_D))),
+            RvOpcode::FMIN_D => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                0b000,
+                rs1,
+                rs2,
+                FUNCT7_FMIN_D,
+            ))),
+            RvOpcode::FMAX_D => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                0b001,
+                rs1,
+                rs2,
+                FUNCT7_FMIN_D,
+            ))),
 
-            RvOpcode::FMIN_D => Ok(make_std(encode_r_type(OP_OP_FP, rd, 0b000, rs1, rs2, FUNCT7_FMIN_D))),
-            RvOpcode::FMAX_D => Ok(make_std(encode_r_type(OP_OP_FP, rd, 0b001, rs1, rs2, FUNCT7_FMIN_D))),
+            RvOpcode::FSGNJ_D => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                0b000,
+                rs1,
+                rs2,
+                FUNCT7_FSGNJ_D,
+            ))),
+            RvOpcode::FSGNJN_D => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                0b001,
+                rs1,
+                rs2,
+                FUNCT7_FSGNJ_D,
+            ))),
+            RvOpcode::FSGNJX_D => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                0b010,
+                rs1,
+                rs2,
+                FUNCT7_FSGNJ_D,
+            ))),
 
-            RvOpcode::FSGNJ_D  => Ok(make_std(encode_r_type(OP_OP_FP, rd, 0b000, rs1, rs2, FUNCT7_FSGNJ_D))),
-            RvOpcode::FSGNJN_D => Ok(make_std(encode_r_type(OP_OP_FP, rd, 0b001, rs1, rs2, FUNCT7_FSGNJ_D))),
-            RvOpcode::FSGNJX_D => Ok(make_std(encode_r_type(OP_OP_FP, rd, 0b010, rs1, rs2, FUNCT7_FSGNJ_D))),
+            RvOpcode::FCVT_W_D => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                RM_DYN,
+                rs1,
+                0,
+                FUNCT7_FCVT_W_D,
+            ))),
+            RvOpcode::FCVT_WU_D => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                RM_DYN,
+                rs1,
+                1,
+                FUNCT7_FCVT_W_D,
+            ))),
+            RvOpcode::FCVT_L_D => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                RM_DYN,
+                rs1,
+                2,
+                FUNCT7_FCVT_W_D,
+            ))),
+            RvOpcode::FCVT_LU_D => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                RM_DYN,
+                rs1,
+                3,
+                FUNCT7_FCVT_W_D,
+            ))),
 
-            RvOpcode::FCVT_W_D  => Ok(make_std(encode_r_type(OP_OP_FP, rd, RM_DYN, rs1, 0, FUNCT7_FCVT_W_D))),
-            RvOpcode::FCVT_WU_D => Ok(make_std(encode_r_type(OP_OP_FP, rd, RM_DYN, rs1, 1, FUNCT7_FCVT_W_D))),
-            RvOpcode::FCVT_L_D  => Ok(make_std(encode_r_type(OP_OP_FP, rd, RM_DYN, rs1, 2, FUNCT7_FCVT_W_D))),
-            RvOpcode::FCVT_LU_D => Ok(make_std(encode_r_type(OP_OP_FP, rd, RM_DYN, rs1, 3, FUNCT7_FCVT_W_D))),
-
-            RvOpcode::FCVT_D_W  => Ok(make_std(encode_r_type(OP_OP_FP, rd, RM_DYN, rs1, 0, FUNCT7_FCVT_D_W))),
-            RvOpcode::FCVT_D_WU => Ok(make_std(encode_r_type(OP_OP_FP, rd, RM_DYN, rs1, 1, FUNCT7_FCVT_D_W))),
-            RvOpcode::FCVT_D_L  => Ok(make_std(encode_r_type(OP_OP_FP, rd, RM_DYN, rs1, 2, FUNCT7_FCVT_D_W))),
-            RvOpcode::FCVT_D_LU => Ok(make_std(encode_r_type(OP_OP_FP, rd, RM_DYN, rs1, 3, FUNCT7_FCVT_D_W))),
+            RvOpcode::FCVT_D_W => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                RM_DYN,
+                rs1,
+                0,
+                FUNCT7_FCVT_D_W,
+            ))),
+            RvOpcode::FCVT_D_WU => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                RM_DYN,
+                rs1,
+                1,
+                FUNCT7_FCVT_D_W,
+            ))),
+            RvOpcode::FCVT_D_L => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                RM_DYN,
+                rs1,
+                2,
+                FUNCT7_FCVT_D_W,
+            ))),
+            RvOpcode::FCVT_D_LU => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                RM_DYN,
+                rs1,
+                3,
+                FUNCT7_FCVT_D_W,
+            ))),
 
             // Cross-format conversions
-            RvOpcode::FCVT_S_D => Ok(make_std(encode_r_type(OP_OP_FP, rd, RM_DYN, rs1, 1, FUNCT7_FCVT_S_D))),
-            RvOpcode::FCVT_D_S => Ok(make_std(encode_r_type(OP_OP_FP, rd, RM_DYN, rs1, 0, FUNCT7_FCVT_D_S))),
+            RvOpcode::FCVT_S_D => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                RM_DYN,
+                rs1,
+                1,
+                FUNCT7_FCVT_S_D,
+            ))),
+            RvOpcode::FCVT_D_S => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                RM_DYN,
+                rs1,
+                0,
+                FUNCT7_FCVT_D_S,
+            ))),
 
             // 64-bit FP move (RV64 only)
-            RvOpcode::FMV_X_D => Ok(make_std(encode_r_type(OP_OP_FP, rd, 0b000, rs1, 0, FUNCT7_FMV_X_D))),
-            RvOpcode::FMV_D_X => Ok(make_std(encode_r_type(OP_OP_FP, rd, 0b000, rs1, 0, FUNCT7_FMV_D_X))),
+            RvOpcode::FMV_X_D => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                0b000,
+                rs1,
+                0,
+                FUNCT7_FMV_X_D,
+            ))),
+            RvOpcode::FMV_D_X => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                0b000,
+                rs1,
+                0,
+                FUNCT7_FMV_D_X,
+            ))),
 
-            RvOpcode::FEQ_D => Ok(make_std(encode_r_type(OP_OP_FP, rd, 0b010, rs1, rs2, FUNCT7_FCMP_D))),
-            RvOpcode::FLT_D => Ok(make_std(encode_r_type(OP_OP_FP, rd, 0b001, rs1, rs2, FUNCT7_FCMP_D))),
-            RvOpcode::FLE_D => Ok(make_std(encode_r_type(OP_OP_FP, rd, 0b000, rs1, rs2, FUNCT7_FCMP_D))),
+            RvOpcode::FEQ_D => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                0b010,
+                rs1,
+                rs2,
+                FUNCT7_FCMP_D,
+            ))),
+            RvOpcode::FLT_D => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                0b001,
+                rs1,
+                rs2,
+                FUNCT7_FCMP_D,
+            ))),
+            RvOpcode::FLE_D => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                0b000,
+                rs1,
+                rs2,
+                FUNCT7_FCMP_D,
+            ))),
 
-            RvOpcode::FCLASS_D => Ok(make_std(encode_r_type(OP_OP_FP, rd, 0b001, rs1, 0, FUNCT7_FMV_X_D))),
+            RvOpcode::FCLASS_D => Ok(make_std(encode_r_type(
+                OP_OP_FP,
+                rd,
+                0b001,
+                rs1,
+                0,
+                FUNCT7_FMV_X_D,
+            ))),
 
             // R4-type: Fused multiply-add (double)
-            RvOpcode::FMADD_D  => Ok(make_std(encode_r4_type(OP_FMADD, rd, RM_DYN, rs1, rs2, rs3, FMT_D))),
-            RvOpcode::FMSUB_D  => Ok(make_std(encode_r4_type(OP_FMSUB, rd, RM_DYN, rs1, rs2, rs3, FMT_D))),
-            RvOpcode::FNMSUB_D => Ok(make_std(encode_r4_type(OP_FNMSUB, rd, RM_DYN, rs1, rs2, rs3, FMT_D))),
-            RvOpcode::FNMADD_D => Ok(make_std(encode_r4_type(OP_FNMADD, rd, RM_DYN, rs1, rs2, rs3, FMT_D))),
+            RvOpcode::FMADD_D => Ok(make_std(encode_r4_type(
+                OP_FMADD, rd, RM_DYN, rs1, rs2, rs3, FMT_D,
+            ))),
+            RvOpcode::FMSUB_D => Ok(make_std(encode_r4_type(
+                OP_FMSUB, rd, RM_DYN, rs1, rs2, rs3, FMT_D,
+            ))),
+            RvOpcode::FNMSUB_D => Ok(make_std(encode_r4_type(
+                OP_FNMSUB, rd, RM_DYN, rs1, rs2, rs3, FMT_D,
+            ))),
+            RvOpcode::FNMADD_D => Ok(make_std(encode_r4_type(
+                OP_FNMADD, rd, RM_DYN, rs1, rs2, rs3, FMT_D,
+            ))),
 
             // =============================================================
             // Inline ASM passthrough — raw bytes are handled elsewhere
             // =============================================================
-
             RvOpcode::INLINE_ASM => {
                 // Inline assembly is stored as raw bytes; encode as NOP placeholder
                 // if it reaches the encoder (the assembler module handles it separately).
@@ -756,7 +1584,9 @@ impl RiscV64Encoder {
             }
 
             // C.ADDI: addi rd, rd, imm (rd != 0, imm != 0, 6-bit signed)
-            RvOpcode::ADDI if rd_hw != 0 && rd_hw == rs1_hw && imm != 0 && fits_imm_bits(imm, 6) => {
+            RvOpcode::ADDI
+                if rd_hw != 0 && rd_hw == rs1_hw && imm != 0 && fits_imm_bits(imm, 6) =>
+            {
                 let nzimm = (imm as u16) & 0x3F;
                 // [15:13]=000, [12]=nzimm[5], [11:7]=rd, [6:2]=nzimm[4:0], [1:0]=01
                 let half: u16 = (((nzimm >> 5) & 1) << 12)
@@ -792,47 +1622,37 @@ impl RiscV64Encoder {
             // C.MV: add rd, x0, rs2 → CR format (rd != 0, rs2 != 0)
             RvOpcode::MV if rd_hw != 0 && rs2_hw != 0 => {
                 // [15:12]=1000, [11:7]=rd, [6:2]=rs2, [1:0]=10
-                let half: u16 = (0b1000 << 12)
-                    | ((rd_hw as u16) << 7)
-                    | ((rs2_hw as u16) << 2)
-                    | C_OP_Q2;
+                let half: u16 =
+                    (0b1000 << 12) | ((rd_hw as u16) << 7) | ((rs2_hw as u16) << 2) | C_OP_Q2;
                 Some(make_compressed(half))
             }
 
             // C.ADD: add rd, rd, rs2 → CR format (rd != 0, rs2 != 0)
             RvOpcode::ADD if rd_hw != 0 && rd_hw == rs1_hw && rs2_hw != 0 => {
                 // [15:12]=1001, [11:7]=rd, [6:2]=rs2, [1:0]=10
-                let half: u16 = (0b1001 << 12)
-                    | ((rd_hw as u16) << 7)
-                    | ((rs2_hw as u16) << 2)
-                    | C_OP_Q2;
+                let half: u16 =
+                    (0b1001 << 12) | ((rd_hw as u16) << 7) | ((rs2_hw as u16) << 2) | C_OP_Q2;
                 Some(make_compressed(half))
             }
 
             // C.JR: jalr x0, rs1, 0 → CR format (rs1 != 0)
             RvOpcode::JALR if rd_hw == 0 && rs1_hw != 0 && imm == 0 => {
                 // [15:12]=1000, [11:7]=rs1, [6:2]=00000, [1:0]=10
-                let half: u16 = (0b1000 << 12)
-                    | ((rs1_hw as u16) << 7)
-                    | C_OP_Q2;
+                let half: u16 = (0b1000 << 12) | ((rs1_hw as u16) << 7) | C_OP_Q2;
                 Some(make_compressed(half))
             }
 
             // C.JALR: jalr ra, rs1, 0 → CR format (rs1 != 0)
             RvOpcode::JALR if rd_hw == 1 && rs1_hw != 0 && imm == 0 => {
                 // [15:12]=1001, [11:7]=rs1, [6:2]=00000, [1:0]=10
-                let half: u16 = (0b1001 << 12)
-                    | ((rs1_hw as u16) << 7)
-                    | C_OP_Q2;
+                let half: u16 = (0b1001 << 12) | ((rs1_hw as u16) << 7) | C_OP_Q2;
                 Some(make_compressed(half))
             }
 
             // C.RET → C.JR ra
             RvOpcode::RET => {
                 let ra_hw = registers::hw_encoding(registers::RA);
-                let half: u16 = (0b1000 << 12)
-                    | ((ra_hw as u16) << 7)
-                    | C_OP_Q2;
+                let half: u16 = (0b1000 << 12) | ((ra_hw as u16) << 7) | C_OP_Q2;
                 Some(make_compressed(half))
             }
 
@@ -848,7 +1668,9 @@ impl RiscV64Encoder {
             }
 
             // C.LW: lw rd', offset(rs1') — both in x8–x15, offset 0–124 (word-aligned)
-            RvOpcode::LW if is_creg(rd) && is_creg(rs1) && (0..128).contains(&imm) && imm % 4 == 0 => {
+            RvOpcode::LW
+                if is_creg(rd) && is_creg(rs1) && (0..128).contains(&imm) && imm % 4 == 0 =>
+            {
                 let rd_c = creg_encode(rd);
                 let rs1_c = creg_encode(rs1);
                 let off = imm as u16;
@@ -865,7 +1687,9 @@ impl RiscV64Encoder {
             }
 
             // C.LD: ld rd', offset(rs1') — both in x8–x15, offset 0–248 (dword-aligned)
-            RvOpcode::LD if is_creg(rd) && is_creg(rs1) && (0..256).contains(&imm) && imm % 8 == 0 => {
+            RvOpcode::LD
+                if is_creg(rd) && is_creg(rs1) && (0..256).contains(&imm) && imm % 8 == 0 =>
+            {
                 let rd_c = creg_encode(rd);
                 let rs1_c = creg_encode(rs1);
                 let off = imm as u16;
@@ -881,7 +1705,9 @@ impl RiscV64Encoder {
             }
 
             // C.SW: sw rs2', offset(rs1') — both in x8–x15
-            RvOpcode::SW if is_creg(rs1) && is_creg(rs2) && (0..128).contains(&imm) && imm % 4 == 0 => {
+            RvOpcode::SW
+                if is_creg(rs1) && is_creg(rs2) && (0..128).contains(&imm) && imm % 4 == 0 =>
+            {
                 let rs2_c = creg_encode(rs2);
                 let rs1_c = creg_encode(rs1);
                 let off = imm as u16;
@@ -898,7 +1724,9 @@ impl RiscV64Encoder {
             }
 
             // C.SD: sd rs2', offset(rs1') — both in x8–x15
-            RvOpcode::SD if is_creg(rs1) && is_creg(rs2) && (0..256).contains(&imm) && imm % 8 == 0 => {
+            RvOpcode::SD
+                if is_creg(rs1) && is_creg(rs2) && (0..256).contains(&imm) && imm % 8 == 0 =>
+            {
                 let rs2_c = creg_encode(rs2);
                 let rs1_c = creg_encode(rs1);
                 let off = imm as u16;
@@ -914,8 +1742,11 @@ impl RiscV64Encoder {
             }
 
             // C.LDSP: ld rd, offset(sp) — rd != 0, offset 0–504 dword-aligned
-            RvOpcode::LD if rd_hw != 0 && rs1_hw == registers::hw_encoding(registers::SP)
-                && (0..512).contains(&imm) && imm % 8 == 0 =>
+            RvOpcode::LD
+                if rd_hw != 0
+                    && rs1_hw == registers::hw_encoding(registers::SP)
+                    && (0..512).contains(&imm)
+                    && imm % 8 == 0 =>
             {
                 let off = imm as u16;
                 // [15:13]=011, [12]=offset[5], [11:7]=rd, [6:4]=offset[4:3|8:6]...
@@ -930,8 +1761,10 @@ impl RiscV64Encoder {
             }
 
             // C.SDSP: sd rs2, offset(sp) — offset 0–504 dword-aligned
-            RvOpcode::SD if rs1_hw == registers::hw_encoding(registers::SP)
-                && (0..512).contains(&imm) && imm % 8 == 0 =>
+            RvOpcode::SD
+                if rs1_hw == registers::hw_encoding(registers::SP)
+                    && (0..512).contains(&imm)
+                    && imm % 8 == 0 =>
             {
                 let off = imm as u16;
                 // [15:13]=111, [12:10]=offset[5:3], [9:7]=offset[8:6], [6:2]=rs2, [1:0]=10
@@ -944,11 +1777,15 @@ impl RiscV64Encoder {
             }
 
             // C.BEQZ / C.BNEZ: branch if rs1'==0 / rs1'!=0, 9-bit signed even offset
-            RvOpcode::BEQ if is_creg(rs1) && rs2_hw == 0 && fits_imm_bits(imm, 9) && imm % 2 == 0 => {
+            RvOpcode::BEQ
+                if is_creg(rs1) && rs2_hw == 0 && fits_imm_bits(imm, 9) && imm % 2 == 0 =>
+            {
                 let rs1_c = creg_encode(rs1);
                 Some(make_compressed(encode_cb_branch(0b110, rs1_c, imm)))
             }
-            RvOpcode::BNE if is_creg(rs1) && rs2_hw == 0 && fits_imm_bits(imm, 9) && imm % 2 == 0 => {
+            RvOpcode::BNE
+                if is_creg(rs1) && rs2_hw == 0 && fits_imm_bits(imm, 9) && imm % 2 == 0 =>
+            {
                 let rs1_c = creg_encode(rs1);
                 Some(make_compressed(encode_cb_branch(0b111, rs1_c, imm)))
             }
@@ -959,18 +1796,18 @@ impl RiscV64Encoder {
             }
 
             // C.SUB, C.XOR, C.OR, C.AND (CA-format, both x8–x15)
-            RvOpcode::SUB if is_creg(rd) && rd == rs1 && is_creg(rs2) => {
-                Some(make_compressed(encode_ca(0b00, creg_encode(rd), creg_encode(rs2))))
-            }
-            RvOpcode::XOR if is_creg(rd) && rd == rs1 && is_creg(rs2) => {
-                Some(make_compressed(encode_ca(0b01, creg_encode(rd), creg_encode(rs2))))
-            }
-            RvOpcode::OR if is_creg(rd) && rd == rs1 && is_creg(rs2) => {
-                Some(make_compressed(encode_ca(0b10, creg_encode(rd), creg_encode(rs2))))
-            }
-            RvOpcode::AND if is_creg(rd) && rd == rs1 && is_creg(rs2) => {
-                Some(make_compressed(encode_ca(0b11, creg_encode(rd), creg_encode(rs2))))
-            }
+            RvOpcode::SUB if is_creg(rd) && rd == rs1 && is_creg(rs2) => Some(make_compressed(
+                encode_ca(0b00, creg_encode(rd), creg_encode(rs2)),
+            )),
+            RvOpcode::XOR if is_creg(rd) && rd == rs1 && is_creg(rs2) => Some(make_compressed(
+                encode_ca(0b01, creg_encode(rd), creg_encode(rs2)),
+            )),
+            RvOpcode::OR if is_creg(rd) && rd == rs1 && is_creg(rs2) => Some(make_compressed(
+                encode_ca(0b10, creg_encode(rd), creg_encode(rs2)),
+            )),
+            RvOpcode::AND if is_creg(rd) && rd == rs1 && is_creg(rs2) => Some(make_compressed(
+                encode_ca(0b11, creg_encode(rd), creg_encode(rs2)),
+            )),
 
             // C.ADDW: addw rd', rd', rs2' (both x8–x15)
             RvOpcode::ADDW if is_creg(rd) && rd == rs1 && is_creg(rs2) => {
@@ -990,10 +1827,8 @@ impl RiscV64Encoder {
                 let rd_c = creg_encode(rd);
                 let rs2_c = creg_encode(rs2);
                 // [15:10]=100111, [9:7]=rd', [6:5]=00, [4:2]=rs2', [1:0]=01
-                let half: u16 = (0b100111 << 10)
-                    | ((rd_c as u16) << 7)
-                    | ((rs2_c as u16) << 2)
-                    | C_OP_Q1;
+                let half: u16 =
+                    (0b100111 << 10) | ((rd_c as u16) << 7) | ((rs2_c as u16) << 2) | C_OP_Q1;
                 Some(make_compressed(half))
             }
 
@@ -1083,7 +1918,12 @@ impl RiscV64Encoder {
     /// For small immediates (fits 12-bit signed): ADDI rd, x0, imm.
     /// For 32-bit immediates: LUI rd, upper + ADDI rd, rd, lower.
     /// For symbol references: LUI + ADDI with Hi20/Lo12I relocations.
-    fn encode_li(&self, rd: u8, imm: i64, symbol: &Option<String>) -> Result<EncodedInstruction, String> {
+    fn encode_li(
+        &self,
+        rd: u8,
+        imm: i64,
+        symbol: &Option<String>,
+    ) -> Result<EncodedInstruction, String> {
         if symbol.is_some() {
             // LUI rd, %hi(symbol) + ADDI rd, rd, %lo(symbol)
             let lui_word = encode_u_type(OP_LUI, rd, 0);
@@ -1109,7 +1949,13 @@ impl RiscV64Encoder {
             })
         } else if fits_imm_bits(imm, 12) {
             // Small immediate: ADDI rd, x0, imm
-            Ok(make_std(encode_i_type(OP_OP_IMM, rd, FUNCT3_ADDI, 0, imm as i32)))
+            Ok(make_std(encode_i_type(
+                OP_OP_IMM,
+                rd,
+                FUNCT3_ADDI,
+                0,
+                imm as i32,
+            )))
         } else {
             // 32-bit immediate: LUI + ADDI with sign-extension compensation
             let (hi, lo) = split_i32_lui_addi(imm);
@@ -1127,7 +1973,12 @@ impl RiscV64Encoder {
     /// Encode LA (Load Address) pseudo-instruction.
     ///
     /// PC-relative: AUIPC rd, %pcrel_hi(symbol) + ADDI rd, rd, %pcrel_lo(symbol)
-    fn encode_la(&self, rd: u8, imm: i64, symbol: &Option<String>) -> Result<EncodedInstruction, String> {
+    fn encode_la(
+        &self,
+        rd: u8,
+        imm: i64,
+        symbol: &Option<String>,
+    ) -> Result<EncodedInstruction, String> {
         if symbol.is_some() {
             let auipc_word = encode_u_type(OP_AUIPC, rd, 0);
             let addi_word = encode_i_type(OP_OP_IMM, rd, FUNCT3_ADDI, rd, 0);
@@ -1198,7 +2049,14 @@ impl RiscV64Encoder {
     }
 
     /// Encode a branch instruction, possibly with a relocation.
-    fn encode_branch(&self, funct3: u32, rs1: u8, rs2: u8, imm: i64, symbol: &Option<String>) -> Result<EncodedInstruction, String> {
+    fn encode_branch(
+        &self,
+        funct3: u32,
+        rs1: u8,
+        rs2: u8,
+        imm: i64,
+        symbol: &Option<String>,
+    ) -> Result<EncodedInstruction, String> {
         if symbol.is_some() {
             let word = encode_b_type(OP_BRANCH, funct3, rs1, rs2, 0);
             Ok(EncodedInstruction {
@@ -1212,7 +2070,9 @@ impl RiscV64Encoder {
                 continuation: None,
             })
         } else {
-            Ok(make_std(encode_b_type(OP_BRANCH, funct3, rs1, rs2, imm as i32)))
+            Ok(make_std(encode_b_type(
+                OP_BRANCH, funct3, rs1, rs2, imm as i32,
+            )))
         }
     }
 }
@@ -1298,9 +2158,7 @@ fn encode_b_type(opcode: u32, funct3: u32, rs1: u8, rs2: u8, imm: i32) -> u32 {
 /// The upper 20 bits of the immediate are placed directly at bits [31:12].
 #[inline]
 fn encode_u_type(opcode: u32, rd: u8, imm: i32) -> u32 {
-    ((imm as u32) & 0xFFFFF000)
-        | ((rd as u32) << 7)
-        | opcode
+    ((imm as u32) & 0xFFFFF000) | ((rd as u32) << 7) | opcode
 }
 
 /// Encode J-type instruction.
@@ -1435,7 +2293,11 @@ fn is_creg(reg: u8) -> bool {
 #[inline]
 fn creg_encode(reg: u8) -> u8 {
     let hw = registers::hw_encoding(reg);
-    debug_assert!((8..=15).contains(&hw), "creg_encode: register {} not in x8–x15", hw);
+    debug_assert!(
+        (8..=15).contains(&hw),
+        "creg_encode: register {} not in x8–x15",
+        hw
+    );
     hw - 8
 }
 
@@ -1444,8 +2306,8 @@ fn creg_encode(reg: u8) -> u8 {
 /// Layout: `funct3[15:13] | offset[8|4:3][12:10] | rs1'[9:7] | offset[7:6|2:1|5][6:2] | op[1:0]=01`
 fn encode_cb_branch(funct3: u16, rs1_c: u8, imm: i64) -> u16 {
     let off = (imm as u16) & 0x1FF; // 9-bit
-    // Bit layout in CB:
-    // [12]=off[8], [11:10]=off[4:3], [9:7]=rs1', [6:5]=off[7:6], [4:3]=off[2:1], [2]=off[5], [1:0]=01
+                                    // Bit layout in CB:
+                                    // [12]=off[8], [11:10]=off[4:3], [9:7]=rs1', [6:5]=off[7:6], [4:3]=off[2:1], [2]=off[5], [1:0]=01
     (funct3 << 13)
         | (((off >> 8) & 1) << 12)
         | (((off >> 3) & 0x3) << 10)
@@ -1466,13 +2328,13 @@ fn encode_cb_branch(funct3: u16, rs1_c: u8, imm: i64) -> u16 {
 fn encode_cj(imm: i64) -> u16 {
     let off = (imm as u16) & 0xFFF;
     let bit11 = (off >> 11) & 1;
-    let bit4  = (off >> 4)  & 1;
+    let bit4 = (off >> 4) & 1;
     let bits9_8 = (off >> 8) & 0x3;
     let bit10 = (off >> 10) & 1;
-    let bit6  = (off >> 6)  & 1;
-    let bit7  = (off >> 7)  & 1;
+    let bit6 = (off >> 6) & 1;
+    let bit7 = (off >> 7) & 1;
     let bits3_1 = (off >> 1) & 0x7;
-    let bit5  = (off >> 5)  & 1;
+    let bit5 = (off >> 5) & 1;
 
     (0b101 << 13)
         | (bit11 << 12)
@@ -1490,11 +2352,7 @@ fn encode_cj(imm: i64) -> u16 {
 ///
 /// [15:10]=100011, [9:7]=rd'/rs1', [6:5]=funct2, [4:2]=rs2', [1:0]=01
 fn encode_ca(funct2: u16, rd_c: u8, rs2_c: u8) -> u16 {
-    (0b100011 << 10)
-        | ((rd_c as u16) << 7)
-        | (funct2 << 5)
-        | ((rs2_c as u16) << 2)
-        | C_OP_Q1
+    (0b100011 << 10) | ((rd_c as u16) << 7) | (funct2 << 5) | ((rs2_c as u16) << 2) | C_OP_Q1
 }
 
 // ===========================================================================
@@ -1508,7 +2366,13 @@ mod tests {
     use crate::backend::riscv64::registers;
 
     /// Helper to create a minimal instruction for testing.
-    fn test_inst(opcode: RvOpcode, rd: Option<u8>, rs1: Option<u8>, rs2: Option<u8>, imm: i64) -> RvInstruction {
+    fn test_inst(
+        opcode: RvOpcode,
+        rd: Option<u8>,
+        rs1: Option<u8>,
+        rs2: Option<u8>,
+        imm: i64,
+    ) -> RvInstruction {
         RvInstruction {
             opcode,
             rd,
@@ -1692,7 +2556,10 @@ mod tests {
         assert_eq!(enc.size, 4);
         assert!(enc.relocation.is_some());
         let reloc = enc.relocation.as_ref().unwrap();
-        assert_eq!(reloc.reloc_type, RiscV64RelocationType::CallPlt.as_elf_type());
+        assert_eq!(
+            reloc.reloc_type,
+            RiscV64RelocationType::CallPlt.as_elf_type()
+        );
         assert!(enc.continuation.is_some());
     }
 
@@ -1895,9 +2762,9 @@ mod tests {
         let encoder = RiscV64Encoder::new();
         let inst = RvInstruction {
             opcode: RvOpcode::FADD_D,
-            rd: Some(42),   // f10
-            rs1: Some(43),  // f11
-            rs2: Some(44),  // f12
+            rd: Some(42),  // f10
+            rs1: Some(43), // f11
+            rs2: Some(44), // f12
             rs3: None,
             imm: 0,
             symbol: None,
