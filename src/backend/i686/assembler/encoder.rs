@@ -165,7 +165,10 @@ fn imm(op: &MachineOperand) -> Result<i64, String> {
 /// True for Memory or FrameSlot operands.
 #[inline]
 fn is_mem(op: &MachineOperand) -> bool {
-    matches!(op, MachineOperand::Memory { .. } | MachineOperand::FrameSlot(_))
+    matches!(
+        op,
+        MachineOperand::Memory { .. } | MachineOperand::FrameSlot(_)
+    )
 }
 
 /// Create an [`EncodedInstruction`] with no relocation.
@@ -226,8 +229,7 @@ fn encode_mem_raw(
     }
 
     // Determine if SIB byte is needed
-    let need_sib = has_index
-        || (has_base && (base.unwrap() as u8) == ESP_IDX);
+    let need_sib = has_index || (has_base && (base.unwrap() as u8) == ESP_IDX);
 
     if need_sib {
         let bv = base.map(|r| r as u8).unwrap_or(0b101);
@@ -280,10 +282,20 @@ fn encode_mem(reg_field: u8, op: &MachineOperand) -> Result<Vec<u8>, String> {
             index,
             scale,
             displacement,
-        } => Ok(encode_mem_raw(reg_field, *base, *index, *scale, *displacement)),
-        MachineOperand::FrameSlot(off) => {
-            Ok(encode_mem_raw(reg_field, Some(registers::EBP), None, 1, *off as i64))
-        }
+        } => Ok(encode_mem_raw(
+            reg_field,
+            *base,
+            *index,
+            *scale,
+            *displacement,
+        )),
+        MachineOperand::FrameSlot(off) => Ok(encode_mem_raw(
+            reg_field,
+            Some(registers::EBP),
+            None,
+            1,
+            *off as i64,
+        )),
         _ => Err(format!("Expected memory operand, got {}", op)),
     }
 }
@@ -327,7 +339,10 @@ fn extract_cc(instr: &MachineInstruction) -> Result<u8, String> {
 /// Find the branch/call target operand (BlockLabel or GlobalSymbol).
 fn find_target(instr: &MachineInstruction) -> Option<&MachineOperand> {
     instr.operands.iter().find(|op| {
-        matches!(op, MachineOperand::BlockLabel(_) | MachineOperand::GlobalSymbol(_))
+        matches!(
+            op,
+            MachineOperand::BlockLabel(_) | MachineOperand::GlobalSymbol(_)
+        )
     })
 }
 
@@ -354,16 +369,16 @@ pub fn encode_instruction(
 ) -> Result<EncodedInstruction, String> {
     match instr.opcode {
         // Data movement
-        codegen::I686_MOV   => encode_mov(instr),
+        codegen::I686_MOV => encode_mov(instr),
         codegen::I686_MOVZX => encode_movzx(instr),
         codegen::I686_MOVSX => encode_movsx(instr),
-        codegen::I686_LEA   => encode_lea(instr),
-        codegen::I686_PUSH  => encode_push(instr),
-        codegen::I686_POP   => encode_pop(instr),
-        codegen::I686_XCHG  => encode_xchg(instr),
+        codegen::I686_LEA => encode_lea(instr),
+        codegen::I686_PUSH => encode_push(instr),
+        codegen::I686_POP => encode_pop(instr),
+        codegen::I686_XCHG => encode_xchg(instr),
         // ALU (shared pattern)
         codegen::I686_ADD => encode_alu(instr, 0),
-        codegen::I686_OR  => encode_alu(instr, 1),
+        codegen::I686_OR => encode_alu(instr, 1),
         codegen::I686_ADC => encode_alu(instr, 2),
         codegen::I686_SBB => encode_alu(instr, 3),
         codegen::I686_AND => encode_alu(instr, 4),
@@ -372,14 +387,14 @@ pub fn encode_instruction(
         codegen::I686_CMP => encode_alu(instr, 7),
         // Multiply / Divide / Unary
         codegen::I686_IMUL => encode_imul(instr),
-        codegen::I686_MUL  => encode_unary_f7(instr, 4),
-        codegen::I686_DIV  => encode_unary_f7(instr, 6),
+        codegen::I686_MUL => encode_unary_f7(instr, 4),
+        codegen::I686_DIV => encode_unary_f7(instr, 6),
         codegen::I686_IDIV => encode_unary_f7(instr, 7),
-        codegen::I686_NEG  => encode_unary_f7(instr, 3),
-        codegen::I686_NOT  => encode_unary_f7(instr, 2),
-        codegen::I686_INC  => encode_inc(instr),
-        codegen::I686_DEC  => encode_dec(instr),
-        codegen::I686_CDQ  => Ok(enc(vec![0x99])),
+        codegen::I686_NEG => encode_unary_f7(instr, 3),
+        codegen::I686_NOT => encode_unary_f7(instr, 2),
+        codegen::I686_INC => encode_inc(instr),
+        codegen::I686_DEC => encode_dec(instr),
+        codegen::I686_CDQ => Ok(enc(vec![0x99])),
         // Shifts
         codegen::I686_SHL => encode_shift(instr, 4),
         codegen::I686_SHR => encode_shift(instr, 5),
@@ -387,33 +402,33 @@ pub fn encode_instruction(
         // Test
         codegen::I686_TEST => encode_test(instr),
         // Conditional set / move
-        codegen::I686_SETCC  => encode_setcc(instr),
+        codegen::I686_SETCC => encode_setcc(instr),
         codegen::I686_CMOVCC => encode_cmovcc(instr),
         // Control flow
-        codegen::I686_JMP  => encode_jmp(instr, label_offsets, current_offset),
-        codegen::I686_JCC  => encode_jcc(instr, label_offsets, current_offset),
+        codegen::I686_JMP => encode_jmp(instr, label_offsets, current_offset),
+        codegen::I686_JCC => encode_jcc(instr, label_offsets, current_offset),
         codegen::I686_CALL => encode_call(instr, label_offsets, current_offset),
-        codegen::I686_RET  => encode_ret(instr),
+        codegen::I686_RET => encode_ret(instr),
         // x87 FPU
-        codegen::I686_FLD     => encode_fld(instr),
-        codegen::I686_FSTP    => encode_fstp(instr),
-        codegen::I686_FADD    => encode_fpu_arith(instr, 0xC0, 0, 0),
-        codegen::I686_FSUB    => encode_fpu_arith(instr, 0xE0, 4, 4),
-        codegen::I686_FMUL    => encode_fpu_arith(instr, 0xC8, 1, 1),
-        codegen::I686_FDIV    => encode_fpu_arith(instr, 0xF0, 6, 6),
-        codegen::I686_FCHS    => Ok(enc(vec![0xD9, 0xE0])),
-        codegen::I686_FCOMP   => encode_fcomp(instr),
-        codegen::I686_FILD    => encode_fild(instr),
-        codegen::I686_FISTP   => encode_fistp(instr),
-        codegen::I686_FXCH    => encode_fxch(instr),
+        codegen::I686_FLD => encode_fld(instr),
+        codegen::I686_FSTP => encode_fstp(instr),
+        codegen::I686_FADD => encode_fpu_arith(instr, 0xC0, 0, 0),
+        codegen::I686_FSUB => encode_fpu_arith(instr, 0xE0, 4, 4),
+        codegen::I686_FMUL => encode_fpu_arith(instr, 0xC8, 1, 1),
+        codegen::I686_FDIV => encode_fpu_arith(instr, 0xF0, 6, 6),
+        codegen::I686_FCHS => Ok(enc(vec![0xD9, 0xE0])),
+        codegen::I686_FCOMP => encode_fcomp(instr),
+        codegen::I686_FILD => encode_fild(instr),
+        codegen::I686_FISTP => encode_fistp(instr),
+        codegen::I686_FXCH => encode_fxch(instr),
         codegen::I686_FUCOMIP => encode_fucomip(instr),
         // Stack frame
         codegen::I686_ENTER => encode_enter(instr),
         codegen::I686_LEAVE => Ok(enc(vec![0xC9])),
         // Miscellaneous
-        codegen::I686_NOP  => Ok(enc(vec![0x90])),
+        codegen::I686_NOP => Ok(enc(vec![0x90])),
         codegen::I686_INT3 => Ok(enc(vec![0xCC])),
-        codegen::I686_UD2  => Ok(enc(vec![0x0F, 0x0B])),
+        codegen::I686_UD2 => Ok(enc(vec![0x0F, 0x0B])),
         _ => Err(format!("i686 encoder: unknown opcode 0x{:X}", instr.opcode)),
     }
 }
@@ -499,14 +514,23 @@ fn encode_mov(instr: &MachineInstruction) -> Result<EncodedInstruction, String> 
             other => return Err(format!("MOV store: unsupported src {}", other)),
         }
     }
-    Ok(EncodedInstruction { bytes, relocation: reloc })
+    Ok(EncodedInstruction {
+        bytes,
+        relocation: reloc,
+    })
 }
 
 /// Encode `MOVZX r32, r/m8` or `MOVZX r32, r/m16`.
 fn encode_movzx(instr: &MachineInstruction) -> Result<EncodedInstruction, String> {
     let d = gpr(instr.result.as_ref().ok_or("MOVZX: no result")?)?;
-    if instr.operands.is_empty() { return Err("MOVZX: no source".into()); }
-    let w: u8 = if instr.operands.len() > 1 { imm(&instr.operands[1]).unwrap_or(8) as u8 } else { 8 };
+    if instr.operands.is_empty() {
+        return Err("MOVZX: no source".into());
+    }
+    let w: u8 = if instr.operands.len() > 1 {
+        imm(&instr.operands[1]).unwrap_or(8) as u8
+    } else {
+        8
+    };
     let op2 = if w == 16 { 0xB7u8 } else { 0xB6u8 };
     let mut b = vec![0x0F, op2];
     match &instr.operands[0] {
@@ -520,8 +544,14 @@ fn encode_movzx(instr: &MachineInstruction) -> Result<EncodedInstruction, String
 /// Encode `MOVSX r32, r/m8` or `MOVSX r32, r/m16`.
 fn encode_movsx(instr: &MachineInstruction) -> Result<EncodedInstruction, String> {
     let d = gpr(instr.result.as_ref().ok_or("MOVSX: no result")?)?;
-    if instr.operands.is_empty() { return Err("MOVSX: no source".into()); }
-    let w: u8 = if instr.operands.len() > 1 { imm(&instr.operands[1]).unwrap_or(8) as u8 } else { 8 };
+    if instr.operands.is_empty() {
+        return Err("MOVSX: no source".into());
+    }
+    let w: u8 = if instr.operands.len() > 1 {
+        imm(&instr.operands[1]).unwrap_or(8) as u8
+    } else {
+        8
+    };
     let op2 = if w == 16 { 0xBFu8 } else { 0xBEu8 };
     let mut b = vec![0x0F, op2];
     match &instr.operands[0] {
@@ -535,7 +565,9 @@ fn encode_movsx(instr: &MachineInstruction) -> Result<EncodedInstruction, String
 /// Encode `LEA r32, [mem]`.
 fn encode_lea(instr: &MachineInstruction) -> Result<EncodedInstruction, String> {
     let d = gpr(instr.result.as_ref().ok_or("LEA: no result")?)?;
-    if instr.operands.is_empty() { return Err("LEA: no memory operand".into()); }
+    if instr.operands.is_empty() {
+        return Err("LEA: no memory operand".into());
+    }
     let mut b = vec![0x8D];
     b.extend(encode_mem(d, &instr.operands[0])?);
     Ok(enc(b))
@@ -543,23 +575,38 @@ fn encode_lea(instr: &MachineInstruction) -> Result<EncodedInstruction, String> 
 
 /// Encode `PUSH` (register, immediate, memory, or global symbol).
 fn encode_push(instr: &MachineInstruction) -> Result<EncodedInstruction, String> {
-    if instr.operands.is_empty() { return Err("PUSH: no operand".into()); }
+    if instr.operands.is_empty() {
+        return Err("PUSH: no operand".into());
+    }
     let mut b = Vec::new();
     match &instr.operands[0] {
         MachineOperand::Register(r) => b.push(0x50 + *r as u8),
         MachineOperand::Immediate(v) => {
-            if fits_in_i8(*v) { b.push(0x6A); b.push(emit_i8(*v)); }
-            else { b.push(0x68); b.extend_from_slice(&emit_i32(*v)); }
+            if fits_in_i8(*v) {
+                b.push(0x6A);
+                b.push(emit_i8(*v));
+            } else {
+                b.push(0x68);
+                b.extend_from_slice(&emit_i32(*v));
+            }
         }
-        op if is_mem(op) => { b.push(0xFF); b.extend(encode_mem(6, op)?); }
+        op if is_mem(op) => {
+            b.push(0xFF);
+            b.extend(encode_mem(6, op)?);
+        }
         MachineOperand::GlobalSymbol(name) => {
             b.push(0x68);
             let off = b.len();
             b.extend_from_slice(&[0; 4]);
-            return Ok(enc_reloc(b, InstructionRelocation {
-                offset_in_instruction: off, symbol: name.clone(),
-                rel_type: relocations::R_386_32, addend: 0,
-            }));
+            return Ok(enc_reloc(
+                b,
+                InstructionRelocation {
+                    offset_in_instruction: off,
+                    symbol: name.clone(),
+                    rel_type: relocations::R_386_32,
+                    addend: 0,
+                },
+            ));
         }
         o => return Err(format!("PUSH: bad operand {}", o)),
     }
@@ -568,13 +615,18 @@ fn encode_push(instr: &MachineInstruction) -> Result<EncodedInstruction, String>
 
 /// Encode `POP` (register or memory).
 fn encode_pop(instr: &MachineInstruction) -> Result<EncodedInstruction, String> {
-    let op = instr.result.as_ref()
+    let op = instr
+        .result
+        .as_ref()
         .or_else(|| instr.operands.first())
         .ok_or("POP: no destination")?;
     let mut b = Vec::new();
     match op {
         MachineOperand::Register(r) => b.push(0x58 + *r as u8),
-        m if is_mem(m) => { b.push(0x8F); b.extend(encode_mem(0, m)?); }
+        m if is_mem(m) => {
+            b.push(0x8F);
+            b.extend(encode_mem(0, m)?);
+        }
         o => return Err(format!("POP: bad operand {}", o)),
     }
     Ok(enc(b))
@@ -582,20 +634,29 @@ fn encode_pop(instr: &MachineInstruction) -> Result<EncodedInstruction, String> 
 
 /// Encode `XCHG` (reg-reg or reg-mem).
 fn encode_xchg(instr: &MachineInstruction) -> Result<EncodedInstruction, String> {
-    if instr.operands.len() < 2 { return Err("XCHG: need 2 operands".into()); }
+    if instr.operands.len() < 2 {
+        return Err("XCHG: need 2 operands".into());
+    }
     let mut b = Vec::new();
     match (&instr.operands[0], &instr.operands[1]) {
         (MachineOperand::Register(a), MachineOperand::Register(bb)) => {
             let (a, bb) = (*a as u8, *bb as u8);
-            if a == EAX_IDX      { b.push(0x90 + bb); }
-            else if bb == EAX_IDX { b.push(0x90 + a); }
-            else { b.push(0x87); b.push(modrm(0b11, a, bb)); }
+            if a == EAX_IDX {
+                b.push(0x90 + bb);
+            } else if bb == EAX_IDX {
+                b.push(0x90 + a);
+            } else {
+                b.push(0x87);
+                b.push(modrm(0b11, a, bb));
+            }
         }
         (MachineOperand::Register(r), m) if is_mem(m) => {
-            b.push(0x87); b.extend(encode_mem(*r as u8, m)?);
+            b.push(0x87);
+            b.extend(encode_mem(*r as u8, m)?);
         }
         (m, MachineOperand::Register(r)) if is_mem(m) => {
-            b.push(0x87); b.extend(encode_mem(*r as u8, m)?);
+            b.push(0x87);
+            b.extend(encode_mem(*r as u8, m)?);
         }
         _ => return Err("XCHG: unsupported operand combination".into()),
     }
@@ -622,8 +683,8 @@ fn encode_xchg(instr: &MachineInstruction) -> Result<EncodedInstruction, String>
 /// |  6  | XOR         | 0x31   | 0x33   | 0x35   | /6    |
 /// |  7  | CMP         | 0x39   | 0x3B   | 0x3D   | /7    |
 fn encode_alu(instr: &MachineInstruction, ext: u8) -> Result<EncodedInstruction, String> {
-    let mr  = ext * 8 + 0x01; // r/m32, r32   (reg field = source)
-    let rm  = ext * 8 + 0x03; // r32,   r/m32 (reg field = dest)
+    let mr = ext * 8 + 0x01; // r/m32, r32   (reg field = source)
+    let rm = ext * 8 + 0x03; // r32,   r/m32 (reg field = dest)
     let axi = ext * 8 + 0x05; // EAX,   imm32
 
     if instr.operands.len() < 2 {
@@ -679,7 +740,12 @@ fn encode_alu(instr: &MachineInstruction, ext: u8) -> Result<EncodedInstruction,
                 b.extend_from_slice(&emit_i32(v));
             }
         }
-        _ => return Err(format!("ALU ext={}: unsupported operands {} , {}", ext, dst, src)),
+        _ => {
+            return Err(format!(
+                "ALU ext={}: unsupported operands {} , {}",
+                ext, dst, src
+            ))
+        }
     }
     Ok(enc(b))
 }
@@ -710,14 +776,25 @@ fn encode_imul(instr: &MachineInstruction) -> Result<EncodedInstruction, String>
         }
     } else if last_is_imm {
         // Three-operand (or two-operand with imm): IMUL r32, r/m32, imm
-        let dst = if let Some(ref r) = instr.result { gpr(r)? }
-                  else { gpr(&ops[0])? };
+        let dst = if let Some(ref r) = instr.result {
+            gpr(r)?
+        } else {
+            gpr(&ops[0])?
+        };
         let src_idx = if ops.len() >= 3 { 1 } else { 0 };
         let imm_idx = ops.len() - 1;
         let v = imm(&ops[imm_idx])?;
-        let src = if src_idx < imm_idx { &ops[src_idx] } else { &ops[0] };
+        let src = if src_idx < imm_idx {
+            &ops[src_idx]
+        } else {
+            &ops[0]
+        };
 
-        if fits_in_i8(v) { b.push(0x6B); } else { b.push(0x69); }
+        if fits_in_i8(v) {
+            b.push(0x6B);
+        } else {
+            b.push(0x69);
+        }
         match src {
             MachineOperand::Register(s) => b.push(modrm(0b11, dst, *s as u8)),
             m if is_mem(m) => b.extend(encode_mem(dst, m)?),
@@ -726,12 +803,18 @@ fn encode_imul(instr: &MachineInstruction) -> Result<EncodedInstruction, String>
                 b.push(modrm(0b11, dst, dst));
             }
         }
-        if fits_in_i8(v) { b.push(emit_i8(v)); }
-        else { b.extend_from_slice(&emit_i32(v)); }
+        if fits_in_i8(v) {
+            b.push(emit_i8(v));
+        } else {
+            b.extend_from_slice(&emit_i32(v));
+        }
     } else {
         // Two-operand: IMUL r32, r/m32 → 0F AF
-        let dst = if let Some(ref r) = instr.result { gpr(r)? }
-                  else { gpr(&ops[0])? };
+        let dst = if let Some(ref r) = instr.result {
+            gpr(r)?
+        } else {
+            gpr(&ops[0])?
+        };
         let src_idx = if instr.result.is_some() { 0 } else { 1 };
         let src = &ops[src_idx];
 
@@ -762,13 +845,18 @@ fn encode_unary_f7(instr: &MachineInstruction, ext: u8) -> Result<EncodedInstruc
 
 /// Encode `INC` — short form `0x40+rd` for registers.
 fn encode_inc(instr: &MachineInstruction) -> Result<EncodedInstruction, String> {
-    let op = instr.result.as_ref()
+    let op = instr
+        .result
+        .as_ref()
         .or_else(|| instr.operands.first())
         .ok_or("INC: no operand")?;
     let mut b = Vec::new();
     match op {
         MachineOperand::Register(r) => b.push(0x40 + *r as u8),
-        m if is_mem(m) => { b.push(0xFF); b.extend(encode_mem(0, m)?); }
+        m if is_mem(m) => {
+            b.push(0xFF);
+            b.extend(encode_mem(0, m)?);
+        }
         o => return Err(format!("INC: bad operand {}", o)),
     }
     Ok(enc(b))
@@ -776,13 +864,18 @@ fn encode_inc(instr: &MachineInstruction) -> Result<EncodedInstruction, String> 
 
 /// Encode `DEC` — short form `0x48+rd` for registers.
 fn encode_dec(instr: &MachineInstruction) -> Result<EncodedInstruction, String> {
-    let op = instr.result.as_ref()
+    let op = instr
+        .result
+        .as_ref()
         .or_else(|| instr.operands.first())
         .ok_or("DEC: no operand")?;
     let mut b = Vec::new();
     match op {
         MachineOperand::Register(r) => b.push(0x48 + *r as u8),
-        m if is_mem(m) => { b.push(0xFF); b.extend(encode_mem(1, m)?); }
+        m if is_mem(m) => {
+            b.push(0xFF);
+            b.extend(encode_mem(1, m)?);
+        }
         o => return Err(format!("DEC: bad operand {}", o)),
     }
     Ok(enc(b))
@@ -898,7 +991,9 @@ fn encode_test(instr: &MachineInstruction) -> Result<EncodedInstruction, String>
 /// Encode `SETcc r/m8` → `0x0F 0x90+cc ModR/M`.
 fn encode_setcc(instr: &MachineInstruction) -> Result<EncodedInstruction, String> {
     let cc = extract_cc(instr)?;
-    let dst = instr.result.as_ref()
+    let dst = instr
+        .result
+        .as_ref()
         .or_else(|| instr.operands.first())
         .ok_or("SETCC: no destination")?;
     let mut b = vec![0x0Fu8, 0x90 + cc];
@@ -913,10 +1008,15 @@ fn encode_setcc(instr: &MachineInstruction) -> Result<EncodedInstruction, String
 /// Encode `CMOVcc r32, r/m32` → `0x0F 0x40+cc ModR/M`.
 fn encode_cmovcc(instr: &MachineInstruction) -> Result<EncodedInstruction, String> {
     let cc = extract_cc(instr)?;
-    let dst = if let Some(ref r) = instr.result { gpr(r)? }
-              else { gpr(&instr.operands[0])? };
+    let dst = if let Some(ref r) = instr.result {
+        gpr(r)?
+    } else {
+        gpr(&instr.operands[0])?
+    };
     let src_idx = if instr.result.is_some() { 0 } else { 1 };
-    let src = instr.operands.get(src_idx)
+    let src = instr
+        .operands
+        .get(src_idx)
         .ok_or("CMOVCC: no source operand")?;
 
     let mut b = vec![0x0Fu8, 0x40 + cc];
@@ -970,10 +1070,15 @@ fn encode_jmp(
             b.push(0xE9);
             let reloc_off = b.len();
             b.extend_from_slice(&emit_i32(0));
-            return Ok(enc_reloc(b, InstructionRelocation {
-                offset_in_instruction: reloc_off, symbol: sym.clone(),
-                rel_type: relocations::R_386_PC32, addend: -4,
-            }));
+            return Ok(enc_reloc(
+                b,
+                InstructionRelocation {
+                    offset_in_instruction: reloc_off,
+                    symbol: sym.clone(),
+                    rel_type: relocations::R_386_PC32,
+                    addend: -4,
+                },
+            ));
         }
         MachineOperand::Register(r) => {
             // JMP r/m32 → FF /4
@@ -996,8 +1101,7 @@ fn encode_jcc(
     current_offset: usize,
 ) -> Result<EncodedInstruction, String> {
     let cc = extract_cc(instr)?;
-    let target = find_target(instr)
-        .ok_or_else(|| "JCC: no branch target operand".to_string())?;
+    let target = find_target(instr).ok_or_else(|| "JCC: no branch target operand".to_string())?;
     let mut b = Vec::new();
 
     match target {
@@ -1021,10 +1125,15 @@ fn encode_jcc(
             b.push(0x80 + cc);
             let reloc_off = b.len();
             b.extend_from_slice(&emit_i32(0));
-            return Ok(enc_reloc(b, InstructionRelocation {
-                offset_in_instruction: reloc_off, symbol: sym.clone(),
-                rel_type: relocations::R_386_PC32, addend: -4,
-            }));
+            return Ok(enc_reloc(
+                b,
+                InstructionRelocation {
+                    offset_in_instruction: reloc_off,
+                    symbol: sym.clone(),
+                    rel_type: relocations::R_386_PC32,
+                    addend: -4,
+                },
+            ));
         }
         o => return Err(format!("JCC: unsupported target {}", o)),
     }
@@ -1049,10 +1158,15 @@ fn encode_call(
             b.push(0xE8);
             let reloc_off = b.len();
             b.extend_from_slice(&emit_i32(0));
-            return Ok(enc_reloc(b, InstructionRelocation {
-                offset_in_instruction: reloc_off, symbol: sym.clone(),
-                rel_type: relocations::R_386_PLT32, addend: -4,
-            }));
+            return Ok(enc_reloc(
+                b,
+                InstructionRelocation {
+                    offset_in_instruction: reloc_off,
+                    symbol: sym.clone(),
+                    rel_type: relocations::R_386_PLT32,
+                    addend: -4,
+                },
+            ));
         }
         MachineOperand::BlockLabel(id) => {
             let key = label_key(*id);
@@ -1105,8 +1219,7 @@ fn fpu_idx(op: &MachineOperand) -> Result<u8, String> {
     match op {
         MachineOperand::Register(r) => {
             if registers::is_fpu_reg(*r) {
-                registers::fpu_stack_index(*r)
-                    .ok_or_else(|| format!("Bad FPU reg {}", r))
+                registers::fpu_stack_index(*r).ok_or_else(|| format!("Bad FPU reg {}", r))
             } else {
                 Err(format!("Expected FPU register, got GPR {}", r))
             }
@@ -1120,20 +1233,28 @@ fn fpu_idx(op: &MachineOperand) -> Result<u8, String> {
 fn fpu_mem_width(instr: &MachineInstruction, default_ext: u8) -> (u8, u8) {
     // If there's a width hint as a second or third immediate, use it.
     // Convention: operands may include an Immediate(4|8|10) for width.
-    let width = instr.operands.iter().find_map(|op| match op {
-        MachineOperand::Immediate(4) => Some(4i64),
-        MachineOperand::Immediate(8) => Some(8),
-        MachineOperand::Immediate(10) => Some(10),
-        _ => None,
-    }).unwrap_or(8); // default to 64-bit double
+    let width = instr
+        .operands
+        .iter()
+        .find_map(|op| match op {
+            MachineOperand::Immediate(4) => Some(4i64),
+            MachineOperand::Immediate(8) => Some(8),
+            MachineOperand::Immediate(10) => Some(10),
+            _ => None,
+        })
+        .unwrap_or(8); // default to 64-bit double
 
     match width {
-        4 => (0xD9, default_ext),   // 32-bit float
+        4 => (0xD9, default_ext), // 32-bit float
         10 | 16 => {
             // 80-bit extended precision: DB /5 for FLD, DB /7 for FSTP
-            if default_ext == 0 { (0xDB, 5) } else { (0xDB, 7) }
+            if default_ext == 0 {
+                (0xDB, 5)
+            } else {
+                (0xDB, 7)
+            }
         }
-        _ => (0xDD, default_ext),   // 64-bit double (default)
+        _ => (0xDD, default_ext), // 64-bit double (default)
     }
 }
 
@@ -1147,8 +1268,8 @@ fn encode_fld(instr: &MachineInstruction) -> Result<EncodedInstruction, String> 
 
     match src {
         MachineOperand::Register(r) if registers::is_fpu_reg(*r) => {
-            let i = registers::fpu_stack_index(*r)
-                .ok_or_else(|| format!("FLD: bad FPU reg {}", r))?;
+            let i =
+                registers::fpu_stack_index(*r).ok_or_else(|| format!("FLD: bad FPU reg {}", r))?;
             // FLD ST(i) → D9 C0+i
             b.push(0xD9);
             b.push(0xC0 + i);
@@ -1173,8 +1294,8 @@ fn encode_fstp(instr: &MachineInstruction) -> Result<EncodedInstruction, String>
 
     match dst {
         MachineOperand::Register(r) if registers::is_fpu_reg(*r) => {
-            let i = registers::fpu_stack_index(*r)
-                .ok_or_else(|| format!("FSTP: bad FPU reg {}", r))?;
+            let i =
+                registers::fpu_stack_index(*r).ok_or_else(|| format!("FSTP: bad FPU reg {}", r))?;
             // FSTP ST(i) → DD D8+i
             b.push(0xDD);
             b.push(0xD8 + i);
@@ -1279,12 +1400,16 @@ fn encode_fild(instr: &MachineInstruction) -> Result<EncodedInstruction, String>
     }
     let mut b = Vec::new();
 
-    let width = instr.operands.iter().find_map(|op| match op {
-        MachineOperand::Immediate(2) => Some(2i64),
-        MachineOperand::Immediate(4) => Some(4),
-        MachineOperand::Immediate(8) => Some(8),
-        _ => None,
-    }).unwrap_or(4);
+    let width = instr
+        .operands
+        .iter()
+        .find_map(|op| match op {
+            MachineOperand::Immediate(2) => Some(2i64),
+            MachineOperand::Immediate(4) => Some(4),
+            MachineOperand::Immediate(8) => Some(8),
+            _ => None,
+        })
+        .unwrap_or(4);
 
     match width {
         2 => {
@@ -1317,12 +1442,16 @@ fn encode_fistp(instr: &MachineInstruction) -> Result<EncodedInstruction, String
     }
     let mut b = Vec::new();
 
-    let width = instr.operands.iter().find_map(|op| match op {
-        MachineOperand::Immediate(2) => Some(2i64),
-        MachineOperand::Immediate(4) => Some(4),
-        MachineOperand::Immediate(8) => Some(8),
-        _ => None,
-    }).unwrap_or(4);
+    let width = instr
+        .operands
+        .iter()
+        .find_map(|op| match op {
+            MachineOperand::Immediate(2) => Some(2i64),
+            MachineOperand::Immediate(4) => Some(4),
+            MachineOperand::Immediate(8) => Some(8),
+            _ => None,
+        })
+        .unwrap_or(4);
 
     match width {
         2 => {
@@ -1435,8 +1564,7 @@ pub fn compute_instruction_size(instr: &MachineInstruction) -> usize {
         }
 
         // ---- ALU ----
-        I686_ADD | I686_SUB | I686_ADC | I686_SBB |
-        I686_AND | I686_OR  | I686_XOR | I686_CMP => {
+        I686_ADD | I686_SUB | I686_ADC | I686_SBB | I686_AND | I686_OR | I686_XOR | I686_CMP => {
             // Worst case: 81 /ext + mem(6) + imm32(4) = 11
             11
         }
@@ -1519,13 +1647,13 @@ pub fn compute_instruction_size(instr: &MachineInstruction) -> usize {
         I686_FUCOMIP => 2,
 
         // ---- Stack Frame ----
-        I686_ENTER => 4,  // C8 imm16 imm8
-        I686_LEAVE => 1,  // C9
+        I686_ENTER => 4, // C8 imm16 imm8
+        I686_LEAVE => 1, // C9
 
         // ---- Misc ----
-        I686_NOP  => 1,  // 90
-        I686_INT3 => 1,  // CC
-        I686_UD2  => 2,  // 0F 0B
+        I686_NOP => 1,  // 90
+        I686_INT3 => 1, // CC
+        I686_UD2 => 2,  // 0F 0B
 
         // Unknown opcode — pessimistic estimate
         _ => 15,
