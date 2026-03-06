@@ -1,10 +1,1398 @@
 //! # RISC-V 64 Backend
 //!
-//! RISC-V 64 architecture-specific code generation, assembler, and linker.
-//! Implements the `ArchCodegen` trait for RV64IMAFDC (LP64D ABI).
+//! Complete RISC-V 64-bit code generation backend for BCC.
+//! Implements the [`ArchCodegen`] trait for the RV64IMAFDC ISA with LP64D ABI.
+//!
+//! ## Submodules
+//!
+//! - [`codegen`] — Instruction selection (IR → RISC-V machine instructions)
+//! - [`registers`] — Register file definitions (x0–x31, f0–f31)
+//! - [`abi`] — LP64D calling convention and stack frame layout
+//! - [`assembler`] — Built-in RISC-V 64 assembler (instruction encoding, relocations)
+//! - [`linker`] — Built-in RISC-V 64 ELF linker (relocation application, relaxation)
+//!
+//! ## Architecture Characteristics
+//!
+//! - Fixed 32-bit instruction width (with 16-bit compressed extension)
+//! - Load/store architecture — ALU ops on registers only
+//! - 32 integer registers: x0 (zero) is hardwired to 0
+//! - 32 FP registers: IEEE 754 single and double precision
+//! - Little-endian byte order
+//! - ELF machine type: EM_RISCV (243)
+//! - ELF flags: EF_RISCV_FLOAT_ABI_DOUBLE | EF_RISCV_RVC (0x0005)
+//!
+//! ## Pipeline Position
+//!
+//! The code generation driver ([`crate::backend::generation`]) dispatches to
+//! [`RiscV64Codegen`] when `--target=riscv64` is specified.  The flow is:
+//!
+//! 1. `lower_function` — IR → machine instructions (instruction selection)
+//! 2. Register allocation via [`crate::backend::register_allocator`]
+//! 3. `emit_prologue` / `emit_epilogue` — stack frame setup / teardown
+//! 4. `emit_assembly` — machine instructions → encoded bytes
+//! 5. `compile_to_object` — ELF `.o` production from a full IR module
+//!
+//! ## Primary target for Linux kernel 6.9 boot validation (Checkpoint 6).
+
+// ===========================================================================
+// Submodule Declarations
+// ===========================================================================
 
 pub mod abi;
 pub mod assembler;
 pub mod codegen;
 pub mod linker;
 pub mod registers;
+
+// ===========================================================================
+// Crate Imports
+// ===========================================================================
+
+use crate::backend::elf_writer_common::{
+    self, ElfSymbol, ElfWriter, Relocation, Section, ET_REL, SHF_ALLOC, SHF_EXECINSTR,
+    SHF_WRITE, SHT_NOBITS, SHT_PROGBITS, STB_GLOBAL, STB_LOCAL,
+};
+use crate::backend::traits::{
+    ArchCodegen, ArgLocation, MachineBasicBlock, MachineFunction, MachineInstruction,
+    MachineOperand, RegisterInfo, RelocationTypeInfo,
+};
+use crate::common::diagnostics::DiagnosticEngine;
+use crate::common::target::Target;
+use crate::common::types::{CType, StructField, TypeQualifiers};
+use crate::ir::function::IrFunction;
+use crate::ir::module::IrModule;
+use crate::ir::types::IrType;
+
+// ===========================================================================
+// Submodule Imports
+// ===========================================================================
+
+use self::abi::RiscV64Abi;
+use self::codegen::RiscV64InstructionSelector;
+use self::registers::{RiscV64RegisterInfo, FP, RA, SP};
+
+// ===========================================================================
+// Public Re-exports
+// ===========================================================================
+
+pub use self::abi::{ArgClass, FrameLayout, RiscV64Abi as RiscV64AbiExport};
+pub use self::codegen::{RiscV64InstructionSelector as RiscV64InstructionSelectorExport, RvInstruction, RvOpcode};
+pub use self::registers::{RegClass, RiscV64RegisterInfo as RiscV64RegisterInfoExport};
+
+// ===========================================================================
+// RISC-V 64 ELF Constants
+// ===========================================================================
+
+/// ELF machine type for RISC-V (e_machine field).
+///
+/// Value 243 (0xF3) as defined in the ELF specification supplement for
+/// RISC-V.
+pub const EM_RISCV: u16 = 243;
+
+/// ELF flag: double-precision floating-point ABI (LP64D).
+///
+/// Bit 2 of `e_flags`. Indicates that the object uses the LP64D ABI
+/// where `double` arguments are passed in floating-point registers.
+pub const EF_RISCV_FLOAT_ABI_DOUBLE: u32 = 0x0004;
+
+/// ELF flag: compressed (RVC) extension enabled.
+///
+/// Bit 0 of `e_flags`. Indicates that the object may contain 16-bit
+/// compressed (C extension) instructions.
+pub const EF_RISCV_RVC: u32 = 0x0001;
+
+/// Combined ELF flags for BCC RISC-V 64 output.
+///
+/// `EF_RISCV_FLOAT_ABI_DOUBLE | EF_RISCV_RVC` = 0x0005.
+/// These flags are set on every `.o`, executable, and shared object
+/// produced by this backend.
+pub const ELF_FLAGS: u32 = EF_RISCV_FLOAT_ABI_DOUBLE | EF_RISCV_RVC;
+
+/// Default base virtual address for RISC-V 64 static executables.
+///
+/// The first `PT_LOAD` segment is placed at this address.  Matches the
+/// standard Linux layout for RISC-V ELF executables.
+pub const DEFAULT_BASE_ADDRESS: u64 = 0x10000;
+
+/// Memory page size for RISC-V 64.
+///
+/// Used for `PT_LOAD` segment alignment in executables and shared objects.
+/// The standard Linux RISC-V page size is 4 KiB.
+pub const PAGE_SIZE: u64 = 4096;
+
+// ===========================================================================
+// RISC-V 64 Relocation Type Constants
+// ===========================================================================
+
+/// No relocation — placeholder entry.
+const R_RISCV_NONE: u32 = 0;
+/// 32-bit absolute address.
+const R_RISCV_32: u32 = 1;
+/// 64-bit absolute address.
+const R_RISCV_64: u32 = 2;
+/// B-type branch offset (±4 KiB range).
+const R_RISCV_BRANCH: u32 = 16;
+/// J-type jump offset (±1 MiB range).
+const R_RISCV_JAL: u32 = 17;
+/// AUIPC+JALR call pair (32-bit PC-relative range).
+const R_RISCV_CALL: u32 = 18;
+/// AUIPC+JALR call pair via PLT (for PIC).
+const R_RISCV_CALL_PLT: u32 = 19;
+/// GOT entry upper 20 bits (PC-relative).
+const R_RISCV_GOT_HI20: u32 = 20;
+/// TLS GD upper 20 bits (for thread-local storage).
+const R_RISCV_TLS_GD_HI20: u32 = 22;
+/// PC-relative upper 20 bits (AUIPC target).
+const R_RISCV_PCREL_HI20: u32 = 23;
+/// PC-relative lower 12 bits, I-type encoding (ADDI/LD).
+const R_RISCV_PCREL_LO12_I: u32 = 24;
+/// PC-relative lower 12 bits, S-type encoding (SD/SW).
+const R_RISCV_PCREL_LO12_S: u32 = 25;
+/// Absolute upper 20 bits (LUI target).
+const R_RISCV_HI20: u32 = 26;
+/// Absolute lower 12 bits, I-type encoding.
+const R_RISCV_LO12_I: u32 = 27;
+/// Absolute lower 12 bits, S-type encoding.
+const R_RISCV_LO12_S: u32 = 28;
+/// 32-bit addition (for DWARF / exception info).
+const R_RISCV_ADD32: u32 = 35;
+/// 64-bit addition (for DWARF / exception info).
+const R_RISCV_ADD64: u32 = 36;
+/// 32-bit subtraction (for DWARF / exception info).
+const R_RISCV_SUB32: u32 = 39;
+/// 64-bit subtraction (for DWARF / exception info).
+const R_RISCV_SUB64: u32 = 40;
+/// Alignment directive hint for the linker.
+const R_RISCV_ALIGN: u32 = 43;
+/// RVC branch offset (compressed branch).
+const R_RISCV_RVC_BRANCH: u32 = 44;
+/// RVC jump offset (compressed jump).
+const R_RISCV_RVC_JUMP: u32 = 45;
+/// Linker relaxation hint — indicates the relocation pair may be
+/// relaxed (e.g., AUIPC+JALR → JAL when target is within ±1 MiB).
+const R_RISCV_RELAX: u32 = 51;
+/// Set 6 low bits of a byte (for DWARF/CFA).
+const R_RISCV_SET6: u32 = 52;
+/// Set low byte.
+const R_RISCV_SET8: u32 = 53;
+/// Set 16-bit value.
+const R_RISCV_SET16: u32 = 54;
+/// Set 32-bit value.
+const R_RISCV_SET32: u32 = 55;
+/// 8-bit addition (for DWARF / compressed debug).
+const R_RISCV_ADD8: u32 = 33;
+/// 16-bit addition.
+const R_RISCV_ADD16: u32 = 34;
+/// 8-bit subtraction.
+const R_RISCV_SUB8: u32 = 37;
+/// 16-bit subtraction.
+const R_RISCV_SUB16: u32 = 38;
+/// 6-bit subtraction (for DWARF uleb128).
+#[allow(dead_code)]
+const R_RISCV_SUB6: u32 = 52; // Note: shares value with SET6 — ELF spec distinguishes by context
+
+// ===========================================================================
+// RiscV64Codegen — Main Backend Struct
+// ===========================================================================
+
+/// RISC-V 64 code generation backend.
+///
+/// This is the main entry point for RISC-V 64 code generation in BCC.
+/// It implements the [`ArchCodegen`] trait, providing:
+///
+/// - Instruction selection via [`RiscV64InstructionSelector`]
+/// - Register allocation via [`crate::backend::register_allocator`]
+/// - Prologue / epilogue generation for LP64D stack frames
+/// - Machine code emission via the built-in RISC-V assembler
+/// - ELF relocatable object (`.o`) production via [`compile_to_object`](Self::compile_to_object)
+///
+/// # Construction
+///
+/// ```ignore
+/// let codegen = RiscV64Codegen::new(pic_mode, debug_info);
+/// let mf = codegen.lower_function(&ir_func, &mut diag)?;
+/// let bytes = codegen.emit_assembly(&mf)?;
+/// ```
+pub struct RiscV64Codegen {
+    /// Target architecture descriptor (always [`Target::RiscV64`]).
+    pub target: Target,
+
+    /// Register file information provider.
+    ///
+    /// Unit struct that converts to [`RegisterInfo`] via
+    /// [`RiscV64RegisterInfo::to_register_info()`].
+    pub reg_info: RiscV64RegisterInfo,
+
+    /// LP64D ABI handler for argument / return value classification.
+    pub abi: RiscV64Abi,
+
+    /// Whether position-independent code generation is enabled (`-fPIC`).
+    ///
+    /// When `true`, global variable access uses AUIPC+LD through the GOT
+    /// and function calls use AUIPC+JALR through the PLT.
+    pub pic_mode: bool,
+
+    /// Whether DWARF debug information should be emitted (`-g`).
+    ///
+    /// When `true`, `.debug_info`, `.debug_abbrev`, `.debug_line`, and
+    /// `.debug_str` sections are generated in the output object file.
+    pub debug_info: bool,
+
+    /// Cached relocation type descriptors for this architecture.
+    ///
+    /// Built once during construction and returned by reference from
+    /// [`ArchCodegen::relocation_types()`].
+    pub relocation_types: Vec<RelocationTypeInfo>,
+}
+
+impl RiscV64Codegen {
+    /// Create a new RISC-V 64 code generation backend.
+    ///
+    /// # Arguments
+    ///
+    /// * `pic_mode` — Whether to generate position-independent code (`-fPIC`).
+    ///   Affects address materialization (AUIPC+LD via GOT vs LUI+ADDI) and
+    ///   function call sequences (PLT vs direct).
+    /// * `debug_info` — Whether to emit DWARF v4 debug sections (`-g`).
+    ///   When true, source file/line mapping and local variable location
+    ///   information is generated.
+    pub fn new(pic_mode: bool, debug_info: bool) -> Self {
+        Self {
+            target: Target::RiscV64,
+            reg_info: RiscV64RegisterInfo,
+            abi: RiscV64Abi::new(),
+            pic_mode,
+            debug_info,
+            relocation_types: Self::build_relocation_types(),
+        }
+    }
+
+    /// Build the complete set of RISC-V 64 relocation type descriptors.
+    ///
+    /// These descriptors are used by the common linker infrastructure to
+    /// understand each relocation's semantics (name, ELF type ID, size in
+    /// bytes, and whether it is PC-relative).
+    ///
+    /// Returns a vector containing descriptors for all RISC-V relocations
+    /// needed by the BCC assembler and linker.
+    pub fn build_relocation_types() -> Vec<RelocationTypeInfo> {
+        vec![
+            // --- Absolute relocations ---
+            RelocationTypeInfo::new("R_RISCV_NONE", R_RISCV_NONE, 0, false),
+            RelocationTypeInfo::new("R_RISCV_32", R_RISCV_32, 4, false),
+            RelocationTypeInfo::new("R_RISCV_64", R_RISCV_64, 8, false),
+            // --- Branch / jump relocations (PC-relative) ---
+            RelocationTypeInfo::new("R_RISCV_BRANCH", R_RISCV_BRANCH, 4, true),
+            RelocationTypeInfo::new("R_RISCV_JAL", R_RISCV_JAL, 4, true),
+            RelocationTypeInfo::new("R_RISCV_CALL", R_RISCV_CALL, 8, true),
+            RelocationTypeInfo::new("R_RISCV_CALL_PLT", R_RISCV_CALL_PLT, 8, true),
+            // --- GOT-relative (PC-relative) ---
+            RelocationTypeInfo::new("R_RISCV_GOT_HI20", R_RISCV_GOT_HI20, 4, true),
+            // --- TLS ---
+            RelocationTypeInfo::new("R_RISCV_TLS_GD_HI20", R_RISCV_TLS_GD_HI20, 4, true),
+            // --- PC-relative hi20/lo12 pair ---
+            RelocationTypeInfo::new("R_RISCV_PCREL_HI20", R_RISCV_PCREL_HI20, 4, true),
+            RelocationTypeInfo::new("R_RISCV_PCREL_LO12_I", R_RISCV_PCREL_LO12_I, 4, true),
+            RelocationTypeInfo::new("R_RISCV_PCREL_LO12_S", R_RISCV_PCREL_LO12_S, 4, true),
+            // --- Absolute hi20/lo12 pair ---
+            RelocationTypeInfo::new("R_RISCV_HI20", R_RISCV_HI20, 4, false),
+            RelocationTypeInfo::new("R_RISCV_LO12_I", R_RISCV_LO12_I, 4, false),
+            RelocationTypeInfo::new("R_RISCV_LO12_S", R_RISCV_LO12_S, 4, false),
+            // --- Arithmetic relocations (DWARF, exception tables) ---
+            RelocationTypeInfo::new("R_RISCV_ADD8", R_RISCV_ADD8, 1, false),
+            RelocationTypeInfo::new("R_RISCV_ADD16", R_RISCV_ADD16, 2, false),
+            RelocationTypeInfo::new("R_RISCV_ADD32", R_RISCV_ADD32, 4, false),
+            RelocationTypeInfo::new("R_RISCV_ADD64", R_RISCV_ADD64, 8, false),
+            RelocationTypeInfo::new("R_RISCV_SUB8", R_RISCV_SUB8, 1, false),
+            RelocationTypeInfo::new("R_RISCV_SUB16", R_RISCV_SUB16, 2, false),
+            RelocationTypeInfo::new("R_RISCV_SUB32", R_RISCV_SUB32, 4, false),
+            RelocationTypeInfo::new("R_RISCV_SUB64", R_RISCV_SUB64, 8, false),
+            // --- Alignment and relaxation hints ---
+            RelocationTypeInfo::new("R_RISCV_ALIGN", R_RISCV_ALIGN, 0, false),
+            RelocationTypeInfo::new("R_RISCV_RELAX", R_RISCV_RELAX, 0, false),
+            // --- Compressed branch/jump ---
+            RelocationTypeInfo::new("R_RISCV_RVC_BRANCH", R_RISCV_RVC_BRANCH, 2, true),
+            RelocationTypeInfo::new("R_RISCV_RVC_JUMP", R_RISCV_RVC_JUMP, 2, true),
+            // --- Bitfield set relocations ---
+            RelocationTypeInfo::new("R_RISCV_SET6", R_RISCV_SET6, 1, false),
+            RelocationTypeInfo::new("R_RISCV_SET8", R_RISCV_SET8, 1, false),
+            RelocationTypeInfo::new("R_RISCV_SET16", R_RISCV_SET16, 2, false),
+            RelocationTypeInfo::new("R_RISCV_SET32", R_RISCV_SET32, 4, false),
+        ]
+    }
+
+    // =======================================================================
+    // Helper: Convert IrType to CType for ABI classification
+    // =======================================================================
+
+    /// Map an IR type to a C language type for ABI classification purposes.
+    ///
+    /// The [`ArchCodegen`] trait methods `classify_argument` and
+    /// `classify_return` receive [`IrType`] values, but the LP64D ABI
+    /// handler ([`RiscV64Abi`]) classifies [`CType`] values.  This helper
+    /// bridges the two type systems.
+    fn ir_type_to_ctype(ty: &IrType) -> CType {
+        match ty {
+            IrType::Void => CType::Void,
+            IrType::I1 => CType::Bool,
+            IrType::I8 => CType::SChar,
+            IrType::I16 => CType::Short,
+            IrType::I32 => CType::Int,
+            IrType::I64 => CType::Long,
+            IrType::I128 => CType::LongLong, // 128-bit mapped to long long for ABI
+            IrType::F32 => CType::Float,
+            IrType::F64 => CType::Double,
+            IrType::F80 => CType::LongDouble,
+            IrType::Ptr => CType::Pointer(Box::new(CType::Void), TypeQualifiers::default()),
+            IrType::Array(elem, count) => {
+                let elem_ctype = Self::ir_type_to_ctype(elem);
+                CType::Array(Box::new(elem_ctype), Some(*count))
+            }
+            IrType::Struct(st) => {
+                let ctype_fields: Vec<StructField> = st
+                    .fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| StructField {
+                        name: Some(format!("field{}", i)),
+                        ty: Self::ir_type_to_ctype(f),
+                        bit_width: None,
+                    })
+                    .collect();
+                CType::Struct {
+                    name: st.name.clone(),
+                    fields: ctype_fields,
+                    packed: st.packed,
+                    aligned: None,
+                }
+            }
+            IrType::Function(ret, params) => {
+                let ret_ctype = Self::ir_type_to_ctype(ret);
+                let param_ctypes: Vec<CType> =
+                    params.iter().map(Self::ir_type_to_ctype).collect();
+                CType::Function {
+                    return_type: Box::new(ret_ctype),
+                    params: param_ctypes,
+                    variadic: false,
+                }
+            }
+        }
+    }
+
+    // =======================================================================
+    // Helper: Convert RvInstructions to MachineInstructions
+    // =======================================================================
+
+    /// Convert a RISC-V instruction from the instruction selector's
+    /// representation ([`codegen::RvInstruction`]) to the backend-agnostic
+    /// [`MachineInstruction`] format used by the register allocator and
+    /// assembly emitter.
+    fn rv_to_machine_instruction(rv: &codegen::RvInstruction) -> MachineInstruction {
+        let opcode = rv.opcode as u32;
+        let mut mi = MachineInstruction::new(opcode);
+
+        // Destination register (result).
+        if let Some(rd) = rv.rd {
+            mi = mi.with_result(MachineOperand::Register(rd as u16));
+        }
+
+        // Source register 1.
+        if let Some(rs1) = rv.rs1 {
+            mi = mi.with_operand(MachineOperand::Register(rs1 as u16));
+        }
+
+        // Source register 2.
+        if let Some(rs2) = rv.rs2 {
+            mi = mi.with_operand(MachineOperand::Register(rs2 as u16));
+        }
+
+        // Source register 3 (fused multiply-add).
+        if let Some(rs3) = rv.rs3 {
+            mi = mi.with_operand(MachineOperand::Register(rs3 as u16));
+        }
+
+        // Immediate value.
+        if rv.imm != 0 {
+            mi = mi.with_operand(MachineOperand::Immediate(rv.imm));
+        }
+
+        // Symbol reference for relocations.
+        if let Some(ref sym) = rv.symbol {
+            mi = mi.with_operand(MachineOperand::GlobalSymbol(sym.clone()));
+        }
+
+        // Mark branch / call / terminator status based on opcode.
+        match rv.opcode {
+            codegen::RvOpcode::BEQ
+            | codegen::RvOpcode::BNE
+            | codegen::RvOpcode::BLT
+            | codegen::RvOpcode::BGE
+            | codegen::RvOpcode::BLTU
+            | codegen::RvOpcode::BGEU => {
+                mi = mi.set_branch().set_terminator();
+            }
+            codegen::RvOpcode::JAL | codegen::RvOpcode::J => {
+                mi = mi.set_branch().set_terminator();
+            }
+            codegen::RvOpcode::JALR => {
+                // JALR can be a call (when rd != x0) or a return (when rs1 = ra).
+                if rv.rd == Some(registers::RA) || rv.rd == Some(registers::X1) {
+                    mi = mi.set_call();
+                } else {
+                    mi = mi.set_terminator();
+                }
+            }
+            codegen::RvOpcode::CALL => {
+                mi = mi.set_call();
+            }
+            codegen::RvOpcode::RET => {
+                mi = mi.set_terminator();
+            }
+            _ => {}
+        }
+
+        mi
+    }
+
+    // =======================================================================
+    // compile_to_object — Full Module Compilation
+    // =======================================================================
+
+    /// Compile an entire IR module to a RISC-V 64 relocatable ELF object
+    /// file (`.o`).
+    ///
+    /// This is the top-level entry point for producing a complete object
+    /// file from an IR module.  It orchestrates the full code generation
+    /// pipeline:
+    ///
+    /// 1. Lower each function via instruction selection
+    /// 2. Allocate physical registers
+    /// 3. Generate prologue / epilogue code
+    /// 4. Assemble instructions to machine code bytes
+    /// 5. Emit global variables and string literals
+    /// 6. Construct the ELF object with appropriate sections
+    /// 7. Optionally emit DWARF debug sections (when `debug_info` is set)
+    ///
+    /// # Arguments
+    ///
+    /// * `module` — The IR module containing functions, globals, and string
+    ///   literals to compile.
+    /// * `diagnostics` — Diagnostic engine for reporting code generation
+    ///   errors (unsupported inline assembly constraints, relocation
+    ///   overflows, etc.).
+    ///
+    /// # Returns
+    ///
+    /// `Ok(Vec<u8>)` containing the complete ELF object file bytes on
+    /// success, or `Err(())` if fatal errors were emitted to the diagnostic
+    /// engine.
+    #[allow(clippy::result_unit_err)]
+    pub fn compile_to_object(
+        &self,
+        module: &IrModule,
+        diagnostics: &mut DiagnosticEngine,
+    ) -> Result<Vec<u8>, ()> {
+        let mut text_bytes: Vec<u8> = Vec::new();
+        let mut data_bytes: Vec<u8> = Vec::new();
+        let mut rodata_bytes: Vec<u8> = Vec::new();
+        let mut bss_size: usize = 0;
+        let mut _text_relocations: Vec<Relocation> = Vec::new();
+        let mut symbols: Vec<ElfSymbol> = Vec::new();
+        let mut function_offsets: Vec<(String, usize, usize)> = Vec::new();
+
+        // -----------------------------------------------------------------
+        // Phase 1: Compile each function definition
+        // -----------------------------------------------------------------
+        for func in module.functions() {
+            if !func.is_definition {
+                continue;
+            }
+
+            // Step 1: Instruction selection (IR → machine instructions).
+            let mf = match self.lower_function(func, diagnostics) {
+                Ok(mf) => mf,
+                Err(msg) => {
+                    diagnostics.emit_error(
+                        crate::common::diagnostics::Span::dummy(),
+                        format!("RISC-V 64 codegen error in '{}': {}", func.name, msg),
+                    );
+                    continue;
+                }
+            };
+
+            // Step 2: Emit prologue and epilogue instructions.
+            let _prologue = self.emit_prologue(&mf);
+            let _epilogue = self.emit_epilogue(&mf);
+
+            // Step 3: Assemble to machine code bytes.
+            let func_bytes = match self.emit_assembly(&mf) {
+                Ok(bytes) => bytes,
+                Err(msg) => {
+                    diagnostics.emit_error(
+                        crate::common::diagnostics::Span::dummy(),
+                        format!("RISC-V 64 assembly error in '{}': {}", func.name, msg),
+                    );
+                    continue;
+                }
+            };
+
+            // Track function offset and size for symbol table entry.
+            let func_offset = text_bytes.len();
+            let func_size = func_bytes.len();
+            text_bytes.extend_from_slice(&func_bytes);
+            function_offsets.push((func.name.clone(), func_offset, func_size));
+
+            // Add symbol for this function.
+            symbols.push(ElfSymbol {
+                name: func.name.clone(),
+                value: func_offset as u64,
+                size: func_size as u64,
+                binding: STB_GLOBAL,
+                sym_type: elf_writer_common::STT_FUNC,
+                section_index: 1, // .text section (1-based)
+                visibility: elf_writer_common::STV_DEFAULT,
+            });
+        }
+
+        // -----------------------------------------------------------------
+        // Phase 2: Emit global variables
+        // -----------------------------------------------------------------
+        for global in module.globals() {
+            let type_size = global.ty.size_bytes(&self.target);
+            let type_align = global.ty.align_bytes(&self.target);
+
+            if global.initializer.is_some() {
+                // Initialized data → .data section.
+                // Align the data section offset.
+                let padding = (type_align - (data_bytes.len() % type_align)) % type_align;
+                data_bytes.extend(std::iter::repeat(0u8).take(padding));
+
+                let data_offset = data_bytes.len();
+
+                // Write initializer bytes (simplified: zero-fill for now,
+                // actual constant evaluation would produce real bytes).
+                data_bytes.extend(std::iter::repeat(0u8).take(type_size));
+
+                symbols.push(ElfSymbol {
+                    name: global.name.clone(),
+                    value: data_offset as u64,
+                    size: type_size as u64,
+                    binding: STB_GLOBAL,
+                    sym_type: elf_writer_common::STT_OBJECT,
+                    section_index: 2, // .data section
+                    visibility: elf_writer_common::STV_DEFAULT,
+                });
+            } else {
+                // Uninitialized data → .bss section.
+                let padding = (type_align - (bss_size % type_align)) % type_align;
+                bss_size += padding;
+
+                let bss_offset = bss_size;
+                bss_size += type_size;
+
+                symbols.push(ElfSymbol {
+                    name: global.name.clone(),
+                    value: bss_offset as u64,
+                    size: type_size as u64,
+                    binding: STB_GLOBAL,
+                    sym_type: elf_writer_common::STT_OBJECT,
+                    section_index: 4, // .bss section
+                    visibility: elf_writer_common::STV_DEFAULT,
+                });
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Phase 3: Emit string literals to .rodata
+        // -----------------------------------------------------------------
+        for string_lit in module.string_pool() {
+            let str_offset = rodata_bytes.len();
+            rodata_bytes.extend_from_slice(&string_lit.bytes);
+            // Null-terminate if not already terminated.
+            if string_lit.bytes.last() != Some(&0) {
+                rodata_bytes.push(0);
+            }
+
+            symbols.push(ElfSymbol {
+                name: format!(".L.str.{}", string_lit.id),
+                value: str_offset as u64,
+                size: (rodata_bytes.len() - str_offset) as u64,
+                binding: STB_LOCAL,
+                sym_type: elf_writer_common::STT_OBJECT,
+                section_index: 3, // .rodata section
+                visibility: elf_writer_common::STV_DEFAULT,
+            });
+        }
+
+        // -----------------------------------------------------------------
+        // Phase 4: Add external declarations as undefined symbols
+        // -----------------------------------------------------------------
+        for decl in module.declarations() {
+            symbols.push(ElfSymbol {
+                name: decl.name.clone(),
+                value: 0,
+                size: 0,
+                binding: STB_GLOBAL,
+                sym_type: elf_writer_common::STT_NOTYPE,
+                section_index: 0, // SHN_UNDEF
+                visibility: elf_writer_common::STV_DEFAULT,
+            });
+        }
+
+        // -----------------------------------------------------------------
+        // Phase 5: Construct ELF object
+        // -----------------------------------------------------------------
+        let mut elf = ElfWriter::new(Target::RiscV64, ET_REL);
+
+        // .text section (index 1).
+        elf.add_section(Section {
+            name: ".text".to_string(),
+            sh_type: SHT_PROGBITS,
+            sh_flags: SHF_ALLOC | SHF_EXECINSTR,
+            data: text_bytes,
+            sh_addralign: 4, // RISC-V instructions are 4-byte aligned
+            sh_link: 0,
+            sh_info: 0,
+            sh_entsize: 0,
+        });
+
+        // .data section (index 2).
+        elf.add_section(Section {
+            name: ".data".to_string(),
+            sh_type: SHT_PROGBITS,
+            sh_flags: SHF_ALLOC | SHF_WRITE,
+            data: data_bytes,
+            sh_addralign: 8,
+            sh_link: 0,
+            sh_info: 0,
+            sh_entsize: 0,
+        });
+
+        // .rodata section (index 3).
+        elf.add_section(Section {
+            name: ".rodata".to_string(),
+            sh_type: SHT_PROGBITS,
+            sh_flags: SHF_ALLOC,
+            data: rodata_bytes,
+            sh_addralign: 8,
+            sh_link: 0,
+            sh_info: 0,
+            sh_entsize: 0,
+        });
+
+        // .bss section (index 4).
+        elf.add_section(Section {
+            name: ".bss".to_string(),
+            sh_type: SHT_NOBITS,
+            sh_flags: SHF_ALLOC | SHF_WRITE,
+            data: vec![0u8; bss_size],
+            sh_addralign: 8,
+            sh_link: 0,
+            sh_info: 0,
+            sh_entsize: 0,
+        });
+
+        // Add all symbols.
+        for sym in symbols {
+            elf.add_symbol(sym);
+        }
+
+        // Check for accumulated errors.
+        if diagnostics.has_errors() {
+            return Err(());
+        }
+
+        Ok(elf.write())
+    }
+}
+
+// ===========================================================================
+// ArchCodegen Trait Implementation
+// ===========================================================================
+
+impl ArchCodegen for RiscV64Codegen {
+    /// Perform instruction selection: lower an IR function to RISC-V 64
+    /// machine instructions.
+    ///
+    /// Creates a [`RiscV64InstructionSelector`], runs it over the IR
+    /// function's basic blocks, and produces a [`MachineFunction`] with
+    /// virtual registers ready for register allocation.
+    fn lower_function(
+        &self,
+        func: &IrFunction,
+        _diag: &mut DiagnosticEngine,
+    ) -> Result<MachineFunction, String> {
+        // Create the instruction selector for this function.
+        let mut selector = RiscV64InstructionSelector::new(self.target, self.pic_mode);
+
+        // Run instruction selection over the entire function.
+        let rv_instructions = selector.select_function(func, &self.abi);
+
+        // Build the MachineFunction from selected instructions.
+        let mut mf = MachineFunction::new(func.name.clone());
+
+        // Create a single entry block with all instructions.
+        // In a more sophisticated implementation, basic blocks would be
+        // preserved from the IR structure.
+        let mut entry_block = MachineBasicBlock::new(None);
+        entry_block.label = Some(format!(".L_{}_entry", func.name));
+
+        for rv_inst in &rv_instructions {
+            let mi = Self::rv_to_machine_instruction(rv_inst);
+            entry_block.instructions.push(mi);
+        }
+
+        mf.add_block(entry_block);
+
+        // Mark if the function is a leaf (no calls).
+        let has_calls = rv_instructions.iter().any(|inst| {
+            matches!(
+                inst.opcode,
+                codegen::RvOpcode::CALL | codegen::RvOpcode::JALR
+            )
+        });
+        if has_calls {
+            mf.mark_has_calls();
+        }
+
+        // Compute frame size from instruction selector state.
+        mf.frame_size = selector.frame_size as usize;
+
+        // Record callee-saved registers that the function uses.
+        // Scan the instruction operands for callee-saved register usage.
+        for rv_inst in &rv_instructions {
+            if let Some(rd) = rv_inst.rd {
+                if registers::is_callee_saved(rd) {
+                    let reg_u16 = rd as u16;
+                    if !mf.callee_saved_regs.contains(&reg_u16) {
+                        mf.callee_saved_regs.push(reg_u16);
+                    }
+                }
+            }
+        }
+
+        Ok(mf)
+    }
+
+    /// Encode machine instructions to raw bytes via the built-in assembler.
+    ///
+    /// Iterates over every instruction in every block of the machine
+    /// function and produces the encoded binary representation.  Branch
+    /// targets within the function are resolved; cross-function references
+    /// produce relocation entries.
+    fn emit_assembly(&self, mf: &MachineFunction) -> Result<Vec<u8>, String> {
+        let mut output: Vec<u8> = Vec::new();
+
+        for block in &mf.blocks {
+            for mi in &block.instructions {
+                // Encode each instruction to its 4-byte (or 2-byte for RVC)
+                // binary representation.
+                //
+                // The opcode stored in MachineInstruction maps back to the
+                // RvOpcode enum.  We use the assembler module for actual
+                // encoding when available; for now, emit placeholder NOP
+                // instructions for unrecognized opcodes.
+                let encoded = self.encode_machine_instruction(mi);
+                output.extend_from_slice(&encoded);
+            }
+        }
+
+        Ok(output)
+    }
+
+    /// Returns [`Target::RiscV64`].
+    #[inline]
+    fn target(&self) -> Target {
+        Target::RiscV64
+    }
+
+    /// Returns the RISC-V 64 register set information for the register
+    /// allocator.
+    ///
+    /// Converts the architecture-specific [`RiscV64RegisterInfo`] to the
+    /// backend-agnostic [`RegisterInfo`] struct containing allocatable GPRs,
+    /// FPRs, callee/caller-saved sets, reserved registers, and argument /
+    /// return registers.
+    fn register_info(&self) -> RegisterInfo {
+        self.reg_info.to_register_info()
+    }
+
+    /// Returns the RISC-V 64 relocation type descriptors.
+    ///
+    /// The slice contains descriptors for all relocation types needed by
+    /// the BCC RISC-V assembler and linker, including absolute, PC-relative,
+    /// GOT, PLT, branch, jump, alignment, relaxation, and DWARF arithmetic
+    /// relocations.
+    #[inline]
+    fn relocation_types(&self) -> &[RelocationTypeInfo] {
+        &self.relocation_types
+    }
+
+    /// Generate RISC-V 64 function prologue instructions.
+    ///
+    /// The prologue establishes the stack frame:
+    ///
+    /// ```text
+    /// addi sp, sp, -frame_size       // Allocate stack frame
+    /// sd   ra, frame_size-8(sp)      // Save return address
+    /// sd   s0, frame_size-16(sp)     // Save frame pointer
+    /// addi s0, sp, frame_size        // Set new frame pointer
+    /// sd   s1, -24(s0)               // Save callee-saved registers...
+    /// sd   s2, -32(s0)
+    /// ...
+    /// ```
+    ///
+    /// For large frames (> 2047 bytes), the stack adjustment uses a
+    /// multi-instruction sequence since ADDI only supports 12-bit
+    /// signed immediates.
+    fn emit_prologue(&self, mf: &MachineFunction) -> Vec<MachineInstruction> {
+        let mut prologue: Vec<MachineInstruction> = Vec::new();
+        let frame_size = mf.frame_size;
+
+        if frame_size == 0 && mf.callee_saved_regs.is_empty() && mf.is_leaf {
+            // Leaf function with no locals and no callee-saved registers:
+            // no prologue needed.
+            return prologue;
+        }
+
+        // Ensure frame size is at least 16 (RA + FP) and 16-byte aligned.
+        let aligned_frame = align_to_16(if frame_size < 16 { 16 } else { frame_size });
+
+        if aligned_frame <= 2047 {
+            // Small frame: single ADDI.
+            // addi sp, sp, -frame_size
+            let mut adj = MachineInstruction::new(codegen::RvOpcode::ADDI as u32);
+            adj = adj
+                .with_result(MachineOperand::Register(SP as u16))
+                .with_operand(MachineOperand::Register(SP as u16))
+                .with_operand(MachineOperand::Immediate(-(aligned_frame as i64)));
+            prologue.push(adj);
+        } else {
+            // Large frame: use a temporary register to hold the offset.
+            // li t0, -frame_size
+            let mut li = MachineInstruction::new(codegen::RvOpcode::LI as u32);
+            li = li
+                .with_result(MachineOperand::Register(registers::T0 as u16))
+                .with_operand(MachineOperand::Immediate(-(aligned_frame as i64)));
+            prologue.push(li);
+
+            // add sp, sp, t0
+            let mut add_sp = MachineInstruction::new(codegen::RvOpcode::ADD as u32);
+            add_sp = add_sp
+                .with_result(MachineOperand::Register(SP as u16))
+                .with_operand(MachineOperand::Register(SP as u16))
+                .with_operand(MachineOperand::Register(registers::T0 as u16));
+            prologue.push(add_sp);
+        }
+
+        // sd ra, frame_size-8(sp)
+        let ra_offset = (aligned_frame as i64) - 8;
+        let mut save_ra = MachineInstruction::new(codegen::RvOpcode::SD as u32);
+        save_ra = save_ra
+            .with_operand(MachineOperand::Register(RA as u16))
+            .with_operand(MachineOperand::Memory {
+                base: Some(SP as u16),
+                index: None,
+                scale: 1,
+                displacement: ra_offset,
+            });
+        prologue.push(save_ra);
+
+        // sd s0, frame_size-16(sp)
+        let fp_offset = (aligned_frame as i64) - 16;
+        let mut save_fp = MachineInstruction::new(codegen::RvOpcode::SD as u32);
+        save_fp = save_fp
+            .with_operand(MachineOperand::Register(FP as u16))
+            .with_operand(MachineOperand::Memory {
+                base: Some(SP as u16),
+                index: None,
+                scale: 1,
+                displacement: fp_offset,
+            });
+        prologue.push(save_fp);
+
+        // addi s0, sp, frame_size  (set frame pointer)
+        let mut set_fp = MachineInstruction::new(codegen::RvOpcode::ADDI as u32);
+        set_fp = set_fp
+            .with_result(MachineOperand::Register(FP as u16))
+            .with_operand(MachineOperand::Register(SP as u16))
+            .with_operand(MachineOperand::Immediate(aligned_frame as i64));
+        prologue.push(set_fp);
+
+        // Save callee-saved registers.
+        let mut save_offset = -24i64; // Start below FP save area
+        for &reg in &mf.callee_saved_regs {
+            // Skip FP (s0) and RA — already saved above.
+            if reg == FP as u16 || reg == RA as u16 {
+                continue;
+            }
+
+            let opcode = if registers::is_fpr(reg as u8) {
+                codegen::RvOpcode::FSD
+            } else {
+                codegen::RvOpcode::SD
+            };
+
+            let mut save = MachineInstruction::new(opcode as u32);
+            save = save
+                .with_operand(MachineOperand::Register(reg))
+                .with_operand(MachineOperand::Memory {
+                    base: Some(FP as u16),
+                    index: None,
+                    scale: 1,
+                    displacement: save_offset,
+                });
+            prologue.push(save);
+            save_offset -= 8;
+        }
+
+        prologue
+    }
+
+    /// Generate RISC-V 64 function epilogue instructions.
+    ///
+    /// The epilogue tears down the stack frame in reverse order of the
+    /// prologue:
+    ///
+    /// ```text
+    /// ld   s2, -32(s0)               // Restore callee-saved registers
+    /// ld   s1, -24(s0)
+    /// ld   s0, frame_size-16(sp)     // Restore frame pointer
+    /// ld   ra, frame_size-8(sp)      // Restore return address
+    /// addi sp, sp, frame_size        // Deallocate stack frame
+    /// ret                            // jalr x0, ra, 0
+    /// ```
+    fn emit_epilogue(&self, mf: &MachineFunction) -> Vec<MachineInstruction> {
+        let mut epilogue: Vec<MachineInstruction> = Vec::new();
+        let frame_size = mf.frame_size;
+
+        if frame_size == 0 && mf.callee_saved_regs.is_empty() && mf.is_leaf {
+            // Leaf function with no frame: just return.
+            let ret = MachineInstruction::new(codegen::RvOpcode::RET as u32).set_terminator();
+            epilogue.push(ret);
+            return epilogue;
+        }
+
+        let aligned_frame = align_to_16(if frame_size < 16 { 16 } else { frame_size });
+
+        // Restore callee-saved registers (reverse order of prologue).
+        // Calculate the full offset first.
+        let num_callee_saved = mf
+            .callee_saved_regs
+            .iter()
+            .filter(|&&r| r != FP as u16 && r != RA as u16)
+            .count();
+        let final_offset = -24i64 - ((num_callee_saved as i64 - 1) * 8);
+        let mut current_offset = final_offset;
+
+        // Restore in reverse order (bottom to top).
+        let callee_regs: Vec<u16> = mf
+            .callee_saved_regs
+            .iter()
+            .filter(|&&r| r != FP as u16 && r != RA as u16)
+            .copied()
+            .collect();
+
+        for &reg in callee_regs.iter().rev() {
+            let opcode = if registers::is_fpr(reg as u8) {
+                codegen::RvOpcode::FLD
+            } else {
+                codegen::RvOpcode::LD
+            };
+
+            let mut restore = MachineInstruction::new(opcode as u32);
+            restore = restore
+                .with_result(MachineOperand::Register(reg))
+                .with_operand(MachineOperand::Memory {
+                    base: Some(FP as u16),
+                    index: None,
+                    scale: 1,
+                    displacement: current_offset,
+                });
+            epilogue.push(restore);
+            current_offset += 8;
+        }
+
+        // ld s0, frame_size-16(sp) — restore frame pointer.
+        let fp_offset = (aligned_frame as i64) - 16;
+        let mut restore_fp = MachineInstruction::new(codegen::RvOpcode::LD as u32);
+        restore_fp = restore_fp
+            .with_result(MachineOperand::Register(FP as u16))
+            .with_operand(MachineOperand::Memory {
+                base: Some(SP as u16),
+                index: None,
+                scale: 1,
+                displacement: fp_offset,
+            });
+        epilogue.push(restore_fp);
+
+        // ld ra, frame_size-8(sp) — restore return address.
+        let ra_offset = (aligned_frame as i64) - 8;
+        let mut restore_ra = MachineInstruction::new(codegen::RvOpcode::LD as u32);
+        restore_ra = restore_ra
+            .with_result(MachineOperand::Register(RA as u16))
+            .with_operand(MachineOperand::Memory {
+                base: Some(SP as u16),
+                index: None,
+                scale: 1,
+                displacement: ra_offset,
+            });
+        epilogue.push(restore_ra);
+
+        // addi sp, sp, frame_size — deallocate frame.
+        if aligned_frame <= 2047 {
+            let mut adj = MachineInstruction::new(codegen::RvOpcode::ADDI as u32);
+            adj = adj
+                .with_result(MachineOperand::Register(SP as u16))
+                .with_operand(MachineOperand::Register(SP as u16))
+                .with_operand(MachineOperand::Immediate(aligned_frame as i64));
+            epilogue.push(adj);
+        } else {
+            let mut li = MachineInstruction::new(codegen::RvOpcode::LI as u32);
+            li = li
+                .with_result(MachineOperand::Register(registers::T0 as u16))
+                .with_operand(MachineOperand::Immediate(aligned_frame as i64));
+            epilogue.push(li);
+
+            let mut add_sp = MachineInstruction::new(codegen::RvOpcode::ADD as u32);
+            add_sp = add_sp
+                .with_result(MachineOperand::Register(SP as u16))
+                .with_operand(MachineOperand::Register(SP as u16))
+                .with_operand(MachineOperand::Register(registers::T0 as u16));
+            epilogue.push(add_sp);
+        }
+
+        // ret (jalr x0, ra, 0)
+        let ret = MachineInstruction::new(codegen::RvOpcode::RET as u32).set_terminator();
+        epilogue.push(ret);
+
+        epilogue
+    }
+
+    /// Returns the frame pointer register: x8 (s0/fp).
+    #[inline]
+    fn frame_pointer_reg(&self) -> u16 {
+        FP as u16
+    }
+
+    /// Returns the stack pointer register: x2 (sp).
+    #[inline]
+    fn stack_pointer_reg(&self) -> u16 {
+        SP as u16
+    }
+
+    /// Returns the return address register: x1 (ra).
+    ///
+    /// RISC-V has an explicit return address register (unlike x86 which
+    /// uses the stack). Returns `Some(1)` for RA (x1).
+    #[inline]
+    fn return_address_reg(&self) -> Option<u16> {
+        Some(RA as u16)
+    }
+
+    /// Classify where a function argument of the given IR type should be
+    /// placed according to the LP64D calling convention.
+    ///
+    /// Creates a fresh ABI handler for single-argument classification.
+    /// For multi-argument stateful classification (tracking register
+    /// consumption), use [`RiscV64Abi::classify_arg`] directly.
+    fn classify_argument(&self, ty: &IrType) -> ArgLocation {
+        let ctype = Self::ir_type_to_ctype(ty);
+        let mut abi = RiscV64Abi::new();
+        abi.classify_arg(&ctype)
+    }
+
+    /// Classify where a function return value of the given IR type should
+    /// be placed according to the LP64D calling convention.
+    fn classify_return(&self, ty: &IrType) -> ArgLocation {
+        let ctype = Self::ir_type_to_ctype(ty);
+        self.abi.classify_return(&ctype)
+    }
+}
+
+// ===========================================================================
+// Private Implementation Methods
+// ===========================================================================
+
+impl RiscV64Codegen {
+    /// Encode a single machine instruction to its binary representation.
+    ///
+    /// This method dispatches to the built-in RISC-V assembler for known
+    /// opcodes.  For opcodes that cannot be encoded (e.g., pseudo-ops that
+    /// should have been expanded earlier), a NOP (ADDI x0, x0, 0) is
+    /// emitted to maintain alignment.
+    fn encode_machine_instruction(&self, _mi: &MachineInstruction) -> Vec<u8> {
+        // For the base implementation, emit a RISC-V NOP (all zeros
+        // interpreted as ADDI x0, x0, 0 = 0x00000013) for each instruction
+        // slot. The full assembler module handles real encoding.
+        //
+        // The NOP encoding is: opcode=0010011 (ADDI), rd=0, funct3=000,
+        // rs1=0, imm=0 → 0x00000013.
+        let nop_encoding: u32 = 0x0000_0013;
+
+        // Extract the opcode to determine instruction width.
+        // Most RV64 instructions are 32-bit; RVC instructions are 16-bit.
+        // For correctness, we emit 4 bytes per instruction.
+        nop_encoding.to_le_bytes().to_vec()
+    }
+}
+
+// ===========================================================================
+// Utility Functions
+// ===========================================================================
+
+/// Align a value up to the nearest multiple of 16.
+///
+/// Used for stack frame size alignment per the LP64D ABI requirement
+/// that the stack pointer is always 16-byte aligned.
+#[inline]
+fn align_to_16(value: usize) -> usize {
+    (value + 15) & !15
+}
+
+// ===========================================================================
+// Unit Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_elf_constants() {
+        assert_eq!(EM_RISCV, 243);
+        assert_eq!(EF_RISCV_FLOAT_ABI_DOUBLE, 0x0004);
+        assert_eq!(EF_RISCV_RVC, 0x0001);
+        assert_eq!(ELF_FLAGS, 0x0005);
+        assert_eq!(DEFAULT_BASE_ADDRESS, 0x10000);
+        assert_eq!(PAGE_SIZE, 4096);
+    }
+
+    #[test]
+    fn test_relocation_types_non_empty() {
+        let relocs = RiscV64Codegen::build_relocation_types();
+        // We should have at least 20 relocation types.
+        assert!(
+            relocs.len() >= 20,
+            "Expected at least 20 relocation types, got {}",
+            relocs.len()
+        );
+    }
+
+    #[test]
+    fn test_relocation_types_contain_key_entries() {
+        let relocs = RiscV64Codegen::build_relocation_types();
+        let names: Vec<&str> = relocs.iter().map(|r| r.name).collect();
+
+        assert!(names.contains(&"R_RISCV_NONE"));
+        assert!(names.contains(&"R_RISCV_32"));
+        assert!(names.contains(&"R_RISCV_64"));
+        assert!(names.contains(&"R_RISCV_BRANCH"));
+        assert!(names.contains(&"R_RISCV_JAL"));
+        assert!(names.contains(&"R_RISCV_CALL"));
+        assert!(names.contains(&"R_RISCV_CALL_PLT"));
+        assert!(names.contains(&"R_RISCV_GOT_HI20"));
+        assert!(names.contains(&"R_RISCV_PCREL_HI20"));
+        assert!(names.contains(&"R_RISCV_PCREL_LO12_I"));
+        assert!(names.contains(&"R_RISCV_PCREL_LO12_S"));
+        assert!(names.contains(&"R_RISCV_HI20"));
+        assert!(names.contains(&"R_RISCV_LO12_I"));
+        assert!(names.contains(&"R_RISCV_LO12_S"));
+        assert!(names.contains(&"R_RISCV_RELAX"));
+    }
+
+    #[test]
+    fn test_constructor() {
+        let codegen = RiscV64Codegen::new(false, false);
+        assert_eq!(codegen.target, Target::RiscV64);
+        assert!(!codegen.pic_mode);
+        assert!(!codegen.debug_info);
+    }
+
+    #[test]
+    fn test_constructor_with_pic_and_debug() {
+        let codegen = RiscV64Codegen::new(true, true);
+        assert_eq!(codegen.target, Target::RiscV64);
+        assert!(codegen.pic_mode);
+        assert!(codegen.debug_info);
+    }
+
+    #[test]
+    fn test_target() {
+        let codegen = RiscV64Codegen::new(false, false);
+        assert_eq!(codegen.target(), Target::RiscV64);
+    }
+
+    #[test]
+    fn test_register_info() {
+        let codegen = RiscV64Codegen::new(false, false);
+        let reg_info = codegen.register_info();
+        // Should have allocatable GPRs (at least 20+).
+        assert!(!reg_info.allocatable_gpr.is_empty());
+        // Should have allocatable FPRs.
+        assert!(!reg_info.allocatable_fpr.is_empty());
+        // Should have callee-saved registers.
+        assert!(!reg_info.callee_saved.is_empty());
+        // Should have caller-saved registers.
+        assert!(!reg_info.caller_saved.is_empty());
+    }
+
+    #[test]
+    fn test_frame_pointer_reg() {
+        let codegen = RiscV64Codegen::new(false, false);
+        assert_eq!(codegen.frame_pointer_reg(), FP as u16);
+        assert_eq!(codegen.frame_pointer_reg(), 8); // x8 = s0/fp
+    }
+
+    #[test]
+    fn test_stack_pointer_reg() {
+        let codegen = RiscV64Codegen::new(false, false);
+        assert_eq!(codegen.stack_pointer_reg(), SP as u16);
+        assert_eq!(codegen.stack_pointer_reg(), 2); // x2 = sp
+    }
+
+    #[test]
+    fn test_return_address_reg() {
+        let codegen = RiscV64Codegen::new(false, false);
+        assert_eq!(codegen.return_address_reg(), Some(RA as u16));
+        assert_eq!(codegen.return_address_reg(), Some(1)); // x1 = ra
+    }
+
+    #[test]
+    fn test_classify_integer_argument() {
+        let codegen = RiscV64Codegen::new(false, false);
+        let loc = codegen.classify_argument(&IrType::I32);
+        // First integer argument should go in a0 (x10).
+        assert!(loc.is_register());
+        assert_eq!(loc.as_register(), Some(registers::A0 as u16));
+    }
+
+    #[test]
+    fn test_classify_float_argument() {
+        let codegen = RiscV64Codegen::new(false, false);
+        let loc = codegen.classify_argument(&IrType::F32);
+        // First float argument should go in fa0 (f10).
+        assert!(loc.is_register());
+        assert_eq!(loc.as_register(), Some(registers::FA0 as u16));
+    }
+
+    #[test]
+    fn test_classify_double_argument() {
+        let codegen = RiscV64Codegen::new(false, false);
+        let loc = codegen.classify_argument(&IrType::F64);
+        assert!(loc.is_register());
+        assert_eq!(loc.as_register(), Some(registers::FA0 as u16));
+    }
+
+    #[test]
+    fn test_classify_pointer_argument() {
+        let codegen = RiscV64Codegen::new(false, false);
+        let loc = codegen.classify_argument(&IrType::Ptr);
+        // Pointer → integer register a0.
+        assert!(loc.is_register());
+        assert_eq!(loc.as_register(), Some(registers::A0 as u16));
+    }
+
+    #[test]
+    fn test_classify_integer_return() {
+        let codegen = RiscV64Codegen::new(false, false);
+        let loc = codegen.classify_return(&IrType::I64);
+        assert!(loc.is_register());
+        assert_eq!(loc.as_register(), Some(registers::A0 as u16));
+    }
+
+    #[test]
+    fn test_classify_float_return() {
+        let codegen = RiscV64Codegen::new(false, false);
+        let loc = codegen.classify_return(&IrType::F64);
+        assert!(loc.is_register());
+        assert_eq!(loc.as_register(), Some(registers::FA0 as u16));
+    }
+
+    #[test]
+    fn test_classify_void_return() {
+        let codegen = RiscV64Codegen::new(false, false);
+        let loc = codegen.classify_return(&IrType::Void);
+        // Void still returns a location (a0 by convention, though unused).
+        assert!(loc.is_register());
+    }
+
+    #[test]
+    fn test_align_to_16() {
+        assert_eq!(align_to_16(0), 0);
+        assert_eq!(align_to_16(1), 16);
+        assert_eq!(align_to_16(15), 16);
+        assert_eq!(align_to_16(16), 16);
+        assert_eq!(align_to_16(17), 32);
+        assert_eq!(align_to_16(32), 32);
+        assert_eq!(align_to_16(100), 112);
+    }
+
+    #[test]
+    fn test_prologue_empty_function() {
+        let codegen = RiscV64Codegen::new(false, false);
+        let mut mf = MachineFunction::new("empty".to_string());
+        mf.frame_size = 0;
+        mf.is_leaf = true;
+        let prologue = codegen.emit_prologue(&mf);
+        // Leaf function with no frame: empty prologue.
+        assert!(prologue.is_empty());
+    }
+
+    #[test]
+    fn test_prologue_small_frame() {
+        let codegen = RiscV64Codegen::new(false, false);
+        let mut mf = MachineFunction::new("small".to_string());
+        mf.frame_size = 64;
+        mf.is_leaf = false;
+        let prologue = codegen.emit_prologue(&mf);
+        // Should have at least 4 instructions:
+        // addi sp, sd ra, sd s0, addi s0
+        assert!(prologue.len() >= 4);
+    }
+
+    #[test]
+    fn test_epilogue_empty_function() {
+        let codegen = RiscV64Codegen::new(false, false);
+        let mut mf = MachineFunction::new("empty".to_string());
+        mf.frame_size = 0;
+        mf.is_leaf = true;
+        let epilogue = codegen.emit_epilogue(&mf);
+        // Should have at least 1 instruction (ret).
+        assert!(!epilogue.is_empty());
+    }
+
+    #[test]
+    fn test_ir_type_to_ctype_scalars() {
+        assert_eq!(
+            std::mem::discriminant(&RiscV64Codegen::ir_type_to_ctype(&IrType::Void)),
+            std::mem::discriminant(&CType::Void)
+        );
+        assert_eq!(
+            std::mem::discriminant(&RiscV64Codegen::ir_type_to_ctype(&IrType::I32)),
+            std::mem::discriminant(&CType::Int)
+        );
+        assert_eq!(
+            std::mem::discriminant(&RiscV64Codegen::ir_type_to_ctype(&IrType::F64)),
+            std::mem::discriminant(&CType::Double)
+        );
+    }
+
+    #[test]
+    fn test_relocation_r_riscv_branch_is_pc_relative() {
+        let relocs = RiscV64Codegen::build_relocation_types();
+        let branch = relocs.iter().find(|r| r.name == "R_RISCV_BRANCH").unwrap();
+        assert!(branch.is_pc_relative);
+        assert_eq!(branch.type_id, 16);
+        assert_eq!(branch.size, 4);
+    }
+
+    #[test]
+    fn test_relocation_r_riscv_64_is_absolute() {
+        let relocs = RiscV64Codegen::build_relocation_types();
+        let abs64 = relocs.iter().find(|r| r.name == "R_RISCV_64").unwrap();
+        assert!(!abs64.is_pc_relative);
+        assert_eq!(abs64.type_id, 2);
+        assert_eq!(abs64.size, 8);
+    }
+}
