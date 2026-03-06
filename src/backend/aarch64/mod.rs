@@ -5,5 +5,6 @@
 
 pub mod abi;
 pub mod assembler;
+pub mod codegen;
 pub mod linker;
 pub mod registers;
