@@ -510,7 +510,7 @@ impl RiscV64Codegen {
             }
 
             // Step 1: Instruction selection (IR → machine instructions).
-            let mf = match self.lower_function(func, diagnostics) {
+            let mf = match self.lower_function(func, diagnostics, module.globals()) {
                 Ok(mf) => mf,
                 Err(msg) => {
                     diagnostics.emit_error(
@@ -713,6 +713,8 @@ impl RiscV64Codegen {
             sh_info: 0,
             sh_entsize: 0,
             logical_size: 0,
+            virtual_address: 0,
+            file_offset_hint: 0,
         });
 
         // .data section (index 2).
@@ -726,6 +728,8 @@ impl RiscV64Codegen {
             sh_info: 0,
             sh_entsize: 0,
             logical_size: 0,
+            virtual_address: 0,
+            file_offset_hint: 0,
         });
 
         // .rodata section (index 3).
@@ -739,6 +743,8 @@ impl RiscV64Codegen {
             sh_info: 0,
             sh_entsize: 0,
             logical_size: 0,
+            virtual_address: 0,
+            file_offset_hint: 0,
         });
 
         // .bss section (index 4).
@@ -754,6 +760,8 @@ impl RiscV64Codegen {
             sh_info: 0,
             sh_entsize: 0,
             logical_size: bss_size as u64,
+            virtual_address: 0,
+            file_offset_hint: 0,
         });
 
         // Add all symbols.
@@ -785,6 +793,7 @@ impl ArchCodegen for RiscV64Codegen {
         &self,
         func: &IrFunction,
         _diag: &mut DiagnosticEngine,
+        _globals: &[crate::ir::module::GlobalVariable],
     ) -> Result<MachineFunction, String> {
         // Create the instruction selector for this function.
         let mut selector = RiscV64InstructionSelector::new(self.target, self.pic_mode);

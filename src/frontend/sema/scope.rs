@@ -211,13 +211,8 @@ pub struct ScopeStack {
     depth: u32,
 }
 
-impl ScopeStack {
-    // ===================================================================
-    // Construction
-    // ===================================================================
-
-    /// Create a new scope stack with an initial Global scope at depth 0.
-    pub fn new() -> Self {
+impl Default for ScopeStack {
+    fn default() -> Self {
         let mut stack = ScopeStack {
             scopes: Vec::with_capacity(32),
             depth: 0,
@@ -225,6 +220,17 @@ impl ScopeStack {
         // Push the initial Global scope at depth 0.
         stack.scopes.push(Scope::new(ScopeKind::Global, 0));
         stack
+    }
+}
+
+impl ScopeStack {
+    // ===================================================================
+    // Construction
+    // ===================================================================
+
+    /// Create a new scope stack with an initial Global scope at depth 0.
+    pub fn new() -> Self {
+        Self::default()
     }
 
     // ===================================================================

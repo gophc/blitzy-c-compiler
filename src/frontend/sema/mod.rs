@@ -216,11 +216,9 @@ impl<'a> SemanticAnalyzer<'a> {
             let _ = self.analyze_external_declaration(ext_decl);
         }
 
-        // Finalize tentative definitions (C11 §6.9.2) and check for unused
-        // symbols at file scope.
-        self.symbols
-            .finalize_tentative_definitions(self.diagnostics);
-        self.symbols.check_unused_symbols(self.diagnostics);
+        // Note: tentative definition finalization and unused symbol checks
+        // are performed in `finalize()`, which is called separately after
+        // `analyze()`. This avoids emitting duplicate diagnostics.
 
         if self.diagnostics.has_errors() {
             Err(())
@@ -334,7 +332,11 @@ impl<'a> SemanticAnalyzer<'a> {
                     is_used: false,
                     scope_depth: 0, // Will be set by declare()
                 };
-                let _ = self.symbols.declare(param_entry, self.diagnostics);
+                if let Ok(id) = self.symbols.declare(param_entry, self.diagnostics) {
+                    // Register the parameter in the scope stack so that
+                    // scopes.lookup_ordinary() can find it during body analysis.
+                    self.scopes.declare_ordinary(pname, id);
+                }
             }
         }
 
@@ -1351,7 +1353,8 @@ impl<'a> SemanticAnalyzer<'a> {
     pub fn finalize(&mut self) -> Result<(), ()> {
         self.symbols
             .finalize_tentative_definitions(self.diagnostics);
-        self.symbols.check_unused_symbols(self.diagnostics);
+        self.symbols
+            .check_unused_symbols(self.diagnostics, self.interner);
 
         if self.diagnostics.has_errors() {
             Err(())

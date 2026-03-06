@@ -87,6 +87,18 @@ impl Symbol {
     pub fn as_u32(&self) -> u32 {
         self.0
     }
+
+    /// Constructs a `Symbol` from a raw `u32` index.
+    ///
+    /// # Safety (logical)
+    ///
+    /// The caller must ensure that `raw` corresponds to a valid index in
+    /// the [`Interner`] that produced it.  Using an out-of-range index
+    /// with [`Interner::resolve`] will panic.
+    #[inline]
+    pub fn from_u32(raw: u32) -> Self {
+        Self(raw)
+    }
 }
 
 // ---------------------------------------------------------------------------

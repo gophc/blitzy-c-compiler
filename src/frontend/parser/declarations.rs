@@ -1,3 +1,4 @@
+#![allow(clippy::result_unit_err)]
 //! Declaration parsing for the BCC C11 parser (Phase 4).
 //!
 //! Handles all C11 declaration forms:

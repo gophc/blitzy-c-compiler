@@ -1,3 +1,4 @@
+#![allow(clippy::result_unit_err)]
 //! Statement parsing for the BCC C11 parser (Phase 4).
 //!
 //! Implements all C11 statement forms plus GCC extensions (case ranges,

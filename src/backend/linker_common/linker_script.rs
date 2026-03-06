@@ -929,8 +929,23 @@ impl DefaultLinkerScript {
                         continue;
                     }
 
-                    let total_filesz = last_end_file.saturating_sub(first_offset);
-                    let total_memsz = last_end_mem.saturating_sub(first_vaddr);
+                    // For the FIRST PT_LOAD segment in an executable, extend
+                    // it backwards to cover the ELF header and program header
+                    // table (file offset 0, vaddr = base_address).  This is
+                    // standard ELF convention and ensures the PHDR segment is
+                    // covered by a LOAD segment, satisfying the kernel loader.
+                    let is_first_load = seg_def.seg_type == PT_LOAD
+                        && !segment_layouts.iter().any(|s| s.seg_type == PT_LOAD);
+
+                    let (seg_offset, seg_vaddr) = if is_first_load && self.base_address > 0 {
+                        // Extend to cover from the start of the file.
+                        (0u64, self.base_address)
+                    } else {
+                        (first_offset, first_vaddr)
+                    };
+
+                    let total_filesz = last_end_file.saturating_sub(seg_offset);
+                    let total_memsz = last_end_mem.saturating_sub(seg_vaddr);
 
                     let seg_alignment = if seg_def.seg_type == PT_LOAD {
                         page_size
@@ -941,9 +956,9 @@ impl DefaultLinkerScript {
                     segment_layouts.push(SegmentLayout {
                         seg_type: seg_def.seg_type,
                         flags: seg_def.flags,
-                        offset: first_offset,
-                        vaddr: first_vaddr,
-                        paddr: first_vaddr, // paddr mirrors vaddr on Linux
+                        offset: seg_offset,
+                        vaddr: seg_vaddr,
+                        paddr: seg_vaddr, // paddr mirrors vaddr on Linux
                         filesz: total_filesz,
                         memsz: total_memsz,
                         alignment: seg_alignment,

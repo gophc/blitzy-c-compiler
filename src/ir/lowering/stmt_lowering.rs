@@ -29,12 +29,14 @@
 use crate::common::diagnostics::{Diagnostic, DiagnosticEngine, Span};
 use crate::common::fx_hash::FxHashMap;
 use crate::common::target::Target;
+use crate::common::type_builder::TypeBuilder;
 use crate::common::types::CType;
 use crate::frontend::parser::ast;
 use crate::ir::basic_block::BasicBlock;
 use crate::ir::builder::IrBuilder;
 use crate::ir::function::IrFunction;
 use crate::ir::instructions::{BlockId, Instruction, Value};
+use crate::ir::lowering::expr_lowering::{lower_expression, ExprLoweringContext};
 use crate::ir::module::IrModule;
 use crate::ir::types::IrType;
 
@@ -122,6 +124,16 @@ pub struct StmtLoweringContext<'a> {
     pub switch_ctx: Option<SwitchContext>,
     /// Current recursion depth (enforced to ≤512).
     pub recursion_depth: u32,
+
+    // --- Fields required for expression lowering integration ---
+    /// Type builder for sizeof/alignof/struct layout queries.
+    pub type_builder: &'a TypeBuilder,
+    /// Function parameter name → Value mapping.
+    pub param_values: &'a FxHashMap<String, Value>,
+    /// Symbol index → interned name table.
+    pub name_table: &'a [String],
+    /// Local variable name → declared C type.
+    pub local_types: &'a FxHashMap<String, CType>,
 }
 
 // ===========================================================================
@@ -1323,22 +1335,22 @@ fn eval_case_constant(expr: &ast::Expression) -> i64 {
 /// for ensuring the full context (including `type_builder`, `param_values`,
 /// `name_table`, `local_types`) is available when the driver invokes
 /// statement lowering.
-fn lower_expr_via_context(ctx: &mut StmtLoweringContext<'_>, _expr: &ast::Expression) -> Value {
-    // The ExprLoweringContext requires fields (type_builder, param_values,
-    // name_table, local_types) that are not directly available in
-    // StmtLoweringContext. In the full integrated BCC system, the lowering
-    // driver creates both contexts from the same root state and orchestrates
-    // the calls.
-    //
-    // For the statement lowering module's perspective, expressions are
-    // evaluated by generating a fresh SSA value. The actual expression
-    // lowering logic resides in expr_lowering.rs and is invoked by the
-    // parent driver which holds the complete context.
-    //
-    // This function returns a fresh Value that acts as the SSA handle for
-    // the expression result. The parent driver hooks up the actual expression
-    // lowering to populate these values.
-    ctx.builder.fresh_value()
+fn lower_expr_via_context(ctx: &mut StmtLoweringContext<'_>, expr: &ast::Expression) -> Value {
+    // Construct a full ExprLoweringContext from the StmtLoweringContext
+    // and delegate to expr_lowering::lower_expression.
+    let mut expr_ctx = ExprLoweringContext {
+        builder: ctx.builder,
+        function: ctx.function,
+        module: ctx.module,
+        target: ctx.target,
+        type_builder: ctx.type_builder,
+        diagnostics: ctx.diagnostics,
+        local_vars: ctx.local_vars,
+        param_values: ctx.param_values,
+        name_table: ctx.name_table,
+        local_types: ctx.local_types,
+    };
+    lower_expression(&mut expr_ctx, expr)
 }
 
 /// Converts an expression result to an I1 (boolean) value for use as a
@@ -1354,17 +1366,35 @@ fn lower_expr_via_context(ctx: &mut StmtLoweringContext<'_>, _expr: &ast::Expres
 fn lower_expr_to_i1(
     ctx: &mut StmtLoweringContext<'_>,
     expr: &ast::Expression,
-    _span: Span,
+    span: Span,
 ) -> Value {
-    // In the integrated system, this would lower the expression and then
-    // check if the result type is I1. If not, it would emit an ICmp NE
-    // against zero. The parent driver handles the type-aware path.
-    //
-    // The C type system mapping is:
-    //   CType::Bool  -> IrType::I1 (already boolean)
-    //   CType::Int   -> IrType::I32 (needs != 0 comparison)
-    //   CType::Void  -> error
-    //   etc.
-    let _ = (IrType::I1, CType::Bool, CType::Int, CType::Void);
-    lower_expr_via_context(ctx, expr)
+    // Lower the expression to get its SSA value.
+    let val = lower_expr_via_context(ctx, expr);
+
+    // If the expression result is already I1 (e.g., a comparison), return directly.
+    // Otherwise emit `val != 0` to produce a boolean result (C truthiness rule).
+    // Since we do not yet track per-Value IR types within the statement lowering
+    // context, we conservatively emit the comparison. Constant folding will
+    // simplify trivial cases.
+    let zero = ctx.builder.fresh_value();
+    let zero_inst = Instruction::BinOp {
+        result: zero,
+        op: crate::ir::instructions::BinOp::Add,
+        lhs: zero,
+        rhs: Value::UNDEF,
+        ty: IrType::I32,
+        span,
+    };
+    emit_instruction_to_current_block(ctx, zero_inst);
+
+    let cmp_result = ctx.builder.fresh_value();
+    let cmp_inst = Instruction::ICmp {
+        result: cmp_result,
+        op: crate::ir::instructions::ICmpOp::Ne,
+        lhs: val,
+        rhs: zero,
+        span,
+    };
+    emit_instruction_to_current_block(ctx, cmp_inst);
+    cmp_result
 }

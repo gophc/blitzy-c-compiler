@@ -1,3 +1,4 @@
+#![allow(clippy::result_unit_err)]
 //! Preprocessor directive handling for the BCC C compiler.
 //!
 //! This module implements all C11 preprocessor directives:
@@ -809,19 +810,105 @@ fn detect_and_register_guard(
 // Conditional compilation directives
 // ---------------------------------------------------------------------------
 
+/// Resolve `defined(X)` and `defined X` operators in a preprocessor
+/// expression token stream.  Replaces each `defined` operator sequence
+/// with a `1` or `0` pp-number token.  This MUST run before macro
+/// expansion so that `#define defined ...` cannot alter semantics
+/// (C11 §6.10.1p4).
+pub fn resolve_defined_operators(
+    tokens: &[PPToken],
+    macro_defs: &FxHashMap<String, MacroDef>,
+) -> Vec<PPToken> {
+    let mut result: Vec<PPToken> = Vec::with_capacity(tokens.len());
+    let mut i = 0;
+    while i < tokens.len() {
+        let tok = &tokens[i];
+        if tok.kind == PPTokenKind::Identifier && tok.text == "defined" {
+            let span = tok.span;
+            // Skip any whitespace after `defined`.
+            let mut j = i + 1;
+            while j < tokens.len() && tokens[j].kind == PPTokenKind::Whitespace {
+                j += 1;
+            }
+            if j < tokens.len()
+                && tokens[j].kind == PPTokenKind::Punctuator
+                && tokens[j].text == "("
+            {
+                // `defined ( IDENT )`  form.
+                let mut k = j + 1;
+                while k < tokens.len() && tokens[k].kind == PPTokenKind::Whitespace {
+                    k += 1;
+                }
+                if k < tokens.len() && tokens[k].kind == PPTokenKind::Identifier {
+                    let name = &tokens[k].text;
+                    let is_def = macro_defs.contains_key(name.as_str());
+                    // Skip past closing `)`.
+                    let mut m = k + 1;
+                    while m < tokens.len() && tokens[m].kind == PPTokenKind::Whitespace {
+                        m += 1;
+                    }
+                    if m < tokens.len()
+                        && tokens[m].kind == PPTokenKind::Punctuator
+                        && tokens[m].text == ")"
+                    {
+                        result.push(PPToken {
+                            kind: PPTokenKind::Number,
+                            text: if is_def {
+                                "1".to_string()
+                            } else {
+                                "0".to_string()
+                            },
+                            span,
+                            from_macro: false,
+                            painted: false,
+                        });
+                        i = m + 1;
+                        continue;
+                    }
+                }
+                // Malformed `defined(` — fall through and keep tokens as-is.
+            } else if j < tokens.len() && tokens[j].kind == PPTokenKind::Identifier {
+                // `defined IDENT` form (no parentheses).
+                let name = &tokens[j].text;
+                let is_def = macro_defs.contains_key(name.as_str());
+                result.push(PPToken {
+                    kind: PPTokenKind::Number,
+                    text: if is_def {
+                        "1".to_string()
+                    } else {
+                        "0".to_string()
+                    },
+                    span,
+                    from_macro: false,
+                    painted: false,
+                });
+                i = j + 1;
+                continue;
+            }
+            // Malformed `defined` at end of tokens — keep as-is.
+        }
+        result.push(tok.clone());
+        i += 1;
+    }
+    result
+}
+
 /// Process `#if` — begin a conditional block whose activity depends on the
 /// value of a preprocessor constant expression.
 fn process_if(pp: &mut Preprocessor, tokens: &[PPToken], directive_span: Span) -> Result<(), ()> {
     let tokens = skip_whitespace(tokens);
 
-    // Macro-expand the expression tokens before evaluation.
+    // Step 1: Resolve `defined(X)` / `defined X` operators BEFORE macro expansion.
+    let with_defined = resolve_defined_operators(tokens, &pp.macro_defs);
+
+    // Step 2: Macro-expand the remaining expression tokens.
     let expanded = {
         let mut expander =
             MacroExpander::new(&pp.macro_defs, &mut *pp.diagnostics, pp.max_recursion_depth);
-        expander.expand_tokens(tokens)
+        expander.expand_tokens(&with_defined)
     };
 
-    // Evaluate the preprocessor constant expression.
+    // Step 3: Evaluate the preprocessor constant expression.
     let result = match evaluate_pp_expression(&expanded, &mut *pp.diagnostics) {
         Ok(value) => value.is_nonzero(),
         Err(()) => {
@@ -944,10 +1031,13 @@ fn process_elif(
 
     // Evaluate the condition.
     let tokens = skip_whitespace(tokens);
+    // Step 1: Resolve `defined(X)` / `defined X` operators.
+    let with_defined = resolve_defined_operators(tokens, &pp.macro_defs);
+    // Step 2: Macro-expand remaining tokens.
     let expanded = {
         let mut expander =
             MacroExpander::new(&pp.macro_defs, &mut *pp.diagnostics, pp.max_recursion_depth);
-        expander.expand_tokens(tokens)
+        expander.expand_tokens(&with_defined)
     };
 
     let result = match evaluate_pp_expression(&expanded, &mut *pp.diagnostics) {

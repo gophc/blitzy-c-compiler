@@ -279,9 +279,10 @@ impl ArchCodegen for X86_64Backend {
         &self,
         func: &IrFunction,
         diag: &mut DiagnosticEngine,
+        globals: &[crate::ir::module::GlobalVariable],
     ) -> Result<MachineFunction, String> {
         let mut codegen = X86_64CodeGen::new(self.target);
-        codegen.lower(func, diag)
+        codegen.lower(func, diag, globals)
     }
 
     /// Emit machine code bytes from a fully register-allocated

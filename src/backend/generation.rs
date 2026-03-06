@@ -388,7 +388,7 @@ fn generate_for_arch<A: ArchCodegen>(
         }
 
         // Step 1: Instruction selection — IR → MachineFunction
-        let mut mf = match arch.lower_function(func, diagnostics) {
+        let mut mf = match arch.lower_function(func, diagnostics, module.globals()) {
             Ok(mf) => mf,
             Err(e) => {
                 diagnostics.emit_error(
@@ -915,6 +915,8 @@ fn write_relocatable_object(
             sh_link: 0,
             sh_info: 0,
             logical_size: 0,
+            virtual_address: 0,
+            file_offset_hint: 0,
         };
         writer.add_section(text_section);
     }
@@ -931,6 +933,8 @@ fn write_relocatable_object(
             sh_link: 0,
             sh_info: 0,
             logical_size: 0,
+            virtual_address: 0,
+            file_offset_hint: 0,
         };
         writer.add_section(data_sec);
     }
@@ -947,6 +951,8 @@ fn write_relocatable_object(
             sh_link: 0,
             sh_info: 0,
             logical_size: 0,
+            virtual_address: 0,
+            file_offset_hint: 0,
         };
         writer.add_section(rodata_sec);
     }
@@ -963,6 +969,8 @@ fn write_relocatable_object(
             sh_link: 0,
             sh_info: 0,
             logical_size: bss_size,
+            virtual_address: 0,
+            file_offset_hint: 0,
         };
         writer.add_section(bss_sec);
     }
@@ -1067,6 +1075,8 @@ fn add_dwarf_sections(writer: &mut ElfWriter, dwarf: &DwarfSections) {
                 sh_link: 0,
                 sh_info: 0,
                 logical_size: 0,
+                virtual_address: 0,
+                file_offset_hint: 0,
             };
             writer.add_section(sec);
         }
@@ -1111,12 +1121,25 @@ fn link_to_final_output(
 
     // Parse the relocatable ELF object bytes back into linker internal
     // representation: sections, symbols, and relocations.
-    let input = parse_elf_object_to_linker_input(0, "input.o", object_bytes);
+    let mut input = parse_elf_object_to_linker_input(0, "input.o", object_bytes);
+
+    // For executables (not shared libs), inject a CRT `_start` stub that
+    // calls `main` and invokes the exit syscall — but only if the user
+    // did not already define `_start`.
+    if output_type == OutputType::Executable {
+        let has_user_start = input
+            .symbols
+            .iter()
+            .any(|s| s.name == "_start" && s.section_index != 0);
+        if !has_user_start {
+            inject_crt_start(&mut input, ctx.target);
+        }
+    }
 
     // Create the architecture-specific relocation handler.
     let handler = create_relocation_handler(ctx.target);
 
-    // Invoke the built-in linker with real sections and relocation handler.
+    // Invoke the built-in linker with a single unified input.
     match link(&config, vec![input], handler.as_ref(), diagnostics) {
         Ok(output) => {
             // Validate the linker output.
@@ -1135,6 +1158,168 @@ fn link_to_final_output(
             Err(format!("linking failed: {}", e))
         }
     }
+}
+
+/// Generate a synthetic CRT startup object that defines `_start`.
+///
+/// The `_start` entry point:
+/// 1. Clears the frame pointer (ABI requirement)
+/// 2. Calls `main`
+/// 3. Passes the return value to the `exit` syscall
+///
+/// This is the minimal CRT startup needed to produce a working executable
+/// without linking against the system CRT objects (crt0.o, crti.o, etc.).
+/// Inject a CRT `_start` stub into the linker input, appending it to
+/// the existing .text section with the call to `main` pre-resolved.
+///
+/// The stub is placed immediately after the user's code. Because both `main`
+/// and `_start` are in the same .text section, the PC-relative call
+/// displacement can be computed at injection time without a relocation.
+fn inject_crt_start(input: &mut LinkerInput, target: Target) {
+    use crate::backend::linker_common::symbol_resolver::{
+        InputSymbol, STB_GLOBAL, STT_FUNC, STV_DEFAULT,
+    };
+
+    // Find the .text section in the existing input.
+    let text_idx = input.sections.iter().position(|s| s.name == ".text");
+
+    let text_idx = match text_idx {
+        Some(idx) => idx,
+        None => return, // No .text — nothing to inject into.
+    };
+
+    // Align _start to 16 bytes within .text.
+    let current_len = input.sections[text_idx].data.len();
+    let aligned = (current_len + 15) & !15;
+    // Pad with NOP (0x90 for x86, 0x00 is fine for non-x86 since it won't execute).
+    let nop_byte = match target {
+        Target::X86_64 | Target::I686 => 0x90u8,
+        _ => 0x00u8,
+    };
+    input.sections[text_idx].data.resize(aligned, nop_byte);
+
+    let start_offset = input.sections[text_idx].data.len();
+    // main is at offset 0 in .text (the first function).
+    let main_offset = 0u64;
+
+    match target {
+        Target::X86_64 => {
+            // _start stub (16 bytes):
+            //   xor %ebp, %ebp          ; 31 ed
+            //   call main               ; e8 <disp32>
+            //   mov %eax, %edi           ; 89 c7
+            //   mov $60, %eax            ; b8 3c 00 00 00
+            //   syscall                  ; 0f 05
+            let call_site = start_offset + 2; // offset of the E8 opcode
+            let call_next = call_site + 5; // IP after the CALL
+            let disp = (main_offset as i64) - (call_next as i64);
+            let disp_bytes = (disp as i32).to_le_bytes();
+            let stub = vec![
+                0x31,
+                0xed,
+                0xe8,
+                disp_bytes[0],
+                disp_bytes[1],
+                disp_bytes[2],
+                disp_bytes[3],
+                0x89,
+                0xc7,
+                0xb8,
+                0x3c,
+                0x00,
+                0x00,
+                0x00,
+                0x0f,
+                0x05,
+            ];
+            input.sections[text_idx].data.extend_from_slice(&stub);
+        }
+        Target::I686 => {
+            let call_site = start_offset + 2;
+            let call_next = call_site + 5;
+            let disp = (main_offset as i64) - (call_next as i64);
+            let disp_bytes = (disp as i32).to_le_bytes();
+            let stub = vec![
+                0x31,
+                0xed,
+                0xe8,
+                disp_bytes[0],
+                disp_bytes[1],
+                disp_bytes[2],
+                disp_bytes[3],
+                0x89,
+                0xc3,
+                0xb8,
+                0x01,
+                0x00,
+                0x00,
+                0x00,
+                0xcd,
+                0x80,
+            ];
+            input.sections[text_idx].data.extend_from_slice(&stub);
+        }
+        Target::AArch64 => {
+            // bl main: encoding is (imm26 << 0) | 0x94000000
+            // imm26 = (main_offset - start_offset) / 4
+            let bl_offset = start_offset;
+            let offset_bytes = ((main_offset as i64) - (bl_offset as i64)) / 4;
+            let imm26 = (offset_bytes as u32) & 0x03FF_FFFF;
+            let bl_inst = 0x9400_0000u32 | imm26;
+            let mov_x8_93 = 0xD280_0BA8u32; // mov x8, #93
+            let svc = 0xD400_0001u32; // svc #0
+            let mut stub = Vec::new();
+            stub.extend_from_slice(&bl_inst.to_le_bytes());
+            stub.extend_from_slice(&mov_x8_93.to_le_bytes());
+            stub.extend_from_slice(&svc.to_le_bytes());
+            input.sections[text_idx].data.extend_from_slice(&stub);
+        }
+        Target::RiscV64 => {
+            // For RISC-V, use a JAL instruction to call main.
+            // jal ra, offset  where offset = main_offset - start_offset
+            let jal_offset = start_offset;
+            let offset = (main_offset as i64) - (jal_offset as i64);
+            // JAL encoding: imm[20|10:1|11|19:12] rd=1(ra) opcode=1101111
+            let imm = offset as i32;
+            let imm20 = ((imm >> 20) & 1) as u32;
+            let imm10_1 = ((imm >> 1) & 0x3FF) as u32;
+            let imm11 = ((imm >> 11) & 1) as u32;
+            let imm19_12 = ((imm >> 12) & 0xFF) as u32;
+            let jal = (imm20 << 31)
+                | (imm10_1 << 21)
+                | (imm11 << 20)
+                | (imm19_12 << 12)
+                | (1 << 7) // rd = ra (x1)
+                | 0x6F; // opcode = JAL
+                        // li a7, 93: addi a7, zero, 93
+            let li_a7_93 = 0x05D0_0893u32;
+            // ecall
+            let ecall = 0x0000_0073u32;
+            let mut stub = Vec::new();
+            stub.extend_from_slice(&jal.to_le_bytes());
+            stub.extend_from_slice(&li_a7_93.to_le_bytes());
+            stub.extend_from_slice(&ecall.to_le_bytes());
+            input.sections[text_idx].data.extend_from_slice(&stub);
+        }
+    }
+
+    let stub_size = input.sections[text_idx].data.len() - start_offset;
+
+    // Update section size.
+    input.sections[text_idx].size = input.sections[text_idx].data.len() as u64;
+
+    // Add the `_start` symbol at the stub's offset.
+    let section_original_index = input.sections[text_idx].original_index;
+    input.symbols.push(InputSymbol {
+        name: "_start".to_string(),
+        value: start_offset as u64,
+        size: stub_size as u64,
+        binding: STB_GLOBAL,
+        sym_type: STT_FUNC,
+        visibility: STV_DEFAULT,
+        section_index: section_original_index as u16,
+        object_file_id: input.object_id,
+    });
 }
 
 /// Create an architecture-specific relocation handler based on the target.
@@ -1187,7 +1372,7 @@ pub fn parse_elf_object_to_linker_input(
         input.sections.push(InputSection {
             name: ".text".to_string(),
             section_type: SHT_PROGBITS,
-            flags: (SHF_ALLOC | SHF_EXECINSTR) as u64,
+            flags: SHF_ALLOC | SHF_EXECINSTR,
             data: data.to_vec(),
             size: data.len() as u64,
             alignment: 16,
@@ -1267,7 +1452,7 @@ pub fn parse_elf_object_to_linker_input(
         input.sections.push(InputSection {
             name: ".text".to_string(),
             section_type: SHT_PROGBITS,
-            flags: (SHF_ALLOC | SHF_EXECINSTR) as u64,
+            flags: SHF_ALLOC | SHF_EXECINSTR,
             data: data.to_vec(),
             size: data.len() as u64,
             alignment: 16,
@@ -1505,7 +1690,7 @@ pub fn parse_elf_object_to_linker_input(
         input.sections.push(InputSection {
             name: ".text".to_string(),
             section_type: SHT_PROGBITS,
-            flags: (SHF_ALLOC | SHF_EXECINSTR) as u64,
+            flags: SHF_ALLOC | SHF_EXECINSTR,
             data: data.to_vec(),
             size: data.len() as u64,
             alignment: 16,
@@ -1580,7 +1765,7 @@ fn emit_assembly_text<A: ArchCodegen>(
         output.push_str(&format!("{}:\n", func.name));
 
         // Perform instruction selection for assembly text output.
-        let mf = match arch.lower_function(func, diagnostics) {
+        let mf = match arch.lower_function(func, diagnostics, module.globals()) {
             Ok(mf) => mf,
             Err(e) => {
                 diagnostics.emit_error(

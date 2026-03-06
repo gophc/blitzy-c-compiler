@@ -1,3 +1,4 @@
+#![allow(clippy::identity_op, clippy::unusual_byte_groupings)]
 //! # AArch64 (A64) Instruction Encoder
 //!
 //! Encodes A64 instructions into fixed 32-bit (4-byte) binary machine code.
@@ -91,10 +92,16 @@ pub struct EncoderRelocation {
 // Constructor
 // ===========================================================================
 
+impl Default for AArch64Encoder {
+    fn default() -> Self {
+        AArch64Encoder
+    }
+}
+
 impl AArch64Encoder {
     /// Create a new AArch64 instruction encoder.
     pub fn new() -> Self {
-        AArch64Encoder
+        Self
     }
 }
 

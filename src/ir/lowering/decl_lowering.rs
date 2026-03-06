@@ -43,6 +43,7 @@ use crate::ir::module::{
 use crate::ir::types::IrType;
 
 use super::expr_lowering;
+use super::stmt_lowering;
 
 // ---------------------------------------------------------------------------
 // Symbol resolution helper
@@ -271,6 +272,56 @@ pub fn lower_function_definition(
 
     // --- Function prologue (IR-level, minimal) ---
     setup_function_prologue(&mut builder, &mut ir_function);
+
+    // --- Build param_values from allocated parameter allocas ---
+    // Parameters were stored in local_vars by allocate_parameters. Create
+    // a parallel map so that expression lowering can find parameters.
+    let mut param_values: FxHashMap<String, Value> = FxHashMap::default();
+    for param_decl in &param_declarations {
+        let pname = extract_param_name(param_decl, name_table);
+        if !pname.is_empty() {
+            if let Some(&alloca_val) = local_vars.get(&pname) {
+                param_values.insert(pname, alloca_val);
+            }
+        }
+    }
+
+    // --- Build local_types from collected local variable info ---
+    let mut local_types: FxHashMap<String, CType> = FxHashMap::default();
+    for local_info in &locals {
+        local_types.insert(local_info.name.clone(), local_info.c_type.clone());
+    }
+    // Add parameter types as well.
+    for param_decl in &param_declarations {
+        let pname = extract_param_name(param_decl, name_table);
+        if !pname.is_empty() {
+            let ptype = resolve_param_type(param_decl, target, name_table);
+            local_types.insert(pname, ptype);
+        }
+    }
+
+    // --- Lower the function body statements ---
+    {
+        let mut label_blocks: FxHashMap<String, BlockId> = FxHashMap::default();
+        let body_stmt = ast::Statement::Compound(func_def.body.clone());
+        let mut stmt_ctx = stmt_lowering::StmtLoweringContext {
+            builder: &mut builder,
+            function: &mut ir_function,
+            module,
+            target,
+            diagnostics,
+            local_vars: &mut local_vars,
+            label_blocks: &mut label_blocks,
+            loop_stack: Vec::new(),
+            switch_ctx: None,
+            recursion_depth: 0,
+            type_builder,
+            param_values: &param_values,
+            name_table,
+            local_types: &local_types,
+        };
+        stmt_lowering::lower_statement(&mut stmt_ctx, &body_stmt);
+    }
 
     // --- Verify function termination ---
     verify_function_termination(&mut ir_function, &return_ir_type, &mut builder, diagnostics);
@@ -1174,11 +1225,9 @@ fn extract_alignment_attribute(
 ) -> Option<usize> {
     for attr in attributes {
         if resolve_sym(name_table, &attr.name) == "aligned" {
-            if let Some(first_arg) = attr.args.first() {
-                if let ast::AttributeArg::Expression(expr) = first_arg {
-                    if let ast::Expression::IntegerLiteral { value, .. } = expr.as_ref() {
-                        return Some(*value as usize);
-                    }
+            if let Some(ast::AttributeArg::Expression(expr)) = attr.args.first() {
+                if let ast::Expression::IntegerLiteral { value, .. } = expr.as_ref() {
+                    return Some(*value as usize);
                 }
             }
             // aligned without argument defaults to max alignment (usually 16).

@@ -506,6 +506,7 @@ impl ArchCodegen for I686Codegen {
         &self,
         func: &IrFunction,
         diag: &mut DiagnosticEngine,
+        _globals: &[crate::ir::module::GlobalVariable],
     ) -> Result<MachineFunction, String> {
         let mut mf = MachineFunction::new(func.name.clone());
         let target = Target::I686;
@@ -1896,7 +1897,7 @@ mod tests {
             span: Span::dummy(),
         });
 
-        let result = cg.lower_function(&func, &mut diag);
+        let result = cg.lower_function(&func, &mut diag, &[]);
         assert!(result.is_ok());
         let mf = result.unwrap();
         assert_eq!(mf.name, "empty");
@@ -1927,7 +1928,7 @@ mod tests {
         });
         func.value_count = 3;
 
-        let result = cg.lower_function(&func, &mut diag);
+        let result = cg.lower_function(&func, &mut diag, &[]);
         assert!(result.is_ok());
         let mf = result.unwrap();
         assert_eq!(mf.name, "add");

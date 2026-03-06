@@ -1,3 +1,4 @@
+#![allow(clippy::result_unit_err)]
 //! Type specifier and qualifier parsing for the BCC C11 parser (Phase 4).
 //!
 //! This module handles all C11 type keywords plus GCC extensions:

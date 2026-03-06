@@ -1,3 +1,4 @@
+#![allow(clippy::result_unit_err)]
 //! Inline assembly (`asm`/`__asm__`) statement parsing for the BCC C11 parser.
 //!
 //! Implements full parsing of GCC-style inline assembly statements (Phase 4),

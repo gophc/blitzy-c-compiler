@@ -254,11 +254,9 @@ fn ctype_to_ir(ctype: &CType, target: &Target) -> IrType {
         CType::Float => IrType::F32,
         CType::Double => IrType::F64,
         CType::LongDouble => {
-            if target.long_double_size() == 16 {
-                IrType::F80
-            } else {
-                IrType::F80
-            }
+            // Both 80-bit and 128-bit extended precision map to IrType::F80
+            // for code generation purposes.
+            IrType::F80
         }
         CType::Pointer(..) => IrType::Ptr,
         CType::Array(elem, count) => {
@@ -458,7 +456,7 @@ fn lookup_var(ctx: &ExprLoweringContext<'_>, name: &str) -> Option<(Value, bool)
 }
 
 /// Look up the declared C type of a variable.
-fn lookup_var_type<'a>(ctx: &'a ExprLoweringContext<'_>, name: &str) -> CType {
+fn lookup_var_type(ctx: &ExprLoweringContext<'_>, name: &str) -> CType {
     ctx.local_types.get(name).cloned().unwrap_or(CType::Int)
 }
 

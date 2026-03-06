@@ -1176,6 +1176,7 @@ pub trait ArchCodegen {
         &self,
         func: &IrFunction,
         diag: &mut DiagnosticEngine,
+        globals: &[crate::ir::module::GlobalVariable],
     ) -> Result<MachineFunction, String>;
 
     /// Encode machine instructions to raw bytes (built-in assembler).

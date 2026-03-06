@@ -53,9 +53,12 @@ pub mod stmt_lowering;
 // Imports — only `std` and `crate::` references (zero-dependency mandate)
 // ============================================================================
 
+use std::cell::RefCell;
+
 use crate::common::diagnostics::{DiagnosticEngine, Span};
 use crate::common::fx_hash::FxHashMap;
 use crate::common::source_map::SourceMap;
+use crate::common::string_interner::Interner;
 use crate::common::target::Target;
 use crate::common::type_builder::TypeBuilder;
 use crate::common::types::{alignof_ctype, sizeof_ctype, CType};
@@ -66,6 +69,18 @@ use crate::ir::function::IrFunction;
 use crate::ir::instructions::{BlockId, Value};
 use crate::ir::module::IrModule;
 use crate::ir::types::IrType;
+
+// ============================================================================
+// Thread-local interner snapshot for symbol name resolution
+// ============================================================================
+
+thread_local! {
+    // Snapshot of the string interner content, populated once at the start of
+    // `lower_translation_unit` so that all name extraction helpers can resolve
+    // Symbol handles to real C identifier strings without threading a borrow of
+    // the interner through deeply nested call chains.
+    static INTERNER_SNAPSHOT: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+}
 
 // ============================================================================
 // Re-export for external convenience
@@ -110,9 +125,9 @@ pub enum LoweringError {
     /// architecture does not support a particular type configuration.
     TypeConversionError {
         /// Description of the source C type that failed conversion.
-        from: CType,
+        from: Box<CType>,
         /// The IR type that was expected or partially produced.
-        to: IrType,
+        to: Box<IrType>,
         /// Source location of the type reference.
         span: Span,
     },
@@ -648,7 +663,22 @@ pub fn lower_translation_unit(
     type_builder: &TypeBuilder,
     source_map: &SourceMap,
     diagnostics: &mut DiagnosticEngine,
+    interner: &Interner,
 ) -> Result<IrModule, LoweringError> {
+    // Snapshot the interner content into thread-local storage so that all
+    // name extraction helpers (extract_declarator_name, etc.) can resolve
+    // Symbol handles to real C identifier strings without threading the
+    // interner through every call.
+    let snapshot: Vec<String> = (0..interner.len())
+        .map(|idx| {
+            let sym = crate::common::string_interner::Symbol::from_u32(idx as u32);
+            interner.resolve(sym).to_string()
+        })
+        .collect();
+    INTERNER_SNAPSHOT.with(|snap| {
+        *snap.borrow_mut() = Some(snapshot);
+    });
+
     // The symbol table from semantic analysis (Phase 5) provides type
     // information, linkage classification, storage class, and attribute
     // data for all declared symbols.  It is threaded into the
@@ -663,34 +693,14 @@ pub fn lower_translation_unit(
 
     let mut module = IrModule::new(module_name);
 
-    // Pre-populate the name table with global function and variable names
-    // from the AST declarations.  Names are extracted from the direct
-    // declarator's Identifier variant using the Symbol's numeric index
-    // as a string key.  This provides early visibility of globals to the
-    // lowering context so that forward references within function bodies
-    // can be resolved without a second discovery pass.
-    let mut name_table: Vec<String> = Vec::new();
-    for ext_decl in &translation_unit.declarations {
-        match ext_decl {
-            ast::ExternalDeclaration::Declaration(decl) => {
-                for init_decl in &decl.declarators {
-                    if let Some(name) = extract_declarator_name(&init_decl.declarator) {
-                        if !name_table.contains(&name) {
-                            name_table.push(name);
-                        }
-                    }
-                }
-            }
-            ast::ExternalDeclaration::FunctionDefinition(func_def) => {
-                if let Some(name) = extract_declarator_name(&func_def.declarator) {
-                    if !name_table.contains(&name) {
-                        name_table.push(name);
-                    }
-                }
-            }
-            ast::ExternalDeclaration::Empty | ast::ExternalDeclaration::AsmStatement(_) => {}
-        }
-    }
+    // Use the interner snapshot as the name table.  The snapshot maps
+    // each Symbol's as_u32() index to its interned string, so
+    // resolve_sym(name_table, sym) can resolve any identifier — not just
+    // top-level declaration names.  This ensures function parameters,
+    // local variables, and all other identifiers are resolvable during
+    // expression and statement lowering.
+    let name_table: Vec<String> =
+        INTERNER_SNAPSHOT.with(|snap| snap.borrow().as_ref().cloned().unwrap_or_default());
 
     // ====================================================================
     // Pass 1 — Global declarations, function prototypes, file-scope asm
@@ -925,25 +935,5 @@ fn extract_asm_template(asm_stmt: &ast::AsmStatement) -> String {
     String::from_utf8_lossy(&asm_stmt.template).to_string()
 }
 
-/// Extract the name from a [`Declarator`] by traversing its
-/// [`DirectDeclarator`] to find the `Identifier` variant.
-///
-/// Returns the symbol's numeric index formatted as a string key (e.g.,
-/// `"sym_42"`).  Since the lowering context does not hold a reference to
-/// the [`Interner`], we use the opaque symbol index as a stable identifier
-/// rather than the resolved human-readable name.  This is sufficient for
-/// the name-table pre-population pass because all downstream references
-/// within the same translation unit will resolve the same `Symbol` index.
-fn extract_declarator_name(decl: &ast::Declarator) -> Option<String> {
-    extract_direct_declarator_name(&decl.direct)
-}
-
-/// Recursively find the Identifier name within a DirectDeclarator.
-fn extract_direct_declarator_name(dd: &ast::DirectDeclarator) -> Option<String> {
-    match dd {
-        ast::DirectDeclarator::Identifier(sym, _span) => Some(format!("sym_{}", sym.as_u32())),
-        ast::DirectDeclarator::Parenthesized(inner) => extract_declarator_name(inner),
-        ast::DirectDeclarator::Array { base, .. } => extract_direct_declarator_name(base),
-        ast::DirectDeclarator::Function { base, .. } => extract_direct_declarator_name(base),
-    }
-}
+// Dead functions removed: extract_declarator_name and extract_direct_declarator_name
+// were superseded by the versions in decl_lowering.rs that accept a name_table parameter.

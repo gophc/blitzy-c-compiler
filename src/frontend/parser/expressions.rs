@@ -1,3 +1,4 @@
+#![allow(clippy::result_unit_err)]
 //! Expression parsing for the BCC C11 parser (Phase 4).
 //!
 //! Implements operator-precedence climbing (Pratt parsing) for binary

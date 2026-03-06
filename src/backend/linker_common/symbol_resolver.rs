@@ -743,6 +743,56 @@ impl SymbolResolver {
     /// - `_end` / `__end` — end of all loadable sections
     /// - `__executable_start` — base load address of the executable
     ///
+    /// Relocate resolved symbol values from section-relative offsets to
+    /// absolute virtual addresses after section merging.
+    ///
+    /// For each resolved symbol, looks up its input section via
+    /// `(object_file_id, section_index)` → section_name, then adds the
+    /// section's virtual address to the symbol's `final_address`.
+    pub fn relocate_symbol_addresses(
+        &mut self,
+        address_map: &crate::backend::linker_common::section_merger::AddressMap,
+        section_index_to_name: &FxHashMap<(u32, u16), String>,
+    ) {
+        for resolved in self.resolved.values_mut() {
+            if !resolved.is_defined {
+                continue;
+            }
+            // Try to find the section this symbol belongs to.
+            // The section_name is "section_N" where N is the section index.
+            if let Some(idx_str) = resolved.section_name.strip_prefix("section_") {
+                if let Ok(idx) = idx_str.parse::<u16>() {
+                    let lookup_key = (resolved.from_object, idx);
+                    if let Some(section_name) = section_index_to_name.get(&lookup_key) {
+                        if let Some(addr_info) = address_map.section_addresses.get(section_name) {
+                            resolved.final_address += addr_info.virtual_address;
+                            // Update section_name to the real name.
+                            resolved.section_name = section_name.clone();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Relocate local symbol values from section-relative offsets to
+    /// absolute virtual addresses after section merging.
+    pub fn relocate_local_symbol_addresses(
+        &mut self,
+        address_map: &crate::backend::linker_common::section_merger::AddressMap,
+        section_index_to_name: &FxHashMap<(u32, u16), String>,
+    ) {
+        for sym in &mut self.local_symbols {
+            let lookup_key = (sym.object_file_id, sym.section_index);
+            if let Some(section_name) = section_index_to_name.get(&lookup_key) {
+                if let Some(addr_info) = address_map.section_addresses.get(section_name) {
+                    sym.value += addr_info.virtual_address;
+                }
+            }
+        }
+    }
+
+    ///
     /// The `section_addresses` map provides `(start_address, end_address)`
     /// for each output section name (e.g. `".text"`, `".data"`, `".bss"`).
     pub fn define_linker_symbols(&mut self, section_addresses: &FxHashMap<String, (u64, u64)>) {

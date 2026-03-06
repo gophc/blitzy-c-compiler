@@ -1001,8 +1001,12 @@ impl<'a> Preprocessor<'a> {
                     pos += 1;
                 }
 
-                // Process the directive.
-                self.process_directive_line(&tokens[hash_pos], &directive_tokens);
+                // Process the directive.  #include may produce output tokens.
+                if let Some(included) =
+                    self.process_directive_line(&tokens[hash_pos], &directive_tokens)
+                {
+                    output.extend(included);
+                }
                 continue;
             }
 
@@ -1099,10 +1103,14 @@ impl<'a> Preprocessor<'a> {
     ///
     /// `hash_token` is the `#` token, `tokens` are the remaining tokens on the
     /// directive line (after `#` and whitespace).
-    fn process_directive_line(&mut self, _hash_token: &PPToken, tokens: &[PPToken]) {
+    fn process_directive_line(
+        &mut self,
+        _hash_token: &PPToken,
+        tokens: &[PPToken],
+    ) -> Option<Vec<PPToken>> {
         // Null directive: `#` alone on a line — valid C11 no-op.
         if tokens.is_empty() {
-            return;
+            return None;
         }
 
         let directive = &tokens[0];
@@ -1125,42 +1133,70 @@ impl<'a> Preprocessor<'a> {
                     // In inactive region: push a nested inactive conditional.
                     self.conditional_stack
                         .push(ConditionalState::new(false, directive.span));
-                    return;
+                    return None;
                 }
             }
             "elif" => {
                 self.process_elif(directive, &rest);
-                return;
+                return None;
             }
             "else" => {
                 self.process_else(directive);
-                return;
+                return None;
             }
             "endif" => {
                 self.process_endif(directive);
-                return;
+                return None;
             }
             _ => {
                 if !self.is_active() {
-                    return; // Skip all other directives in inactive regions.
+                    return None; // Skip all other directives in inactive regions.
                 }
             }
         }
 
         // Active-region directives.
         match directive_name {
-            "define" => self.process_define(&rest),
-            "undef" => self.process_undef(&rest),
-            "include" => {
-                let _ = self.process_include(&rest);
+            "define" => {
+                self.process_define(&rest);
+                None
             }
-            "if" => self.process_if(&rest, directive.span),
-            "ifdef" => self.process_ifdef(&rest, directive.span),
-            "ifndef" => self.process_ifndef(&rest, directive.span),
-            "error" => self.process_error(&rest, directive.span),
-            "warning" => self.process_warning(&rest, directive.span),
-            "line" => self.process_line_directive(&rest),
-            "pragma" => self.process_pragma(&rest),
+            "undef" => {
+                self.process_undef(&rest);
+                None
+            }
+            "include" => {
+                // process_include returns Ok(tokens) on success.
+                self.process_include(&rest).ok()
+            }
+            "if" => {
+                self.process_if(&rest, directive.span);
+                None
+            }
+            "ifdef" => {
+                self.process_ifdef(&rest, directive.span);
+                None
+            }
+            "ifndef" => {
+                self.process_ifndef(&rest, directive.span);
+                None
+            }
+            "error" => {
+                self.process_error(&rest, directive.span);
+                None
+            }
+            "warning" => {
+                self.process_warning(&rest, directive.span);
+                None
+            }
+            "line" => {
+                self.process_line_directive(&rest);
+                None
+            }
+            "pragma" => {
+                self.process_pragma(&rest);
+                None
+            }
             _ => {
                 // Unknown directive — emit diagnostic.
                 self.diagnostics.emit_warning(
@@ -1170,6 +1206,7 @@ impl<'a> Preprocessor<'a> {
                         directive_name
                     ),
                 );
+                None
             }
         }
     }
@@ -1327,15 +1364,17 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Process `#include` directive.
-    fn process_include(&mut self, tokens: &[PPToken]) -> Result<(), ()> {
+    fn process_include(&mut self, tokens: &[PPToken]) -> Result<Vec<PPToken>, ()> {
         if tokens.is_empty() {
             self.diagnostics
                 .emit_error(Span::dummy(), "expected header name after #include");
             return Err(());
         }
 
+        let directive_span = tokens[0].span;
+
         // Determine header name and type (system vs user).
-        let (header_name, _is_system) = match tokens[0].kind {
+        let (header_name, is_system) = match tokens[0].kind {
             PPTokenKind::HeaderName => {
                 let text = &tokens[0].text;
                 if text.starts_with('<') && text.ends_with('>') {
@@ -1375,13 +1414,95 @@ impl<'a> Preprocessor<'a> {
             }
         };
 
-        // For now, emit a note that #include processing is deferred to the
-        // include_handler submodule (which coordinates file resolution,
-        // circular detection, and recursive preprocessing).
-        let _ = self.interner.intern(&header_name);
-        let _ = self.source_map.get_filename(0);
+        // Determine the including file for relative path resolution.
+        let including_file = self
+            .source_map
+            .get_filename(directive_span.file_id)
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
 
-        Ok(())
+        // Build search paths for file resolution.
+        let mut handler = include_handler::IncludeHandler::new(
+            self.include_paths.clone(),
+            self.system_include_paths.clone(),
+        );
+
+        // Resolve the header to an absolute path.
+        let resolved_path = match handler.resolve_include(&header_name, is_system, &including_file)
+        {
+            Some(path) => path,
+            None => {
+                self.diagnostics
+                    .emit_error(directive_span, format!("'{}' file not found", header_name));
+                return Err(());
+            }
+        };
+
+        // Check include guards and #pragma once.
+        if handler.should_skip_file(&resolved_path, &self.macro_defs) {
+            return Ok(Vec::new());
+        }
+
+        // Check for circular includes and depth limit.
+        if let Err(inc_err) = handler.push_include(&resolved_path) {
+            let msg = match inc_err {
+                include_handler::IncludeError::Circular(_) => {
+                    format!("circular #include of '{}'", resolved_path.display())
+                }
+                include_handler::IncludeError::TooDeep(d) => {
+                    format!("#include nested too deeply (depth {})", d)
+                }
+                include_handler::IncludeError::NotFound(ref n) => {
+                    format!("'{}' file not found", n)
+                }
+                include_handler::IncludeError::IoError(ref e) => {
+                    format!("cannot open '{}': {}", resolved_path.display(), e)
+                }
+            };
+            self.diagnostics.emit_error(directive_span, msg);
+            return Err(());
+        }
+
+        // Read the file contents using PUA-encoded reader.
+        let source_content = match crate::common::encoding::read_source_file(&resolved_path) {
+            Ok(content) => content,
+            Err(e) => {
+                handler.pop_include();
+                self.diagnostics.emit_error(
+                    directive_span,
+                    format!("cannot read '{}': {}", resolved_path.display(), e),
+                );
+                return Err(());
+            }
+        };
+
+        // Register the file in the source map.
+        let file_id = self.source_map.add_file(
+            resolved_path.to_string_lossy().to_string(),
+            source_content.clone(),
+        );
+
+        // Apply Phase 1 transforms (trigraphs and line splicing).
+        let processed = phase1_line_splice(&phase1_trigraphs(&source_content));
+
+        // Tokenize the included source.
+        let included_tokens = tokenize_preprocessing(&processed, file_id);
+
+        // Recursively preprocess the included file's tokens.
+        self.include_depth += 1;
+        let result = self.process_tokens(&included_tokens);
+        self.include_depth -= 1;
+
+        handler.pop_include();
+
+        // Filter out the EOF token from included output to avoid premature
+        // termination of the parent file's token stream.
+        let filtered: Vec<PPToken> = result
+            .into_iter()
+            .filter(|t| t.kind != PPTokenKind::EndOfFile)
+            .collect();
+
+        Ok(filtered)
     }
 
     /// Process `#if` directive.
@@ -1420,26 +1541,28 @@ impl<'a> Preprocessor<'a> {
 
     /// Process `#elif` directive.
     fn process_elif(&mut self, directive_token: &PPToken, tokens: &[PPToken]) {
-        if let Some(top) = self.conditional_stack.last_mut() {
-            if top.seen_else {
-                self.diagnostics
-                    .emit_error(directive_token.span, "#elif after #else");
-                return;
-            }
-            if top.seen_active {
-                // A previous branch was taken — deactivate.
-                top.active = false;
-            } else {
-                // No branch taken yet — evaluate condition.
-                let value = evaluate_simple_condition(tokens, &self.macro_defs);
-                top.active = value;
-                if value {
-                    top.seen_active = true;
-                }
-            }
-        } else {
+        if self.conditional_stack.is_empty() {
             self.diagnostics
                 .emit_error(directive_token.span, "#elif without matching #if");
+            return;
+        }
+        let top = self.conditional_stack.last_mut().unwrap();
+        if top.seen_else {
+            self.diagnostics
+                .emit_error(directive_token.span, "#elif after #else");
+            return;
+        }
+        if top.seen_active {
+            // A previous branch was taken — deactivate.
+            top.active = false;
+        } else {
+            // No branch taken yet — evaluate condition using full evaluator.
+            let value = self.evaluate_condition(tokens);
+            let top = self.conditional_stack.last_mut().unwrap();
+            top.active = value;
+            if value {
+                top.seen_active = true;
+            }
         }
     }
 
@@ -1564,11 +1687,28 @@ impl<'a> Preprocessor<'a> {
 
     /// Evaluate a preprocessor condition expression.
     ///
-    /// Performs a simplified evaluation: checks for `defined(X)` patterns and
-    /// basic integer literal truthiness.  Full expression evaluation is
-    /// delegated to the `expression` submodule.
-    fn evaluate_condition(&self, tokens: &[PPToken]) -> bool {
-        evaluate_simple_condition(tokens, &self.macro_defs)
+    /// This performs the full C11 §6.10.1 evaluation sequence:
+    /// 1. Resolve `defined(X)` / `defined X` operators to `1` / `0` tokens
+    /// 2. Macro-expand remaining tokens
+    /// 3. Replace any remaining identifiers with `0` (handled by evaluator)
+    /// 4. Evaluate the resulting integer constant expression
+    fn evaluate_condition(&mut self, tokens: &[PPToken]) -> bool {
+        // Step 1: Resolve `defined` operators BEFORE macro expansion.
+        let with_defined = directives::resolve_defined_operators(tokens, &self.macro_defs);
+        // Step 2: Macro-expand remaining tokens.
+        let expanded = {
+            let mut expander = macro_expander::MacroExpander::new(
+                &self.macro_defs,
+                &mut *self.diagnostics,
+                self.max_recursion_depth,
+            );
+            expander.expand_tokens(&with_defined)
+        };
+        // Step 3+4: Evaluate the expression.
+        match expression::evaluate_pp_expression(&expanded, &mut *self.diagnostics) {
+            Ok(value) => value.is_nonzero(),
+            Err(()) => false,
+        }
     }
 
     /// Expand an object-like macro, returning the expanded token list.
@@ -1711,57 +1851,6 @@ impl<'a> Preprocessor<'a> {
 // ---------------------------------------------------------------------------
 // Helper: simplified condition evaluation
 // ---------------------------------------------------------------------------
-
-/// Evaluate a simplified preprocessor condition.
-///
-/// Handles `defined(X)`, `defined X`, integer literals, and basic identifiers
-/// (which evaluate to 0 per C11 §6.10.1p4).  Full expression evaluation
-/// (arithmetic, logical operators, ternary) is delegated to the `expression`
-/// submodule.
-fn evaluate_simple_condition(tokens: &[PPToken], macro_defs: &FxHashMap<String, MacroDef>) -> bool {
-    let non_ws: Vec<&PPToken> = tokens
-        .iter()
-        .filter(|t| !t.is_whitespace() && t.kind != PPTokenKind::EndOfFile)
-        .collect();
-
-    if non_ws.is_empty() {
-        return false;
-    }
-
-    // Handle `defined(X)` or `defined X`.
-    if non_ws[0].kind == PPTokenKind::Identifier && non_ws[0].text == "defined" {
-        if non_ws.len() >= 4 && non_ws[1].text == "(" && non_ws[3].text == ")" {
-            return macro_defs.contains_key(&non_ws[2].text);
-        }
-        if non_ws.len() >= 2 {
-            return macro_defs.contains_key(&non_ws[1].text);
-        }
-        return false;
-    }
-
-    // Handle `!defined(X)` or `!defined X`.
-    if non_ws[0].kind == PPTokenKind::Punctuator
-        && non_ws[0].text == "!"
-        && non_ws.len() >= 2
-        && non_ws[1].text == "defined"
-    {
-        if non_ws.len() >= 5 && non_ws[2].text == "(" && non_ws[4].text == ")" {
-            return !macro_defs.contains_key(&non_ws[3].text);
-        }
-        if non_ws.len() >= 3 {
-            return !macro_defs.contains_key(&non_ws[2].text);
-        }
-        return false;
-    }
-
-    // Handle integer literal.
-    if non_ws[0].kind == PPTokenKind::Number {
-        return non_ws[0].text != "0";
-    }
-
-    // Any other identifier evaluates to 0 per C11 §6.10.1p4.
-    false
-}
 
 // ===========================================================================
 // Unit Tests
@@ -1984,50 +2073,7 @@ mod tests {
         assert!(matches!(def.kind, MacroKind::FunctionLike { .. }));
     }
 
-    // -- Simplified condition evaluation ----------------------------------
-
-    #[test]
-    fn condition_defined_true() {
-        let mut defs = FxHashMap::default();
-        defs.insert(
-            "FOO".to_string(),
-            MacroDef {
-                name: "FOO".to_string(),
-                kind: MacroKind::ObjectLike,
-                replacement: Vec::new(),
-                is_predefined: false,
-                definition_span: Span::dummy(),
-            },
-        );
-        let tokens = tokenize_preprocessing("defined(FOO)", 0);
-        assert!(evaluate_simple_condition(&tokens, &defs));
-    }
-
-    #[test]
-    fn condition_defined_false() {
-        let defs = FxHashMap::default();
-        let tokens = tokenize_preprocessing("defined(FOO)", 0);
-        assert!(!evaluate_simple_condition(&tokens, &defs));
-    }
-
-    #[test]
-    fn condition_integer_nonzero() {
-        let defs = FxHashMap::default();
-        let tokens = tokenize_preprocessing("1", 0);
-        assert!(evaluate_simple_condition(&tokens, &defs));
-    }
-
-    #[test]
-    fn condition_integer_zero() {
-        let defs = FxHashMap::default();
-        let tokens = tokenize_preprocessing("0", 0);
-        assert!(!evaluate_simple_condition(&tokens, &defs));
-    }
-
-    #[test]
-    fn condition_undefined_identifier() {
-        let defs = FxHashMap::default();
-        let tokens = tokenize_preprocessing("UNKNOWN", 0);
-        assert!(!evaluate_simple_condition(&tokens, &defs));
-    }
+    // Condition evaluation is now tested via the full expression evaluator
+    // in the `expression` submodule.  The previous `evaluate_simple_condition`
+    // helper was removed in favour of the complete implementation.
 }

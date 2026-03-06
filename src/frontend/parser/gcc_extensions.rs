@@ -1,3 +1,4 @@
+#![allow(clippy::result_unit_err)]
 //! GCC language extension parsing dispatch for the BCC C11 parser (Phase 4).
 //!
 //! This module provides centralized handling for GCC-specific language

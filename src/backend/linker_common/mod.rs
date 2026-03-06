@@ -482,14 +482,65 @@ pub fn link(
 
     // Compute the base address for the target and output type.
     let is_shared = config.is_shared();
-    let base_address = linker_script::default_base_address(&config.target, is_shared);
-    let page_alignment = linker_script::PAGE_ALIGNMENT;
 
-    // Assign virtual addresses and file offsets to all output sections.
-    let address_map = merger.assign_addresses(base_address, page_alignment);
+    // -----------------------------------------------------------------------
+    // Authoritative Address Layout via Linker Script
+    // -----------------------------------------------------------------------
+    // Use the linker script as the SINGLE source of truth for virtual addresses
+    // and file offsets.  Both the symbol table and the ELF program headers are
+    // derived from this layout, which guarantees they are mutually consistent.
+    let ordered_sections_for_layout = merger.get_ordered_sections();
+    let section_infos_for_layout: Vec<linker_script::InputSectionInfo> =
+        ordered_sections_for_layout
+            .iter()
+            .map(|sec| linker_script::InputSectionInfo {
+                name: sec.name.clone(),
+                size: sec.total_size,
+                alignment: sec.alignment,
+                flags: sec.flags as u32,
+            })
+            .collect();
 
-    // Resolve fragment-level addresses within each output section.
-    merger.resolve_fragment_addresses();
+    let mut layout_script = linker_script::DefaultLinkerScript::new(config.target, is_shared);
+    let layout_result = layout_script.compute_layout(&section_infos_for_layout);
+
+    // Build the address map from the linker-script layout.
+    let mut address_map = section_merger::AddressMap {
+        section_addresses: FxHashMap::default(),
+    };
+    for sl in &layout_result.sections {
+        address_map.section_addresses.insert(
+            sl.name.clone(),
+            section_merger::SectionAddress {
+                virtual_address: sl.virtual_address,
+                file_offset: sl.file_offset,
+                size: sl.size,
+                mem_size: sl.mem_size,
+            },
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2b: Relocate Symbol Values
+    // -----------------------------------------------------------------------
+    // After section merging assigned virtual addresses, update each symbol's
+    // value from a section-relative offset to an absolute virtual address.
+    // Build a mapping: (object_id, section_index) → section_name.
+    let mut section_index_to_name: FxHashMap<(u32, u16), String> = FxHashMap::default();
+    for input in &inputs {
+        for section in &input.sections {
+            section_index_to_name.insert(
+                (section.object_id, section.original_index as u16),
+                section.name.clone(),
+            );
+        }
+    }
+
+    // For each resolved symbol, compute: final_address = section_va + symbol_offset.
+    resolver.relocate_symbol_addresses(&address_map, &section_index_to_name);
+
+    // Also relocate local symbols.
+    resolver.relocate_local_symbol_addresses(&address_map, &section_index_to_name);
 
     // -----------------------------------------------------------------------
     // Phase 3: Linker-Defined Symbols
@@ -645,6 +696,8 @@ fn link_relocatable(
                 sh_addralign: section.alignment,
                 sh_entsize: 0,
                 logical_size: 0,
+                virtual_address: 0,
+                file_offset_hint: 0,
             };
             writer.add_section(elf_section);
         }
@@ -804,6 +857,10 @@ fn write_elf_output(
     }
 
     // Add output sections to the ELF writer.
+    // For linked output (ET_EXEC / ET_DYN), populate virtual addresses and
+    // file-offset hints from the address map so the ELF writer places
+    // section data at the exact offsets the program headers reference.
+    let is_linked = config.output_type.is_linked();
     for &output_section in ordered_sections {
         // Use patched data from the section data map if available,
         // otherwise fall back to the merged section data.
@@ -811,6 +868,16 @@ fn write_elf_output(
             .get(&output_section.name)
             .cloned()
             .unwrap_or_default();
+
+        let (vaddr, foff) = if is_linked {
+            if let Some(addr_info) = address_map.section_addresses.get(&output_section.name) {
+                (addr_info.virtual_address, addr_info.file_offset)
+            } else {
+                (0, 0)
+            }
+        } else {
+            (0, 0)
+        };
 
         let elf_section = Section {
             name: output_section.name.clone(),
@@ -822,6 +889,8 @@ fn write_elf_output(
             sh_addralign: output_section.alignment,
             sh_entsize: 0,
             logical_size: 0,
+            virtual_address: vaddr,
+            file_offset_hint: foff,
         };
         writer.add_section(elf_section);
     }
@@ -861,6 +930,8 @@ fn write_elf_output(
                     sh_addralign: if config.target.is_64bit() { 8 } else { 4 },
                     sh_entsize,
                     logical_size: 0,
+                    virtual_address: 0,
+                    file_offset_hint: 0,
                 };
                 writer.add_section(elf_section);
             }

@@ -611,6 +611,27 @@ impl X86_64Encoder {
     /// back to [`X86Opcode`], examines operand types, and delegates to
     /// the appropriate encoding helper.
     pub fn encode_instruction(&mut self, inst: &MachineInstruction) -> EncodedInstruction {
+        // Normalise the operand layout.  The x86-64 codegen places the
+        // destination in `inst.result` and the source(s) in
+        // `inst.operands`, but the encoding helpers expect the
+        // destination in `operands[0]` and the source in `operands[1]`.
+        // When `inst.result` is present we prepend it to the operand
+        // list so every downstream helper sees the expected convention.
+        let normalised: MachineInstruction;
+        let inst = if let Some(ref res) = inst.result {
+            let mut ni = MachineInstruction::new(inst.opcode);
+            ni.operands.push(res.clone());
+            ni.operands.extend(inst.operands.iter().cloned());
+            ni.is_terminator = inst.is_terminator;
+            ni.is_branch = inst.is_branch;
+            ni.is_call = inst.is_call;
+            ni.operand_size = inst.operand_size;
+            normalised = ni;
+            &normalised
+        } else {
+            inst
+        };
+
         let opcode = match X86Opcode::from_u32(inst.opcode) {
             Some(op) => op,
             None => {

@@ -1,3 +1,4 @@
+#![allow(clippy::result_unit_err)]
 //! `__attribute__((...))` parsing for all 21+ required GCC attributes.
 //!
 //! This module implements parsing for the GCC `__attribute__` specifier syntax

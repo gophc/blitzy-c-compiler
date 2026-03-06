@@ -1,3 +1,4 @@
+#![allow(clippy::result_unit_err)]
 //! # BCC Parser — Phase 4: Recursive-Descent C11 Parser
 //!
 //! This module implements a recursive-descent parser consuming tokens from the
@@ -517,6 +518,9 @@ impl<'src> Parser<'src> {
         let mut declarations = Vec::new();
 
         while !self.current.is_eof() {
+            // Record the current position so we can detect no-progress loops.
+            let pos_before = self.current.span.start;
+
             match self.parse_external_declaration() {
                 Ok(decl) => {
                     declarations.push(decl);
@@ -524,6 +528,13 @@ impl<'src> Parser<'src> {
                 Err(()) => {
                     // Error already reported; synchronize and continue.
                     self.synchronize();
+
+                    // If synchronize didn't advance past the problematic token,
+                    // force-skip one token to guarantee forward progress and
+                    // prevent an infinite loop.
+                    if !self.current.is_eof() && self.current.span.start == pos_before {
+                        self.advance();
+                    }
                 }
             }
         }

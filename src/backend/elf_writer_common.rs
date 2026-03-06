@@ -985,6 +985,18 @@ pub struct Section {
     /// is non-zero but no bytes need to be stored in the data vector.
     /// When zero, `data.len()` is used as the logical size.
     pub logical_size: u64,
+    /// Virtual address hint for linked output (ET_EXEC / ET_DYN).
+    /// When non-zero, used as `sh_addr` in the section header, and
+    /// the section data is placed at `file_offset_hint` in the file.
+    /// When zero, the section is placed sequentially after the preceding
+    /// section with `sh_addr = 0` (relocatable mode).
+    pub virtual_address: u64,
+    /// File offset hint for linked output (ET_EXEC / ET_DYN).
+    /// When `virtual_address` is non-zero, the ELF writer places this
+    /// section's data at exactly this file offset, inserting padding as
+    /// necessary.  This ensures the file layout matches the program
+    /// headers produced by the linker script.
+    pub file_offset_hint: u64,
 }
 
 impl Default for Section {
@@ -999,6 +1011,8 @@ impl Default for Section {
             sh_addralign: 1,
             sh_entsize: 0,
             logical_size: 0,
+            virtual_address: 0,
+            file_offset_hint: 0,
         }
     }
 }
@@ -1246,38 +1260,57 @@ impl ElfWriter {
             current_offset += phdrs_total_size;
         }
 
-        // Track (file_offset, logical_size) for every section.
-        let mut section_file_offsets: Vec<(u64, u64)> = Vec::with_capacity(total_sections);
-        section_file_offsets.push((0, 0)); // null section
+        // Track (file_offset, logical_size, virtual_address) for every section.
+        let mut section_file_offsets: Vec<(u64, u64, u64)> = Vec::with_capacity(total_sections);
+        section_file_offsets.push((0, 0, 0)); // null section
 
         for sec in &self.sections {
-            let align = (sec.sh_addralign as usize).max(1);
-            current_offset = align_up(current_offset, align);
             // Use the explicit logical_size if non-zero, otherwise data.len().
             let logical_size = if sec.logical_size > 0 {
                 sec.logical_size
             } else {
                 sec.data.len() as u64
             };
-            section_file_offsets.push((current_offset as u64, logical_size));
-            // NOBITS sections take no file space.
-            if sec.sh_type != SHT_NOBITS {
-                current_offset += sec.data.len();
+
+            // For linked output, use the file_offset_hint if provided.
+            // This ensures the file layout matches the program headers.
+            if sec.file_offset_hint > 0 {
+                current_offset = sec.file_offset_hint as usize;
+                section_file_offsets.push((
+                    sec.file_offset_hint,
+                    logical_size,
+                    sec.virtual_address,
+                ));
+                if sec.sh_type != SHT_NOBITS {
+                    current_offset += sec.data.len();
+                }
+            } else {
+                let align = (sec.sh_addralign as usize).max(1);
+                current_offset = align_up(current_offset, align);
+                section_file_offsets.push((
+                    current_offset as u64,
+                    logical_size,
+                    sec.virtual_address,
+                ));
+                // NOBITS sections take no file space.
+                if sec.sh_type != SHT_NOBITS {
+                    current_offset += sec.data.len();
+                }
             }
         }
 
         // .symtab — aligned to pointer width
         let ptr_align = ptr_width;
         current_offset = align_up(current_offset, ptr_align);
-        section_file_offsets.push((current_offset as u64, sym_bytes.len() as u64));
+        section_file_offsets.push((current_offset as u64, sym_bytes.len() as u64, 0));
         current_offset += sym_bytes.len();
 
         // .strtab — alignment 1
-        section_file_offsets.push((current_offset as u64, strtab_bytes.len() as u64));
+        section_file_offsets.push((current_offset as u64, strtab_bytes.len() as u64, 0));
         current_offset += strtab_bytes.len();
 
         // .shstrtab — alignment 1
-        section_file_offsets.push((current_offset as u64, shstrtab_bytes.len() as u64));
+        section_file_offsets.push((current_offset as u64, shstrtab_bytes.len() as u64, 0));
         current_offset += shstrtab_bytes.len();
 
         // Section header table — aligned to pointer width
@@ -1349,7 +1382,7 @@ impl ElfWriter {
         // -----------------------------------------------------------------
 
         for (i, sec) in self.sections.iter().enumerate() {
-            let (target_offset, _) = section_file_offsets[i + 1];
+            let (target_offset, _, _) = section_file_offsets[i + 1];
             pad_to(&mut buf, target_offset as usize);
             if sec.sh_type != SHT_NOBITS {
                 buf.extend_from_slice(&sec.data);
@@ -1388,14 +1421,14 @@ impl ElfWriter {
 
         // User sections
         for (i, sec) in self.sections.iter().enumerate() {
-            let (file_off, logical_size) = section_file_offsets[i + 1];
+            let (file_off, logical_size, virt_addr) = section_file_offsets[i + 1];
             let name_off = section_name_offsets[i + 1];
 
             let shdr = Elf64SectionHeader {
                 sh_name: name_off,
                 sh_type: sec.sh_type,
                 sh_flags: sec.sh_flags,
-                sh_addr: 0,
+                sh_addr: virt_addr,
                 sh_offset: file_off,
                 sh_size: logical_size,
                 sh_link: sec.sh_link,
@@ -1408,7 +1441,7 @@ impl ElfWriter {
 
         // .symtab section header
         {
-            let (off, size) = section_file_offsets[symtab_section_idx];
+            let (off, size, _) = section_file_offsets[symtab_section_idx];
             let shdr = Elf64SectionHeader {
                 sh_name: symtab_name_off,
                 sh_type: SHT_SYMTAB,
@@ -1426,7 +1459,7 @@ impl ElfWriter {
 
         // .strtab section header
         {
-            let (off, size) = section_file_offsets[strtab_section_idx];
+            let (off, size, _) = section_file_offsets[strtab_section_idx];
             let shdr = Elf64SectionHeader {
                 sh_name: strtab_name_off,
                 sh_type: SHT_STRTAB,
@@ -1444,7 +1477,7 @@ impl ElfWriter {
 
         // .shstrtab section header
         {
-            let (off, size) = section_file_offsets[shstrtab_section_idx];
+            let (off, size, _) = section_file_offsets[shstrtab_section_idx];
             let shdr = Elf64SectionHeader {
                 sh_name: shstrtab_name_off,
                 sh_type: SHT_STRTAB,

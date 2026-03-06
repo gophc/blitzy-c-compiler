@@ -724,6 +724,8 @@ pub fn assemble_to_object(
         sh_addralign: 16,
         sh_entsize: 0,
         logical_size: 0,
+        virtual_address: 0,
+        file_offset_hint: 0,
     });
 
     let mut data_idx: Option<usize> = None;
@@ -738,6 +740,8 @@ pub fn assemble_to_object(
             sh_addralign: 8,
             sh_entsize: 0,
             logical_size: 0,
+            virtual_address: 0,
+            file_offset_hint: 0,
         }));
     }
 
@@ -756,6 +760,8 @@ pub fn assemble_to_object(
             sh_addralign: 8,
             sh_entsize: 0,
             logical_size: bss_size as u64,
+            virtual_address: 0,
+            file_offset_hint: 0,
         }));
     }
 
@@ -771,6 +777,8 @@ pub fn assemble_to_object(
             sh_addralign: 8,
             sh_entsize: 0,
             logical_size: 0,
+            virtual_address: 0,
+            file_offset_hint: 0,
         }));
     }
 
@@ -821,6 +829,8 @@ pub fn assemble_to_object(
             sh_addralign: 8,
             sh_entsize: 24, // sizeof(Elf64_Rela)
             logical_size: 0,
+            virtual_address: 0,
+            file_offset_hint: 0,
         });
     }
 
@@ -837,6 +847,8 @@ pub fn assemble_to_object(
             sh_addralign: 8,
             sh_entsize: 0,
             logical_size: 0,
+            virtual_address: 0,
+            file_offset_hint: 0,
         });
     }
 
@@ -851,6 +863,8 @@ pub fn assemble_to_object(
         sh_addralign: 1,
         sh_entsize: 0,
         logical_size: 0,
+        virtual_address: 0,
+        file_offset_hint: 0,
     });
 
     // -- Section symbols --------------------------------------------------

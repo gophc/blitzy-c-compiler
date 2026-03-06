@@ -1199,9 +1199,9 @@ impl AArch64Assembler {
                     if let Some((rn, offset)) = parse_memory_operand_aarch64(operands[1]) {
                         let scaled = ((offset / 8) as u32) & 0xFFF;
                         // STR Xt, [Xn, #offset] (unsigned offset, 64-bit)
+                        // opc=00 for STR 64-bit is bits [23:22] = 0
                         (0b11 << 30)
                             | (0b111001 << 24)
-                            | (0b00 << 22)
                             | (scaled << 10)
                             | ((rn as u32) << 5)
                             | (rt as u32)

@@ -814,6 +814,47 @@ fn run_preprocess_only(
             pp.add_include_path(path);
         }
 
+        // Add compiler-builtin include path (for stdarg.h, stddef.h, etc.).
+        // Locate the `include/` directory relative to the bcc binary.
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(exe_dir) = exe.parent() {
+                let builtin = exe_dir.join("../../include");
+                if builtin.is_dir() {
+                    if let Some(s) = builtin
+                        .canonicalize()
+                        .ok()
+                        .and_then(|p| p.to_str().map(|s| s.to_string()))
+                    {
+                        pp.add_system_include_path(&s);
+                    }
+                }
+                // Also try directly next to executable.
+                let builtin2 = exe_dir.join("include");
+                if builtin2.is_dir() {
+                    if let Some(s) = builtin2
+                        .canonicalize()
+                        .ok()
+                        .and_then(|p| p.to_str().map(|s| s.to_string()))
+                    {
+                        pp.add_system_include_path(&s);
+                    }
+                }
+            }
+        }
+
+        // Add default system include paths so that `#include <stdio.h>` etc. work.
+        let system_paths = [
+            "/usr/include",
+            "/usr/local/include",
+            "/usr/include/x86_64-linux-gnu",
+            "/usr/include/linux",
+        ];
+        for sp in &system_paths {
+            if std::path::Path::new(sp).is_dir() {
+                pp.add_system_include_path(sp);
+            }
+        }
+
         // Add defines from CLI
         for (name, value) in &ctx.defines {
             let val = value.as_deref().unwrap_or("1");
@@ -887,6 +928,43 @@ fn compile_single_file(
     // Configure preprocessor with CLI options
     for path in &ctx.include_paths {
         pp.add_include_path(path);
+    }
+    // Compiler-builtin include path (for stdarg.h, stddef.h, etc.).
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            let builtin = exe_dir.join("../../include");
+            if builtin.is_dir() {
+                if let Some(s) = builtin
+                    .canonicalize()
+                    .ok()
+                    .and_then(|p| p.to_str().map(|s| s.to_string()))
+                {
+                    pp.add_system_include_path(&s);
+                }
+            }
+            let builtin2 = exe_dir.join("include");
+            if builtin2.is_dir() {
+                if let Some(s) = builtin2
+                    .canonicalize()
+                    .ok()
+                    .and_then(|p| p.to_str().map(|s| s.to_string()))
+                {
+                    pp.add_system_include_path(&s);
+                }
+            }
+        }
+    }
+    // Default system include paths.
+    let system_paths = [
+        "/usr/include",
+        "/usr/local/include",
+        "/usr/include/x86_64-linux-gnu",
+        "/usr/include/linux",
+    ];
+    for sp in &system_paths {
+        if std::path::Path::new(sp).is_dir() {
+            pp.add_system_include_path(sp);
+        }
     }
     for (name, value) in &ctx.defines {
         let val = value.as_deref().unwrap_or("1");
@@ -984,6 +1062,7 @@ fn compile_single_file(
         &type_builder,
         &source_map,
         &mut diagnostics,
+        &interner,
     )
     .map_err(|e| {
         diagnostics.print_all(&source_map);

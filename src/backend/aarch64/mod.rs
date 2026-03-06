@@ -458,6 +458,8 @@ impl AArch64Codegen {
             sh_addralign: 4,
             sh_entsize: 0,
             logical_size: 0,
+            virtual_address: 0,
+            file_offset_hint: 0,
         };
         let text_idx = elf.add_section(text_section);
 
@@ -491,6 +493,8 @@ impl AArch64Codegen {
                 sh_addralign: 8,
                 sh_entsize: 0,
                 logical_size: 0,
+                virtual_address: 0,
+                file_offset_hint: 0,
             };
             elf.add_section(data_section);
         }
@@ -530,6 +534,8 @@ impl AArch64Codegen {
                 sh_addralign: 8,
                 sh_entsize: 0,
                 logical_size: 0,
+                virtual_address: 0,
+                file_offset_hint: 0,
             };
             elf.add_section(rodata_section);
         }
@@ -561,6 +567,8 @@ impl AArch64Codegen {
                 sh_addralign: 8,
                 sh_entsize: 0,
                 logical_size: bss_size,
+                virtual_address: 0,
+                file_offset_hint: 0,
             };
             elf.add_section(bss_section);
         }
@@ -612,6 +620,8 @@ impl AArch64Codegen {
                 sh_addralign: 8,
                 sh_entsize: 24,
                 logical_size: 0,
+                virtual_address: 0,
+                file_offset_hint: 0,
             };
             elf.add_section(rela_section);
         }
@@ -637,6 +647,7 @@ impl ArchCodegen for AArch64Codegen {
         &self,
         func: &IrFunction,
         _diag: &mut DiagnosticEngine,
+        _globals: &[crate::ir::module::GlobalVariable],
     ) -> Result<MachineFunction, String> {
         if !func.is_definition {
             return Err(format!(

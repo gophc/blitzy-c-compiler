@@ -1,3 +1,4 @@
+#![allow(clippy::manual_range_contains)]
 //! # RISC-V 64 ELF Relocation Types
 //!
 //! Defines all RISC-V 64 relocation types as specified by the RISC-V ELF psABI.

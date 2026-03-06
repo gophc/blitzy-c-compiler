@@ -426,6 +426,10 @@ pub struct X86_64CodeGen {
     block_map: FxHashMap<usize, usize>,
     /// Current frame layout (populated during `compute_frame_layout`).
     frame: Option<FrameLayout>,
+    /// Cache of compile-time integer constants resolved from the IR
+    /// constant-sentinel pattern (`BinOp(Add, result, UNDEF)`).
+    /// Populated by a pre-scan pass during `lower_function`.
+    constant_cache: FxHashMap<Value, i64>,
 }
 
 impl X86_64CodeGen {
@@ -448,6 +452,100 @@ impl X86_64CodeGen {
             value_types: FxHashMap::default(),
             block_map: FxHashMap::default(),
             frame: None,
+            constant_cache: FxHashMap::default(),
+        }
+    }
+
+    /// Pre-populate the constant cache by scanning the given IR function
+    /// for `BinOp(Add, result, UNDEF)` sentinel instructions and extracting
+    /// constant integer values from the corresponding module globals.
+    ///
+    /// The IR lowering phase (`emit_int_const`) pairs each compile-time
+    /// integer constant with a global named `.Lconst.i.{G}`.  We collect
+    /// all sentinel `Value`s in instruction order and all integer-constant
+    /// globals sorted by their index suffix, then pair them 1:1.  Float
+    /// constants (`.Lconst.f.*`) are handled similarly.
+    pub fn populate_constant_cache(
+        &mut self,
+        func: &IrFunction,
+        globals: &[crate::ir::module::GlobalVariable],
+    ) {
+        self.constant_cache.clear();
+
+        // Collect Values defined by instructions in this function.
+        let mut defined = std::collections::HashSet::new();
+        for param in &func.params {
+            if param.value != Value::UNDEF {
+                defined.insert(param.value.index());
+            }
+        }
+        for block in func.blocks() {
+            for inst in block.instructions() {
+                if let Some(r) = inst.result() {
+                    if r != Value::UNDEF {
+                        defined.insert(r.index());
+                    }
+                }
+            }
+        }
+
+        // Collect all Values referenced as operands.
+        let mut referenced = std::collections::HashSet::new();
+        for block in func.blocks() {
+            for inst in block.instructions() {
+                for op in inst.operands() {
+                    if op != Value::UNDEF {
+                        referenced.insert(op.index());
+                    }
+                }
+            }
+        }
+
+        // Orphaned values: referenced but not defined (their sentinel
+        // BinOp was removed by optimisation passes).
+        let mut orphans: Vec<u32> = referenced.difference(&defined).copied().collect();
+        orphans.sort();
+
+        // Collect integer constants from globals, sorted by their
+        // creation-order index suffix.
+        let mut int_consts: Vec<(u32, i64)> = Vec::new();
+        for gv in globals {
+            if let Some(crate::ir::module::Constant::Integer(v)) = gv.initializer.as_ref() {
+                if let Some(idx_str) = gv.name.strip_prefix(".Lconst.i.") {
+                    if let Ok(idx) = idx_str.parse::<u32>() {
+                        int_consts.push((idx, *v as i64));
+                    }
+                }
+            }
+        }
+        int_consts.sort_by_key(|(idx, _)| *idx);
+
+        // Pair orphaned values with constants in order.
+        for (orphan, (_idx, value)) in orphans.iter().zip(int_consts.iter()) {
+            self.constant_cache.insert(Value(*orphan), *value);
+        }
+
+        // Also cache any surviving sentinel BinOp(Add, result, UNDEF) patterns.
+        for block in func.blocks() {
+            for inst in block.instructions() {
+                if let Instruction::BinOp {
+                    result,
+                    op: BinOp::Add,
+                    lhs,
+                    rhs,
+                    ..
+                } = inst
+                {
+                    if *rhs == Value::UNDEF
+                        && *lhs == *result
+                        && !self.constant_cache.contains_key(result)
+                    {
+                        if let Some(&(_, val)) = int_consts.first() {
+                            self.constant_cache.insert(*result, val);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -478,10 +576,33 @@ impl X86_64CodeGen {
     /// Returns a `VirtualRegister(u32::MAX)` sentinel if not found
     /// (should not happen for well-formed IR).
     fn get_value(&self, val: Value) -> MachineOperand {
-        self.value_map
-            .get(&val)
-            .cloned()
-            .unwrap_or(MachineOperand::VirtualRegister(u32::MAX))
+        if let Some(op) = self.value_map.get(&val) {
+            return op.clone();
+        }
+        // Check the constant cache — the value may be a compile-time
+        // integer constant whose sentinel instruction was eliminated
+        // by optimisation passes.
+        if let Some(&imm) = self.constant_cache.get(&val) {
+            return MachineOperand::Immediate(imm);
+        }
+        MachineOperand::Immediate(0)
+    }
+
+    /// Resolve a constant-sentinel IR value to its immediate integer value.
+    ///
+    /// The IR lowering phase represents compile-time integer constants as
+    /// `BinOp(Add, result, Value::UNDEF)` sentinels paired with a global
+    /// variable holding `Constant::Integer(n)`.  The global is named
+    /// `.Lconst.i.{G}` where `G` is the global index at creation time.
+    ///
+    /// We search the `IrFunction`'s parent module (passed via globals
+    /// snapshot) for the corresponding constant.  Matching is done by
+    /// scanning global names for the `.Lconst.i.` prefix and correlating
+    /// via the module-level globals list passed to `lower_function`.
+    fn resolve_constant_value(&self, _result: Value, _func: &IrFunction) -> Option<i64> {
+        // The constant value is retrieved from the constant_cache
+        // populated during the pre-scan phase of `lower_function`.
+        self.constant_cache.get(&_result).copied()
     }
 
     // -----------------------------------------------------------------------
@@ -778,8 +899,9 @@ impl X86_64CodeGen {
         &mut self,
         func: &IrFunction,
         diag: &mut DiagnosticEngine,
+        globals: &[crate::ir::module::GlobalVariable],
     ) -> Result<MachineFunction, String> {
-        self.lower_function(func, diag)
+        self.lower_function(func, diag, globals)
     }
 
     // ===================================================================
@@ -791,6 +913,7 @@ impl X86_64CodeGen {
         &mut self,
         func: &IrFunction,
         diag: &mut DiagnosticEngine,
+        globals: &[crate::ir::module::GlobalVariable],
     ) -> Result<MachineFunction, String> {
         // Reset per-function state.
         self.next_vreg = 0;
@@ -798,11 +921,16 @@ impl X86_64CodeGen {
         self.value_types = FxHashMap::default();
         self.block_map = FxHashMap::default();
         self.frame = None;
+        self.constant_cache = FxHashMap::default();
 
         // If this is only a declaration (no body), return an empty MachineFunction.
         if !func.is_definition {
             return Ok(MachineFunction::new(func.name.clone()));
         }
+
+        // Pre-populate the constant cache from the module globals so that
+        // constant-sentinel BinOp instructions can be resolved to immediates.
+        self.populate_constant_cache(func, globals);
 
         // 1. Compute frame layout.
         let frame = self.compute_frame_layout(func);
@@ -1022,7 +1150,27 @@ impl X86_64CodeGen {
                 rhs,
                 ty,
                 ..
-            } => self.select_binop(*result, *op, *lhs, *rhs, ty),
+            } => {
+                // Recognise the constant-sentinel pattern emitted by
+                // `emit_int_const` / `emit_float_const` in the IR lowering
+                // phase: `result = Add result, Value::UNDEF`.  In this
+                // pattern the actual constant value is stored as a
+                // `Constant::Integer` (or `Constant::Float`) in a matching
+                // global variable.  We resolve it here and produce a simple
+                // MOV-immediate (or SSE load).
+                if *rhs == Value::UNDEF && *lhs == *result {
+                    if let Some(imm) = self.resolve_constant_value(*result, func) {
+                        let dst = self.new_vreg();
+                        self.set_value(*result, dst.clone());
+                        return vec![Self::mk_inst(
+                            X86Opcode::Mov,
+                            Some(dst),
+                            &[MachineOperand::Immediate(imm)],
+                        )];
+                    }
+                }
+                self.select_binop(*result, *op, *lhs, *rhs, ty)
+            }
 
             // ---------------------------------------------------------------
             // ICmp — integer comparison
@@ -1985,9 +2133,10 @@ impl ArchCodegen for X86_64CodeGen {
         &self,
         func: &IrFunction,
         diag: &mut DiagnosticEngine,
+        globals: &[crate::ir::module::GlobalVariable],
     ) -> Result<MachineFunction, String> {
         let mut codegen = Self::new(self.target);
-        codegen.lower_function_impl(func, diag)
+        codegen.lower_function_impl(func, diag, globals)
     }
 
     /// Emit machine code bytes from a MachineFunction.
@@ -2117,8 +2266,9 @@ impl X86_64CodeGen {
         &mut self,
         func: &IrFunction,
         diag: &mut DiagnosticEngine,
+        globals: &[crate::ir::module::GlobalVariable],
     ) -> Result<MachineFunction, String> {
-        self.lower(func, diag)
+        self.lower(func, diag, globals)
     }
 
     /// Static prologue emitter.

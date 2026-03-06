@@ -1010,6 +1010,8 @@ impl RiscV64Linker {
                 sh_addralign: sec_layout.alignment,
                 sh_entsize: 0,
                 logical_size: 0,
+                virtual_address: 0,
+                file_offset_hint: 0,
             };
             writer.add_section(section);
         }

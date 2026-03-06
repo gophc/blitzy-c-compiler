@@ -279,7 +279,7 @@ impl SymbolTable {
                     return Ok(existing_id);
                 } else {
                     diagnostics.emit(
-                        Diagnostic::error(entry.span, format!("conflicting types for typedef"))
+                        Diagnostic::error(entry.span, "conflicting types for typedef".to_string())
                             .with_note(existing.span, "previous declaration is here"),
                     );
                     return Err(());
@@ -289,7 +289,7 @@ impl SymbolTable {
             // Enum constant redeclaration is always an error.
             if existing.kind == SymbolKind::EnumConstant || entry.kind == SymbolKind::EnumConstant {
                 diagnostics.emit(
-                    Diagnostic::error(entry.span, format!("redefinition of enumerator"))
+                    Diagnostic::error(entry.span, "redefinition of enumerator".to_string())
                         .with_note(existing.span, "previous definition is here"),
                 );
                 return Err(());
@@ -298,7 +298,7 @@ impl SymbolTable {
             // Check type compatibility.
             if !self.types_are_compatible(&existing.ty, &entry.ty) {
                 diagnostics.emit(
-                    Diagnostic::error(entry.span, format!("conflicting types for symbol"))
+                    Diagnostic::error(entry.span, "conflicting types for symbol".to_string())
                         .with_note(existing.span, "previous declaration is here"),
                 );
                 return Err(());
@@ -362,7 +362,7 @@ impl SymbolTable {
             // Two actual definitions in the same scope → error.
             if existing.is_defined && entry.is_defined {
                 diagnostics.emit(
-                    Diagnostic::error(entry.span, format!("redefinition of symbol"))
+                    Diagnostic::error(entry.span, "redefinition of symbol".to_string())
                         .with_note(existing.span, "previous definition is here"),
                 );
                 return Err(());
@@ -380,10 +380,7 @@ impl SymbolTable {
         let id = SymbolId(self.symbols.len() as u32);
         self.symbols.push(entry);
         let name = self.symbols[id.0 as usize].name;
-        self.name_to_ids
-            .entry(name)
-            .or_insert_with(Vec::new)
-            .push(id);
+        self.name_to_ids.entry(name).or_default().push(id);
         Ok(id)
     }
 
@@ -631,17 +628,18 @@ impl SymbolTable {
         }
 
         // Both external linkage: types must be compatible.
-        if existing.linkage == Linkage::External && new_entry.linkage == Linkage::External {
-            if !self.types_are_compatible(&existing.ty, &new_entry.ty) {
-                diagnostics.emit(
-                    Diagnostic::error(
-                        new_entry.span,
-                        "conflicting types for symbol with external linkage",
-                    )
-                    .with_note(existing.span, "previous declaration is here"),
-                );
-                return Err(());
-            }
+        if existing.linkage == Linkage::External
+            && new_entry.linkage == Linkage::External
+            && !self.types_are_compatible(&existing.ty, &new_entry.ty)
+        {
+            diagnostics.emit(
+                Diagnostic::error(
+                    new_entry.span,
+                    "conflicting types for symbol with external linkage",
+                )
+                .with_note(existing.span, "previous declaration is here"),
+            );
+            return Err(());
         }
 
         Ok(())
@@ -712,7 +710,11 @@ impl SymbolTable {
     ///
     /// This should be called at the end of the translation unit (or at
     /// scope exit for block-scope variables).
-    pub fn check_unused_symbols(&self, diagnostics: &mut DiagnosticEngine) {
+    pub fn check_unused_symbols(
+        &self,
+        diagnostics: &mut DiagnosticEngine,
+        interner: &crate::common::string_interner::Interner,
+    ) {
         for entry in &self.symbols {
             if entry.is_used {
                 continue;
@@ -742,6 +744,13 @@ impl SymbolTable {
             // Skip enum constants — they are part of an enum definition
             // and not individually "used".
             if entry.kind == SymbolKind::EnumConstant {
+                continue;
+            }
+
+            // Skip well-known entry-point functions — `main` and `_start`
+            // are called by the runtime/linker and should never be flagged.
+            let sym_name = interner.resolve(entry.name);
+            if sym_name == "main" || sym_name == "_start" {
                 continue;
             }
 
@@ -818,10 +827,7 @@ impl SymbolTable {
 
         let id = SymbolId(self.symbols.len() as u32);
         self.symbols.push(entry);
-        self.name_to_ids
-            .entry(name)
-            .or_insert_with(Vec::new)
-            .push(id);
+        self.name_to_ids.entry(name).or_default().push(id);
         Ok(id)
     }
 
