@@ -881,6 +881,15 @@ impl<'a> Preprocessor<'a> {
         );
     }
 
+    /// Remove a macro definition, implementing the `-U` command-line flag.
+    ///
+    /// This is applied after all `-D` defines during preprocessor
+    /// initialization, matching GCC's behaviour where `-U` overrides
+    /// earlier `-D` for the same macro name.
+    pub fn add_undef(&mut self, name: &str) {
+        self.macro_defs.remove(name);
+    }
+
     /// Preprocess a source file, returning the fully macro-expanded token stream.
     ///
     /// This is the main entry point for the preprocessor.  It:

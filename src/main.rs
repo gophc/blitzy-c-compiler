@@ -139,6 +139,9 @@ struct CliArgs {
     include_paths: Vec<String>,
     /// `-D<macro>[=value]`: preprocessor defines (multiple allowed).
     defines: Vec<(String, Option<String>)>,
+    /// `-U<macro>`: preprocessor undefines (multiple allowed).
+    /// Applied after all `-D` defines during preprocessor initialization.
+    undefs: Vec<String>,
     /// `-L<dir>`: library search paths (multiple allowed).
     library_paths: Vec<String>,
     /// `-l<lib>`: libraries to link (multiple allowed).
@@ -162,6 +165,7 @@ impl Default for CliArgs {
             cf_protection: false,
             include_paths: Vec::new(),
             defines: Vec::new(),
+            undefs: Vec::new(),
             library_paths: Vec::new(),
             libraries: Vec::new(),
         }
@@ -201,6 +205,9 @@ struct CompilationContext {
     include_paths: Vec<String>,
     /// Preprocessor defines from `-D` flags.
     defines: Vec<(String, Option<String>)>,
+    /// Preprocessor undefines from `-U` flags.
+    /// Applied after defines during preprocessor initialization.
+    undefs: Vec<String>,
     /// Library search paths from `-L` flags.
     library_paths: Vec<String>,
     /// Libraries to link from `-l` flags.
@@ -225,6 +232,7 @@ impl CompilationContext {
             cf_protection: args.cf_protection,
             include_paths: args.include_paths.clone(),
             defines: args.defines.clone(),
+            undefs: args.undefs.clone(),
             library_paths: args.library_paths.clone(),
             libraries: args.libraries.clone(),
             max_recursion_depth: MAX_RECURSION_DEPTH,
@@ -409,10 +417,18 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
             continue;
         }
 
-        // -U<macro> (undefine — accept but store as define with None value marker)
+        // -U<macro> (undefine — store and propagate to preprocessor)
+        if arg == "-U" {
+            i += 1;
+            if i >= args.len() {
+                return Err("missing argument to '-U'".to_string());
+            }
+            cli.undefs.push(args[i].clone());
+            i += 1;
+            continue;
+        }
         if let Some(undef_str) = arg.strip_prefix("-U") {
-            // -U is accepted for GCC compat but handled at preprocessor level
-            let _ = undef_str;
+            cli.undefs.push(undef_str.to_string());
             i += 1;
             continue;
         }
@@ -804,6 +820,11 @@ fn run_preprocess_only(
             pp.add_define(name, val);
         }
 
+        // Apply undefs from CLI (after defines, matching GCC behaviour)
+        for name in &ctx.undefs {
+            pp.add_undef(name);
+        }
+
         // Run preprocessor
         let tokens = pp.preprocess_file(input).map_err(|_| {
             diagnostics.print_all(&source_map);
@@ -870,6 +891,11 @@ fn compile_single_file(
     for (name, value) in &ctx.defines {
         let val = value.as_deref().unwrap_or("1");
         pp.add_define(name, val);
+    }
+
+    // Apply undefs from CLI (after defines, matching GCC behaviour)
+    for name in &ctx.undefs {
+        pp.add_undef(name);
     }
 
     let pp_tokens = pp.preprocess_file(input).map_err(|_| {
@@ -1042,40 +1068,84 @@ fn compile_single_file(
 
 /// Link multiple object files into a final executable or shared library.
 ///
-/// Currently delegates to the code generation module's linker infrastructure
-/// by constructing a minimal IR module and invoking the linker through the
-/// code generation path. In a full implementation, this would directly
-/// invoke the built-in linker from `bcc::backend::linker_common`.
+/// Invokes the built-in linker infrastructure (`bcc::backend::linker_common`)
+/// to perform symbol resolution, section merging, relocation application,
+/// and ELF output generation.
+///
+/// # Pipeline
+///
+/// 1. Read each `.o` file from disk.
+/// 2. Parse each ELF object into a [`LinkerInput`] via the ELF parser in
+///    `generation.rs`.
+/// 3. Construct a [`LinkerConfig`] from the [`CompilationContext`].
+/// 4. Create the architecture-specific relocation handler.
+/// 5. Call `link()` from `linker_common` to produce a [`LinkerOutput`].
+/// 6. Write the output bytes to the destination file with executable
+///    permissions.
+///
+/// # Errors
+///
+/// Returns `Err(message)` if any object file cannot be read, the linker
+/// reports unresolved symbols, or the output cannot be written.
 fn link_object_files(
     object_files: &[PathBuf],
     output: &str,
-    _ctx: &CompilationContext,
+    ctx: &CompilationContext,
 ) -> Result<(), String> {
-    // Read all object files
-    let mut combined_data: Vec<Vec<u8>> = Vec::new();
-    for obj_path in object_files {
+    use bcc::backend::generation::{create_relocation_handler, parse_elf_object_to_linker_input};
+    use bcc::backend::linker_common::{link, LinkerConfig, OutputType};
+
+    // Determine output type based on compilation flags.
+    let output_type = if ctx.shared {
+        OutputType::SharedLibrary
+    } else {
+        OutputType::Executable
+    };
+
+    let mut config = LinkerConfig::new(ctx.target, output_type);
+    config.output_path = output.to_string();
+    config.pic = ctx.pic;
+    config.library_paths = ctx.library_paths.clone();
+    config.libraries = ctx.libraries.clone();
+    config.emit_debug = ctx.debug_info;
+
+    // Parse each object file into a LinkerInput.
+    let mut inputs = Vec::with_capacity(object_files.len());
+    for (idx, obj_path) in object_files.iter().enumerate() {
         let data = fs::read(obj_path)
             .map_err(|e| format!("failed to read object file '{}': {}", obj_path.display(), e))?;
-        combined_data.push(data);
+        let filename = obj_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("input.o");
+        let linker_input = parse_elf_object_to_linker_input(idx as u32, filename, &data);
+        inputs.push(linker_input);
     }
 
-    // For multi-file linking, we would invoke the built-in linker directly.
-    // The linker_common module provides the infrastructure for this.
-    // For now, the single-file path handles the common case, and multi-file
-    // linking is orchestrated through the backend linker infrastructure.
+    // Create the architecture-specific relocation handler.
+    let handler = create_relocation_handler(ctx.target);
 
-    // If there's only one object file, just copy it as the output
-    // (the single-file path already handles linking internally)
-    if combined_data.len() == 1 {
-        fs::write(output, &combined_data[0])
-            .map_err(|e| format!("failed to write output to '{}': {}", output, e))?;
+    // Run the built-in linker.
+    let mut diagnostics = DiagnosticEngine::new();
+    let linker_output = link(&config, inputs, handler.as_ref(), &mut diagnostics)
+        .map_err(|e| format!("linking failed: {}", e))?;
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = fs::Permissions::from_mode(0o755);
-            let _ = fs::set_permissions(output, perms);
-        }
+    if diagnostics.has_errors() {
+        let source_map = SourceMap::new();
+        diagnostics.print_all(&source_map);
+        return Err("linking failed due to errors".to_string());
+    }
+
+    // Write the linked output to disk.
+    fs::write(output, &linker_output.elf_data)
+        .map_err(|e| format!("failed to write output to '{}': {}", output, e))?;
+
+    // Set executable permission bit on Unix.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = fs::Permissions::from_mode(0o755);
+        let _ = fs::set_permissions(output, perms);
     }
 
     Ok(())

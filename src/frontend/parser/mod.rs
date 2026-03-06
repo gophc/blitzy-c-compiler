@@ -585,6 +585,7 @@ impl<'src> Parser<'src> {
             return Ok(ExternalDeclaration::Declaration(Box::new(Declaration {
                 specifiers,
                 declarators: Vec::new(),
+                static_assert: None,
                 span,
             })));
         }
@@ -627,11 +628,11 @@ impl<'src> Parser<'src> {
         self.expect(TokenKind::LeftParen)?;
 
         // Parse condition expression (constant expression).
-        let _condition = expressions::parse_constant_expression(self)?;
+        let condition = expressions::parse_constant_expression(self)?;
 
         // Parse optional `,` followed by string-literal message.
         // C11 requires the message; C23 makes it optional; GCC is lenient.
-        let _message = if self.match_token(&TokenKind::Comma) {
+        let message = if self.match_token(&TokenKind::Comma) {
             self.parse_string_literal_bytes()
         } else {
             None
@@ -643,9 +644,15 @@ impl<'src> Parser<'src> {
 
         let span = self.make_span(start_span);
 
-        // Wrap in a Declaration with empty specifiers/declarators.
-        // The StaticAssert data is carried through a zero-declarator
-        // declaration whose span encodes the assertion.
+        // Construct a `StaticAssert` AST node and attach it to the
+        // `Declaration` so the semantic analyzer can evaluate the assertion
+        // condition as an integer constant expression at compile time.
+        let sa = StaticAssert {
+            condition: Box::new(condition),
+            message,
+            span,
+        };
+
         let decl = Declaration {
             specifiers: DeclarationSpecifiers {
                 storage_class: None,
@@ -657,6 +664,7 @@ impl<'src> Parser<'src> {
                 span,
             },
             declarators: Vec::new(),
+            static_assert: Some(sa),
             span,
         };
 
@@ -735,6 +743,7 @@ impl<'src> Parser<'src> {
         Ok(ExternalDeclaration::Declaration(Box::new(Declaration {
             specifiers,
             declarators: init_declarators,
+            static_assert: None,
             span,
         })))
     }

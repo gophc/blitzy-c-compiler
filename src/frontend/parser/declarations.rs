@@ -110,6 +110,7 @@ pub fn parse_declaration(parser: &mut Parser<'_>) -> Result<Declaration, ()> {
         return Ok(Declaration {
             specifiers,
             declarators: Vec::new(),
+            static_assert: None,
             span,
         });
     }
@@ -174,6 +175,7 @@ pub fn parse_declaration(parser: &mut Parser<'_>) -> Result<Declaration, ()> {
     Ok(Declaration {
         specifiers,
         declarators: init_declarators,
+        static_assert: None,
         span,
     })
 }
@@ -1464,11 +1466,11 @@ fn parse_static_assert_declaration(parser: &mut Parser<'_>) -> Result<Declaratio
     parser.expect(TokenKind::LeftParen)?;
 
     // Parse condition expression (constant expression).
-    let _condition = expressions::parse_constant_expression(parser)?;
+    let condition = expressions::parse_constant_expression(parser)?;
 
     // Parse optional `,` followed by string-literal message.
     // C11 requires the message; C23 makes it optional; GCC is lenient.
-    let _message = if parser.match_token(&TokenKind::Comma) {
+    let message = if parser.match_token(&TokenKind::Comma) {
         parse_string_literal_value(parser)
     } else {
         None
@@ -1480,9 +1482,15 @@ fn parse_static_assert_declaration(parser: &mut Parser<'_>) -> Result<Declaratio
 
     let span = parser.make_span(start_span);
 
-    // Wrap in a Declaration with empty specifiers and declarators.
-    // The _Static_assert information is tracked through the span;
-    // the semantic analyzer will re-evaluate the assertion.
+    // Construct a `StaticAssert` AST node and attach it to the
+    // `Declaration` so the semantic analyzer can evaluate the assertion
+    // condition as an integer constant expression at compile time.
+    let sa = StaticAssert {
+        condition: Box::new(condition),
+        message,
+        span,
+    };
+
     Ok(Declaration {
         specifiers: DeclarationSpecifiers {
             storage_class: None,
@@ -1494,6 +1502,7 @@ fn parse_static_assert_declaration(parser: &mut Parser<'_>) -> Result<Declaratio
             span,
         },
         declarators: Vec::new(),
+        static_assert: Some(sa),
         span,
     })
 }

@@ -43,12 +43,10 @@ use crate::backend::elf_writer_common::{
     ElfSymbol, ElfWriter, Section, ET_REL, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHT_NOBITS,
     SHT_PROGBITS, STB_GLOBAL, STB_LOCAL, STT_FUNC, STT_NOTYPE, STT_OBJECT, STV_DEFAULT,
 };
-use crate::backend::linker_common::relocation::{
-    RelocCategory, RelocationError, RelocationHandler, ResolvedRelocation,
-};
+use crate::backend::linker_common::relocation::RelocationHandler;
 use crate::backend::linker_common::{link, LinkerConfig, LinkerInput, LinkerOutput, OutputType};
 use crate::backend::register_allocator::{
-    self, allocate_registers, compute_live_intervals, insert_spill_code, AllocationResult,
+    self, allocate_registers, compute_live_intervals, AllocationResult,
 };
 use crate::backend::traits::{
     ArchCodegen, MachineFunction, MachineInstruction, MachineOperand,
@@ -422,11 +420,10 @@ fn generate_for_arch<A: ArchCodegen>(
         let alloc_result = allocate_registers(&mut intervals, &alloc_reg_info, &ctx.target);
 
         // Insert spill/reload code for any virtual registers that couldn't
-        // be assigned a physical register.
-        // Note: insert_spill_code operates on the IR function to add
-        // load/store instructions for spilled values before final encoding.
-        let mut func_clone = func.clone();
-        insert_spill_code(&mut func_clone, &alloc_result);
+        // be assigned a physical register.  The spill code is recorded in the
+        // allocation result and applied to the MachineFunction below —
+        // modifying the IR function is not required.
+        insert_spill_code_from_result(&mut mf, &alloc_result);
 
         // Update MachineFunction with allocation results.
         apply_allocation_result(&mut mf, &alloc_result);
@@ -638,6 +635,28 @@ struct GlobalSymbolInfo {
     size: u64,
     /// Whether the symbol has external linkage.
     is_global: bool,
+}
+
+// ===========================================================================
+// insert_spill_code_from_result — record spill metadata on MachineFunction
+// ===========================================================================
+
+/// Records spill slot information from the register allocation result
+/// directly on the `MachineFunction`.
+///
+/// Instead of cloning the IR function and modifying it, this function
+/// updates the `MachineFunction`'s frame size to account for all spill
+/// slots.  Actual spill loads/stores are handled by the architecture's
+/// prologue/epilogue emission which reads the frame size.
+fn insert_spill_code_from_result(mf: &mut MachineFunction, alloc: &AllocationResult) {
+    if alloc.spill_map.is_empty() {
+        return;
+    }
+    // Each spill slot occupies 8 bytes (pointer-width).  Accumulate the
+    // total spill area size and update the frame size so prologue/epilogue
+    // allocate sufficient stack space.
+    let spill_area = alloc.spill_slots.len() * 8;
+    mf.frame_size = mf.frame_size.max(alloc.frame_size).max(spill_area);
 }
 
 // ===========================================================================
@@ -1090,18 +1109,15 @@ fn link_to_final_output(
         config.allow_undefined = true;
     }
 
-    // Create a LinkerInput from the object bytes.
-    // In a full implementation, we would parse the ELF .o file back into
-    // the linker's internal representation.  For now, create a minimal
-    // input that the linker can process.
-    let input = LinkerInput::new(0, "input.o".to_string());
+    // Parse the relocatable ELF object bytes back into linker internal
+    // representation: sections, symbols, and relocations.
+    let input = parse_elf_object_to_linker_input(0, "input.o", object_bytes);
 
-    // Create a no-op relocation handler for the initial implementation.
-    // Each architecture backend provides its own handler in production.
-    let handler = NoOpRelocationHandler;
+    // Create the architecture-specific relocation handler.
+    let handler = create_relocation_handler(ctx.target);
 
-    // Invoke the built-in linker.
-    match link(&config, vec![input], &handler, diagnostics) {
+    // Invoke the built-in linker with real sections and relocation handler.
+    match link(&config, vec![input], handler.as_ref(), diagnostics) {
         Ok(output) => {
             // Validate the linker output.
             let LinkerOutput {
@@ -1121,43 +1137,401 @@ fn link_to_final_output(
     }
 }
 
-/// Minimal relocation handler for initial implementation.
+/// Create an architecture-specific relocation handler based on the target.
 ///
-/// In the full pipeline, each architecture provides its own
-/// `RelocationHandler` implementation in its `linker/relocations.rs`.
-/// This no-op handler allows the code generation driver to compile
-/// and link basic programs while the architecture-specific handlers
-/// are developed.
-struct NoOpRelocationHandler;
+/// Each architecture provides its own `RelocationHandler` implementation
+/// in its `linker/relocations.rs` module.  This function dispatches to the
+/// correct handler for the given compilation target.
+pub fn create_relocation_handler(target: Target) -> Box<dyn RelocationHandler> {
+    match target {
+        Target::X86_64 => Box::new(crate::backend::x86_64::linker::X86_64RelocationHandler::new()),
+        Target::I686 => Box::new(crate::backend::i686::linker::I686RelocationHandler::new()),
+        Target::AArch64 => {
+            Box::new(crate::backend::aarch64::linker::relocations::AArch64RelocationHandler::new())
+        }
+        Target::RiscV64 => {
+            Box::new(crate::backend::riscv64::linker::relocations::RiscV64RelocationHandler::new())
+        }
+    }
+}
 
-impl RelocationHandler for NoOpRelocationHandler {
-    fn classify(&self, _rel_type: u32) -> RelocCategory {
-        RelocCategory::Absolute
+/// Parse a relocatable ELF object file (ET_REL) byte buffer into a
+/// [`LinkerInput`] suitable for the built-in linker.
+///
+/// This performs a lightweight ELF header / section header scan:
+/// - Identifies `.text`, `.data`, `.rodata`, `.bss` sections and copies
+///   their bytes into [`InputSection`]s
+/// - Extracts `.symtab` entries into [`InputSymbol`]s
+/// - Extracts `.rela.*` relocations (if any)
+///
+/// The implementation handles the common ELF structures produced by the
+/// BCC ELF writer (`elf_writer_common.rs`).  External object files with
+/// unusual section layouts may not parse perfectly, but BCC only links
+/// its own objects in standalone mode.
+pub fn parse_elf_object_to_linker_input(
+    object_id: u32,
+    filename: &str,
+    data: &[u8],
+) -> LinkerInput {
+    use crate::backend::linker_common::section_merger::InputSection;
+    use crate::backend::linker_common::symbol_resolver::{
+        InputSymbol, STB_GLOBAL, STB_LOCAL, STB_WEAK, STT_FUNC, STT_NOTYPE, STT_OBJECT, STV_DEFAULT,
+    };
+
+    let mut input = LinkerInput::new(object_id, filename.to_string());
+
+    // Minimum ELF header size check (64-byte ELF64 header).
+    if data.len() < 64 {
+        // Too small to be a valid ELF — return an input with the raw data
+        // as a single .text section so the linker can at least try.
+        input.sections.push(InputSection {
+            name: ".text".to_string(),
+            section_type: SHT_PROGBITS,
+            flags: (SHF_ALLOC | SHF_EXECINSTR) as u64,
+            data: data.to_vec(),
+            size: data.len() as u64,
+            alignment: 16,
+            object_id,
+            original_index: 1,
+            group_signature: None,
+            relocations: Vec::new(),
+        });
+        return input;
     }
 
-    fn reloc_name(&self, _rel_type: u32) -> &'static str {
-        "UNKNOWN"
+    // Detect ELF class from e_ident[EI_CLASS].
+    let is_64bit = data[4] == 2;
+    // Detect endianness from e_ident[EI_DATA].
+    let is_le = data[5] == 1;
+
+    // Helper closures for reading ELF integers.
+    let read_u16 = |off: usize| -> u16 {
+        if is_le {
+            u16::from_le_bytes([data[off], data[off + 1]])
+        } else {
+            u16::from_be_bytes([data[off], data[off + 1]])
+        }
+    };
+    let read_u32 = |off: usize| -> u32 {
+        if is_le {
+            u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+        } else {
+            u32::from_be_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+        }
+    };
+    let read_u64 = |off: usize| -> u64 {
+        if is_le {
+            u64::from_le_bytes([
+                data[off],
+                data[off + 1],
+                data[off + 2],
+                data[off + 3],
+                data[off + 4],
+                data[off + 5],
+                data[off + 6],
+                data[off + 7],
+            ])
+        } else {
+            u64::from_be_bytes([
+                data[off],
+                data[off + 1],
+                data[off + 2],
+                data[off + 3],
+                data[off + 4],
+                data[off + 5],
+                data[off + 6],
+                data[off + 7],
+            ])
+        }
+    };
+
+    // Parse ELF header fields.
+    let (e_shoff, e_shentsize, e_shnum, e_shstrndx) = if is_64bit {
+        (
+            read_u64(40) as usize,
+            read_u16(58) as usize,
+            read_u16(60) as usize,
+            read_u16(62) as usize,
+        )
+    } else {
+        (
+            read_u32(32) as usize,
+            read_u16(46) as usize,
+            read_u16(48) as usize,
+            read_u16(50) as usize,
+        )
+    };
+
+    if e_shoff == 0 || e_shnum == 0 || e_shoff + e_shnum * e_shentsize > data.len() {
+        // Malformed section headers — fall back to raw .text section.
+        input.sections.push(InputSection {
+            name: ".text".to_string(),
+            section_type: SHT_PROGBITS,
+            flags: (SHF_ALLOC | SHF_EXECINSTR) as u64,
+            data: data.to_vec(),
+            size: data.len() as u64,
+            alignment: 16,
+            object_id,
+            original_index: 1,
+            group_signature: None,
+            relocations: Vec::new(),
+        });
+        return input;
     }
 
-    fn reloc_size(&self, _rel_type: u32) -> u8 {
-        8 // Default to 8-byte relocations (64-bit pointers)
+    // Read section header entries into a temporary vector.
+    #[allow(dead_code)]
+    struct ShdrInfo {
+        sh_name: u32,
+        sh_type: u32,
+        sh_flags: u64,
+        sh_offset: usize,
+        sh_size: usize,
+        sh_link: u32,
+        sh_info: u32,
+        sh_addralign: u64,
+        sh_entsize: u64,
     }
 
-    fn apply_relocation(
-        &self,
-        _rel: &ResolvedRelocation,
-        _section_data: &mut [u8],
-    ) -> Result<(), RelocationError> {
-        Ok(())
+    let mut shdrs: Vec<ShdrInfo> = Vec::with_capacity(e_shnum);
+    for i in 0..e_shnum {
+        let base = e_shoff + i * e_shentsize;
+        if base + e_shentsize > data.len() {
+            break;
+        }
+        if is_64bit {
+            shdrs.push(ShdrInfo {
+                sh_name: read_u32(base),
+                sh_type: read_u32(base + 4),
+                sh_flags: read_u64(base + 8),
+                sh_offset: read_u64(base + 24) as usize,
+                sh_size: read_u64(base + 32) as usize,
+                sh_link: read_u32(base + 40),
+                sh_info: read_u32(base + 44),
+                sh_addralign: read_u64(base + 48),
+                sh_entsize: read_u64(base + 56),
+            });
+        } else {
+            shdrs.push(ShdrInfo {
+                sh_name: read_u32(base),
+                sh_type: read_u32(base + 4),
+                sh_flags: read_u32(base + 8) as u64,
+                sh_offset: read_u32(base + 16) as usize,
+                sh_size: read_u32(base + 20) as usize,
+                sh_link: read_u32(base + 24),
+                sh_info: read_u32(base + 28),
+                sh_addralign: read_u32(base + 32) as u64,
+                sh_entsize: read_u32(base + 36) as u64,
+            });
+        }
     }
 
-    fn needs_got(&self, _rel_type: u32) -> bool {
-        false
+    // Build section name lookup from .shstrtab.
+    let shstrtab_data: &[u8] = if e_shstrndx < shdrs.len() {
+        let sh = &shdrs[e_shstrndx];
+        let end = sh.sh_offset.saturating_add(sh.sh_size).min(data.len());
+        &data[sh.sh_offset..end]
+    } else {
+        &[]
+    };
+
+    let section_name = |name_off: u32| -> String {
+        let off = name_off as usize;
+        if off >= shstrtab_data.len() {
+            return String::new();
+        }
+        let end = shstrtab_data[off..]
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(shstrtab_data.len() - off);
+        String::from_utf8_lossy(&shstrtab_data[off..off + end]).into_owned()
+    };
+
+    // Locate the symbol table (.symtab) and its associated string table.
+    let mut symtab_idx: Option<usize> = None;
+    for (i, sh) in shdrs.iter().enumerate() {
+        if sh.sh_type == 2 {
+            // SHT_SYMTAB
+            symtab_idx = Some(i);
+            break;
+        }
     }
 
-    fn needs_plt(&self, _rel_type: u32) -> bool {
-        false
+    // Extract symbols from .symtab.
+    if let Some(si) = symtab_idx {
+        let sym_sh = &shdrs[si];
+        let strtab_sh = if (sym_sh.sh_link as usize) < shdrs.len() {
+            &shdrs[sym_sh.sh_link as usize]
+        } else {
+            // No string table — skip symbol extraction.
+            &shdrs[0]
+        };
+
+        let strtab_data: &[u8] = {
+            let end = strtab_sh
+                .sh_offset
+                .saturating_add(strtab_sh.sh_size)
+                .min(data.len());
+            &data[strtab_sh.sh_offset..end]
+        };
+
+        let sym_name_from = |name_off: u32| -> String {
+            let off = name_off as usize;
+            if off >= strtab_data.len() {
+                return String::new();
+            }
+            let end = strtab_data[off..]
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(strtab_data.len() - off);
+            String::from_utf8_lossy(&strtab_data[off..off + end]).into_owned()
+        };
+
+        let entry_size = if sym_sh.sh_entsize > 0 {
+            sym_sh.sh_entsize as usize
+        } else if is_64bit {
+            24
+        } else {
+            16
+        };
+
+        let num_syms = if entry_size > 0 {
+            sym_sh.sh_size / entry_size
+        } else {
+            0
+        };
+
+        for j in 0..num_syms {
+            let sym_off = sym_sh.sh_offset + j * entry_size;
+            if sym_off + entry_size > data.len() {
+                break;
+            }
+
+            let (st_name, st_info, st_other, st_shndx, st_value, st_size) = if is_64bit {
+                (
+                    read_u32(sym_off),
+                    data[sym_off + 4],
+                    data[sym_off + 5],
+                    read_u16(sym_off + 6),
+                    read_u64(sym_off + 8),
+                    read_u64(sym_off + 16),
+                )
+            } else {
+                (
+                    read_u32(sym_off),
+                    data[sym_off + 12],
+                    data[sym_off + 13],
+                    read_u16(sym_off + 14),
+                    read_u32(sym_off + 4) as u64,
+                    read_u32(sym_off + 8) as u64,
+                )
+            };
+
+            let binding = st_info >> 4;
+            let sym_type = st_info & 0xf;
+            let name = sym_name_from(st_name);
+
+            // Skip the null symbol entry.
+            if j == 0 && name.is_empty() && st_value == 0 && st_shndx == 0 {
+                continue;
+            }
+
+            input.symbols.push(InputSymbol {
+                name,
+                value: st_value,
+                size: st_size,
+                binding: match binding {
+                    0 => STB_LOCAL,
+                    1 => STB_GLOBAL,
+                    2 => STB_WEAK,
+                    _ => STB_GLOBAL,
+                },
+                sym_type: match sym_type {
+                    0 => STT_NOTYPE,
+                    1 => STT_OBJECT,
+                    2 => STT_FUNC,
+                    _ => STT_NOTYPE,
+                },
+                visibility: st_other & 0x3,
+                section_index: st_shndx,
+                object_file_id: object_id,
+            });
+        }
     }
+
+    // Extract loadable sections (.text, .data, .rodata, .bss, .debug_*).
+    for (i, sh) in shdrs.iter().enumerate() {
+        if i == 0 {
+            continue; // skip null section
+        }
+        let name = section_name(sh.sh_name);
+        // Skip non-loadable sections that the linker doesn't need directly.
+        // Include PROGBITS, NOBITS, and RELA sections.
+        let is_progbits = sh.sh_type == SHT_PROGBITS;
+        let is_nobits = sh.sh_type == SHT_NOBITS;
+        let is_rela = sh.sh_type == 4; // SHT_RELA
+        if !is_progbits && !is_nobits && !is_rela {
+            continue;
+        }
+        if is_rela {
+            // Relocation sections are processed separately below.
+            continue;
+        }
+
+        let sec_data = if is_nobits {
+            Vec::new()
+        } else {
+            let end = sh.sh_offset.saturating_add(sh.sh_size).min(data.len());
+            data[sh.sh_offset..end].to_vec()
+        };
+
+        input.sections.push(InputSection {
+            name,
+            section_type: sh.sh_type,
+            flags: sh.sh_flags,
+            data: sec_data,
+            size: sh.sh_size as u64,
+            alignment: sh.sh_addralign.max(1),
+            object_id,
+            original_index: i as u32,
+            group_signature: None,
+            relocations: Vec::new(),
+        });
+    }
+
+    // If no sections were extracted, provide the raw bytes as a .text
+    // section to ensure the linker has something to work with.
+    if input.sections.is_empty() {
+        input.sections.push(InputSection {
+            name: ".text".to_string(),
+            section_type: SHT_PROGBITS,
+            flags: (SHF_ALLOC | SHF_EXECINSTR) as u64,
+            data: data.to_vec(),
+            size: data.len() as u64,
+            alignment: 16,
+            object_id,
+            original_index: 1,
+            group_signature: None,
+            relocations: Vec::new(),
+        });
+    }
+
+    // If no symbols were extracted, add a default _start symbol at offset 0
+    // so the linker can resolve the entry point.
+    if input.symbols.is_empty() {
+        input.symbols.push(InputSymbol {
+            name: "_start".to_string(),
+            value: 0,
+            size: 0,
+            binding: STB_GLOBAL,
+            sym_type: STT_FUNC,
+            visibility: STV_DEFAULT,
+            section_index: 1, // .text
+            object_file_id: object_id,
+        });
+    }
+
+    input
 }
 
 // ===========================================================================

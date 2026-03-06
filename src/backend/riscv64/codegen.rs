@@ -363,6 +363,36 @@ pub enum RvOpcode {
     /// Float Classify Double
     FCLASS_D,
 
+    // System / CSR instructions
+    /// CSR Read-Write: rd = csr; csr = rs1
+    CSRRW,
+    /// CSR Read-Set: rd = csr; csr |= rs1
+    CSRRS,
+    /// CSR Read-Clear: rd = csr; csr &= ~rs1
+    CSRRC,
+    /// CSR Read-Write Immediate: rd = csr; csr = zimm
+    CSRRWI,
+    /// CSR Read-Set Immediate: rd = csr; csr |= zimm
+    CSRRSI,
+    /// CSR Read-Clear Immediate: rd = csr; csr &= ~zimm
+    CSRRCI,
+    /// Environment Call (triggers ecall exception)
+    ECALL,
+    /// Environment Breakpoint (triggers breakpoint exception)
+    EBREAK,
+    /// Memory Fence (ordering predecessor/successor sets)
+    FENCE,
+    /// Instruction Fence
+    FENCE_I,
+    /// Wait For Interrupt (hint to stall until next interrupt)
+    WFI,
+    /// Supervisor Fence Virtual Memory
+    SFENCE_VMA,
+    /// Machine Return (return from M-mode trap)
+    MRET,
+    /// Supervisor Return (return from S-mode trap)
+    SRET,
+
     // Pseudo-instructions (expanded by assembler)
     /// No operation: ADDI x0, x0, 0
     NOP,

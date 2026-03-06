@@ -1236,19 +1236,160 @@ impl RiscV64Assembler {
                     "not" => RvOpcode::NOT,
                     "seqz" => RvOpcode::SEQZ,
                     "snez" => RvOpcode::SNEZ,
-                    "fence" | "fence.i" | "ecall" | "ebreak" | "wfi" | "sfence.vma" | "csrr"
-                    | "csrw" | "csrs" | "csrc" | "csrrs" | "csrrc" | "csrrw" | "csrrwi"
-                    | "csrrsi" | "csrrci" => {
-                        // System/fence instructions — emit as NOP for now
-                        // A full implementation would encode each correctly
-                        RvOpcode::NOP
+                    // CSR and system instructions — properly encoded via
+                    // dedicated opcodes (not NOP) per AAP §0.7.6.
+                    "csrrw" => RvOpcode::CSRRW,
+                    "csrrs" => RvOpcode::CSRRS,
+                    "csrrc" => RvOpcode::CSRRC,
+                    "csrrwi" => RvOpcode::CSRRWI,
+                    "csrrsi" => RvOpcode::CSRRSI,
+                    "csrrci" => RvOpcode::CSRRCI,
+                    "ecall" => RvOpcode::ECALL,
+                    "ebreak" => RvOpcode::EBREAK,
+                    "fence" => RvOpcode::FENCE,
+                    "fence.i" => RvOpcode::FENCE_I,
+                    "wfi" => RvOpcode::WFI,
+                    "sfence.vma" => RvOpcode::SFENCE_VMA,
+                    "mret" => RvOpcode::MRET,
+                    "sret" => RvOpcode::SRET,
+                    // CSR pseudo-instructions — expand to canonical forms.
+                    // csrr rd, csr  → csrrs rd, csr, x0
+                    "csrr" => {
+                        // Operand layout: rd, csr
+                        if operands.len() >= 2 {
+                            let csr_num = parse_csr_name(operands[1]);
+                            return Ok(RvInstruction {
+                                opcode: RvOpcode::CSRRS,
+                                rd: parse_register_name(operands[0]),
+                                rs1: Some(0), // x0
+                                rs2: None,
+                                rs3: None,
+                                imm: csr_num as i64,
+                                symbol: None,
+                                is_fp: false,
+                                comment: None,
+                            });
+                        }
+                        RvOpcode::CSRRS
+                    }
+                    // csrw csr, rs1  → csrrw x0, csr, rs1
+                    "csrw" => {
+                        if operands.len() >= 2 {
+                            let csr_num = parse_csr_name(operands[0]);
+                            return Ok(RvInstruction {
+                                opcode: RvOpcode::CSRRW,
+                                rd: Some(0), // x0
+                                rs1: parse_register_name(operands[1]),
+                                rs2: None,
+                                rs3: None,
+                                imm: csr_num as i64,
+                                symbol: None,
+                                is_fp: false,
+                                comment: None,
+                            });
+                        }
+                        RvOpcode::CSRRW
+                    }
+                    // csrs csr, rs1  → csrrs x0, csr, rs1
+                    "csrs" => {
+                        if operands.len() >= 2 {
+                            let csr_num = parse_csr_name(operands[0]);
+                            return Ok(RvInstruction {
+                                opcode: RvOpcode::CSRRS,
+                                rd: Some(0),
+                                rs1: parse_register_name(operands[1]),
+                                rs2: None,
+                                rs3: None,
+                                imm: csr_num as i64,
+                                symbol: None,
+                                is_fp: false,
+                                comment: None,
+                            });
+                        }
+                        RvOpcode::CSRRS
+                    }
+                    // csrc csr, rs1  → csrrc x0, csr, rs1
+                    "csrc" => {
+                        if operands.len() >= 2 {
+                            let csr_num = parse_csr_name(operands[0]);
+                            return Ok(RvInstruction {
+                                opcode: RvOpcode::CSRRC,
+                                rd: Some(0),
+                                rs1: parse_register_name(operands[1]),
+                                rs2: None,
+                                rs3: None,
+                                imm: csr_num as i64,
+                                symbol: None,
+                                is_fp: false,
+                                comment: None,
+                            });
+                        }
+                        RvOpcode::CSRRC
                     }
                     _ => {
                         return Err(format!("unrecognized instruction mnemonic: {}", mnemonic));
                     }
                 };
 
-                // Parse register operands
+                // --- CSR instruction operand parsing (special layout) ---
+                // csrrw/csrrs/csrrc rd, csr, rs1
+                // csrrwi/csrrsi/csrrci rd, csr, zimm
+                match inst.opcode {
+                    RvOpcode::CSRRW | RvOpcode::CSRRS | RvOpcode::CSRRC => {
+                        if operands.len() >= 3 {
+                            inst.rd = parse_register_name(operands[0]);
+                            inst.imm = parse_csr_name(operands[1]) as i64;
+                            inst.rs1 = parse_register_name(operands[2]);
+                        } else if operands.len() == 2 {
+                            inst.rd = parse_register_name(operands[0]);
+                            inst.imm = parse_csr_name(operands[1]) as i64;
+                            inst.rs1 = Some(0); // x0
+                        }
+                        return Ok(inst);
+                    }
+                    RvOpcode::CSRRWI | RvOpcode::CSRRSI | RvOpcode::CSRRCI => {
+                        if operands.len() >= 3 {
+                            inst.rd = parse_register_name(operands[0]);
+                            inst.imm = parse_csr_name(operands[1]) as i64;
+                            // zimm is a 5-bit unsigned immediate stored in the rs1
+                            // field; encode as a register number directly.
+                            let zimm = parse_asm_immediate(operands[2]).unwrap_or(0) as u8;
+                            inst.rs1 = Some(zimm & 0x1F);
+                        } else if operands.len() == 2 {
+                            inst.rd = parse_register_name(operands[0]);
+                            inst.imm = parse_csr_name(operands[1]) as i64;
+                            inst.rs1 = Some(0);
+                        }
+                        return Ok(inst);
+                    }
+                    RvOpcode::SFENCE_VMA => {
+                        // sfence.vma rs1, rs2
+                        inst.rs1 = if !operands.is_empty() {
+                            parse_register_name(operands[0])
+                        } else {
+                            Some(0)
+                        };
+                        inst.rs2 = if operands.len() > 1 {
+                            parse_register_name(operands[1])
+                        } else {
+                            Some(0)
+                        };
+                        return Ok(inst);
+                    }
+                    RvOpcode::ECALL
+                    | RvOpcode::EBREAK
+                    | RvOpcode::FENCE
+                    | RvOpcode::FENCE_I
+                    | RvOpcode::WFI
+                    | RvOpcode::MRET
+                    | RvOpcode::SRET => {
+                        // No operands needed — encoding is fixed.
+                        return Ok(inst);
+                    }
+                    _ => {} // fall through to generic operand parsing
+                }
+
+                // --- Generic operand parsing for non-CSR/system instructions ---
                 if !operands.is_empty() {
                     inst.rd = parse_register_name(operands[0]);
                 }
@@ -1642,6 +1783,112 @@ fn parse_asm_immediate(s: &str) -> Option<i64> {
     };
 
     Some(if negative { -value } else { value })
+}
+
+/// Parse a CSR name or numeric CSR address into a 12-bit CSR number.
+///
+/// Handles both symbolic names used by the Linux kernel (e.g., `sstatus`,
+/// `mtvec`, `satp`) and numeric CSR addresses (e.g., `0x100`, `768`).
+/// Returns 0 for unrecognized names to avoid blocking compilation — the
+/// kernel uses many CSR aliases and the set may grow.
+fn parse_csr_name(name: &str) -> u32 {
+    let name = name.trim();
+
+    // Try numeric parse first (decimal, hex).
+    if let Some(hex) = name.strip_prefix("0x").or_else(|| name.strip_prefix("0X")) {
+        if let Ok(v) = u32::from_str_radix(hex, 16) {
+            return v & 0xFFF;
+        }
+    }
+    if let Ok(v) = name.parse::<u32>() {
+        return v & 0xFFF;
+    }
+
+    // Symbolic names — covers the CSRs commonly used by the Linux kernel.
+    // Machine-level CSRs (M-mode, 0x3xx)
+    match name {
+        // User trap handling
+        "ustatus" => 0x000,
+        "uie" => 0x004,
+        "utvec" => 0x005,
+        // User trap registers
+        "uscratch" => 0x040,
+        "uepc" => 0x041,
+        "ucause" => 0x042,
+        "utval" => 0x043,
+        "uip" => 0x044,
+        // Supervisor trap setup
+        "sstatus" => 0x100,
+        "sedeleg" => 0x102,
+        "sideleg" => 0x103,
+        "sie" => 0x104,
+        "stvec" => 0x105,
+        "scounteren" => 0x106,
+        // Supervisor trap handling
+        "sscratch" => 0x140,
+        "sepc" => 0x141,
+        "scause" => 0x142,
+        "stval" => 0x143,
+        "sip" => 0x144,
+        // Supervisor protection and translation
+        "satp" => 0x180,
+        // Machine information registers
+        "mvendorid" => 0xF11,
+        "marchid" => 0xF12,
+        "mimpid" => 0xF13,
+        "mhartid" => 0xF14,
+        // Machine trap setup
+        "mstatus" => 0x300,
+        "misa" => 0x301,
+        "medeleg" => 0x302,
+        "mideleg" => 0x303,
+        "mie" => 0x304,
+        "mtvec" => 0x305,
+        "mcounteren" => 0x306,
+        // Machine trap handling
+        "mscratch" => 0x340,
+        "mepc" => 0x341,
+        "mcause" => 0x342,
+        "mtval" => 0x343,
+        "mip" => 0x344,
+        // Machine counter / timers
+        "mcycle" => 0xB00,
+        "minstret" => 0xB02,
+        "cycle" => 0xC00,
+        "time" => 0xC01,
+        "instret" => 0xC02,
+        "cycleh" => 0xC80,
+        "timeh" => 0xC81,
+        "instreth" => 0xC82,
+        // Floating-point CSRs
+        "fflags" => 0x001,
+        "frm" => 0x002,
+        "fcsr" => 0x003,
+        // Supervisor address translation and protection (RISC-V H extension)
+        "hstatus" => 0x600,
+        "hedeleg" => 0x602,
+        "hideleg" => 0x603,
+        "hie" => 0x604,
+        "htimedelta" => 0x605,
+        "hcounteren" => 0x606,
+        "hgeie" => 0x607,
+        "htval" => 0x643,
+        "hip" => 0x644,
+        "hvip" => 0x645,
+        "htinst" => 0x64A,
+        "hgeip" => 0xE12,
+        "henvcfg" => 0x60A,
+        "henvcfgh" => 0x61A,
+        "hgatp" => 0x680,
+        // Supervisor environment configuration
+        "senvcfg" => 0x10A,
+        // Machine environment configuration
+        "menvcfg" => 0x30A,
+        "menvcfgh" => 0x31A,
+        // Performance monitoring
+        "scountovf" => 0xDA0,
+        _ => 0, // default to 0 for unrecognized names
+    }
 }
 
 // ===========================================================================

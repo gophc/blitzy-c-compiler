@@ -84,6 +84,11 @@ pub struct Declaration {
     pub specifiers: DeclarationSpecifiers,
     /// Zero or more declarators, each optionally with an initializer.
     pub declarators: Vec<InitDeclarator>,
+    /// Optional `_Static_assert` data.  When present, this declaration
+    /// represents a compile-time assertion rather than a variable/type
+    /// declaration.  The `specifiers` and `declarators` fields are empty
+    /// in this case; the assertion condition and message live here.
+    pub static_assert: Option<StaticAssert>,
     /// Source span covering the entire declaration.
     pub span: Span,
 }

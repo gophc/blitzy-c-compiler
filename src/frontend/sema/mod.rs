@@ -373,10 +373,10 @@ impl<'a> SemanticAnalyzer<'a> {
     pub fn analyze_declaration(&mut self, decl: &mut Declaration) -> Result<(), ()> {
         let _decl_span = decl.span;
 
-        // Handle _Static_assert: check if specifiers indicate this is a
-        // static assert declaration (detected by the parser as a special
-        // type specifier or separate declaration).
-        if self.is_static_assert_declaration(&decl.specifiers) {
+        // Handle _Static_assert: the parser attaches a `StaticAssert` node
+        // to the declaration's `static_assert` field when it encounters
+        // `_Static_assert(...)`.  Evaluate the condition at compile time.
+        if decl.static_assert.is_some() {
             return self.handle_static_assert(decl);
         }
 
@@ -1950,20 +1950,24 @@ impl<'a> SemanticAnalyzer<'a> {
         }
     }
 
-    /// Check if declaration specifiers indicate a _Static_assert.
-    fn is_static_assert_declaration(&self, _specs: &DeclarationSpecifiers) -> bool {
-        // _Static_assert is handled as a special declaration form by the parser.
-        // In the AST, it typically manifests as a specific pattern.
-        // For mod.rs, we handle it in the declaration flow.
-        false
-    }
-
-    /// Handle a _Static_assert declaration.
-    fn handle_static_assert(&mut self, _decl: &Declaration) -> Result<(), ()> {
-        // In a full implementation, this evaluates the condition as an
-        // integer constant expression via ConstantEvaluator and reports
-        // the error message string if the assertion fails.
-        Ok(())
+    /// Handle a `_Static_assert` declaration by evaluating the condition
+    /// as an integer constant expression.
+    ///
+    /// If the condition evaluates to zero the diagnostic engine emits an
+    /// error that includes the optional message string.  A non-zero
+    /// condition (or a condition that cannot be evaluated at compile time)
+    /// passes silently.
+    fn handle_static_assert(&mut self, decl: &Declaration) -> Result<(), ()> {
+        if let Some(ref sa) = decl.static_assert {
+            let target = self.target;
+            let mut evaluator = crate::frontend::sema::constant_eval::ConstantEvaluator::new(
+                self.diagnostics,
+                target,
+            );
+            evaluator.evaluate_static_assert_node(sa)
+        } else {
+            Ok(())
+        }
     }
 
     /// Process embedded struct/union/enum definitions within specifiers.

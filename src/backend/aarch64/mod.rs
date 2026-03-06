@@ -66,7 +66,7 @@ pub use self::codegen::{A64Instruction, A64Opcode, AArch64InstructionSelector, C
 pub use self::registers::{AArch64RegisterInfo, RegClass};
 
 /// Re-export ABI types.
-pub use self::abi::{AArch64Abi, ArgClass, FrameLayout};
+pub use self::abi::{classify_arguments_ir, AArch64Abi, ArgClass, FrameLayout};
 
 // ============================================================================
 // AArch64 ELF Constants
@@ -904,23 +904,15 @@ impl ArchCodegen for AArch64Codegen {
     }
 
     /// Classify where a function argument should be placed per AAPCS64.
+    ///
+    /// Delegates to the AAPCS64 batch classifier (`abi::classify_arguments_ir`)
+    /// with a single-element slice, matching the pattern used by x86_64. This
+    /// ensures correct register advancement when multiple arguments are
+    /// classified sequentially via separate calls — each isolated call returns
+    /// the first available register (X0 or V0) for that single argument.
     fn classify_argument(&self, ty: &IrType) -> ArgLocation {
-        match ty {
-            IrType::F32 | IrType::F64 | IrType::F80 => ArgLocation::Register(registers::V0 as u16),
-            IrType::Struct(_fields) => {
-                let size = ty.size_bytes(&self.target);
-                if size <= 8 {
-                    ArgLocation::Register(registers::X0 as u16)
-                } else if size <= 16 {
-                    ArgLocation::RegisterPair(registers::X0 as u16, registers::X1 as u16)
-                } else {
-                    ArgLocation::Stack(0)
-                }
-            }
-            IrType::Array(_, _) => ArgLocation::Register(registers::X0 as u16),
-            IrType::Void => ArgLocation::Stack(0),
-            _ => ArgLocation::Register(registers::X0 as u16),
-        }
+        let locs = classify_arguments_ir(std::slice::from_ref(ty), &self.target);
+        locs.into_iter().next().unwrap_or(ArgLocation::Stack(0))
     }
 
     /// Classify where a function return value should be placed per AAPCS64.

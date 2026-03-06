@@ -1557,6 +1557,62 @@ impl RiscV64Encoder {
             ))),
 
             // =============================================================
+            // System / CSR instructions (I-type with OP_SYSTEM opcode)
+            // =============================================================
+
+            // CSR Read-Write: CSRRW rd, csr, rs1
+            // I-type encoding: imm[11:0]=csr, rs1, funct3=001, rd, opcode=SYSTEM
+            RvOpcode::CSRRW => {
+                let csr = imm32 & 0xFFF;
+                Ok(make_std(encode_i_type(OP_SYSTEM, rd, 0b001, rs1, csr)))
+            }
+            // CSR Read-Set: CSRRS rd, csr, rs1
+            RvOpcode::CSRRS => {
+                let csr = imm32 & 0xFFF;
+                Ok(make_std(encode_i_type(OP_SYSTEM, rd, 0b010, rs1, csr)))
+            }
+            // CSR Read-Clear: CSRRC rd, csr, rs1
+            RvOpcode::CSRRC => {
+                let csr = imm32 & 0xFFF;
+                Ok(make_std(encode_i_type(OP_SYSTEM, rd, 0b011, rs1, csr)))
+            }
+            // CSR Read-Write Immediate: CSRRWI rd, csr, zimm
+            // rs1 field holds the 5-bit unsigned immediate (zimm).
+            RvOpcode::CSRRWI => {
+                let csr = imm32 & 0xFFF;
+                Ok(make_std(encode_i_type(OP_SYSTEM, rd, 0b101, rs1, csr)))
+            }
+            // CSR Read-Set Immediate: CSRRSI rd, csr, zimm
+            RvOpcode::CSRRSI => {
+                let csr = imm32 & 0xFFF;
+                Ok(make_std(encode_i_type(OP_SYSTEM, rd, 0b110, rs1, csr)))
+            }
+            // CSR Read-Clear Immediate: CSRRCI rd, csr, zimm
+            RvOpcode::CSRRCI => {
+                let csr = imm32 & 0xFFF;
+                Ok(make_std(encode_i_type(OP_SYSTEM, rd, 0b111, rs1, csr)))
+            }
+
+            // ECALL: system call — SYSTEM + funct3=0, funct12=0x000
+            RvOpcode::ECALL => Ok(make_std(0x0000_0073)),
+            // EBREAK: breakpoint — SYSTEM + funct3=0, funct12=0x001
+            RvOpcode::EBREAK => Ok(make_std(0x0010_0073)),
+            // FENCE: memory fence — full ordering (pred=iorw, succ=iorw)
+            RvOpcode::FENCE => Ok(make_std(0x0ff0_000f)),
+            // FENCE.I: instruction fence
+            RvOpcode::FENCE_I => Ok(make_std(0x0000_100f)),
+            // WFI: wait for interrupt — SYSTEM, funct12=0x105
+            RvOpcode::WFI => Ok(make_std(0x1050_0073)),
+            // SFENCE.VMA rs1, rs2 — R-type SYSTEM, funct7=0001001
+            RvOpcode::SFENCE_VMA => Ok(make_std(encode_r_type(
+                OP_SYSTEM, 0, 0b000, rs1, rs2, 0b0001001,
+            ))),
+            // MRET: machine return — funct12=0x302
+            RvOpcode::MRET => Ok(make_std(0x3020_0073)),
+            // SRET: supervisor return — funct12=0x102
+            RvOpcode::SRET => Ok(make_std(0x1020_0073)),
+
+            // =============================================================
             // Inline ASM passthrough — raw bytes are handled elsewhere
             // =============================================================
             RvOpcode::INLINE_ASM => {

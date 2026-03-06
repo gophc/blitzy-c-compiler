@@ -963,6 +963,114 @@ pub fn type_alignment(ty: &CType) -> usize {
 }
 
 // ===========================================================================
+// IR-Type Batch Argument Classification (AAPCS64)
+// ===========================================================================
+
+use crate::ir::types::IrType;
+
+/// Classify a slice of IR-level argument types into AAPCS64 locations.
+///
+/// Tracks the Next General-purpose Register Number (NGRN, X0–X7) and the
+/// Next SIMD/FP Register Number (NSRN, V0–V7), advancing through them as
+/// arguments are assigned.  Arguments that exhaust the available registers
+/// are placed on the stack.
+///
+/// This mirrors the x86_64 ABI module's `classify_arguments` function and
+/// is the correct way to determine per-argument placement when multiple
+/// arguments must be classified together.
+pub fn classify_arguments_ir(
+    params: &[IrType],
+    target: &Target,
+) -> Vec<crate::backend::traits::ArgLocation> {
+    use crate::backend::traits::ArgLocation;
+
+    let mut locs = Vec::with_capacity(params.len());
+    let mut ngrn: usize = 0; // Next General-purpose Register Number
+    let mut nsrn: usize = 0; // Next SIMD/FP Register Number
+    let mut stack_offset: i32 = 0;
+
+    for param in params {
+        match param {
+            // Floating-point scalars → V0–V7
+            IrType::F32 | IrType::F64 | IrType::F80 => {
+                if nsrn < NUM_FP_ARG_REGS {
+                    locs.push(ArgLocation::Register(FP_ARG_REGS[nsrn] as u16));
+                    nsrn += 1;
+                } else {
+                    let size = param.size_bytes(target).max(8) as i32;
+                    locs.push(ArgLocation::Stack(stack_offset));
+                    stack_offset += size;
+                }
+            }
+            // Void — no value to pass
+            IrType::Void => {
+                locs.push(ArgLocation::Stack(0));
+            }
+            // Structs — may use register pairs or spill to stack
+            IrType::Struct(st) => {
+                let size = param.size_bytes(target);
+                if size == 0 {
+                    locs.push(ArgLocation::Stack(0));
+                } else if size <= 8 && ngrn < NUM_INT_ARG_REGS {
+                    locs.push(ArgLocation::Register(INT_ARG_REGS[ngrn] as u16));
+                    ngrn += 1;
+                } else if size <= 16 && ngrn + 2 <= NUM_INT_ARG_REGS {
+                    let r1 = INT_ARG_REGS[ngrn] as u16;
+                    let r2 = INT_ARG_REGS[ngrn + 1] as u16;
+                    locs.push(ArgLocation::RegisterPair(r1, r2));
+                    ngrn += 2;
+                } else {
+                    // Check for HFA (Homogeneous Floating-point Aggregate)
+                    let is_all_fp = !st.fields.is_empty()
+                        && st
+                            .fields
+                            .iter()
+                            .all(|f| matches!(f, IrType::F32 | IrType::F64))
+                        && st.fields.len() <= 4;
+                    if is_all_fp && nsrn + st.fields.len() <= NUM_FP_ARG_REGS {
+                        locs.push(ArgLocation::Register(FP_ARG_REGS[nsrn] as u16));
+                        nsrn += st.fields.len();
+                    } else {
+                        // Large struct: passed by reference (hidden pointer in X[ngrn])
+                        if ngrn < NUM_INT_ARG_REGS {
+                            locs.push(ArgLocation::Register(INT_ARG_REGS[ngrn] as u16));
+                            ngrn += 1;
+                        } else {
+                            let slot = ((size + 7) & !7) as i32;
+                            locs.push(ArgLocation::Stack(stack_offset));
+                            stack_offset += slot;
+                        }
+                    }
+                }
+            }
+            // Arrays — passed by reference (hidden pointer)
+            IrType::Array(_, _) => {
+                if ngrn < NUM_INT_ARG_REGS {
+                    locs.push(ArgLocation::Register(INT_ARG_REGS[ngrn] as u16));
+                    ngrn += 1;
+                } else {
+                    locs.push(ArgLocation::Stack(stack_offset));
+                    stack_offset += 8;
+                }
+            }
+            // Integer / pointer scalars → X0–X7
+            _ => {
+                if ngrn < NUM_INT_ARG_REGS {
+                    locs.push(ArgLocation::Register(INT_ARG_REGS[ngrn] as u16));
+                    ngrn += 1;
+                } else {
+                    let size = param.size_bytes(target).max(8) as i32;
+                    locs.push(ArgLocation::Stack(stack_offset));
+                    stack_offset += size;
+                }
+            }
+        }
+    }
+
+    locs
+}
+
+// ===========================================================================
 // Unit Tests
 // ===========================================================================
 
