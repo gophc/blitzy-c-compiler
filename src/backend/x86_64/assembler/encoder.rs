@@ -1143,6 +1143,51 @@ impl X86_64Encoder {
             (Some(MachineOperand::Register(dst)), Some(MachineOperand::Immediate(imm))) => {
                 self.encode_reg_imm_op(&[0xF7], 0, *dst, *imm, 8)
             }
+            // TEST [mem], reg — memory operand first, register second.
+            // Encoding: REX.W 85 ModR/M SIB (optional) disp (optional)
+            // Used by the stack probe loop: test [rsp], rsp
+            (
+                Some(MachineOperand::Memory {
+                    base,
+                    index,
+                    scale,
+                    displacement,
+                }),
+                Some(MachineOperand::Register(src)),
+            ) => self.encode_mem_reg_op(&[0x85], *base, *index, *scale, *displacement, *src, 8),
+            // TEST [mem], imm — memory operand first, immediate second.
+            // Uses F7 /0 encoding (reg field = 0 for TEST)
+            // Delegates to encode_mem_reg_op with reg=0 as the opcode extension,
+            // then patches the imm32 at the end.
+            (
+                Some(MachineOperand::Memory {
+                    base,
+                    index,
+                    scale,
+                    displacement,
+                }),
+                Some(MachineOperand::Immediate(imm)),
+            ) => {
+                // Encode as TEST r/m64, imm32: REX.W F7 /0 modrm [sib] [disp] imm32
+                // We use encode_mem_reg_op with a dummy register encoding of 0 for the /0 opcode extension
+                let mem_enc = encode_memory_operand(0, *base, *index, *scale, *displacement);
+                let mut bytes = Vec::with_capacity(16);
+                if let Some(rex) = compute_rex(true, None, *index, *base) {
+                    bytes.push(rex);
+                } else {
+                    bytes.push(rex_byte(true, false, false, false));
+                }
+                bytes.push(0xF7);
+                bytes.push(mem_enc.modrm);
+                if let Some(s) = mem_enc.sib {
+                    bytes.push(s);
+                }
+                bytes.extend_from_slice(&mem_enc.displacement);
+                // Append 32-bit immediate
+                let imm_val = *imm as i32;
+                bytes.extend_from_slice(&imm_val.to_le_bytes());
+                EncodedInstruction::new(bytes)
+            }
             _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
         }
     }

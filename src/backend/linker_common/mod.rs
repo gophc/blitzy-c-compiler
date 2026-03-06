@@ -896,6 +896,7 @@ fn write_elf_output(
     }
 
     // Add dynamic linking sections that were generated separately.
+    // Track section indices (1-based ELF indices) for sh_link fixup.
     let dynamic_section_names = [
         ".interp",
         ".dynamic",
@@ -909,10 +910,34 @@ fn write_elf_output(
         ".rela.plt",
     ];
 
-    for &sec_name in &dynamic_section_names {
-        // Skip if already in the ordered sections or if no data was generated.
-        let already_present = ordered_sections.iter().any(|s| s.name == sec_name);
+    // Compute a virtual address base for dynamic sections by finding the
+    // highest address in the existing layout and aligning up.
+    let mut dyn_vaddr_cursor: u64 = 0;
+    let mut dyn_foff_cursor: u64 = 0;
+    if is_linked {
+        for info in address_map.section_addresses.values() {
+            let sec_end_va = info.virtual_address + info.mem_size;
+            let sec_end_fo = info.file_offset + info.size;
+            if sec_end_va > dyn_vaddr_cursor {
+                dyn_vaddr_cursor = sec_end_va;
+            }
+            if sec_end_fo > dyn_foff_cursor {
+                dyn_foff_cursor = sec_end_fo;
+            }
+        }
+        // Align to page boundary for clean segment mapping.
+        let page_align = 0x1000u64;
+        dyn_vaddr_cursor = (dyn_vaddr_cursor + page_align - 1) & !(page_align - 1);
+        dyn_foff_cursor = (dyn_foff_cursor + page_align - 1) & !(page_align - 1);
+    }
 
+    // Map from section name → 1-based ELF section index for sh_link resolution.
+    let mut dyn_section_indices: FxHashMap<String, u32> = FxHashMap::default();
+    // Track dynamic sections' virtual addresses for PT_DYNAMIC generation.
+    let mut dyn_section_vaddrs: FxHashMap<String, (u64, u64, u64)> = FxHashMap::default(); // (vaddr, foff, size)
+
+    for &sec_name in &dynamic_section_names {
+        let already_present = ordered_sections.iter().any(|s| s.name == sec_name);
         if already_present {
             continue;
         }
@@ -920,20 +945,84 @@ fn write_elf_output(
         if let Some(data) = section_data_map.get(sec_name) {
             if !data.is_empty() {
                 let (sh_type, sh_flags, sh_entsize) = dynamic_section_attributes(sec_name, config);
+                let align = if config.target.is_64bit() { 8u64 } else { 4u64 };
+
+                // Assign virtual address and file offset for linked output.
+                let (vaddr, foff) = if is_linked {
+                    dyn_vaddr_cursor = (dyn_vaddr_cursor + align - 1) & !(align - 1);
+                    dyn_foff_cursor = (dyn_foff_cursor + align - 1) & !(align - 1);
+                    let va = dyn_vaddr_cursor;
+                    let fo = dyn_foff_cursor;
+                    dyn_vaddr_cursor += data.len() as u64;
+                    dyn_foff_cursor += data.len() as u64;
+                    (va, fo)
+                } else {
+                    (0, 0)
+                };
+
                 let elf_section = Section {
                     name: sec_name.to_string(),
                     sh_type,
                     sh_flags,
                     data: data.clone(),
-                    sh_link: 0,
+                    sh_link: 0,   // Fixed up below after all sections are added.
                     sh_info: 0,
-                    sh_addralign: if config.target.is_64bit() { 8 } else { 4 },
+                    sh_addralign: align,
                     sh_entsize,
                     logical_size: 0,
-                    virtual_address: 0,
-                    file_offset_hint: 0,
+                    virtual_address: vaddr,
+                    file_offset_hint: foff,
                 };
-                writer.add_section(elf_section);
+                let idx = writer.add_section(elf_section);
+                dyn_section_indices.insert(sec_name.to_string(), idx as u32);
+                if is_linked {
+                    dyn_section_vaddrs.insert(
+                        sec_name.to_string(),
+                        (vaddr, foff, data.len() as u64),
+                    );
+                }
+            }
+        }
+    }
+
+    // ----- Fix up sh_link fields for dynamic sections -----
+    // .dynsym → sh_link must point to .dynstr section index
+    // .dynamic → sh_link must point to .dynstr section index
+    // .gnu.hash → sh_link must point to .dynsym section index
+    // .rela.dyn → sh_link must point to .dynsym section index
+    // .rela.plt → sh_link must point to .dynsym section index
+    let dynstr_idx = dyn_section_indices.get(".dynstr").copied().unwrap_or(0);
+    let dynsym_idx = dyn_section_indices.get(".dynsym").copied().unwrap_or(0);
+
+    // Resolve the 0-based vector indices from the 1-based ELF indices.
+    {
+        let sections = writer.sections_mut();
+        for (sec_name, &elf_idx) in &dyn_section_indices {
+            let vec_idx = (elf_idx as usize).saturating_sub(1);
+            if vec_idx < sections.len() {
+                match sec_name.as_str() {
+                    ".dynsym" => {
+                        sections[vec_idx].sh_link = dynstr_idx;
+                        // sh_info = index of first non-local symbol (usually 1)
+                        sections[vec_idx].sh_info = 1;
+                    }
+                    ".dynamic" => {
+                        sections[vec_idx].sh_link = dynstr_idx;
+                    }
+                    ".gnu.hash" => {
+                        sections[vec_idx].sh_link = dynsym_idx;
+                    }
+                    ".rela.dyn" | ".rela.plt" => {
+                        sections[vec_idx].sh_link = dynsym_idx;
+                        // sh_info for .rela.plt = section index of .plt (or .got.plt)
+                        if sec_name == ".rela.plt" {
+                            if let Some(&plt_idx) = dyn_section_indices.get(".got.plt") {
+                                sections[vec_idx].sh_info = plt_idx;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
     }
@@ -955,6 +1044,60 @@ fn write_elf_output(
     // Build program headers for linked output.
     if config.output_type.is_linked() {
         build_program_headers(config, ordered_sections, address_map, &mut writer);
+
+        // ----- Add PT_DYNAMIC program header for the .dynamic section -----
+        if let Some(&(dyn_vaddr, dyn_foff, dyn_size)) = dyn_section_vaddrs.get(".dynamic") {
+            let pt_dynamic = crate::backend::elf_writer_common::Elf64ProgramHeader {
+                p_type: 2, // PT_DYNAMIC
+                p_flags: 6, // PF_R | PF_W
+                p_offset: dyn_foff,
+                p_vaddr: dyn_vaddr,
+                p_paddr: dyn_vaddr,
+                p_filesz: dyn_size,
+                p_memsz: dyn_size,
+                p_align: if config.target.is_64bit() { 8 } else { 4 },
+            };
+            writer.add_program_header(pt_dynamic);
+        }
+
+        // ----- Add PT_LOAD segment for dynamic sections if they have addresses -----
+        // Gather the full range of dynamic sections to create a LOAD segment.
+        if !dyn_section_vaddrs.is_empty() {
+            let mut min_vaddr = u64::MAX;
+            let mut min_foff = u64::MAX;
+            let mut max_end_va = 0u64;
+            let mut max_end_fo = 0u64;
+            for (va, fo, sz) in dyn_section_vaddrs.values() {
+                if *va < min_vaddr {
+                    min_vaddr = *va;
+                }
+                if *fo < min_foff {
+                    min_foff = *fo;
+                }
+                let end_va = va + sz;
+                let end_fo = fo + sz;
+                if end_va > max_end_va {
+                    max_end_va = end_va;
+                }
+                if end_fo > max_end_fo {
+                    max_end_fo = end_fo;
+                }
+            }
+            let total_filesz = max_end_fo - min_foff;
+            let total_memsz = max_end_va - min_vaddr;
+
+            let pt_load_dyn = crate::backend::elf_writer_common::Elf64ProgramHeader {
+                p_type: 1, // PT_LOAD
+                p_flags: 6, // PF_R | PF_W (dynamic sections are readable + writable)
+                p_offset: min_foff,
+                p_vaddr: min_vaddr,
+                p_paddr: min_vaddr,
+                p_filesz: total_filesz,
+                p_memsz: total_memsz,
+                p_align: 0x1000,
+            };
+            writer.add_program_header(pt_load_dyn);
+        }
     }
 
     // Serialize to bytes.

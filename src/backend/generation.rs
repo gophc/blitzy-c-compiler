@@ -42,6 +42,7 @@ use crate::backend::dwarf::{
 use crate::backend::elf_writer_common::{
     ElfSymbol, ElfWriter, Section, ET_REL, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHT_NOBITS,
     SHT_PROGBITS, STB_GLOBAL, STB_LOCAL, STT_FUNC, STT_NOTYPE, STT_OBJECT, STV_DEFAULT,
+    STV_HIDDEN, STV_PROTECTED,
 };
 use crate::backend::linker_common::relocation::RelocationHandler;
 use crate::backend::linker_common::{link, LinkerConfig, LinkerInput, LinkerOutput, OutputType};
@@ -55,7 +56,7 @@ use crate::backend::traits::{
 use crate::common::diagnostics::{DiagnosticEngine, Span};
 use crate::common::source_map::SourceMap;
 use crate::common::target::Target;
-use crate::ir::function::{IrFunction, Linkage as FunctionLinkage};
+use crate::ir::function::{IrFunction, Linkage as FunctionLinkage, Visibility};
 use crate::ir::module::IrModule;
 
 // ===========================================================================
@@ -469,6 +470,13 @@ fn generate_for_arch<A: ArchCodegen>(
         }
         text_section_offsets.push((func.name.clone(), func_offset, func_size));
 
+        // Map IR visibility enum to ELF STV_* constant for symbol table emission.
+        let elf_visibility = match func.visibility {
+            Visibility::Hidden => STV_HIDDEN,
+            Visibility::Protected => STV_PROTECTED,
+            Visibility::Default => STV_DEFAULT,
+        };
+
         compiled_functions.push(CompiledFunction {
             name: func.name.clone(),
             bytes: func_bytes.clone(),
@@ -476,6 +484,7 @@ fn generate_for_arch<A: ArchCodegen>(
             size: func_size,
             is_global: func.linkage == FunctionLinkage::External
                 || func.linkage == FunctionLinkage::Weak,
+            visibility: elf_visibility,
         });
 
         text_section_data.extend_from_slice(&func_bytes);
@@ -484,6 +493,32 @@ fn generate_for_arch<A: ArchCodegen>(
     // Check for errors after function compilation.
     if diagnostics.has_errors() {
         return Err("code generation aborted due to errors".to_string());
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase A.4b: Append retpoline thunks to .text (x86-64 only)
+    // -----------------------------------------------------------------------
+    // When -mretpoline is active, the assembler transforms indirect
+    // call/jmp instructions into `CALL __x86_indirect_thunk_<reg>`.
+    // The thunk bodies must be physically present in the .text section
+    // and registered in the function offset map so that Phase A.5 can
+    // resolve the CALL relocations targeting them.
+    if ctx.retpoline && ctx.target == Target::X86_64 {
+        let thunks = crate::backend::x86_64::assembler::assemble_retpoline_thunks();
+        for (thunk_name, thunk_bytes) in &thunks {
+            let thunk_offset = text_section_data.len() as u64;
+            let thunk_size = thunk_bytes.len() as u64;
+            text_section_offsets.push((thunk_name.clone(), thunk_offset, thunk_size));
+            compiled_functions.push(CompiledFunction {
+                name: thunk_name.clone(),
+                bytes: thunk_bytes.clone(),
+                offset: thunk_offset,
+                size: thunk_size,
+                is_global: true,
+                visibility: STV_DEFAULT,
+            });
+            text_section_data.extend_from_slice(thunk_bytes);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -655,6 +690,9 @@ struct CompiledFunction {
     size: u64,
     /// Whether this function has external/global linkage.
     is_global: bool,
+    /// ELF symbol visibility (STV_DEFAULT, STV_HIDDEN, STV_PROTECTED).
+    /// Propagated from the IR function's visibility attribute.
+    visibility: u8,
 }
 
 /// Placement of a global symbol within an ELF section.
@@ -1057,9 +1095,30 @@ fn write_relocatable_object(
         add_dwarf_sections(&mut writer, dwarf_data);
     }
 
+    // --- .note.gnu.property section for CET/IBT (x86-64 only) ---
+    // When -fcf-protection is enabled, emit the note section so that the
+    // runtime loader can verify CET support in all linked object files.
+    if ctx.cf_protection && ctx.target == Target::X86_64 {
+        let note_data = crate::backend::x86_64::security::generate_cet_note_section();
+        let note_section = Section {
+            name: ".note.gnu.property".to_string(),
+            sh_type: 7, // SHT_NOTE
+            sh_flags: SHF_ALLOC,
+            data: note_data,
+            sh_link: 0,
+            sh_info: 0,
+            sh_addralign: 8,
+            sh_entsize: 0,
+            logical_size: 0,
+            virtual_address: 0,
+            file_offset_hint: 0,
+        };
+        writer.add_section(note_section);
+    }
+
     // --- Symbol table entries ---
 
-    // Add function symbols.
+    // Add function symbols with proper visibility from the IR.
     for func in functions {
         let binding = if func.is_global {
             STB_GLOBAL
@@ -1072,7 +1131,7 @@ fn write_relocatable_object(
             size: func.size,
             binding,
             sym_type: STT_FUNC,
-            visibility: STV_DEFAULT,
+            visibility: func.visibility,
             section_index: text_section_index,
         };
         writer.add_symbol(sym);

@@ -297,7 +297,12 @@ impl ArchCodegen for X86_64Backend {
     /// Security-related bytes (retpoline thunks, CET note section) are also
     /// handled by the assembler when the corresponding flags are active.
     fn emit_assembly(&self, mf: &MachineFunction) -> Result<AssembledFunction, String> {
-        let result = assembler::assemble(mf, &self.security_config, self.pic_enabled);
+        // Apply security mitigations that transform the MachineFunction:
+        // - Retpoline: replace indirect call/jmp instructions with thunk calls
+        //   so that the assembler can emit CALL rel32 to __x86_indirect_thunk_<reg>.
+        let mut mf_secured = mf.clone();
+        security::transform_indirect_calls(&mut mf_secured, self.security_config.retpoline);
+        let result = assembler::assemble(&mf_secured, &self.security_config, self.pic_enabled);
         let relocations = result
             .relocations
             .iter()
@@ -390,10 +395,16 @@ impl ArchCodegen for X86_64Backend {
 
         if aligned_size > 0 {
             if self.security_config.stack_probe && mf.frame_size > security::PAGE_SIZE {
-                // Large frame: emit probe loop.  The probe loop sets RSP
-                // to the final target, so no additional SUB is needed.
-                let probe_instrs = security::emit_stack_probe(mf.frame_size);
-                prologue.extend(probe_instrs);
+                // Large frame: emit probe loop using pre-encoded raw bytes.
+                // We use generate_stack_probe() which produces correctly-encoded
+                // machine code with proper TEST [rsp],rsp memory operand and
+                // correct JA rel8 back-edge offset within the probe loop.
+                // This avoids the encoder limitations with memory operand
+                // encoding and BlockLabel resolution for inline probe loops.
+                let probe_bytes = security::generate_stack_probe(mf.frame_size);
+                let mut probe_inst = MachineInstruction::new(X86Opcode::Nop.as_u32());
+                probe_inst.encoded_bytes = probe_bytes;
+                prologue.push(probe_inst);
             } else {
                 // Small frame or stack_probe disabled: simple SUB RSP, N.
                 let mut sub_rsp = MachineInstruction::new(X86Opcode::Sub.as_u32());
@@ -702,9 +713,14 @@ mod tests {
         mf.frame_size = 8192; // > 4096, triggers probe
 
         let prologue = backend.emit_prologue(&mf);
-        // Expect: push rbp, mov rbp rsp, [probe instructions...]
-        // probe_instrs from security::emit_stack_probe(8192) should be non-empty
-        assert!(prologue.len() > 3);
+        // Expect: push rbp, mov rbp rsp, probe_instruction(encoded_bytes)
+        // The probe is emitted as a single MachineInstruction with pre-encoded
+        // bytes (28 bytes for the entire probe loop including mov, sub, test,
+        // cmp, ja, and final mov rsp,rax).
+        assert_eq!(prologue.len(), 3);
+        // The probe instruction should have non-empty encoded_bytes.
+        assert!(!prologue[2].encoded_bytes.is_empty());
+        assert_eq!(prologue[2].encoded_bytes.len(), 28);
     }
 
     #[test]

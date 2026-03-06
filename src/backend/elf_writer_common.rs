@@ -1159,6 +1159,17 @@ impl ElfWriter {
         self.sections.len()
     }
 
+    /// Return a mutable reference to the internal sections vector.
+    ///
+    /// This allows post-hoc fixup of section header fields (e.g. `sh_link`,
+    /// `sh_info`) after all sections have been added and their indices are
+    /// known.  The vector uses **0-based** indexing into the user sections;
+    /// the ELF section header index is `vector_index + 1` (because section 0
+    /// is the mandatory null section).
+    pub fn sections_mut(&mut self) -> &mut Vec<Section> {
+        &mut self.sections
+    }
+
     /// Return the target architecture.
     pub fn target(&self) -> Target {
         self.target

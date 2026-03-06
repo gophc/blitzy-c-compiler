@@ -521,10 +521,10 @@ pub fn assemble(
         visibility: SymbolVisibility::Default,
     });
 
-    // If CET/IBT is enabled, emit `endbr64` as the very first instruction.
-    if ctx.security_config.cf_protection {
-        ctx.emit_bytes(&ENDBR64_BYTES);
-    }
+    // NOTE: endbr64 is already emitted by the prologue in X86_64Backend::emit_prologue()
+    // when cf_protection is enabled. Adding it here again would produce a duplicate.
+    // The prologue-based insertion is the correct location since it becomes part of
+    // the function's MachineInstruction sequence and is visible in -S output.
 
     // Create the encoder starting at the current text offset.
     let mut enc = X86_64Encoder::new(ctx.current_offset);
@@ -984,7 +984,7 @@ pub fn assemble_to_object(
 ///     mov [rsp], <reg>                ; REX 89 <ModR/M> 24
 ///     ret                             ; C3
 /// ```
-fn assemble_retpoline_thunks() -> Vec<(String, Vec<u8>)> {
+pub fn assemble_retpoline_thunks() -> Vec<(String, Vec<u8>)> {
     let gprs: [u16; 16] = [
         RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI, R8, R9, R10, R11, R12, R13, R14, R15,
     ];
@@ -1206,7 +1206,14 @@ mod tests {
 
     #[test]
     fn test_assemble_with_cet() {
-        let mf = make_empty_func("cet_fn");
+        // Build a function that already has endbr64 as its first instruction
+        // (as emit_prologue would insert when cf_protection is enabled).
+        // The assembler no longer injects endbr64 itself — that responsibility
+        // lies with the prologue generator to avoid double emission.
+        let mut mf = make_empty_func("cet_fn");
+        let endbr = crate::backend::x86_64::security::emit_endbr64();
+        mf.blocks[0].instructions.insert(0, endbr);
+
         let config = SecurityConfig {
             retpoline: false,
             cf_protection: true,

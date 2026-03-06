@@ -703,6 +703,18 @@ fn run_compilation(args: CliArgs) -> Result<(), String> {
     // Validate all input files exist and are readable before starting the pipeline.
     validate_input_files(&args.input_files)?;
 
+    // Warn when -shared is used without explicit -fPIC — the compiler will
+    // implicitly enable PIC, but the user should be aware that creating a
+    // shared library without -fPIC may produce incorrect code with text
+    // relocations in some scenarios.
+    if args.shared && !args.pic {
+        eprintln!(
+            "{}: warning: creating shared library without -fPIC; \
+             PIC will be enabled implicitly, but explicit -fPIC is recommended",
+            PROGRAM_NAME
+        );
+    }
+
     let ctx = CompilationContext::from_cli_args(&args);
     let output_path = resolve_output_path(&args);
 
