@@ -474,8 +474,11 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
         }
 
         // -f<flag> — accept known flags, warn on unknown
-        if arg.starts_with("-f") && arg != "-fPIC" && arg != "-fpic"
-            && arg != "-fcf-protection" && arg != "-fcf-protection=full"
+        if arg.starts_with("-f")
+            && arg != "-fPIC"
+            && arg != "-fpic"
+            && arg != "-fcf-protection"
+            && arg != "-fcf-protection=full"
             && arg != "-fcf-protection=none"
         {
             // Silently accept common GCC flags for kernel build compatibility
@@ -490,7 +493,9 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
         }
 
         // -nostdinc, -nostdlib, -nodefaultlibs — accepted silently
-        if arg == "-nostdinc" || arg == "-nostdlib" || arg == "-nodefaultlibs"
+        if arg == "-nostdinc"
+            || arg == "-nostdlib"
+            || arg == "-nodefaultlibs"
             || arg == "-nostartfiles"
         {
             i += 1;
@@ -527,8 +532,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
     }
 
     // Validate: mutual exclusivity of -c, -S, -E
-    let mode_count = cli.compile_only as u8 + cli.emit_assembly as u8
-        + cli.preprocess_only as u8;
+    let mode_count = cli.compile_only as u8 + cli.emit_assembly as u8 + cli.preprocess_only as u8;
     if mode_count > 1 {
         return Err("only one of '-c', '-S', '-E' may be specified".to_string());
     }
@@ -738,16 +742,14 @@ fn run_compilation(args: CliArgs) -> Result<(), String> {
     }
 
     // Multi-file link mode: compile each to temp .o, then link all
-    let _temp_dir = TempDir::new().map_err(|e| {
-        format!("failed to create temporary directory: {}", e)
-    })?;
+    let _temp_dir =
+        TempDir::new().map_err(|e| format!("failed to create temporary directory: {}", e))?;
 
     let mut object_files: Vec<PathBuf> = Vec::new();
 
     for input in &args.input_files {
-        let temp_obj: TempFile = create_temp_object_file().map_err(|e| {
-            format!("failed to create temporary object file: {}", e)
-        })?;
+        let temp_obj: TempFile = create_temp_object_file()
+            .map_err(|e| format!("failed to create temporary object file: {}", e))?;
         let obj_path = temp_obj.path().to_path_buf();
 
         // Compile to temporary .o
@@ -788,12 +790,8 @@ fn run_preprocess_only(
         let mut diagnostics = DiagnosticEngine::new();
         let mut interner = Interner::new();
 
-        let mut pp = Preprocessor::new(
-            &mut source_map,
-            &mut diagnostics,
-            ctx.target,
-            &mut interner,
-        );
+        let mut pp =
+            Preprocessor::new(&mut source_map, &mut diagnostics, ctx.target, &mut interner);
 
         // Add include paths from CLI
         for path in &ctx.include_paths {
@@ -823,16 +821,15 @@ fn run_preprocess_only(
 
         // Write output
         if let Some(path) = output_path {
-            fs::write(path, &output).map_err(|e| {
-                format!("failed to write output to '{}': {}", path, e)
-            })?;
+            fs::write(path, &output)
+                .map_err(|e| format!("failed to write output to '{}': {}", path, e))?;
         } else {
             // Write to stdout
             let stdout = io::stdout();
             let mut handle = stdout.lock();
-            handle.write_all(output.as_bytes()).map_err(|e| {
-                format!("failed to write to stdout: {}", e)
-            })?;
+            handle
+                .write_all(output.as_bytes())
+                .map_err(|e| format!("failed to write to stdout: {}", e))?;
         }
 
         // Print any accumulated diagnostics
@@ -864,12 +861,7 @@ fn compile_single_file(
     // Phase 1-2: Preprocessing
     // ========================================================================
 
-    let mut pp = Preprocessor::new(
-        &mut source_map,
-        &mut diagnostics,
-        ctx.target,
-        &mut interner,
-    );
+    let mut pp = Preprocessor::new(&mut source_map, &mut diagnostics, ctx.target, &mut interner);
 
     // Configure preprocessor with CLI options
     for path in &ctx.include_paths {
@@ -907,17 +899,9 @@ fn compile_single_file(
 
     // Register the preprocessed text as a virtual file in the source map
     // so the lexer can produce spans that the diagnostic engine can resolve.
-    let pp_file_id = source_map.add_file(
-        format!("<preprocessed:{}>", input),
-        pp_text.clone(),
-    );
+    let pp_file_id = source_map.add_file(format!("<preprocessed:{}>", input), pp_text.clone());
 
-    let lexer = Lexer::new(
-        &pp_text,
-        pp_file_id,
-        &mut interner,
-        &mut diagnostics,
-    );
+    let lexer = Lexer::new(&pp_text, pp_file_id, &mut interner, &mut diagnostics);
 
     // Check for lexer errors (emitted during tokenization via next_token calls
     // from the parser, so we don't tokenize_all here — the parser drives the lexer)
@@ -942,12 +926,8 @@ fn compile_single_file(
     // The SemanticAnalyzer borrows `diagnostics` mutably, so we scope its
     // lifetime in a block to release the borrow before checking diagnostics.
     let sema_ok = {
-        let mut sema = SemanticAnalyzer::new(
-            &mut diagnostics,
-            &type_builder,
-            ctx.target,
-            &interner,
-        );
+        let mut sema =
+            SemanticAnalyzer::new(&mut diagnostics, &type_builder, ctx.target, &interner);
 
         let analyze_result = sema.analyze(&mut translation_unit);
         let finalize_result = sema.finalize();
@@ -1028,12 +1008,7 @@ fn compile_single_file(
         emit_assembly: args.emit_assembly,
     };
 
-    let output_bytes = generate_code(
-        &ir_module,
-        &codegen_ctx,
-        &mut diagnostics,
-    )
-    .map_err(|e| {
+    let output_bytes = generate_code(&ir_module, &codegen_ctx, &mut diagnostics).map_err(|e| {
         diagnostics.print_all(&source_map);
         format!("code generation failed for '{}': {}", input, e)
     })?;
@@ -1044,9 +1019,8 @@ fn compile_single_file(
     }
 
     // Write the output bytes to the destination file
-    fs::write(output, &output_bytes).map_err(|e| {
-        format!("failed to write output to '{}': {}", output, e)
-    })?;
+    fs::write(output, &output_bytes)
+        .map_err(|e| format!("failed to write output to '{}': {}", output, e))?;
 
     // For ELF executables, set the executable permission bit
     if !args.compile_only && !args.emit_assembly {
@@ -1080,13 +1054,8 @@ fn link_object_files(
     // Read all object files
     let mut combined_data: Vec<Vec<u8>> = Vec::new();
     for obj_path in object_files {
-        let data = fs::read(obj_path).map_err(|e| {
-            format!(
-                "failed to read object file '{}': {}",
-                obj_path.display(),
-                e
-            )
-        })?;
+        let data = fs::read(obj_path)
+            .map_err(|e| format!("failed to read object file '{}': {}", obj_path.display(), e))?;
         combined_data.push(data);
     }
 
@@ -1098,9 +1067,8 @@ fn link_object_files(
     // If there's only one object file, just copy it as the output
     // (the single-file path already handles linking internally)
     if combined_data.len() == 1 {
-        fs::write(output, &combined_data[0]).map_err(|e| {
-            format!("failed to write output to '{}': {}", output, e)
-        })?;
+        fs::write(output, &combined_data[0])
+            .map_err(|e| format!("failed to write output to '{}': {}", output, e))?;
 
         #[cfg(unix)]
         {
