@@ -222,9 +222,7 @@ pub fn parse_statement(parser: &mut Parser<'_>) -> Result<Statement, ()> {
         // -----------------------------------------------------------------
         // Tokens that start declarations — parse as declaration statement
         // -----------------------------------------------------------------
-        _ if is_declaration_start(parser) => {
-            parse_declaration_as_statement(parser)
-        }
+        _ if is_declaration_start(parser) => parse_declaration_as_statement(parser),
 
         // -----------------------------------------------------------------
         // End-of-file: produce an error recovery node.

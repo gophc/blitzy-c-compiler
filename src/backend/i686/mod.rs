@@ -110,8 +110,7 @@ pub use self::abi::I686Abi;
 // ===========================================================================
 
 use crate::backend::traits::{
-    ArchCodegen, ArgLocation, MachineFunction, MachineInstruction, RegisterInfo,
-    RelocationTypeInfo,
+    ArchCodegen, ArgLocation, MachineFunction, MachineInstruction, RegisterInfo, RelocationTypeInfo,
 };
 use crate::common::diagnostics::DiagnosticEngine;
 use crate::common::target::Target;
@@ -656,7 +655,9 @@ mod tests {
         assert!(!relocs.is_empty());
 
         // Verify R_386_NONE is present (type_id 0).
-        assert!(relocs.iter().any(|r| r.type_id == 0 && r.name == "R_386_NONE"));
+        assert!(relocs
+            .iter()
+            .any(|r| r.type_id == 0 && r.name == "R_386_NONE"));
 
         // Verify R_386_32 is present (type_id 1, absolute 32-bit).
         assert!(relocs

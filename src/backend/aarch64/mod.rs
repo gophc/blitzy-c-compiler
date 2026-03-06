@@ -37,25 +37,23 @@ pub mod registers;
 // Crate-level Imports
 // ============================================================================
 
-use crate::backend::traits::{
-    ArchCodegen, ArgLocation, MachineFunction, MachineInstruction,
-    MachineOperand, RegisterInfo, RelocationTypeInfo,
-};
 use crate::backend::elf_writer_common::{
-    ElfWriter, Section, ElfSymbol,
-    ET_REL, SHT_PROGBITS, SHT_NOBITS, SHT_RELA,
-    SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHF_INFO_LINK,
-    STB_GLOBAL, STT_FUNC, STT_NOTYPE, STV_DEFAULT,
+    ElfSymbol, ElfWriter, Section, ET_REL, SHF_ALLOC, SHF_EXECINSTR, SHF_INFO_LINK, SHF_WRITE,
+    SHT_NOBITS, SHT_PROGBITS, SHT_RELA, STB_GLOBAL, STT_FUNC, STT_NOTYPE, STV_DEFAULT,
 };
-use crate::ir::function::IrFunction;
-use crate::ir::module::{IrModule, Constant};
-use crate::ir::types::IrType;
+use crate::backend::traits::{
+    ArchCodegen, ArgLocation, MachineFunction, MachineInstruction, MachineOperand, RegisterInfo,
+    RelocationTypeInfo,
+};
 use crate::common::target::Target;
+use crate::ir::function::IrFunction;
+use crate::ir::module::{Constant, IrModule};
+use crate::ir::types::IrType;
 // CType and MachineType are used for ABI classification in submodules
 // and kept available for future extensions.
+use crate::common::diagnostics::{DiagnosticEngine, Span};
 #[allow(unused_imports)]
 use crate::common::types::{CType, MachineType};
-use crate::common::diagnostics::{DiagnosticEngine, Span};
 
 // ============================================================================
 // Public Re-exports
@@ -236,9 +234,7 @@ impl AArch64Codegen {
 
     /// Convert a list of AArch64-specific `A64Instruction`s into
     /// architecture-agnostic `MachineInstruction`s.
-    fn convert_instructions(
-        a64_instructions: &[A64Instruction],
-    ) -> Vec<MachineInstruction> {
+    fn convert_instructions(a64_instructions: &[A64Instruction]) -> Vec<MachineInstruction> {
         let mut result = Vec::with_capacity(a64_instructions.len());
         for inst in a64_instructions {
             let mut mi = MachineInstruction::new(inst.opcode as u32);
@@ -443,10 +439,7 @@ impl AArch64Codegen {
         let asm_result = match asm.assemble_module(&all_functions) {
             Ok(result) => result,
             Err(e) => {
-                diagnostics.emit_error(
-                    Span::dummy(),
-                    format!("AArch64 assembly failed: {}", e),
-                );
+                diagnostics.emit_error(Span::dummy(), format!("AArch64 assembly failed: {}", e));
                 return Err(());
             }
         };
@@ -479,9 +472,9 @@ impl AArch64Codegen {
                 continue;
             }
             if let Some(ref init) = global.initializer {
-                let align = global.alignment.unwrap_or(
-                    global.ty.align_bytes(&self.target),
-                );
+                let align = global
+                    .alignment
+                    .unwrap_or(global.ty.align_bytes(&self.target));
                 let padding = Self::align_up(data_bytes.len(), align) - data_bytes.len();
                 data_bytes.extend(std::iter::repeat(0u8).take(padding));
                 data_bytes.extend(Self::serialize_constant(init, &self.target));
@@ -518,9 +511,9 @@ impl AArch64Codegen {
                 continue;
             }
             if let Some(ref init) = global.initializer {
-                let align = global.alignment.unwrap_or(
-                    global.ty.align_bytes(&self.target),
-                );
+                let align = global
+                    .alignment
+                    .unwrap_or(global.ty.align_bytes(&self.target));
                 let padding = Self::align_up(rodata_bytes.len(), align) - rodata_bytes.len();
                 rodata_bytes.extend(std::iter::repeat(0u8).take(padding));
                 rodata_bytes.extend(Self::serialize_constant(init, &self.target));
@@ -551,9 +544,9 @@ impl AArch64Codegen {
             if !is_bss {
                 continue;
             }
-            let align = global.alignment.unwrap_or(
-                global.ty.align_bytes(&self.target),
-            ) as u64;
+            let align = global
+                .alignment
+                .unwrap_or(global.ty.align_bytes(&self.target)) as u64;
             bss_size = (bss_size + align - 1) & !(align - 1);
             bss_size += global.ty.size_bytes(&self.target) as u64;
         }
@@ -753,19 +746,37 @@ impl ArchCodegen for AArch64Codegen {
         let mut offset = 16i64;
         let mut i = 0;
         while i + 1 < gpr_saved.len() {
-            prologue.push(Self::make_stp(gpr_saved[i], gpr_saved[i + 1], sp, offset, false));
+            prologue.push(Self::make_stp(
+                gpr_saved[i],
+                gpr_saved[i + 1],
+                sp,
+                offset,
+                false,
+            ));
             offset += 16;
             i += 2;
         }
         if i < gpr_saved.len() {
-            prologue.push(Self::make_stp(gpr_saved[i], gpr_saved[i], sp, offset, false));
+            prologue.push(Self::make_stp(
+                gpr_saved[i],
+                gpr_saved[i],
+                sp,
+                offset,
+                false,
+            ));
             offset += 16;
         }
 
         // Save FPRs in pairs.
         let mut j = 0;
         while j + 1 < fpr_saved.len() {
-            prologue.push(Self::make_stp(fpr_saved[j], fpr_saved[j + 1], sp, offset, true));
+            prologue.push(Self::make_stp(
+                fpr_saved[j],
+                fpr_saved[j + 1],
+                sp,
+                offset,
+                true,
+            ));
             offset += 16;
             j += 2;
         }
@@ -834,7 +845,13 @@ impl ArchCodegen for AArch64Codegen {
                     true,
                 ));
             } else {
-                epilogue.push(Self::make_ldp(fpr_saved[idx], fpr_saved[idx], sp, off, true));
+                epilogue.push(Self::make_ldp(
+                    fpr_saved[idx],
+                    fpr_saved[idx],
+                    sp,
+                    off,
+                    true,
+                ));
             }
         }
 
@@ -889,9 +906,7 @@ impl ArchCodegen for AArch64Codegen {
     /// Classify where a function argument should be placed per AAPCS64.
     fn classify_argument(&self, ty: &IrType) -> ArgLocation {
         match ty {
-            IrType::F32 | IrType::F64 | IrType::F80 => {
-                ArgLocation::Register(registers::V0 as u16)
-            }
+            IrType::F32 | IrType::F64 | IrType::F80 => ArgLocation::Register(registers::V0 as u16),
             IrType::Struct(_fields) => {
                 let size = ty.size_bytes(&self.target);
                 if size <= 8 {
@@ -912,9 +927,7 @@ impl ArchCodegen for AArch64Codegen {
     fn classify_return(&self, ty: &IrType) -> ArgLocation {
         match ty {
             IrType::Void => ArgLocation::Stack(0),
-            IrType::F32 | IrType::F64 | IrType::F80 => {
-                ArgLocation::Register(registers::V0 as u16)
-            }
+            IrType::F32 | IrType::F64 | IrType::F80 => ArgLocation::Register(registers::V0 as u16),
             IrType::Struct(_fields) => {
                 let size = ty.size_bytes(&self.target);
                 if size <= 8 {
@@ -1321,10 +1334,8 @@ mod tests {
     #[test]
     fn test_serialize_constant_string() {
         let target = Target::AArch64;
-        let bytes = AArch64Codegen::serialize_constant(
-            &Constant::String(b"Hello\0".to_vec()),
-            &target,
-        );
+        let bytes =
+            AArch64Codegen::serialize_constant(&Constant::String(b"Hello\0".to_vec()), &target);
         assert_eq!(bytes, b"Hello\0");
     }
 

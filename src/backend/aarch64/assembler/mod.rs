@@ -425,10 +425,7 @@ impl AArch64Assembler {
     /// Expands to an ADRP + ADD pair for non-GOT addressing, or
     /// ADRP + LDR for GOT-relative addressing (PIC mode).
     fn assemble_load_address(&mut self, inst: &A64Instruction) -> Result<(), String> {
-        let sym = inst
-            .symbol
-            .as_deref()
-            .unwrap_or("");
+        let sym = inst.symbol.as_deref().unwrap_or("");
 
         let rd = inst.rd.unwrap_or(0);
 
@@ -478,11 +475,7 @@ impl AArch64Assembler {
             let bl_word: u32 = 0x9400_0000; // BL (imm26=0 placeholder)
             let offset = self.current_offset;
             self.emit_raw_word(bl_word);
-            self.emit_branch_relocation(
-                sym,
-                offset,
-                AArch64RelocationType::Call26.to_raw(),
-            );
+            self.emit_branch_relocation(sym, offset, AArch64RelocationType::Call26.to_raw());
         } else if let Some(rn) = inst.rn {
             // Indirect call via BLR Xn.
             let blr_word: u32 = 0xD63F_0000 | ((registers::hw_encoding(rn) as u32) << 5);
@@ -1048,8 +1041,7 @@ fn encode_ldr_unsigned_imm(rd: u8, rn: u8, imm12: u32) -> u32 {
     let hw_rd = registers::hw_encoding(rd) as u32;
     let hw_rn = registers::hw_encoding(rn) as u32;
     // size=11 (64-bit), V=0 (GPR), opc=01 (LDR)
-    (0b11 << 30) | (0b111001 << 24) | (0b01 << 22) | ((imm12 & 0xFFF) << 10)
-        | (hw_rn << 5) | hw_rd
+    (0b11 << 30) | (0b111001 << 24) | (0b01 << 22) | ((imm12 & 0xFFF) << 10) | (hw_rn << 5) | hw_rd
 }
 
 /// Encode an ADD immediate instruction.
@@ -1108,13 +1100,15 @@ fn parse_int_literal(s: &str) -> Result<i64, String> {
     if s.starts_with("0x") || s.starts_with("0X") {
         i64::from_str_radix(&s[2..], 16).map_err(|e| format!("invalid hex literal '{}': {}", s, e))
     } else if s.starts_with('-') {
-        s.parse::<i64>().map_err(|e| format!("invalid integer '{}': {}", s, e))
+        s.parse::<i64>()
+            .map_err(|e| format!("invalid integer '{}': {}", s, e))
     } else {
         // Try unsigned first to handle large values, then fall back to signed.
         if let Ok(v) = s.parse::<u64>() {
             Ok(v as i64)
         } else {
-            s.parse::<i64>().map_err(|e| format!("invalid integer '{}': {}", s, e))
+            s.parse::<i64>()
+                .map_err(|e| format!("invalid integer '{}': {}", s, e))
         }
     }
 }
@@ -1226,8 +1220,7 @@ mod tests {
     #[test]
     fn test_bl_generates_call26_relocation() {
         let mut asm = AArch64Assembler::new(false);
-        let inst = A64Instruction::new(A64Opcode::BL)
-            .with_symbol("my_function".to_string());
+        let inst = A64Instruction::new(A64Opcode::BL).with_symbol("my_function".to_string());
         let result = asm.assemble_function(&[inst]).unwrap();
         assert_eq!(result.code_size, 4);
 
@@ -1237,15 +1230,17 @@ mod tests {
             .iter()
             .filter(|r| r.reloc_type == AArch64RelocationType::Call26.to_raw())
             .collect();
-        assert!(!call26_relocs.is_empty(), "expected CALL26 relocation for BL");
+        assert!(
+            !call26_relocs.is_empty(),
+            "expected CALL26 relocation for BL"
+        );
         assert_eq!(call26_relocs[0].symbol, "my_function");
     }
 
     #[test]
     fn test_b_generates_jump26_relocation() {
         let mut asm = AArch64Assembler::new(false);
-        let inst = A64Instruction::new(A64Opcode::B)
-            .with_symbol("target_label".to_string());
+        let inst = A64Instruction::new(A64Opcode::B).with_symbol("target_label".to_string());
         let result = asm.assemble_function(&[inst]).unwrap();
 
         let jump26_relocs: Vec<_> = result
@@ -1253,7 +1248,10 @@ mod tests {
             .iter()
             .filter(|r| r.reloc_type == AArch64RelocationType::Jump26.to_raw())
             .collect();
-        assert!(!jump26_relocs.is_empty(), "expected JUMP26 relocation for B");
+        assert!(
+            !jump26_relocs.is_empty(),
+            "expected JUMP26 relocation for B"
+        );
     }
 
     #[test]
@@ -1279,8 +1277,14 @@ mod tests {
     fn test_assemble_module_records_function_symbols() {
         let mut asm = AArch64Assembler::new(false);
         let funcs = vec![
-            ("func_a".to_string(), vec![A64Instruction::new(A64Opcode::NOP)]),
-            ("func_b".to_string(), vec![A64Instruction::new(A64Opcode::NOP)]),
+            (
+                "func_a".to_string(),
+                vec![A64Instruction::new(A64Opcode::NOP)],
+            ),
+            (
+                "func_b".to_string(),
+                vec![A64Instruction::new(A64Opcode::NOP)],
+            ),
         ];
         let result = asm.assemble_module(&funcs).unwrap();
         assert!(result.symbols.contains_key("func_a"));
@@ -1296,7 +1300,7 @@ mod tests {
         // Define a label, emit NOP, then a BL to that label.
         asm.define_label("loop_start");
         asm.emit_nop(); // offset 0..4
-        // Manually add a CALL26 relocation targeting "loop_start".
+                        // Manually add a CALL26 relocation targeting "loop_start".
         let bl_word: u32 = 0x9400_0000; // BL placeholder
         let bl_offset = asm.current_offset();
         asm.emit_raw_word(bl_word);
@@ -1348,7 +1352,10 @@ mod tests {
         let linker_reloc = asm_reloc.to_linker_relocation();
         assert_eq!(linker_reloc.offset, 100);
         assert_eq!(linker_reloc.symbol_name, "extern_func");
-        assert_eq!(linker_reloc.rel_type, AArch64RelocationType::Call26.to_raw());
+        assert_eq!(
+            linker_reloc.rel_type,
+            AArch64RelocationType::Call26.to_raw()
+        );
     }
 
     #[test]
@@ -1373,8 +1380,7 @@ mod tests {
     #[test]
     fn test_call_pseudo_instruction_direct() {
         let mut asm = AArch64Assembler::new(false);
-        let inst = A64Instruction::new(A64Opcode::CALL)
-            .with_symbol("target_fn".to_string());
+        let inst = A64Instruction::new(A64Opcode::CALL).with_symbol("target_fn".to_string());
         asm.assemble_one(&inst).unwrap();
         assert_eq!(asm.current_offset(), 4);
 
