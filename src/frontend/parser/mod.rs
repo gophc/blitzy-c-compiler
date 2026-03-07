@@ -335,6 +335,18 @@ impl<'src> Parser<'src> {
         }
     }
 
+    /// Check whether the parser's recursion depth is at or above the limit.
+    ///
+    /// This is used by error-recovery paths (e.g., in compound statement
+    /// parsing) to detect when further recursive descent would immediately
+    /// fail and trigger repeated synchronize cycles, which can result in
+    /// algorithmic hangs.  When this returns `true`, the caller should
+    /// bail out of the current parsing context instead of attempting
+    /// further recursion.
+    pub fn is_at_recursion_limit(&self) -> bool {
+        self.recursion_depth >= self.max_recursion_depth
+    }
+
     /// Leave a recursion level, decrementing the depth counter.
     ///
     /// # Panics (debug builds)

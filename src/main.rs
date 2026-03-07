@@ -665,12 +665,16 @@ fn validate_input_files(input_files: &[String]) -> Result<(), String> {
         if !path.exists() {
             return Err(format!("'{}': No such file or directory", input));
         }
-        // Verify the file is actually readable by attempting to read it.
-        // This catches permission errors early. We discard the content since
-        // the preprocessor will re-read it with its own PUA-aware encoding.
-        let _content: io::Result<String> = fs::read_to_string(path);
-        if let Err(ref e) = _content {
-            return Err(format!("'{}': {}", input, e));
+        // Verify the file is actually readable by attempting to open it.
+        // This catches permission errors early without reading the entire
+        // contents (which could hang on special files like /dev/zero).
+        // The preprocessor will re-read the file with its own PUA-aware
+        // encoding, which enforces a maximum file size limit.
+        match fs::File::open(path) {
+            Ok(_) => {} // File is readable — discard the handle.
+            Err(e) => {
+                return Err(format!("'{}': {}", input, e));
+            }
         }
     }
     Ok(())

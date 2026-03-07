@@ -307,6 +307,32 @@ pub fn parse_compound_statement(parser: &mut Parser<'_>) -> Result<CompoundState
         // Record the span before this block item for error recovery context.
         let _item_start = parser.current_span();
 
+        // Safety net: if the parser's recursion depth is at or near the
+        // limit, do not attempt to parse more block items in error recovery —
+        // doing so could trigger repeated enter_recursion failures with
+        // synchronize cycles, resulting in an O(n²) or worse hang.  Instead,
+        // skip remaining tokens until we find our closing brace.
+        if parser.is_at_recursion_limit() {
+            // Drain tokens until the matching closing brace (or EOF).
+            let mut brace_depth: u32 = 1; // We already consumed our opening brace.
+            while !parser.current.is_eof() {
+                if parser.check(&TokenKind::LeftBrace) {
+                    brace_depth = brace_depth.saturating_add(1);
+                    parser.advance();
+                } else if parser.check(&TokenKind::RightBrace) {
+                    brace_depth = brace_depth.saturating_sub(1);
+                    if brace_depth == 0 {
+                        break; // Found our matching brace — let the closing-brace
+                               // handler below consume it.
+                    }
+                    parser.advance();
+                } else {
+                    parser.advance();
+                }
+            }
+            break;
+        }
+
         // Disambiguate: declaration or statement?
         //
         // GCC extension tokens (detected by is_gcc_extension_start) may

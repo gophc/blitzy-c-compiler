@@ -826,6 +826,20 @@ impl<'a> SemanticAnalyzer<'a> {
     /// Handles all C11 statement types plus GCC extensions (computed gotos,
     /// case ranges, local labels, inline assembly).
     pub fn analyze_statement(&mut self, stmt: &mut Statement) -> Result<(), ()> {
+        // Enforce recursion depth limit for deeply nested statements.
+        // This mirrors the depth tracking in `analyze_expression()` and
+        // prevents resource exhaustion on adversarial inputs with hundreds
+        // of nested control-flow constructs (e.g., 260+ nested `if`
+        // statements).
+        self.check_recursion_depth(Span::dummy())?;
+        let result = self.analyze_statement_inner(stmt);
+        self.decrement_recursion_depth();
+        result
+    }
+
+    /// Inner implementation of statement analysis, called after the
+    /// recursion depth check in `analyze_statement()`.
+    fn analyze_statement_inner(&mut self, stmt: &mut Statement) -> Result<(), ()> {
         match stmt {
             Statement::Compound(compound) => {
                 self.scopes.push_scope(ScopeKind::Block);

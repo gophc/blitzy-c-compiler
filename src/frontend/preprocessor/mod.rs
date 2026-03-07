@@ -798,8 +798,19 @@ pub struct Preprocessor<'a> {
     pub system_include_paths: Vec<PathBuf>,
     /// Command-line `-D` defines: `(name, value)` pairs.
     pub cli_defines: Vec<(String, String)>,
-    /// Current include nesting depth for circular-include detection.
+    /// Current include nesting depth for depth-limit enforcement.
     pub include_depth: usize,
+    /// Maximum include nesting depth (default: 200, matching GCC).
+    /// Exceeding this limit produces a clean diagnostic error rather than
+    /// a stack overflow, protecting against deeply-chained or circular
+    /// `#include` directives.
+    pub max_include_depth: usize,
+    /// Stack of file paths currently being processed, from outermost to
+    /// innermost.  Used for circular `#include` detection — if a file
+    /// appears in this stack when an `#include` directive tries to include
+    /// it again, the preprocessor emits an error instead of infinitely
+    /// recursing.
+    include_stack: Vec<PathBuf>,
     /// Maximum recursion depth for macro expansion (default: 512).
     pub max_recursion_depth: usize,
     /// Stack of conditional compilation states for nested `#if`/`#endif` blocks.
@@ -834,6 +845,8 @@ impl<'a> Preprocessor<'a> {
             system_include_paths: Vec::new(),
             cli_defines: Vec::new(),
             include_depth: 0,
+            max_include_depth: 200,
+            include_stack: Vec::new(),
             max_recursion_depth: 512,
             conditional_stack: Vec::new(),
         }
@@ -919,6 +932,12 @@ impl<'a> Preprocessor<'a> {
             }
         };
 
+        // Push the initial source file onto the include stack so that
+        // circular detection works when an included file tries to
+        // re-include the original source.
+        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        self.include_stack.push(canonical);
+
         // Step 2: Register the file in the source map.
         let file_id = self
             .source_map
@@ -933,6 +952,9 @@ impl<'a> Preprocessor<'a> {
 
         // Step 5: Process directives and expand macros (Phase 2).
         let expanded = self.process_tokens(&tokens);
+
+        // Pop the initial source file from the include stack.
+        self.include_stack.pop();
 
         // Step 6: Check for unterminated conditional blocks.
         if let Some(cond) = self.conditional_stack.last() {
@@ -1459,8 +1481,23 @@ impl<'a> Preprocessor<'a> {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| std::path::PathBuf::from("."));
 
-        // Build search paths for file resolution.
-        let mut handler = include_handler::IncludeHandler::new(
+        // Enforce include depth limit before recursing.  This check uses
+        // the persistent `include_depth` counter on `self`, which is
+        // incremented for every nested `#include` and decremented when the
+        // included file finishes processing.
+        if self.include_depth >= self.max_include_depth {
+            self.diagnostics.emit_error(
+                directive_span,
+                format!(
+                    "#include nested too deeply ({} levels, maximum is {})",
+                    self.include_depth, self.max_include_depth
+                ),
+            );
+            return Err(());
+        }
+
+        // Build a temporary handler for file resolution and guard checks.
+        let handler = include_handler::IncludeHandler::new(
             self.include_paths.clone(),
             self.system_include_paths.clone(),
         );
@@ -1481,23 +1518,30 @@ impl<'a> Preprocessor<'a> {
             return Ok(Vec::new());
         }
 
-        // Check for circular includes and depth limit.
-        if let Err(inc_err) = handler.push_include(&resolved_path) {
-            let msg = match inc_err {
-                include_handler::IncludeError::Circular(_) => {
-                    format!("circular #include of '{}'", resolved_path.display())
-                }
-                include_handler::IncludeError::TooDeep(d) => {
-                    format!("#include nested too deeply (depth {})", d)
-                }
-                include_handler::IncludeError::NotFound(ref n) => {
-                    format!("'{}' file not found", n)
-                }
-                include_handler::IncludeError::IoError(ref e) => {
-                    format!("cannot open '{}': {}", resolved_path.display(), e)
-                }
-            };
-            self.diagnostics.emit_error(directive_span, msg);
+        // Canonicalize the resolved path for reliable circular detection.
+        let canonical_path =
+            std::fs::canonicalize(&resolved_path).unwrap_or_else(|_| resolved_path.clone());
+
+        // Circular include detection: check if this file is already being
+        // processed in the current include chain.  This uses the persistent
+        // `include_stack` on `self` (not a per-call handler) so that the
+        // stack survives across recursive `process_include` calls.
+        if self.include_stack.contains(&canonical_path) {
+            // Build a human-readable chain for the diagnostic.
+            let chain: Vec<String> = self
+                .include_stack
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect();
+            let chain_str = chain.join(" → ");
+            self.diagnostics.emit_error(
+                directive_span,
+                format!(
+                    "circular #include detected: {} → {}",
+                    chain_str,
+                    canonical_path.display()
+                ),
+            );
             return Err(());
         }
 
@@ -1505,7 +1549,6 @@ impl<'a> Preprocessor<'a> {
         let source_content = match crate::common::encoding::read_source_file(&resolved_path) {
             Ok(content) => content,
             Err(e) => {
-                handler.pop_include();
                 self.diagnostics.emit_error(
                     directive_span,
                     format!("cannot read '{}': {}", resolved_path.display(), e),
@@ -1526,12 +1569,13 @@ impl<'a> Preprocessor<'a> {
         // Tokenize the included source.
         let included_tokens = tokenize_preprocessing(&processed, file_id);
 
-        // Recursively preprocess the included file's tokens.
+        // Push file onto the persistent include stack for circular detection
+        // and increment depth counter, then recursively preprocess.
+        self.include_stack.push(canonical_path.clone());
         self.include_depth += 1;
         let result = self.process_tokens(&included_tokens);
         self.include_depth -= 1;
-
-        handler.pop_include();
+        self.include_stack.pop();
 
         // Filter out the EOF token from included output to avoid premature
         // termination of the parent file's token stream.

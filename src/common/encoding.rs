@@ -50,11 +50,20 @@
 
 use std::fs;
 use std::io;
+use std::io::Read;
 use std::path::Path;
 
 // ---------------------------------------------------------------------------
 // Constants — PUA range boundaries
 // ---------------------------------------------------------------------------
+
+/// Maximum source file size: 256 MiB.
+///
+/// This limit prevents the compiler from hanging when presented with
+/// infinite or extremely large input streams (e.g., `/dev/zero`).
+/// Legitimate C source files, including the largest Linux kernel files,
+/// are well below this limit.
+const MAX_SOURCE_FILE_SIZE: u64 = 256 * 1024 * 1024;
 
 /// Base offset for PUA encoding. Adding a byte value (0x80–0xFF) to this
 /// base produces the corresponding PUA code point (U+E080–U+E0FF).
@@ -194,7 +203,42 @@ pub fn is_pua_encoded(ch: char) -> bool {
 /// // `source` is a valid Rust String — safe for all str operations
 /// ```
 pub fn read_source_file(path: &Path) -> io::Result<String> {
-    let raw_bytes = fs::read(path)?;
+    // Attempt to determine file size from metadata. For regular files this
+    // gives an exact size; for special files (e.g., /dev/zero) the metadata
+    // may report size 0 or be unavailable, so we also enforce a read limit.
+    if let Ok(metadata) = fs::metadata(path) {
+        let file_size = metadata.len();
+        if file_size > MAX_SOURCE_FILE_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "source file exceeds maximum size of {} bytes ({} bytes)",
+                    MAX_SOURCE_FILE_SIZE, file_size
+                ),
+            ));
+        }
+    }
+
+    // Open the file and read with a hard size limit to protect against
+    // infinite streams (e.g., /dev/zero) where metadata reports size 0.
+    let mut file = fs::File::open(path)?;
+    let mut raw_bytes = Vec::new();
+    // Read at most MAX_SOURCE_FILE_SIZE + 1 bytes. If we read more than
+    // MAX_SOURCE_FILE_SIZE, the file exceeds our limit.
+    let bytes_read = file
+        .take(MAX_SOURCE_FILE_SIZE + 1)
+        .read_to_end(&mut raw_bytes)?;
+
+    if bytes_read as u64 > MAX_SOURCE_FILE_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "source file exceeds maximum size of {} bytes",
+                MAX_SOURCE_FILE_SIZE
+            ),
+        ));
+    }
+
     Ok(encode_bytes_to_string(&raw_bytes))
 }
 
