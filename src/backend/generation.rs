@@ -439,6 +439,14 @@ fn generate_for_arch<A: ArchCodegen>(
         // Update MachineFunction with allocation results.
         apply_allocation_result(&mut mf, &alloc_result);
 
+        // Resolve call-argument register move conflicts.
+        // After register allocation, argument setup moves like
+        //   MOV RSI, <vreg_x>  ; MOV RDX, <vreg_y>
+        // may conflict when vreg_y was allocated to RSI (clobbered
+        // by the first MOV before the second reads it).  This pass
+        // detects and fixes such conflicts using R11 as scratch.
+        resolve_call_arg_conflicts(&mut mf);
+
         // Step 3: Insert prologue and epilogue instructions.
         let prologue = arch.emit_prologue(&mf);
         let epilogue = arch.emit_epilogue(&mf);
@@ -744,6 +752,17 @@ fn insert_spill_code_from_result(mf: &mut MachineFunction, alloc: &AllocationRes
 /// Replaces `VirtualRegister` operands with physical `Register` operands
 /// based on the allocation mapping.  Updates the function's callee-saved
 /// register list with registers that were actually used.
+///
+/// For **spilled** virtual registers (those assigned a stack slot instead
+/// of a physical register), this function inserts machine-level spill
+/// loads and stores:
+/// - **Before each USE** of a spilled vreg: inserts `MOV scratch, [RBP-offset]`
+///   and replaces the operand with the scratch register.
+/// - **After each DEF** of a spilled vreg: replaces the result with a scratch
+///   register and inserts `MOV [RBP-offset], scratch`.
+///
+/// The scratch register is chosen dynamically from caller-saved registers
+/// that are not otherwise used by the current instruction.
 fn apply_allocation_result(mf: &mut MachineFunction, alloc: &AllocationResult) {
     // Record callee-saved registers used by this function.
     mf.callee_saved_regs = alloc.callee_saved_used.iter().map(|pr| pr.0).collect();
@@ -752,7 +771,6 @@ fn apply_allocation_result(mf: &mut MachineFunction, alloc: &AllocationResult) {
     mf.frame_size = mf.frame_size.max(alloc.frame_size);
 
     // Build a complete vreg → physical register lookup table upfront.
-    // This avoids borrow conflicts between vreg_to_ir_value and blocks.
     let mut vreg_phys: crate::common::fx_hash::FxHashMap<u32, u16> =
         crate::common::fx_hash::FxHashMap::default();
     for (&vreg, ir_val) in &mf.vreg_to_ir_value {
@@ -760,33 +778,311 @@ fn apply_allocation_result(mf: &mut MachineFunction, alloc: &AllocationResult) {
             vreg_phys.insert(vreg, phys.0);
         }
     }
-    // Also populate from direct Value(vreg) interpretation for backends
-    // that don't populate vreg_to_ir_value (fallback).
     for (val, phys) in &alloc.assignments {
         let vreg = val.index();
         vreg_phys.entry(vreg).or_insert(phys.0);
     }
 
-    // Replace virtual registers with physical registers in all instructions.
+    // Build spilled vreg → frame offset mapping.
+    // Spill slots live below the regular frame (more negative offsets from RBP).
+    let base_offset = mf.frame_size;
+    let mut vreg_spill_offset: crate::common::fx_hash::FxHashMap<u32, i64> =
+        crate::common::fx_hash::FxHashMap::default();
+
+    for (&vreg, ir_val) in &mf.vreg_to_ir_value {
+        if let Some(&slot_idx) = alloc.spill_map.get(ir_val) {
+            let offset = -((base_offset as i64) + 8 * (slot_idx as i64 + 1));
+            vreg_spill_offset.insert(vreg, offset);
+        }
+    }
+    for (val, &slot_idx) in &alloc.spill_map {
+        let vreg = val.index() as u32;
+        let offset = -((base_offset as i64) + 8 * (slot_idx as i64 + 1));
+        vreg_spill_offset.entry(vreg).or_insert(offset);
+    }
+
+    // Expand frame size to include spill area.
+    if !vreg_spill_offset.is_empty() {
+        let spill_area = alloc.spill_slots.len() * 8;
+        mf.frame_size += spill_area;
+    }
+
+    // Architecture-specific constants for x86-64.
+    const RBP_REG: u16 = 5;
+    // X86Opcode::Mov is the first enum variant = 0.
+    const MOV_OPCODE: u32 = 0;
+    // R11 is RESERVED from the allocation pool specifically for spill
+    // load/store operations.  It is never assigned to any live interval,
+    // so it can always be used as a scratch register without clobbering
+    // any allocated value.
+    const SPILL_SCRATCH: u16 = 11; // R11
+
+    // Helper: make a MOV load instruction: MOV scratch, [RBP + offset]
+    fn make_spill_load(scratch: u16, offset: i64) -> MachineInstruction {
+        let mut inst = MachineInstruction::new(MOV_OPCODE);
+        inst.operands.push(MachineOperand::Register(scratch));
+        inst.operands.push(MachineOperand::Memory {
+            base: Some(RBP_REG),
+            index: None,
+            scale: 1,
+            displacement: offset,
+        });
+        inst
+    }
+
+    // Helper: make a MOV store instruction: MOV [RBP + offset], scratch
+    fn make_spill_store(scratch: u16, offset: i64) -> MachineInstruction {
+        let mut inst = MachineInstruction::new(MOV_OPCODE);
+        inst.operands.push(MachineOperand::Memory {
+            base: Some(RBP_REG),
+            index: None,
+            scale: 1,
+            displacement: offset,
+        });
+        inst.operands.push(MachineOperand::Register(scratch));
+        inst
+    }
+
+    // Process each block: replace VRs with physical registers or insert spill code.
+    //
+    // ## Critical x86 Spill Strategy
+    //
+    // x86 ALU instructions are **destructive**: `ADD dst, src` computes
+    // `dst = dst + src`.  The BCC codegen emits these as:
+    //
+    //   result = Some(dst_vreg), operands = [src_vreg]
+    //
+    // The encoder prepends `result` into operands[0], yielding `[dst, src]`.
+    // The destination register is therefore BOTH a source (implicit read)
+    // and a target (write).
+    //
+    // When the result vreg is spilled we must:
+    //   1. LOAD  R11 ← [RBP + result_offset]   (get the old value — implicit source)
+    //   2. Instruction: e.g. ADD R11, <src>      (R11 = old + src)
+    //   3. STORE [RBP + result_offset] ← R11    (save new value)
+    //
+    // Because R11 is occupied by the result, any spilled *explicit operand*
+    // must use a **Memory** operand so there is no scratch-register conflict.
+    //
+    // When the result is NOT spilled (or absent), R11 is free and can be
+    // used for the first spilled explicit operand.
+
     for block in &mut mf.blocks {
-        for inst in &mut block.instructions {
-            // Replace operands.
-            for operand in &mut inst.operands {
-                if let MachineOperand::VirtualRegister(vreg) = *operand {
-                    if let Some(&phys_reg) = vreg_phys.get(&vreg) {
-                        *operand = MachineOperand::Register(phys_reg);
+        let old_insts = std::mem::take(&mut block.instructions);
+        let mut new_insts: Vec<MachineInstruction> =
+            Vec::with_capacity(old_insts.len() + old_insts.len() / 2);
+
+        for mut inst in old_insts {
+            // ----------------------------------------------------------
+            // Step 1: Determine if the result is spilled.
+            // ----------------------------------------------------------
+            let result_spill_offset: Option<i64> = inst.result.as_ref().and_then(|r| {
+                if let MachineOperand::VirtualRegister(vreg) = r {
+                    vreg_spill_offset.get(vreg).copied()
+                } else {
+                    None
+                }
+            });
+
+            // ----------------------------------------------------------
+            // Step 2: Insert a load for the spilled result BEFORE the
+            //         instruction so that R11 holds the old value.
+            // ----------------------------------------------------------
+            if let Some(offset) = result_spill_offset {
+                new_insts.push(make_spill_load(SPILL_SCRATCH, offset));
+            }
+
+            // ----------------------------------------------------------
+            // Step 3: Resolve explicit operands.
+            //
+            // If the result is spilled (R11 is occupied):
+            //   → ALL spilled operands become Memory operands.
+            // If the result is NOT spilled:
+            //   → The FIRST spilled operand loads into R11;
+            //     additional spilled operands become Memory operands.
+            // ----------------------------------------------------------
+            let r11_reserved_for_result = result_spill_offset.is_some();
+            let mut scratch_used_for_operand = false;
+
+            for i in 0..inst.operands.len() {
+                if let MachineOperand::VirtualRegister(vreg) = inst.operands[i] {
+                    if let Some(&offset) = vreg_spill_offset.get(&vreg) {
+                        if !r11_reserved_for_result && !scratch_used_for_operand {
+                            // R11 is free — use it for the first spilled operand.
+                            new_insts.push(make_spill_load(SPILL_SCRATCH, offset));
+                            inst.operands[i] = MachineOperand::Register(SPILL_SCRATCH);
+                            scratch_used_for_operand = true;
+                        } else {
+                            // R11 is occupied (by result or a prior operand) —
+                            // encode as a memory reference.
+                            inst.operands[i] = MachineOperand::Memory {
+                                base: Some(RBP_REG),
+                                index: None,
+                                scale: 1,
+                                displacement: offset,
+                            };
+                        }
+                    } else if let Some(&phys) = vreg_phys.get(&vreg) {
+                        inst.operands[i] = MachineOperand::Register(phys);
                     }
                 }
             }
-            // Replace result operand.
+
+            // ----------------------------------------------------------
+            // Step 4: Resolve the result operand.
+            // ----------------------------------------------------------
+            let mut store_after: Option<i64> = None;
             if let Some(ref mut result) = inst.result {
                 if let MachineOperand::VirtualRegister(vreg) = *result {
-                    if let Some(&phys_reg) = vreg_phys.get(&vreg) {
-                        *result = MachineOperand::Register(phys_reg);
+                    if let Some(&offset) = vreg_spill_offset.get(&vreg) {
+                        *result = MachineOperand::Register(SPILL_SCRATCH);
+                        store_after = Some(offset);
+                    } else if let Some(&phys) = vreg_phys.get(&vreg) {
+                        *result = MachineOperand::Register(phys);
+                    }
+                }
+            }
+
+            // Push the (possibly rewritten) instruction.
+            new_insts.push(inst);
+
+            // ----------------------------------------------------------
+            // Step 5: Insert a store for the spilled result AFTER the
+            //         instruction.
+            // ----------------------------------------------------------
+            if let Some(offset) = store_after {
+                new_insts.push(make_spill_store(SPILL_SCRATCH, offset));
+            }
+        }
+
+        block.instructions = new_insts;
+    }
+}
+
+// ===========================================================================
+// resolve_call_arg_conflicts — fix register clobbering in call setup
+// ===========================================================================
+
+/// After register allocation, call-argument setup sequences like:
+///
+/// ```text
+///   MOV RSI, RAX      ; arg 1 ← x
+///   MOV RDX, RSI      ; arg 2 ← y   (BUG: RSI now holds x, not y!)
+///   CALL printf
+/// ```
+///
+/// may contain conflicts when the source register of a later MOV was
+/// overwritten by an earlier MOV in the same sequence.  This pass scans
+/// for such conflicts and inserts R11-based saves/restores to break them.
+///
+/// Algorithm:
+/// 1. Walk backwards from every CALL instruction to collect the
+///    immediately-preceding argument MOV sequence (MOVs whose result is a
+///    physical register in the argument-register set).
+/// 2. For each sequence, build (dst_reg → src_reg) mapping.
+/// 3. If any source register equals a destination of an earlier MOV in
+///    the sequence, save the conflicted value to R11 before it is
+///    overwritten and fix the later MOV to read from R11.
+fn resolve_call_arg_conflicts(mf: &mut MachineFunction) {
+    use crate::backend::x86_64::registers;
+
+    // Set of integer argument registers (targets of call-argument MOVs).
+    let arg_regs: crate::common::fx_hash::FxHashSet<u16> =
+        registers::ARG_GPRS.iter().copied().collect();
+    // Also include SSE argument registers.
+    let sse_arg_regs: crate::common::fx_hash::FxHashSet<u16> =
+        registers::ARG_SSE.iter().copied().collect();
+
+    const MOV_OPCODE: u32 = 0; // X86Opcode::Mov
+    const SPILL_SCRATCH: u16 = 11; // R11
+
+    for block in &mut mf.blocks {
+        let mut new_insts: Vec<MachineInstruction> =
+            Vec::with_capacity(block.instructions.len() + 8);
+        let insts = std::mem::take(&mut block.instructions);
+
+        for inst in &insts {
+            new_insts.push(inst.clone());
+
+            // After pushing a CALL instruction, walk backwards in
+            // new_insts to find the argument-setup MOV sequence that
+            // precedes it and fix any register conflicts.
+            if !inst.is_call {
+                continue;
+            }
+
+            // The CALL is at the end of new_insts.  Walk backwards to
+            // find consecutive MOVs whose result is an argument register.
+            let call_pos = new_insts.len() - 1;
+            let mut seq_start = call_pos;
+            while seq_start > 0 {
+                let prev = seq_start - 1;
+                let prev_inst = &new_insts[prev];
+                if prev_inst.opcode != MOV_OPCODE {
+                    break;
+                }
+                let is_arg_mov = match &prev_inst.result {
+                    Some(MachineOperand::Register(r)) => {
+                        arg_regs.contains(r) || sse_arg_regs.contains(r)
+                    }
+                    _ => false,
+                };
+                if !is_arg_mov {
+                    break;
+                }
+                seq_start = prev;
+            }
+
+            if seq_start == call_pos {
+                // No argument-setup sequence — nothing to fix.
+                continue;
+            }
+
+            // Detect conflicts: scan left-to-right through the
+            // arg-setup MOVs.  Track which registers have been written.
+            // If any MOV reads a register that was already overwritten,
+            // record the first conflicted register.
+            let mut saved_reg: Option<u16> = None;
+            let mut written_so_far: crate::common::fx_hash::FxHashSet<u16> =
+                crate::common::fx_hash::FxHashSet::default();
+
+            for idx in seq_start..call_pos {
+                for op in &new_insts[idx].operands {
+                    if let MachineOperand::Register(src) = op {
+                        if written_so_far.contains(src) && saved_reg.is_none() {
+                            saved_reg = Some(*src);
+                        }
+                    }
+                }
+                if let Some(MachineOperand::Register(dst)) = &new_insts[idx].result {
+                    written_so_far.insert(*dst);
+                }
+            }
+
+            if let Some(conflict_reg) = saved_reg {
+                // Fix: insert `MOV R11, conflict_reg` at seq_start,
+                // and replace all later reads of conflict_reg with R11.
+                let mut save = MachineInstruction::new(MOV_OPCODE);
+                save.result = Some(MachineOperand::Register(SPILL_SCRATCH));
+                save.operands
+                    .push(MachineOperand::Register(conflict_reg));
+                new_insts.insert(seq_start, save);
+
+                // The sequence shifted right by 1; update indices.
+                let call_pos_new = call_pos + 1;
+                for idx in (seq_start + 1)..call_pos_new {
+                    for op in &mut new_insts[idx].operands {
+                        if let MachineOperand::Register(r) = op {
+                            if *r == conflict_reg {
+                                *r = SPILL_SCRATCH;
+                            }
+                        }
                     }
                 }
             }
         }
+
+        block.instructions = new_insts;
     }
 }
 

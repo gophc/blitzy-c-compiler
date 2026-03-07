@@ -1097,6 +1097,8 @@ mod tests {
             local_count: 0,
             value_count: 0,
             is_definition: is_def,
+            constant_values: crate::common::fx_hash::FxHashMap::default(),
+            float_constant_values: crate::common::fx_hash::FxHashMap::default(),
         }
     }
 

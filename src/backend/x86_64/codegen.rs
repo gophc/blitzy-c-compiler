@@ -166,15 +166,25 @@ pub enum X86Opcode {
     /// `RET`
     Ret,
 
-    /// `LoadInd dst, ptr` — Load from memory at address in ptr register.
-    /// Encoded as `MOV dst, [ptr]`. Ptr operand is a plain register;
-    /// the encoder wraps it in a memory access.
+    /// `LoadInd dst, ptr` — Load 64-bit from memory at address in ptr register.
+    /// Encoded as `MOV r64, [ptr]`.
     LoadInd,
+    /// `LoadInd32 dst, ptr` — Load 32-bit from `[ptr]`, zero-extends to 64-bit.
+    LoadInd32,
+    /// `LoadInd16 dst, ptr` — Load 16-bit from `[ptr]`, zero-extends to 64-bit.
+    LoadInd16,
+    /// `LoadInd8 dst, ptr` — Load 8-bit from `[ptr]`, zero-extends to 64-bit.
+    LoadInd8,
 
-    /// `StoreInd ptr, src` — Store src to memory at address in ptr register.
-    /// Encoded as `MOV [ptr], src`. Ptr operand is a plain register;
-    /// the encoder wraps it in a memory access.
+    /// `StoreInd ptr, src` — Store 64-bit src to memory at address in ptr register.
+    /// Encoded as `MOV [ptr], src`.
     StoreInd,
+    /// `StoreInd32 ptr, src` — Store low 32-bit of src to `[ptr]`.
+    StoreInd32,
+    /// `StoreInd16 ptr, src` — Store low 16-bit of src to `[ptr]`.
+    StoreInd16,
+    /// `StoreInd8 ptr, src` — Store low 8-bit of src to `[ptr]`.
+    StoreInd8,
     /// `NOP`
     Nop,
 
@@ -310,7 +320,13 @@ impl X86Opcode {
             X86Opcode::Call,
             X86Opcode::Ret,
             X86Opcode::LoadInd,
+            X86Opcode::LoadInd32,
+            X86Opcode::LoadInd16,
+            X86Opcode::LoadInd8,
             X86Opcode::StoreInd,
+            X86Opcode::StoreInd32,
+            X86Opcode::StoreInd16,
+            X86Opcode::StoreInd8,
             X86Opcode::Nop,
             X86Opcode::Movsd,
             X86Opcode::Movss,
@@ -442,6 +458,10 @@ pub struct X86_64CodeGen {
     /// constant-sentinel pattern (`BinOp(Add, result, UNDEF)`).
     /// Populated by a pre-scan pass during `lower_function`.
     constant_cache: FxHashMap<Value, i64>,
+    /// Cache of compile-time float constants resolved from the IR
+    /// constant-sentinel pattern, mapping Value to the `.Lconst.f.*`
+    /// global name for RIP-relative SSE loads.
+    float_constant_cache: FxHashMap<Value, String>,
     /// Accumulator mapping every allocated vreg to its IR Value.
     /// Unlike `value_map` (which stores only the *latest* operand per Value
     /// and loses earlier vregs when a Value is redefined in a later block,
@@ -479,6 +499,7 @@ impl X86_64CodeGen {
             block_map: FxHashMap::default(),
             frame: None,
             constant_cache: FxHashMap::default(),
+            float_constant_cache: FxHashMap::default(),
             vreg_ir_map: FxHashMap::default(),
             func_ref_names: FxHashMap::default(),
             global_var_refs: FxHashMap::default(),
@@ -511,8 +532,46 @@ impl X86_64CodeGen {
         globals: &[crate::ir::module::GlobalVariable],
     ) {
         self.constant_cache.clear();
+        self.float_constant_cache.clear();
 
-        // Collect Values defined by instructions in this function.
+        // ---------------------------------------------------------------
+        // Strategy: use the DIRECT Value→constant mappings recorded during
+        // IR lowering on `IrFunction`.  This avoids the fragile positional
+        // matching between orphaned Values and global `.Lconst.*` entries
+        // that breaks when optimisation passes remove some sentinels.
+        // ---------------------------------------------------------------
+
+        // 1. Populate integer constants from the authoritative map on
+        //    the function (recorded at emit_int_const time).
+        for (&val, &imm) in &func.constant_values {
+            self.constant_cache.insert(val, imm);
+        }
+
+        // 2. Populate float constants from the authoritative map.
+        for (&val, (name, _fval)) in &func.float_constant_values {
+            self.float_constant_cache.insert(val, name.clone());
+        }
+
+        // 3. Fallback: if the direct maps are empty (e.g. functions
+        //    built without the new IR lowering), fall back to the
+        //    legacy positional-matching approach.
+        if func.constant_values.is_empty() && func.float_constant_values.is_empty() {
+            self.populate_constant_cache_legacy(func, globals);
+        }
+    }
+
+    /// Legacy constant cache population using positional matching.
+    ///
+    /// Used only when `IrFunction::constant_values` is empty (for
+    /// backwards compatibility with functions not built by the new
+    /// IR lowering that records direct mappings).
+    fn populate_constant_cache_legacy(
+        &mut self,
+        func: &IrFunction,
+        globals: &[crate::ir::module::GlobalVariable],
+    ) {
+        // Collect all constant Values: both surviving sentinels
+        // and orphaned (sentinel-removed) references.
         let mut defined = std::collections::HashSet::new();
         for param in &func.params {
             if param.value != Value::UNDEF {
@@ -529,7 +588,6 @@ impl X86_64CodeGen {
             }
         }
 
-        // Collect all Values referenced as operands.
         let mut referenced = std::collections::HashSet::new();
         for block in func.blocks() {
             for inst in block.instructions() {
@@ -541,25 +599,72 @@ impl X86_64CodeGen {
             }
         }
 
-        // Orphaned values: referenced but not defined (their sentinel
-        // BinOp was removed by optimisation passes).
-        // IMPORTANT: exclude function-reference values and global-variable-
-        // reference values — they are NOT integer constants and must not
-        // consume entries from the constant pool.
         let func_ref_indices: crate::common::fx_hash::FxHashSet<u32> =
             self.func_ref_names.keys().map(|v| v.index()).collect();
         let global_ref_indices: crate::common::fx_hash::FxHashSet<u32> =
             self.global_var_refs.keys().map(|v| v.index()).collect();
-        let mut orphans: Vec<u32> = referenced
+
+        // Collect orphaned values (referenced but not defined).
+        let orphans: std::collections::HashSet<u32> = referenced
             .difference(&defined)
             .copied()
             .filter(|idx| !func_ref_indices.contains(idx) && !global_ref_indices.contains(idx))
             .collect();
-        orphans.sort();
 
-        // Collect integer constants from globals, sorted by their
-        // creation-order index suffix.
+        // Collect surviving integer sentinel values.
+        let mut int_sentinels: Vec<u32> = Vec::new();
+        let mut float_sentinels: Vec<u32> = Vec::new();
+        for block in func.blocks() {
+            for inst in block.instructions() {
+                if let Instruction::BinOp {
+                    result, op, lhs, rhs, ty, ..
+                } = inst
+                {
+                    let is_sentinel = (*op == BinOp::Add || *op == BinOp::FAdd)
+                        && *rhs == Value::UNDEF
+                        && *lhs == *result;
+                    if is_sentinel {
+                        if *op == BinOp::FAdd
+                            || matches!(ty, IrType::F32 | IrType::F64 | IrType::F80)
+                        {
+                            float_sentinels.push(result.index());
+                        } else {
+                            int_sentinels.push(result.index());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Integer orphans: orphaned values that are NOT float sentinels.
+        let float_sentinel_set: std::collections::HashSet<u32> =
+            float_sentinels.iter().copied().collect();
+        let int_sentinel_set: std::collections::HashSet<u32> =
+            int_sentinels.iter().copied().collect();
+
+        // All integer constant values = orphans (non-float) + surviving int sentinels.
+        let mut all_int_const_vals: Vec<u32> = orphans
+            .iter()
+            .copied()
+            .filter(|v| !float_sentinel_set.contains(v))
+            .collect();
+        all_int_const_vals.extend(int_sentinels.iter());
+        all_int_const_vals.sort();
+        all_int_const_vals.dedup();
+
+        // All float constant values = float orphans + surviving float sentinels.
+        let mut all_float_const_vals: Vec<u32> = orphans
+            .iter()
+            .copied()
+            .filter(|v| !int_sentinel_set.contains(v) && !all_int_const_vals.contains(v))
+            .collect();
+        all_float_const_vals.extend(float_sentinels.iter());
+        all_float_const_vals.sort();
+        all_float_const_vals.dedup();
+
+        // Collect integer constants from globals, sorted by creation index.
         let mut int_consts: Vec<(u32, i64)> = Vec::new();
+        let mut float_consts: Vec<(u32, String)> = Vec::new();
         for gv in globals {
             if let Some(crate::ir::module::Constant::Integer(v)) = gv.initializer.as_ref() {
                 if let Some(idx_str) = gv.name.strip_prefix(".Lconst.i.") {
@@ -568,50 +673,26 @@ impl X86_64CodeGen {
                     }
                 }
             }
-        }
-        int_consts.sort_by_key(|(idx, _)| *idx);
-
-        // Pair orphaned values with constants in order.
-        let mut used_const_indices: crate::common::fx_hash::FxHashSet<usize> =
-            crate::common::fx_hash::FxHashSet::default();
-        for (pair_idx, (orphan, (_idx, value))) in orphans.iter().zip(int_consts.iter()).enumerate()
-        {
-            self.constant_cache.insert(Value(*orphan), *value);
-            used_const_indices.insert(pair_idx);
-        }
-
-        // Collect remaining (unused) constants for surviving sentinels.
-        let remaining_consts: Vec<i64> = int_consts
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| !used_const_indices.contains(i))
-            .map(|(_, (_, val))| *val)
-            .collect();
-
-        // Also cache any surviving sentinel BinOp(Add, result, UNDEF) patterns.
-        // Pair them with remaining constants in instruction order.
-        let mut remaining_idx = 0usize;
-        for block in func.blocks() {
-            for inst in block.instructions() {
-                if let Instruction::BinOp {
-                    result,
-                    op: BinOp::Add,
-                    lhs,
-                    rhs,
-                    ..
-                } = inst
-                {
-                    if *rhs == Value::UNDEF
-                        && *lhs == *result
-                        && !self.constant_cache.contains_key(result)
-                        && remaining_idx < remaining_consts.len()
-                    {
-                        self.constant_cache
-                            .insert(*result, remaining_consts[remaining_idx]);
-                        remaining_idx += 1;
+            if let Some(crate::ir::module::Constant::Float(_)) = gv.initializer.as_ref() {
+                if let Some(idx_str) = gv.name.strip_prefix(".Lconst.f.") {
+                    if let Ok(idx) = idx_str.parse::<u32>() {
+                        float_consts.push((idx, gv.name.clone()));
                     }
                 }
             }
+        }
+        int_consts.sort_by_key(|(idx, _)| *idx);
+        float_consts.sort_by_key(|(idx, _)| *idx);
+
+        // Pair ALL integer constant Values with sorted globals.
+        for (val_idx, (_gidx, gval)) in all_int_const_vals.iter().zip(int_consts.iter()) {
+            self.constant_cache.insert(Value(*val_idx), *gval);
+        }
+
+        // Pair ALL float constant Values with sorted float globals.
+        for (val_idx, (_gidx, gname)) in all_float_const_vals.iter().zip(float_consts.iter()) {
+            self.float_constant_cache
+                .insert(Value(*val_idx), gname.clone());
         }
     }
 
@@ -657,6 +738,12 @@ impl X86_64CodeGen {
         // by optimisation passes.
         if let Some(&imm) = self.constant_cache.get(&val) {
             return MachineOperand::Immediate(imm);
+        }
+        // Check float constant cache — the value may be a floating-point
+        // constant whose sentinel was eliminated.  Return a GlobalSymbol
+        // so the encoder emits a RIP-relative SSE load.
+        if let Some(name) = self.float_constant_cache.get(&val) {
+            return MachineOperand::GlobalSymbol(name.clone());
         }
         // Check global variable reference map — the value may represent
         // the address of a global variable.  Return a GlobalSymbol so
@@ -1001,6 +1088,7 @@ impl X86_64CodeGen {
         self.block_map = FxHashMap::default();
         self.frame = None;
         self.constant_cache = FxHashMap::default();
+        self.float_constant_cache = FxHashMap::default();
 
         // If this is only a declaration (no body), return an empty MachineFunction.
         if !func.is_definition {
@@ -1011,7 +1099,7 @@ impl X86_64CodeGen {
         // constant-sentinel BinOp instructions can be resolved to immediates.
         self.populate_constant_cache(func, globals);
 
-        // 1. Compute frame layout.
+                // 1. Compute frame layout.
         let frame = self.compute_frame_layout(func);
         self.frame = Some(frame);
 
@@ -1259,8 +1347,23 @@ impl X86_64CodeGen {
                     }
                     _ => {
                         // Pointer is in a register (virtual or physical).
-                        // Use LoadInd: the encoder will dereference it.
-                        vec![Self::mk_inst(X86Opcode::LoadInd, Some(dst), &[src])]
+                        // Use size-specific LoadInd to ensure correct memory
+                        // access width: I8 → byte load, I16 → word, I32 → dword,
+                        // I64/Ptr → qword.
+                        let opcode = if ty.is_float() {
+                            match ty {
+                                IrType::F32 => X86Opcode::Movss,
+                                _ => X86Opcode::Movsd,
+                            }
+                        } else {
+                            match ty {
+                                IrType::I1 | IrType::I8 => X86Opcode::LoadInd8,
+                                IrType::I16 => X86Opcode::LoadInd16,
+                                IrType::I32 => X86Opcode::LoadInd32,
+                                _ => X86Opcode::LoadInd,
+                            }
+                        };
+                        vec![Self::mk_inst(opcode, Some(dst), &[src])]
                     }
                 }
             }
@@ -1278,9 +1381,54 @@ impl X86_64CodeGen {
                     MachineOperand::Memory { .. } | MachineOperand::FrameSlot(_) => {
                         vec![Self::mk_inst(X86Opcode::Mov, None, &[dest_ptr, src])]
                     }
+                    MachineOperand::GlobalSymbol(name) => {
+                        // Global variable store: emit RIP-relative store.
+                        // On x86-64, this becomes `mov [rip + sym], src`.
+                        // If src is an immediate, materialise it into a
+                        // register first so the encoder always gets a
+                        // (GlobalSymbol, Register) operand pair.
+                        let mem = MachineOperand::GlobalSymbol(name.clone());
+                        match &src {
+                            MachineOperand::Immediate(_) => {
+                                let tmp = self.new_vreg();
+                                let mov_imm = Self::mk_inst(
+                                    X86Opcode::Mov,
+                                    Some(tmp.clone()),
+                                    &[src],
+                                );
+                                let store = Self::mk_inst(
+                                    X86Opcode::Mov,
+                                    None,
+                                    &[mem, tmp],
+                                );
+                                vec![mov_imm, store]
+                            }
+                            _ => {
+                                vec![Self::mk_inst(X86Opcode::Mov, None, &[mem, src])]
+                            }
+                        }
+                    }
                     _ => {
-                        // Pointer is in a register. Use StoreInd.
-                        vec![Self::mk_inst(X86Opcode::StoreInd, None, &[dest_ptr, src])]
+                        // Pointer is in a register. Use size-specific StoreInd
+                        // to match the value type being stored.
+                        let store_op = if let Some(vty) = self.value_types.get(value) {
+                            if vty.is_float() {
+                                match vty {
+                                    IrType::F32 => X86Opcode::Movss,
+                                    _ => X86Opcode::Movsd,
+                                }
+                            } else {
+                                match vty {
+                                    IrType::I1 | IrType::I8 => X86Opcode::StoreInd8,
+                                    IrType::I16 => X86Opcode::StoreInd16,
+                                    IrType::I32 => X86Opcode::StoreInd32,
+                                    _ => X86Opcode::StoreInd,
+                                }
+                            }
+                        } else {
+                            X86Opcode::StoreInd
+                        };
+                        vec![Self::mk_inst(store_op, None, &[dest_ptr, src])]
                     }
                 }
             }
@@ -1298,12 +1446,27 @@ impl X86_64CodeGen {
             } => {
                 // Recognise the constant-sentinel pattern emitted by
                 // `emit_int_const` / `emit_float_const` in the IR lowering
-                // phase: `result = Add result, Value::UNDEF`.  In this
-                // pattern the actual constant value is stored as a
-                // `Constant::Integer` (or `Constant::Float`) in a matching
-                // global variable.  We resolve it here and produce a simple
-                // MOV-immediate (or SSE load).
+                // phase.  Integer sentinels use `Add result, UNDEF`;
+                // float sentinels use `FAdd result, UNDEF`.
                 if *rhs == Value::UNDEF && *lhs == *result {
+                    // Check float constant cache first — float constants
+                    // must be loaded via RIP-relative movsd/movss from
+                    // the .rodata constant pool.
+                    if let Some(sym_name) = self.float_constant_cache.get(result).cloned() {
+                        let dst = self.new_vreg();
+                        self.set_value(*result, dst.clone());
+                        let mov_op = if matches!(ty, IrType::F32) {
+                            X86Opcode::Movss
+                        } else {
+                            X86Opcode::Movsd
+                        };
+                        return vec![Self::mk_inst(
+                            mov_op,
+                            Some(dst),
+                            &[MachineOperand::GlobalSymbol(sym_name)],
+                        )];
+                    }
+                    // Then check integer constant cache.
                     if let Some(imm) = self.resolve_constant_value(*result, func) {
                         let dst = self.new_vreg();
                         self.set_value(*result, dst.clone());
@@ -1363,6 +1526,18 @@ impl X86_64CodeGen {
                 let cond = self.get_value(*condition);
                 let then_idx = *self.block_map.get(&then_block.index()).unwrap_or(&0);
                 let else_idx = *self.block_map.get(&else_block.index()).unwrap_or(&0);
+
+                // If the condition is a known constant (from constant folding),
+                // emit an unconditional jump instead of TEST + JNE + JMP.
+                // This avoids the encoder seeing TEST Imm, Imm which is
+                // not a valid x86 instruction pattern.
+                if let MachineOperand::Immediate(imm) = &cond {
+                    let target = if *imm != 0 { then_idx } else { else_idx };
+                    return vec![Self::mk_term(
+                        X86Opcode::Jmp,
+                        &[MachineOperand::BlockLabel(target as u32)],
+                    )];
+                }
 
                 let mut out = Vec::new();
                 // test cond, cond
@@ -1618,7 +1793,7 @@ impl X86_64CodeGen {
             }
 
             // ---------------------------------------------------------------
-            // BitCast — reinterpretation, no actual codegen needed
+            // BitCast — reinterpretation / phi-copy
             // ---------------------------------------------------------------
             Instruction::BitCast {
                 result,
@@ -1627,8 +1802,18 @@ impl X86_64CodeGen {
                 ..
             } => {
                 let src = self.get_value(*value);
-                let dst = self.new_vreg();
-                self.set_value(*result, dst.clone());
+                // If this result already has a VR assigned (e.g. from a
+                // phi-copy in a different predecessor block), reuse the
+                // same VR so all predecessor paths write to the same
+                // virtual register and the register allocator assigns a
+                // single physical location.
+                let dst = if let Some(existing) = self.value_map.get(result) {
+                    existing.clone()
+                } else {
+                    let vr = self.new_vreg();
+                    self.set_value(*result, vr.clone());
+                    vr
+                };
                 // Use MOV for same-class, MOVD/MOVQ for int↔float.
                 let opcode = if to_type.is_float() {
                     X86Opcode::Movsd
@@ -2627,7 +2812,13 @@ impl std::fmt::Display for X86Opcode {
             X86Opcode::Lfence => "lfence",
             X86Opcode::InlineAsm => "<inline-asm>",
             X86Opcode::LoadInd => "movq_ind_load",
+            X86Opcode::LoadInd32 => "movl_ind_load",
+            X86Opcode::LoadInd16 => "movw_ind_load",
+            X86Opcode::LoadInd8 => "movb_ind_load",
             X86Opcode::StoreInd => "movq_ind_store",
+            X86Opcode::StoreInd32 => "movl_ind_store",
+            X86Opcode::StoreInd16 => "movw_ind_store",
+            X86Opcode::StoreInd8 => "movb_ind_store",
         };
         f.write_str(name)
     }

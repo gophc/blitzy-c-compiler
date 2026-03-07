@@ -1225,18 +1225,19 @@ mod tests {
     #[test]
     fn test_register_info() {
         let info = x86_64_register_info();
-        assert_eq!(info.allocatable_gpr.len(), 14);
+        assert_eq!(info.allocatable_gpr.len(), 13);
         assert_eq!(info.allocatable_fpr.len(), 16);
         assert_eq!(info.argument_gpr.len(), 6);
         assert_eq!(info.argument_fpr.len(), 8);
         assert_eq!(info.return_gpr.len(), 2);
         assert_eq!(info.return_fpr.len(), 2);
-        assert_eq!(info.reserved.len(), 2);
+        assert_eq!(info.reserved.len(), 3);
         assert!(info.argument_gpr.contains(&registers::RDI));
         assert!(info.argument_fpr.contains(&registers::XMM0));
         assert!(info.return_gpr.contains(&registers::RAX));
         assert!(info.reserved.contains(&registers::RSP));
         assert!(info.reserved.contains(&registers::RBP));
+        assert!(info.reserved.contains(&registers::R11));
     }
 
     #[test]

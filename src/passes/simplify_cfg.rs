@@ -639,6 +639,69 @@ fn eliminate_empty_blocks(func: &mut IrFunction) -> bool {
                 })
                 .collect();
 
+            // Safety check: do NOT eliminate E if doing so would create
+            // conflicting phi entries from the same predecessor in T.
+            //
+            // When both arms of a conditional branch are trivial (just
+            // unconditional branches to the same merge block), eliminating
+            // both would place two phi copies with DIFFERENT values in the
+            // same predecessor block.  The second copy would overwrite the
+            // first, destroying the conditional semantics.
+            //
+            // Example: block0 → block1(then) → block3(merge), block0 → block2(else) → block3
+            //   phi in block3: m = phi(a from block1, b from block2)
+            //   After eliminating block1: m = phi(a from block0, b from block2)
+            //   After eliminating block2: m = phi(a from block0, b from block0) ← CONFLICT!
+            //
+            // We detect this by checking if any of E's predecessors P already
+            // has an incoming entry in T's phis with a DIFFERENT value than
+            // what we would insert.
+            let mut would_conflict = false;
+            for inst in func.blocks[t_idx].instructions.iter() {
+                if let Instruction::Phi { incoming, .. } = inst {
+                    // Build a map of existing incoming predecessor → value.
+                    let existing: FxHashMap<usize, Value> = incoming
+                        .iter()
+                        .filter(|&&(_, bid)| bid != BlockId(e_idx as u32))
+                        .map(|&(v, bid)| (bid.index(), v))
+                        .collect();
+
+                    // For each E-predecessor P, compute what value P would
+                    // provide to T's phi if E were bypassed.
+                    for &(val, block_ref) in incoming.iter() {
+                        if block_ref != BlockId(e_idx as u32) {
+                            continue;
+                        }
+                        // val is what E currently provides to T's phi.
+                        for &p_idx in &e_preds {
+                            let resolved_val = if let Some(pred_map) =
+                                phi_resolution.get(&val)
+                            {
+                                pred_map.get(&p_idx).copied().unwrap_or(val)
+                            } else {
+                                val
+                            };
+                            // Check if P already has a DIFFERENT incoming value in this phi.
+                            if let Some(&existing_val) = existing.get(&p_idx) {
+                                if existing_val != resolved_val {
+                                    would_conflict = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if would_conflict {
+                            break;
+                        }
+                    }
+                }
+                if would_conflict {
+                    break;
+                }
+            }
+            if would_conflict {
+                continue;
+            }
+
             // --- Bypass E ---
 
             // 1. Redirect each predecessor P to target T directly.
@@ -744,7 +807,8 @@ fn simplify_branch_chains(func: &mut IrFunction) -> bool {
                 let mut final_target = *target;
                 let mut hops = 0;
 
-                // Follow chain through pure trampoline blocks.
+                // Follow chain through pure trampoline blocks,
+                // checking phi conflicts at each hop.
                 while hops < MAX_CHAIN_HOPS {
                     let t_idx = final_target.index();
                     if t_idx >= num_blocks {
@@ -752,6 +816,14 @@ fn simplify_branch_chains(func: &mut IrFunction) -> bool {
                     }
                     match get_pure_branch_target(&func.blocks[t_idx]) {
                         Some(next) if next != final_target => {
+                            if would_chain_redirect_conflict_phi(
+                                func,
+                                t_idx,
+                                next.index(),
+                                block_idx,
+                            ) {
+                                break;
+                            }
                             final_target = next;
                             hops += 1;
                         }
@@ -792,7 +864,7 @@ fn simplify_branch_chains(func: &mut IrFunction) -> bool {
                 let mut then_final = *then_block;
                 let mut else_final = *else_block;
 
-                // Resolve then-branch chain.
+                // Resolve then-branch chain, checking phi conflicts at each hop.
                 let mut hops = 0;
                 while hops < MAX_CHAIN_HOPS {
                     let t_idx = then_final.index();
@@ -801,6 +873,16 @@ fn simplify_branch_chains(func: &mut IrFunction) -> bool {
                     }
                     match get_pure_branch_target(&func.blocks[t_idx]) {
                         Some(next) if next != then_final => {
+                            // Guard: don't follow chain if it would create
+                            // conflicting phi entries in the target.
+                            if would_chain_redirect_conflict_phi(
+                                func,
+                                t_idx,
+                                next.index(),
+                                block_idx,
+                            ) {
+                                break;
+                            }
                             then_final = next;
                             hops += 1;
                         }
@@ -808,7 +890,7 @@ fn simplify_branch_chains(func: &mut IrFunction) -> bool {
                     }
                 }
 
-                // Resolve else-branch chain.
+                // Resolve else-branch chain, checking phi conflicts at each hop.
                 hops = 0;
                 while hops < MAX_CHAIN_HOPS {
                     let t_idx = else_final.index();
@@ -817,6 +899,14 @@ fn simplify_branch_chains(func: &mut IrFunction) -> bool {
                     }
                     match get_pure_branch_target(&func.blocks[t_idx]) {
                         Some(next) if next != else_final => {
+                            if would_chain_redirect_conflict_phi(
+                                func,
+                                t_idx,
+                                next.index(),
+                                block_idx,
+                            ) {
+                                break;
+                            }
                             else_final = next;
                             hops += 1;
                         }
@@ -879,6 +969,49 @@ fn simplify_branch_chains(func: &mut IrFunction) -> bool {
 /// When a branch chain A → B → … → C is short-circuited to A → C, any phi
 /// nodes in C that reference the old intermediate block B need an additional
 /// incoming entry from A with the same value that B contributed.
+/// Returns `true` if redirecting `from_block → final_target` (bypassing
+/// `old_intermediate`) would create conflicting phi entries in `final_target`.
+///
+/// A conflict exists when `final_target` has a phi that already has an
+/// incoming entry from `from_block` with a value DIFFERENT from the value
+/// that `old_intermediate` contributes.
+fn would_chain_redirect_conflict_phi(
+    func: &IrFunction,
+    old_intermediate: usize,
+    final_target: usize,
+    from_block: usize,
+) -> bool {
+    if final_target >= func.blocks.len() {
+        return false;
+    }
+    let old_bid = BlockId(old_intermediate as u32);
+    let from_bid = BlockId(from_block as u32);
+
+    for inst in func.blocks[final_target].instructions.iter() {
+        if !inst.is_phi() {
+            break;
+        }
+        if let Instruction::Phi { incoming, .. } = inst {
+            // Find the value contributed by the old intermediate block.
+            let intermediate_val = incoming
+                .iter()
+                .find(|&&(_, b)| b == old_bid)
+                .map(|&(v, _)| v);
+            // Find the value already contributed by from_block (if any).
+            let existing_val = incoming
+                .iter()
+                .find(|&&(_, b)| b == from_bid)
+                .map(|&(v, _)| v);
+            if let (Some(new_v), Some(old_v)) = (intermediate_val, existing_val) {
+                if new_v != old_v {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 fn propagate_phi_for_chain(
     func: &mut IrFunction,
     old_intermediate: usize,
@@ -944,10 +1077,106 @@ fn propagate_phi_for_chain(
 pub fn run_simplify_cfg(func: &mut IrFunction) -> bool {
     let mut any_changed = false;
 
+    // Pre-pass: recompute predecessor/successor lists from actual terminators
+    // and remove stale phi incoming entries.  This is necessary because branch
+    // folding (in constant_folding.rs) may convert a CondBranch into an
+    // unconditional Branch, removing a CFG edge, without updating the stored
+    // predecessor/successor lists or phi incoming vectors.  Without this
+    // cleanup, stale phi entries can cause block merging to pick the wrong
+    // incoming value when resolving trivial phis.
+    any_changed |= recompute_cfg_and_cleanup_phis(func);
+
     any_changed |= simplify_trivial_phis(func);
     any_changed |= merge_blocks(func);
     any_changed |= eliminate_empty_blocks(func);
     any_changed |= simplify_branch_chains(func);
 
     any_changed
+}
+
+// ===========================================================================
+// Pre-pass — CFG edge recomputation and stale phi incoming cleanup
+// ===========================================================================
+
+/// Recomputes predecessor and successor lists from actual block terminators,
+/// then removes phi incoming entries whose source block is no longer a
+/// predecessor.
+///
+/// This fixes a class of bugs where branch folding (in constant_folding.rs)
+/// converts a conditional branch to an unconditional one but does not update
+/// the stored CFG edges or phi incoming vectors.  The stale entries can cause
+/// incorrect phi resolution during block merging.
+///
+/// Returns `true` if any phi incoming entries were removed.
+fn recompute_cfg_and_cleanup_phis(func: &mut IrFunction) -> bool {
+    let num_blocks = func.block_count();
+
+    // Step 1: Compute actual successor sets from terminators.
+    let mut actual_succs: Vec<Vec<usize>> = Vec::with_capacity(num_blocks);
+    for block_idx in 0..num_blocks {
+        let mut succs = Vec::new();
+        if let Some(term) = func.blocks[block_idx].terminator() {
+            match term {
+                Instruction::Branch { target, .. } => {
+                    succs.push(target.index());
+                }
+                Instruction::CondBranch {
+                    then_block,
+                    else_block,
+                    ..
+                } => {
+                    succs.push(then_block.index());
+                    if else_block.index() != then_block.index() {
+                        succs.push(else_block.index());
+                    }
+                }
+                Instruction::Switch {
+                    default, cases, ..
+                } => {
+                    succs.push(default.index());
+                    for &(_val, blk) in cases {
+                        if !succs.contains(&blk.index()) {
+                            succs.push(blk.index());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        actual_succs.push(succs);
+    }
+
+    // Step 2: Compute actual predecessor sets from the successor sets.
+    let mut actual_preds: Vec<Vec<usize>> = vec![Vec::new(); num_blocks];
+    for (block_idx, succs) in actual_succs.iter().enumerate() {
+        for &s in succs {
+            if s < num_blocks && !actual_preds[s].contains(&block_idx) {
+                actual_preds[s].push(block_idx);
+            }
+        }
+    }
+
+    // Step 3: Update predecessor and successor lists.
+    for block_idx in 0..num_blocks {
+        func.blocks[block_idx].successors = actual_succs[block_idx].clone();
+        func.blocks[block_idx].predecessors = actual_preds[block_idx].clone();
+    }
+
+    // Step 4: Remove stale phi incoming entries.
+    let mut any_removed = false;
+    for block_idx in 0..num_blocks {
+        let preds = &actual_preds[block_idx];
+        let instructions = func.blocks[block_idx].instructions_mut();
+        for inst in instructions.iter_mut() {
+            if let Instruction::Phi { incoming, .. } = inst {
+                let before_len = incoming.len();
+                incoming.retain(|&(_val, blk)| preds.contains(&blk.index()));
+                if incoming.len() != before_len {
+                    any_removed = true;
+                }
+            }
+        }
+    }
+
+    any_removed
 }

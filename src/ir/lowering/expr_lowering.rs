@@ -143,6 +143,20 @@ fn new_block(ctx: &mut ExprLoweringContext<'_>) -> BlockId {
     block_id
 }
 
+/// Adds a CFG edge (predecessor/successor) between two blocks.
+///
+/// Maintains the predecessor and successor lists that the optimizer's
+/// dead code elimination and CFG simplification passes rely on for
+/// reachability analysis.
+fn add_cfg_edge(ctx: &mut ExprLoweringContext<'_>, from_idx: usize, to_idx: usize) {
+    if let Some(from_block) = ctx.function.blocks.get_mut(from_idx) {
+        from_block.add_successor(to_idx);
+    }
+    if let Some(to_block) = ctx.function.blocks.get_mut(to_idx) {
+        to_block.add_predecessor(from_idx);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Constant materialisation helpers
 // ---------------------------------------------------------------------------
@@ -178,6 +192,9 @@ fn emit_int_const(
         span,
     };
     emit_inst(ctx, inst);
+    // Record the direct Value → constant mapping so the backend can
+    // resolve constants without fragile positional matching.
+    ctx.function.constant_values.insert(result, value as i64);
     result
 }
 
@@ -190,6 +207,7 @@ fn emit_float_const(
 ) -> Value {
     let const_id = ctx.module.globals().len();
     let gname = format!(".Lconst.f.{}", const_id);
+    let gname_clone = gname.clone();
     let mut gv = GlobalVariable::new(gname, ir_ty.clone(), Some(Constant::Float(value)));
     gv.linkage = ir_module::Linkage::Internal;
     gv.is_constant = true;
@@ -205,6 +223,10 @@ fn emit_float_const(
         span,
     };
     emit_inst(ctx, inst);
+    // Record the direct Value → float constant mapping for the backend.
+    ctx.function
+        .float_constant_values
+        .insert(result, (gname_clone, value));
     result
 }
 
@@ -794,14 +816,18 @@ fn lower_string_literal(
     let str_id = ctx.module.intern_string(bytes.clone());
 
     // Register a global for the string literal with Constant::String initializer.
+    // Only add the global once — if the same string content was already interned,
+    // intern_string returns the same id so the global name will collide.
     let str_global_name = format!(".str.{}", str_id);
-    let str_arr_ty = IrType::Array(Box::new(IrType::I8), bytes.len());
-    let gv = GlobalVariable::new(
-        str_global_name.clone(),
-        str_arr_ty,
-        Some(Constant::String(bytes)),
-    );
-    ctx.module.add_global(gv);
+    if ctx.module.get_global(&str_global_name).is_none() {
+        let str_arr_ty = IrType::Array(Box::new(IrType::I8), bytes.len());
+        let gv = GlobalVariable::new(
+            str_global_name.clone(),
+            str_arr_ty,
+            Some(Constant::String(bytes)),
+        );
+        ctx.module.add_global(gv);
+    }
 
     let result = ctx.builder.fresh_value();
     // Register the string literal base pointer as a global variable
@@ -924,7 +950,13 @@ fn lower_identifier_lvalue(
         return TypedValue::new(ptr_val, var_cty);
     }
     if ctx.module.get_global(name).is_some() {
-        return TypedValue::new(ctx.builder.fresh_value(), var_cty);
+        let global_name = name.to_string();
+        let ptr_val = ctx.builder.fresh_value();
+        // Register the mapping from this Value to the global variable name
+        // so the backend can emit architecture-specific global addressing
+        // (e.g., RIP-relative stores on x86-64, ADRP/STR on AArch64).
+        ctx.module.global_var_refs.insert(ptr_val, global_name);
+        return TypedValue::new(ptr_val, var_cty);
     }
     ctx.diagnostics
         .emit_error(span, format!("undeclared identifier '{}'", name));
@@ -1196,17 +1228,27 @@ fn lower_logical_and(
     let mb = new_block(ctx);
     let lhs = lower_expr_inner(ctx, le);
     let lb = lower_to_bool(ctx, lhs.value, &lhs.ty, span);
+    // Emit the short-circuit false constant (0) in the current block BEFORE
+    // the conditional branch.  This ensures the phi in the merge block is the
+    // very first instruction, maintaining the SSA invariant that phi nodes
+    // form a contiguous prefix of a basic block's instruction list.
+    let fv = emit_int_const(ctx, 0, IrType::I1, span);
+    let cond_blk = ctx.builder.get_insert_block().unwrap();
     let ci = ctx.builder.build_cond_branch(lb, rb, mb, span);
     emit_inst(ctx, ci);
-    let le_blk = ctx.builder.get_insert_block().unwrap();
+    // CFG edges: cond_blk → rb (rhs eval), cond_blk → mb (short-circuit false)
+    add_cfg_edge(ctx, cond_blk.index(), rb.index());
+    add_cfg_edge(ctx, cond_blk.index(), mb.index());
+    let le_blk = cond_blk;
     ctx.builder.set_insert_point(rb);
     let rhs = lower_expr_inner(ctx, re);
     let rbv = lower_to_bool(ctx, rhs.value, &rhs.ty, span);
     let bi = ctx.builder.build_branch(mb, span);
     emit_inst(ctx, bi);
     let re_blk = ctx.builder.get_insert_block().unwrap();
+    // CFG edge: re_blk → mb
+    add_cfg_edge(ctx, re_blk.index(), mb.index());
     ctx.builder.set_insert_point(mb);
-    let fv = emit_int_const(ctx, 0, IrType::I1, span);
     let (pv, pi) = ctx
         .builder
         .build_phi(IrType::I1, vec![(fv, le_blk), (rbv, re_blk)], span);
@@ -1224,17 +1266,26 @@ fn lower_logical_or(
     let mb = new_block(ctx);
     let lhs = lower_expr_inner(ctx, le);
     let lb = lower_to_bool(ctx, lhs.value, &lhs.ty, span);
+    // Emit the short-circuit true constant (1) in the current block BEFORE
+    // the conditional branch, so the phi in the merge block is the very
+    // first instruction, preserving the phi-prefix invariant.
+    let tv = emit_int_const(ctx, 1, IrType::I1, span);
+    let cond_blk = ctx.builder.get_insert_block().unwrap();
     let ci = ctx.builder.build_cond_branch(lb, mb, rb, span);
     emit_inst(ctx, ci);
-    let le_blk = ctx.builder.get_insert_block().unwrap();
+    // CFG edges: cond_blk → mb (short-circuit true), cond_blk → rb (rhs eval)
+    add_cfg_edge(ctx, cond_blk.index(), mb.index());
+    add_cfg_edge(ctx, cond_blk.index(), rb.index());
+    let le_blk = cond_blk;
     ctx.builder.set_insert_point(rb);
     let rhs = lower_expr_inner(ctx, re);
     let rbv = lower_to_bool(ctx, rhs.value, &rhs.ty, span);
     let bi = ctx.builder.build_branch(mb, span);
     emit_inst(ctx, bi);
     let re_blk = ctx.builder.get_insert_block().unwrap();
+    // CFG edge: re_blk → mb
+    add_cfg_edge(ctx, re_blk.index(), mb.index());
     ctx.builder.set_insert_point(mb);
-    let tv = emit_int_const(ctx, 1, IrType::I1, span);
     let (pv, pi) = ctx
         .builder
         .build_phi(IrType::I1, vec![(tv, le_blk), (rbv, re_blk)], span);
@@ -1511,10 +1562,17 @@ fn lower_conditional(
 
     let cond_tv = lower_expr_inner(ctx, cond);
     let cond_bool = lower_to_bool(ctx, cond_tv.value, &cond_tv.ty, span);
+
+    // Record the block that emits the conditional branch (current block).
+    let cond_blk = ctx.builder.get_insert_block().unwrap();
     let ci = ctx
         .builder
         .build_cond_branch(cond_bool, then_blk, else_blk, span);
     emit_inst(ctx, ci);
+
+    // Establish CFG edges: cond_blk → then_blk, cond_blk → else_blk
+    add_cfg_edge(ctx, cond_blk.index(), then_blk.index());
+    add_cfg_edge(ctx, cond_blk.index(), else_blk.index());
 
     // Then branch.
     ctx.builder.set_insert_point(then_blk);
@@ -1528,12 +1586,18 @@ fn lower_conditional(
     emit_inst(ctx, bi_then);
     let then_end = ctx.builder.get_insert_block().unwrap();
 
+    // Establish CFG edge: then_end → merge_blk
+    add_cfg_edge(ctx, then_end.index(), merge_blk.index());
+
     // Else branch.
     ctx.builder.set_insert_point(else_blk);
     let else_tv = lower_expr_inner(ctx, else_expr);
     let bi_else = ctx.builder.build_branch(merge_blk, span);
     emit_inst(ctx, bi_else);
     let else_end = ctx.builder.get_insert_block().unwrap();
+
+    // Establish CFG edge: else_end → merge_blk
+    add_cfg_edge(ctx, else_end.index(), merge_blk.index());
 
     // Merge — determine result type via usual-arithmetic-conversion.
     ctx.builder.set_insert_point(merge_blk);
@@ -1722,12 +1786,77 @@ fn lower_cast(
 
 /// Resolve a `TypeName` AST node to its corresponding C type.
 /// This is a simplified resolver that handles the most common patterns.
-fn resolve_type_name(_ctx: &ExprLoweringContext<'_>, _tn: &ast::TypeName) -> CType {
-    // Full type-name resolution requires traversing specifiers, qualifiers,
-    // and declarators.  For the initial lowering implementation we return Int
-    // as a safe default.  The semantic analysis phase provides the actual
-    // resolved types on annotated AST nodes.
-    CType::Int
+fn resolve_type_name(_ctx: &ExprLoweringContext<'_>, tn: &ast::TypeName) -> CType {
+    use super::decl_lowering::resolve_base_type_from_sqlist;
+
+    // Resolve the base type from specifier-qualifier list (e.g. `int`, `double`,
+    // `unsigned long long`, `struct foo`).
+    let base = resolve_base_type_from_sqlist(&tn.specifier_qualifiers);
+
+    // Apply the abstract declarator (pointer, array, function layers) if present.
+    if let Some(ref abs_decl) = tn.abstract_declarator {
+        apply_abstract_declarator(base, abs_decl)
+    } else {
+        base
+    }
+}
+
+/// Apply pointer / array / function layers from an abstract declarator to a
+/// base type.  For example, `char *` has base `char` and one pointer layer.
+fn apply_abstract_declarator(base: CType, abs: &ast::AbstractDeclarator) -> CType {
+    // First apply the direct part (array/function shapes) if any.
+    let mut result = if let Some(ref direct) = abs.direct {
+        apply_direct_abstract_declarator(base, direct)
+    } else {
+        base
+    };
+
+    // Then wrap in pointer layers.
+    if let Some(ref pointer) = abs.pointer {
+        result = apply_pointer_layers_abstract(result, pointer);
+    }
+
+    result
+}
+
+fn apply_pointer_layers_abstract(base: CType, pointer: &ast::Pointer) -> CType {
+    let quals = crate::common::types::TypeQualifiers::default();
+    let mut current = CType::Pointer(Box::new(base), quals);
+    if let Some(ref inner) = pointer.inner {
+        current = apply_pointer_layers_abstract(current, inner);
+    }
+    current
+}
+
+fn apply_direct_abstract_declarator(
+    base: CType,
+    direct: &ast::DirectAbstractDeclarator,
+) -> CType {
+    match direct {
+        ast::DirectAbstractDeclarator::Parenthesized(inner) => {
+            apply_abstract_declarator(base, inner)
+        }
+        ast::DirectAbstractDeclarator::Array { size, .. } => {
+            let len = size
+                .as_ref()
+                .and_then(|e| {
+                    if let ast::Expression::IntegerLiteral { value, .. } = e.as_ref() {
+                        Some(*value as usize)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
+            CType::Array(Box::new(base), Some(len))
+        }
+        ast::DirectAbstractDeclarator::Function { .. } => {
+            // Function pointer type name — simplify to a function pointer.
+            CType::Pointer(
+                Box::new(base),
+                crate::common::types::TypeQualifiers::default(),
+            )
+        }
+    }
 }
 
 // =========================================================================

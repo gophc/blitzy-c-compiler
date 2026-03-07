@@ -390,8 +390,21 @@ impl ArchCodegen for X86_64Backend {
         mov_rbp_rsp.result = Some(MachineOperand::Register(RBP));
         prologue.push(mov_rbp_rsp);
 
-        // Stack frame allocation
-        let aligned_size = (mf.frame_size + 15) & !15;
+        // Stack frame allocation.
+        //
+        // The SUB amount must be chosen so that after ALL callee-saved
+        // register pushes, RSP is 16-byte aligned (System V AMD64 ABI
+        // requirement for CALL instructions).
+        //
+        // After `push rbp` and `mov rbp, rsp`, RSP is 16-byte aligned.
+        // Each subsequent `push` of a callee-saved register decrements
+        // RSP by 8.  If the number of pushes is odd, RSP is off by 8.
+        // We include the callee push bytes in the alignment calculation
+        // and subtract them to get the correct SUB amount.
+        let callee_push_bytes = mf.callee_saved_regs.len() * 8;
+        let total = mf.frame_size + callee_push_bytes;
+        let aligned_total = (total + 15) & !15;
+        let aligned_size = aligned_total - callee_push_bytes;
 
         if aligned_size > 0 {
             if self.security_config.stack_probe && mf.frame_size > security::PAGE_SIZE {
@@ -596,6 +609,9 @@ fn x86_opcode_mnemonic(opcode: u32) -> &'static str {
     use codegen::X86Opcode;
     match X86Opcode::from_u32(opcode) {
         Some(X86Opcode::Mov) | Some(X86Opcode::LoadInd) | Some(X86Opcode::StoreInd) => "movq",
+        Some(X86Opcode::LoadInd32) | Some(X86Opcode::StoreInd32) => "movl",
+        Some(X86Opcode::LoadInd16) | Some(X86Opcode::StoreInd16) => "movw",
+        Some(X86Opcode::LoadInd8) | Some(X86Opcode::StoreInd8) => "movb",
         Some(X86Opcode::MovZX) => "movzbl",
         Some(X86Opcode::MovSX) => "movsbl",
         Some(X86Opcode::Lea) => "leaq",
@@ -837,17 +853,19 @@ mod tests {
         let info = backend.register_info();
 
         // 14 allocatable GPRs (16 - RSP - RBP)
-        assert_eq!(info.allocatable_gpr.len(), 14);
+        assert_eq!(info.allocatable_gpr.len(), 13); // R11 reserved as spill scratch
         // 16 allocatable SSE registers
         assert_eq!(info.allocatable_fpr.len(), 16);
         // 5 callee-saved GPRs: RBX, R12, R13, R14, R15
         assert_eq!(info.callee_saved.len(), 5);
-        // 9 caller-saved GPRs: RAX, RCX, RDX, RSI, RDI, R8-R11
-        assert_eq!(info.caller_saved.len(), 9);
-        // 2 reserved: RSP, RBP
-        assert_eq!(info.reserved.len(), 2);
+        // 8 caller-saved GPRs: RAX, RCX, RDX, RSI, RDI, R8-R10
+        // (R11 is reserved as spill scratch)
+        assert_eq!(info.caller_saved.len(), 8);
+        // 3 reserved: RSP, RBP, R11
+        assert_eq!(info.reserved.len(), 3);
         assert!(info.reserved.contains(&registers::RSP));
         assert!(info.reserved.contains(&registers::RBP));
+        assert!(info.reserved.contains(&registers::R11));
         // 6 integer argument registers
         assert_eq!(info.argument_gpr.len(), 6);
         assert_eq!(info.argument_gpr[0], registers::RDI);

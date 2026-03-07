@@ -137,6 +137,11 @@ pub struct LiveInterval {
     /// IR type of this value — used internally for spill code generation.
     /// Not part of the public API contract but carried for convenience.
     pub(crate) ty: IrType,
+    /// Whether this interval's live range spans across at least one CALL
+    /// instruction.  If true, the interval **must** be assigned to a
+    /// callee-saved register or spilled — caller-saved registers are
+    /// clobbered by the call.
+    pub crosses_call: bool,
 }
 
 // ===========================================================================
@@ -334,6 +339,9 @@ pub fn compute_live_intervals(func: &IrFunction) -> Vec<LiveInterval> {
         types.insert(param.value, param.ty.clone());
     }
 
+    // Collect linear indices of CALL instructions for cross-call detection.
+    let mut call_positions: Vec<u32> = Vec::new();
+
     // Walk every instruction in RPO linear order.
     idx = 0;
     for &bi in &rpo {
@@ -342,6 +350,11 @@ pub fn compute_live_intervals(func: &IrFunction) -> Vec<LiveInterval> {
         }
         let block = &func.blocks[bi];
         for inst in block.instructions.iter() {
+            // Detect call instructions.
+            if matches!(inst, Instruction::Call { .. }) {
+                call_positions.push(idx);
+            }
+
             // --- Record definition ---
             if let Some(result) = inst.result() {
                 if result != Value::UNDEF {
@@ -425,6 +438,13 @@ pub fn compute_live_intervals(func: &IrFunction) -> Vec<LiveInterval> {
         let end = ends.get(value).copied().unwrap_or(start);
         let rc = classes.get(value).copied().unwrap_or(RegClass::Integer);
         let ty = types.get(value).cloned().unwrap_or(IrType::I64);
+        // An interval crosses a call if any CALL instruction index
+        // falls strictly within the interval's [start, end) range.
+        // (The result of the call itself is defined AT the call index,
+        // so we use `> start` to avoid flagging the call's own result.)
+        let crosses = call_positions
+            .iter()
+            .any(|&cp| cp > start && cp < end);
         intervals.push(LiveInterval {
             vreg: *value,
             start,
@@ -433,6 +453,7 @@ pub fn compute_live_intervals(func: &IrFunction) -> Vec<LiveInterval> {
             assigned: None,
             spill_slot: None,
             ty,
+            crosses_call: crosses,
         });
     }
 
@@ -544,7 +565,25 @@ pub fn allocate_registers(
             RegClass::Float => &mut free_fpr,
         };
 
-        if let Some(reg) = pool.pop() {
+        // For intervals that cross a call, we MUST use a callee-saved
+        // register (or spill).  Caller-saved registers are clobbered
+        // by the call, so assigning one would produce incorrect code.
+        let chosen_reg = if intervals[i].crosses_call {
+            // Search the pool for a callee-saved register.
+            let callee_pos = pool
+                .iter()
+                .position(|r| reg_info.callee_saved.contains(r));
+            if let Some(pos) = callee_pos {
+                Some(pool.remove(pos))
+            } else {
+                // No callee-saved register available — will spill below.
+                None
+            }
+        } else {
+            pool.pop()
+        };
+
+        if let Some(reg) = chosen_reg {
             // Register available — assign it.
             intervals[i].assigned = Some(reg);
             assignments.insert(intervals[i].vreg, reg);

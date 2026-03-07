@@ -349,6 +349,23 @@ pub struct IrFunction {
     /// Declaration-only functions have no basic blocks and serve as
     /// placeholders for call target resolution during linking.
     pub is_definition: bool,
+
+    /// Compile-time integer constant map: SSA `Value` → constant integer.
+    ///
+    /// Populated during IR lowering (Phase 6) by `emit_int_const`.  Each
+    /// integer constant materialised as a sentinel `BinOp(Add, V, V, UNDEF)`
+    /// records its value here so that the backend can resolve constants
+    /// without fragile positional matching against global `.Lconst.i.*`
+    /// variables.
+    pub constant_values: crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, i64>,
+
+    /// Compile-time float constant map: SSA `Value` → (global name, f64).
+    ///
+    /// Populated during IR lowering (Phase 6) by `emit_float_const`.
+    /// Records the global name for RIP-relative SSE loads and the raw
+    /// float value for potential constant-folding.
+    pub float_constant_values:
+        crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, (String, f64)>,
 }
 
 // ===========================================================================
@@ -412,6 +429,8 @@ impl IrFunction {
             local_count: 0,
             value_count,
             is_definition: true,
+            constant_values: crate::common::fx_hash::FxHashMap::default(),
+            float_constant_values: crate::common::fx_hash::FxHashMap::default(),
         }
     }
 }

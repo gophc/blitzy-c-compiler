@@ -111,8 +111,15 @@ pub const TOTAL_REGS: usize = NUM_GPRS + NUM_SSE; // 32
 ///
 /// Caller-saved registers are listed first as they are preferred for allocation
 /// (using them avoids the cost of save/restore in the prologue/epilogue).
-pub const ALLOCATABLE_GPRS: [u16; 14] = [
-    RAX, RCX, RDX, RSI, RDI, R8, R9, R10, R11, // caller-saved (preferred)
+/// Allocatable general-purpose registers.
+///
+/// R11 is **reserved** as a dedicated scratch register for spill
+/// load/store code insertion.  The register allocator never assigns
+/// R11 to a live interval, so spill code can safely use it to
+/// move values between physical registers and stack spill slots
+/// without clobbering any allocated value.
+pub const ALLOCATABLE_GPRS: [u16; 13] = [
+    RAX, RCX, RDX, RSI, RDI, R8, R9, R10, // caller-saved (preferred)
     RBX, R12, R13, R14, R15, // callee-saved
 ];
 
@@ -129,11 +136,15 @@ pub const CALLEE_SAVED_GPRS: [u16; 5] = [RBX, R12, R13, R14, R15];
 
 /// Caller-saved GPRs — the caller must save these across function calls if their
 /// values are needed after the call. The callee may freely clobber them.
-pub const CALLER_SAVED_GPRS: [u16; 9] = [RAX, RCX, RDX, RSI, RDI, R8, R9, R10, R11];
+/// Caller-saved GPRs (excluding R11, which is reserved as spill scratch).
+pub const CALLER_SAVED_GPRS: [u16; 8] = [RAX, RCX, RDX, RSI, RDI, R8, R9, R10];
 
 /// Reserved registers — never allocated by the register allocator.
 /// RSP is the stack pointer; RBP is the frame pointer.
-pub const RESERVED_REGS: [u16; 2] = [RSP, RBP];
+/// Reserved registers: RSP (stack pointer), RBP (frame pointer), and R11
+/// (dedicated spill scratch — see `apply_allocation_result` in
+/// `generation.rs`).
+pub const RESERVED_REGS: [u16; 3] = [RSP, RBP, R11];
 
 /// Integer argument passing registers in the System V AMD64 ABI order.
 /// The first 6 integer/pointer arguments are passed in these registers.
@@ -619,7 +630,7 @@ mod tests {
 
     #[test]
     fn test_allocatable_gprs_count() {
-        assert_eq!(ALLOCATABLE_GPRS.len(), 14);
+        assert_eq!(ALLOCATABLE_GPRS.len(), 13); // R11 reserved for spill scratch
         // Must not contain RSP or RBP
         assert!(!ALLOCATABLE_GPRS.contains(&RSP));
         assert!(!ALLOCATABLE_GPRS.contains(&RBP));
@@ -645,17 +656,17 @@ mod tests {
 
     #[test]
     fn test_caller_saved_gprs_set() {
-        assert_eq!(CALLER_SAVED_GPRS.len(), 9);
+        assert_eq!(CALLER_SAVED_GPRS.len(), 8);
         assert_eq!(
             CALLER_SAVED_GPRS,
-            [RAX, RCX, RDX, RSI, RDI, R8, R9, R10, R11]
+            [RAX, RCX, RDX, RSI, RDI, R8, R9, R10]
         );
     }
 
     #[test]
     fn test_reserved_regs() {
-        assert_eq!(RESERVED_REGS.len(), 2);
-        assert_eq!(RESERVED_REGS, [RSP, RBP]);
+        assert_eq!(RESERVED_REGS.len(), 3);
+        assert_eq!(RESERVED_REGS, [RSP, RBP, R11]);
     }
 
     #[test]
@@ -901,8 +912,9 @@ mod tests {
 
     #[test]
     fn test_caller_callee_coverage() {
-        // Caller-saved (9) + callee-saved (5) + reserved (2) = 16 GPRs
+        // Caller-saved (8) + callee-saved (5) + reserved (3) = 16 GPRs
         // Note: RBP is callee-saved by ABI but in RESERVED_REGS (handled separately)
+        // R11 is in RESERVED_REGS as spill scratch.
         let mut all: Vec<u16> = CALLER_SAVED_GPRS.to_vec();
         all.extend_from_slice(&CALLEE_SAVED_GPRS);
         all.extend_from_slice(&RESERVED_REGS);

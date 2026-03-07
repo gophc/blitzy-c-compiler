@@ -1365,7 +1365,7 @@ fn resolve_struct_forward_ref(ctype: &mut CType, struct_defs: &FxHashMap<String,
 }
 
 /// Resolve a base C type from a specifier-qualifier list (used for struct members).
-fn resolve_base_type_from_sqlist(sqlist: &ast::SpecifierQualifierList) -> CType {
+pub fn resolve_base_type_from_sqlist(sqlist: &ast::SpecifierQualifierList) -> CType {
     let type_specs = &sqlist.type_specifiers;
     if type_specs.is_empty() {
         return CType::Int;
