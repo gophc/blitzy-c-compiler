@@ -1247,10 +1247,8 @@ impl I686Codegen {
                 let vreg = vregs.alloc();
                 out.push(MachineInstruction::new(I686_NOP));
                 value_map.insert(result.index(), MachineOperand::VirtualRegister(vreg));
-            }
-
-            // Catch-all for unhandled instructions (e.g., Nop).
-            _ => {}
+            } // All instruction variants are handled above; this comment
+              // serves as documentation that the match is exhaustive.
         }
 
         out

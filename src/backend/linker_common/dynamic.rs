@@ -181,6 +181,14 @@ impl DynamicSymbolTable {
         offset
     }
 
+    /// Add a string to `.dynstr` without creating a symbol.
+    ///
+    /// Used to insert needed-library names (for `DT_NEEDED`) into the
+    /// dynamic string table.
+    pub fn add_dynstr_string(&mut self, s: &str) -> u32 {
+        self.add_string(s)
+    }
+
     /// Encode `.dynsym` to bytes. Locals before globals per ELF spec.
     ///
     /// Symbol binding (`STB_LOCAL`, `STB_GLOBAL`, `STB_WEAK`) determines
@@ -513,7 +521,8 @@ pub struct PltStub {
 
 /// Builder for the `.plt` section with architecture-specific stubs.
 pub struct ProcedureLinkageTable {
-    stubs: Vec<PltStub>,
+    /// PLT stub entries for each dynamically-linked function symbol.
+    pub stubs: Vec<PltStub>,
     target: Target,
 }
 
@@ -830,6 +839,24 @@ impl DynamicRelocationTable {
         self.rela_plt.push(reloc);
     }
 
+    /// Adjust all `.rela.plt` entry offsets from section-relative (within
+    /// `.got.plt`) to absolute virtual addresses by adding `got_plt_vaddr`.
+    /// The dynamic linker expects `r_offset` to be the absolute address
+    /// of the GOT.PLT slot, not a section-relative byte offset.
+    pub fn patch_rela_plt_offsets(&mut self, got_plt_vaddr: u64) {
+        for r in &mut self.rela_plt {
+            r.offset += got_plt_vaddr;
+        }
+    }
+
+    /// Adjust all `.rela.dyn` entry offsets from section-relative to
+    /// absolute virtual addresses.
+    pub fn patch_rela_dyn_offsets(&mut self, got_vaddr: u64) {
+        for r in &mut self.rela_dyn {
+            r.offset += got_vaddr;
+        }
+    }
+
     pub fn encode_rela_dyn(&self, is_64bit: bool) -> Vec<u8> {
         encode_relocations(&self.rela_dyn, is_64bit)
     }
@@ -957,6 +984,41 @@ impl DynamicSection {
         // Terminator (required)
         s.add_entry(DT_NULL, 0);
         s
+    }
+
+    /// Patch the first entry matching `tag` to have the given `value`.
+    ///
+    /// Used by the linker to fill in section base addresses after layout.
+    pub fn patch_address(&mut self, tag: i64, value: u64) {
+        for e in &mut self.entries {
+            if e.tag == tag {
+                e.value = value;
+                return;
+            }
+        }
+    }
+
+    /// Patch the `DT_NEEDED` entries with the correct `.dynstr` offsets for
+    /// each needed library name.
+    ///
+    /// Relies on the `.dynstr` table having been built by the same
+    /// `DynamicSymbolTable` that was used during `build()`.
+    pub fn patch_needed_libs(&mut self, lib_names: &[String], dynstr_data: &[u8]) {
+        let mut lib_iter = lib_names.iter();
+        for e in &mut self.entries {
+            if e.tag == DT_NEEDED {
+                if let Some(lib_name) = lib_iter.next() {
+                    // Find the library name in the dynstr blob.
+                    let name_bytes = lib_name.as_bytes();
+                    if let Some(pos) = dynstr_data
+                        .windows(name_bytes.len() + 1)
+                        .position(|w| w.starts_with(name_bytes) && w[name_bytes.len()] == 0)
+                    {
+                        e.value = pos as u64;
+                    }
+                }
+            }
+        }
     }
 
     /// Encode the `.dynamic` section into a byte vector.

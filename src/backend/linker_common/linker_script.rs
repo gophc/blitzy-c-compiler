@@ -29,7 +29,7 @@
 //!
 //! No external crates. Only `std` and `crate::` references.
 
-use crate::common::fx_hash::FxHashMap;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::target::Target;
 
 // Import ELF constants from elf_writer_common
@@ -276,10 +276,16 @@ impl DefaultLinkerScript {
     /// while executables only include them if `is_shared` is true (which
     /// represents a PIE or dynamically-linked executable context).
     pub fn new(target: Target, is_shared: bool) -> Self {
+        Self::with_dynamic(target, is_shared, is_shared)
+    }
+
+    /// Create a linker script with explicit control over dynamic linking
+    /// section inclusion.  Use this when building a dynamically-linked
+    /// executable (not `is_shared` but still needs `.interp`, `.plt`, etc.).
+    pub fn with_dynamic(target: Target, is_shared: bool, has_dynamic: bool) -> Self {
         let entry_point = target.default_entry_point().to_string();
         let base_address = default_base_address(&target, is_shared);
-        let has_dynamic = is_shared;
-        let is_static = !is_shared;
+        let is_static = !has_dynamic;
 
         let sections = Self::build_default_sections(has_dynamic);
         let segments = Self::build_segment_defs(has_dynamic, &sections);
@@ -414,7 +420,18 @@ impl DefaultLinkerScript {
             let seg_class = classify_section_flags(sec.flags);
 
             // Insert page-alignment padding at segment boundaries.
-            if seg_class != prev_segment_class && prev_segment_class != 0 && seg_class != 0 {
+            // Exception: when transitioning from read-only (class 2) to
+            // executable (class 1), do NOT insert a page boundary.  Pre-text
+            // metadata sections (.interp, .gnu.hash, .dynsym, .dynstr,
+            // .rela.plt) are read-only but belong in the same LOAD segment
+            // as .plt/.text in the traditional ELF layout.  Inserting a page
+            // gap here would place them on separate pages and create
+            // overlapping LOAD segments.
+            let needs_page_boundary = seg_class != prev_segment_class
+                && prev_segment_class != 0
+                && seg_class != 0
+                && !(prev_segment_class == 2 && seg_class == 1);
+            if needs_page_boundary {
                 current_vaddr = align_up(current_vaddr, page_size);
                 if !sec.is_nobits {
                     current_file_offset = align_up(current_file_offset, page_size);
@@ -749,11 +766,32 @@ impl DefaultLinkerScript {
             });
         }
 
-        // PT_LOAD — read-only executable code (R+X)
+        // Dynamic-linker metadata sections that precede .text in the
+        // standard ELF layout.  Although these sections are read-only
+        // (no SHF_EXECINSTR), they must be placed in the first LOAD
+        // segment together with .plt/.text to avoid overlapping LOAD
+        // segments.  Real linkers (GNU ld, lld) do the same.
+        const FIRST_LOAD_METADATA: &[&str] = &[
+            ".interp",
+            ".note",
+            ".gnu.hash",
+            ".dynsym",
+            ".dynstr",
+            ".rela.dyn",
+            ".rela.plt",
+        ];
+
+        // PT_LOAD — first LOAD: executable code + pre-text metadata (R+X)
         let mut rx_sections: Vec<String> = Vec::new();
         for sec in sections {
             let f = sec.flags as u64;
-            if f & SHF_ALLOC != 0 && f & SHF_EXECINSTR != 0 && f & SHF_WRITE == 0 {
+            let is_alloc = f & SHF_ALLOC != 0;
+            let is_exec = f & SHF_EXECINSTR != 0;
+            let is_write = f & SHF_WRITE != 0;
+            let is_first_load_meta =
+                has_dynamic && FIRST_LOAD_METADATA.contains(&sec.name.as_str());
+
+            if is_alloc && !is_write && (is_exec || is_first_load_meta) {
                 rx_sections.push(sec.name.clone());
             }
         }
@@ -762,15 +800,20 @@ impl DefaultLinkerScript {
                 seg_type: PT_LOAD,
                 flags: PF_R | PF_X,
                 alignment: PAGE_ALIGNMENT,
-                sections: rx_sections,
+                sections: rx_sections.clone(),
             });
         }
 
-        // PT_LOAD — read-only data (R)
+        // PT_LOAD — read-only data (R) — sections NOT already in R+X
+        let rx_set: FxHashSet<String> = rx_sections.into_iter().collect();
         let mut ro_sections: Vec<String> = Vec::new();
         for sec in sections {
             let f = sec.flags as u64;
-            if f & SHF_ALLOC != 0 && f & SHF_EXECINSTR == 0 && f & SHF_WRITE == 0 {
+            if f & SHF_ALLOC != 0
+                && f & SHF_EXECINSTR == 0
+                && f & SHF_WRITE == 0
+                && !rx_set.contains(&sec.name)
+            {
                 ro_sections.push(sec.name.clone());
             }
         }

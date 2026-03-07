@@ -1310,8 +1310,29 @@ impl ElfWriter {
             }
         }
 
-        // .symtab — aligned to pointer width
+        // When file_offset_hint is used, current_offset tracks the LAST
+        // hinted position, which may not be the MAXIMUM.  Ensure we place
+        // .symtab/.strtab/.shstrtab and the section header table after ALL
+        // section data by choosing the maximum across every section's end.
         let ptr_align = ptr_width;
+        {
+            let mut max_end = current_offset;
+            for (i, sec) in self.sections.iter().enumerate() {
+                let (off, _, _) = section_file_offsets[i + 1];
+                let data_len = if sec.sh_type != SHT_NOBITS {
+                    sec.data.len()
+                } else {
+                    0
+                };
+                let end = off as usize + data_len;
+                if end > max_end {
+                    max_end = end;
+                }
+            }
+            current_offset = max_end;
+        }
+
+        // .symtab — aligned to pointer width
         current_offset = align_up(current_offset, ptr_align);
         section_file_offsets.push((current_offset as u64, sym_bytes.len() as u64, 0));
         current_offset += sym_bytes.len();
@@ -1391,12 +1412,19 @@ impl ElfWriter {
         // -----------------------------------------------------------------
         // Phase 6: Write section data
         // -----------------------------------------------------------------
-
-        for (i, sec) in self.sections.iter().enumerate() {
-            let (target_offset, _, _) = section_file_offsets[i + 1];
-            pad_to(&mut buf, target_offset as usize);
-            if sec.sh_type != SHT_NOBITS {
-                buf.extend_from_slice(&sec.data);
+        // Write sections in ascending file-offset order to ensure `pad_to`
+        // always moves the buffer forward.  Sections with `file_offset_hint`
+        // may have been added to the writer in an order that does not match
+        // their file layout, so we sort indices by target offset first.
+        {
+            let mut write_order: Vec<usize> = (0..self.sections.len()).collect();
+            write_order.sort_by_key(|&i| section_file_offsets[i + 1].0);
+            for &i in &write_order {
+                let (target_offset, _, _) = section_file_offsets[i + 1];
+                pad_to(&mut buf, target_offset as usize);
+                if self.sections[i].sh_type != SHT_NOBITS {
+                    buf.extend_from_slice(&self.sections[i].data);
+                }
             }
         }
 

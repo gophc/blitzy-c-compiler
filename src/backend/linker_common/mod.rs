@@ -614,9 +614,15 @@ pub fn link(
     }
 
     // -----------------------------------------------------------------------
-    // Phase 6: Dynamic Section Generation (if ET_DYN)
+    // Phase 6: Dynamic Section Generation
     // -----------------------------------------------------------------------
-    if config.is_shared() {
+    // Generate dynamic linking sections when:
+    // - Producing a shared library (ET_DYN), OR
+    // - The executable has DT_NEEDED entries (e.g. implicit -lc for libc)
+    // The latter case produces a dynamically-linked ET_EXEC with PT_INTERP
+    // and PT_DYNAMIC program headers so the runtime dynamic linker resolves
+    // undefined symbols at load time.
+    if config.is_shared() || !config.needed_libs.is_empty() {
         generate_dynamic_sections(
             config,
             &sym_table,
@@ -1108,6 +1114,23 @@ fn write_elf_output(
     // Build program headers for linked output.
     if config.output_type.is_linked() {
         build_program_headers(config, ordered_sections, address_map, &mut writer);
+
+        // ----- Add PT_INTERP program header for the .interp section -----
+        // PT_INTERP tells the kernel which dynamic linker to invoke.
+        // Must be present for dynamically-linked executables and shared libs.
+        if let Some(&(interp_vaddr, interp_foff, interp_size)) = dyn_section_vaddrs.get(".interp") {
+            let pt_interp = crate::backend::elf_writer_common::Elf64ProgramHeader {
+                p_type: 3,  // PT_INTERP
+                p_flags: 4, // PF_R
+                p_offset: interp_foff,
+                p_vaddr: interp_vaddr,
+                p_paddr: interp_vaddr,
+                p_filesz: interp_size,
+                p_memsz: interp_size,
+                p_align: 1,
+            };
+            writer.add_program_header(pt_interp);
+        }
 
         // ----- Add PT_DYNAMIC program header for the .dynamic section -----
         if let Some(&(dyn_vaddr, dyn_foff, dyn_size)) = dyn_section_vaddrs.get(".dynamic") {

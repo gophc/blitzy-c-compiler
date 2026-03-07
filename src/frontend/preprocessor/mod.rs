@@ -1135,8 +1135,12 @@ impl<'a> Preprocessor<'a> {
                 output.extend(expanded);
             }
 
-            // Skip newline.
+            // Emit a newline token so that `-E` output preserves line
+            // structure.  The newline is part of the preprocessed output
+            // (C11 §5.1.1.2 phase 4 produces a stream of pp-tokens and
+            // white-space characters).
             if pos < len && tokens[pos].kind == PPTokenKind::Newline {
+                output.push(tokens[pos].clone());
                 pos += 1;
             }
         }
@@ -1794,6 +1798,7 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// Expand an object-like macro, returning the expanded token list.
+    #[allow(dead_code)]
     fn expand_object_macro(&self, macro_def: &MacroDef, invocation_span: Span) -> Vec<PPToken> {
         // For predefined magic macros, generate dynamic values.
         if macro_def.is_predefined {
@@ -1840,6 +1845,7 @@ impl<'a> Preprocessor<'a> {
     /// token stream starting at `paren_pos` (position of the opening `(`).
     ///
     /// Returns the expanded tokens and the position after the closing `)`.
+    #[allow(dead_code)]
     fn expand_function_macro(
         &self,
         macro_def: &MacroDef,

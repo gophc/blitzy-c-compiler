@@ -140,7 +140,7 @@ pub struct Parser<'src> {
     /// When parsing, the parser must distinguish typedef names from ordinary
     /// identifiers to correctly parse declarations vs. expressions. This set
     /// tracks all names introduced by `typedef` declarations.
-    pub(crate) typedef_names: std::collections::HashSet<u32>,
+    pub(crate) typedef_names: crate::common::fx_hash::FxHashSet<u32>,
 }
 
 // ===========================================================================
@@ -175,7 +175,7 @@ impl<'src> Parser<'src> {
             recursion_depth: 0,
             max_recursion_depth: MAX_RECURSION_DEPTH,
             panic_mode: false,
-            typedef_names: std::collections::HashSet::new(),
+            typedef_names: crate::common::fx_hash::FxHashSet::default(),
         };
 
         // Pre-register GCC builtin type names as typedefs so the parser

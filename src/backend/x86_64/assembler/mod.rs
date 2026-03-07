@@ -51,7 +51,9 @@ use crate::backend::x86_64::registers::{
     hw_encoding, reg_name_64, R10, R11, R12, R13, R14, R15, R8, R9, RAX, RBP, RBX, RCX, RDI, RDX,
     RSI, RSP,
 };
-use crate::backend::x86_64::security::{generate_cet_note_section, SecurityConfig, ENDBR64_BYTES};
+#[cfg(test)]
+use crate::backend::x86_64::security::ENDBR64_BYTES;
+use crate::backend::x86_64::security::{generate_cet_note_section, SecurityConfig};
 use crate::common::diagnostics::{DiagnosticEngine, Span};
 use crate::common::fx_hash::FxHashMap;
 use crate::common::target::Target;

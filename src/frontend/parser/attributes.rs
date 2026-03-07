@@ -229,7 +229,10 @@ fn parse_attribute_args(
         | "leaf" | "nothrow" | "returns_nonnull" | "returns_twice"
         | "no_stack_protector" | "transparent_union" | "artificial"
         | "no_caller_saved_registers" | "naked" | "target"
-        | "optimize" | "no_profile_instrument_function" => {
+        | "optimize" | "no_profile_instrument_function"
+        // More glibc/GCC attributes recognised as no-ops:
+        | "nocf_check" | "gnu_inline" | "nonstring" | "retain"
+        | "warn_unused" => {
             if has_args {
                 // Some nominally-simple attributes may have optional/ignorable
                 // arguments (e.g., GCC tolerates `used(0)` in some versions).
@@ -356,6 +359,23 @@ fn parse_attribute_args(
                     ),
                 );
                 Err(())
+            }
+        }
+
+        // =================================================================
+        // Attributes with optional / generic arguments from glibc / GCC
+        // headers. Recognised to avoid "unknown attribute" warnings.
+        // Arguments are consumed generically; semantic validation (if any)
+        // happens in the attribute handler.
+        // =================================================================
+        "nonnull" | "alloc_size" | "alloc_align" | "assume_aligned"
+        | "access" | "no_sanitize" | "cleanup" | "tls_model"
+        | "alias" | "weakref" | "ifunc" | "mode" | "copy"
+        | "symver" | "patchable_function_entry" => {
+            if has_args {
+                parse_generic_parenthesized_args(parser)
+            } else {
+                Ok(Vec::new())
             }
         }
 

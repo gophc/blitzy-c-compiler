@@ -35,9 +35,9 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::target::Target;
 
 use crate::backend::elf_writer_common::{
-    Elf64ProgramHeader, ElfSymbol, ElfWriter, Section, ET_DYN, ET_EXEC, PT_DYNAMIC, PT_GNU_STACK,
-    PT_INTERP, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHT_DYNAMIC, SHT_DYNSYM, SHT_GNU_HASH,
-    SHT_NOBITS, SHT_PROGBITS, SHT_RELA, SHT_STRTAB,
+    Elf64ProgramHeader, ElfSymbol, ElfWriter, Section, ET_DYN, ET_EXEC, SHF_ALLOC, SHF_EXECINSTR,
+    SHF_WRITE, SHT_DYNAMIC, SHT_DYNSYM, SHT_GNU_HASH, SHT_NOBITS, SHT_PROGBITS, SHT_RELA,
+    SHT_STRTAB,
 };
 use crate::backend::linker_common::dynamic::DynamicLinkContext;
 use crate::backend::linker_common::linker_script::{DefaultLinkerScript, InputSectionInfo};
@@ -168,7 +168,8 @@ impl X86_64Linker {
         // Create a dynamic link context when:
         // - producing a shared library, OR
         // - the executable needs shared libraries (DT_NEEDED entries)
-        let dynamic_context = if is_shared || !config.needed_libs.is_empty() {
+        let has_dynamic = is_shared || !config.needed_libs.is_empty();
+        let dynamic_context = if has_dynamic {
             let mut ctx = DynamicLinkContext::new(target, is_shared);
             // Set PT_INTERP for dynamically-linked executables.
             if !is_shared {
@@ -195,7 +196,7 @@ impl X86_64Linker {
             section_merger: SectionMerger::new(target),
             reloc_handler: X86_64RelocationHandler::new(),
             dynamic_context,
-            linker_script: DefaultLinkerScript::new(target, is_shared),
+            linker_script: DefaultLinkerScript::with_dynamic(target, is_shared, has_dynamic),
             inputs: Vec::new(),
             config,
         }
@@ -371,7 +372,11 @@ impl X86_64Linker {
         let mut plt_entries: FxHashMap<String, u64> = FxHashMap::default();
         let mut got_base: u64 = 0;
 
-        if self.dynamic_context.is_some() || self.pic_enabled || !got_symbols.is_empty() {
+        if self.dynamic_context.is_some()
+            || self.pic_enabled
+            || !got_symbols.is_empty()
+            || !plt_symbols.is_empty()
+        {
             let ctx = self
                 .dynamic_context
                 .get_or_insert_with(|| DynamicLinkContext::new(Target::X86_64, self.is_shared));
@@ -384,40 +389,211 @@ impl X86_64Linker {
 
             // Allocate GOT.PLT entries and PLT stubs for symbols that need PLT.
             for sym_name in &plt_symbols {
-                let (got_plt_offset, _plt_idx) = ctx.got.add_got_plt_entry(sym_name);
+                let (got_plt_offset, plt_idx) = ctx.got.add_got_plt_entry(sym_name);
                 // PLT entry address will be resolved after layout; store the
                 // index for now.
                 plt_entries.insert(sym_name.clone(), got_plt_offset);
+                // Register a PLT stub so that ctx.plt.encode() produces
+                // both PLT0 and per-symbol PLTn entries.
+                ctx.plt
+                    .stubs
+                    .push(crate::backend::linker_common::dynamic::PltStub {
+                        symbol_name: sym_name.clone(),
+                        got_plt_offset,
+                        index: plt_idx,
+                    });
             }
+        }
+
+        // ===================================================================
+        // Phase 5.5: Dynamic Symbol Table & Relocation Preparation
+        // ===================================================================
+        // Populate .dynsym with PLT symbols and add JUMP_SLOT rela entries.
+        // This must happen before layout so the sizes are known.
+        if let Some(ref mut ctx) = self.dynamic_context {
+            use crate::backend::elf_writer_common::{STB_GLOBAL, STT_FUNC, STV_DEFAULT};
+            use crate::backend::linker_common::dynamic::{DynamicRelocation, DynamicSymbol};
+
+            // Add each PLT symbol to .dynsym as an undefined function.
+            for sym_name in &plt_symbols {
+                let ds = DynamicSymbol {
+                    name: sym_name.clone(),
+                    value: 0,
+                    size: 0,
+                    binding: STB_GLOBAL,
+                    sym_type: STT_FUNC,
+                    visibility: STV_DEFAULT,
+                    section_index: 0, // SHN_UNDEF
+                    is_defined: false,
+                    is_plt_entry: true,
+                    got_offset: None,
+                    plt_index: None,
+                };
+                let sym_idx = ctx.dynsym.add_symbol(ds);
+
+                // Add R_X86_64_JUMP_SLOT relocation for this PLT symbol.
+                // The offset is into .got.plt (after the 3 reserved entries).
+                if let Some(gp_entry) = ctx
+                    .got
+                    .got_plt_entries()
+                    .iter()
+                    .find(|e| e.symbol_name == *sym_name)
+                {
+                    ctx.rela.add_rela_plt(DynamicRelocation {
+                        offset: gp_entry.offset,
+                        sym_index: sym_idx,
+                        rel_type: 7, // R_X86_64_JUMP_SLOT
+                        addend: 0,
+                    });
+                }
+            }
+
+            // Add needed library names to .dynstr so DT_NEEDED can reference them.
+            let needed_libs_clone: Vec<String> = ctx.needed_libs.clone();
+            for lib in &needed_libs_clone {
+                ctx.dynsym.add_dynstr_string(lib);
+            }
+
+            // Finalize: build .gnu.hash and .dynamic entries.
+            ctx.finalize();
         }
 
         // ===================================================================
         // Phase 6: Address Layout (Linker Script)
         // ===================================================================
-        // Gather section information for the linker script layout engine.
+        // Build the layout input in proper ELF segment order:
+        //   1. R+X segment: .interp, .gnu.hash, .dynsym, .dynstr,
+        //                   .rela.dyn, .rela.plt, .text, .plt
+        //   2. R   segment: .rodata
+        //   3. R+W segment: .got.plt, .got, .data, .dynamic, .bss
+        //
+        // This ordering ensures that all sections within a segment share
+        // the same permission class, and that file offsets and virtual
+        // addresses remain congruent (p_offset % p_align == p_vaddr % p_align).
         let ordered_sections = self.section_merger.get_ordered_sections();
-        let mut layout_input: Vec<InputSectionInfo> = Vec::new();
+
+        // Separate merged sections by permission class.
+        let mut merged_rx: Vec<InputSectionInfo> = Vec::new(); // text-like
+        let mut merged_ro: Vec<InputSectionInfo> = Vec::new(); // rodata-like
+        let mut merged_rw: Vec<InputSectionInfo> = Vec::new(); // data-like
+        let mut merged_nobits: Vec<InputSectionInfo> = Vec::new(); // bss
+
         for sec in &ordered_sections {
-            layout_input.push(InputSectionInfo {
+            let info = InputSectionInfo {
                 name: sec.name.clone(),
                 size: sec.total_size,
                 alignment: sec.alignment,
                 flags: sec.flags as u32,
-            });
+            };
+            if sec.name == ".bss" {
+                merged_nobits.push(info);
+            } else if (sec.flags & SHF_EXECINSTR) != 0 {
+                merged_rx.push(info);
+            } else if (sec.flags & SHF_WRITE) != 0 {
+                merged_rw.push(info);
+            } else {
+                // Read-only allocatable sections default to rodata segment.
+                if sec.name == ".text" {
+                    merged_rx.push(info);
+                } else {
+                    merged_ro.push(info);
+                }
+            }
         }
 
-        // Add synthetic sections for GOT/PLT if they were generated.
+        let mut layout_input: Vec<InputSectionInfo> = Vec::new();
+
+        // --- R+X segment: read-only dynamic metadata, then .text, then .plt ---
         if let Some(ref ctx) = self.dynamic_context {
-            let got_size = ctx.got.encode_got().len() as u64;
-            if got_size > 0 {
+            // .interp (tiny, read-only)
+            if let Some(interp_bytes) = ctx.get_interp_bytes() {
                 layout_input.push(InputSectionInfo {
-                    name: ".got".to_string(),
-                    size: got_size,
-                    alignment: 8,
-                    flags: (SHF_ALLOC | SHF_WRITE) as u32,
+                    name: ".interp".to_string(),
+                    size: interp_bytes.len() as u64,
+                    alignment: 1,
+                    flags: SHF_ALLOC as u32,
                 });
             }
 
+            // .gnu.hash
+            let gnu_hash_data = ctx.gnu_hash.encode();
+            if !gnu_hash_data.is_empty() {
+                layout_input.push(InputSectionInfo {
+                    name: ".gnu.hash".to_string(),
+                    size: gnu_hash_data.len() as u64,
+                    alignment: 8,
+                    flags: SHF_ALLOC as u32,
+                });
+            }
+
+            // .dynsym
+            let dynsym_data = ctx.dynsym.encode_dynsym(&Target::X86_64);
+            if !dynsym_data.is_empty() {
+                layout_input.push(InputSectionInfo {
+                    name: ".dynsym".to_string(),
+                    size: dynsym_data.len() as u64,
+                    alignment: 8,
+                    flags: SHF_ALLOC as u32,
+                });
+            }
+
+            // .dynstr
+            let dynstr_data = ctx.dynsym.encode_dynstr();
+            if dynstr_data.len() > 1 {
+                layout_input.push(InputSectionInfo {
+                    name: ".dynstr".to_string(),
+                    size: dynstr_data.len() as u64,
+                    alignment: 1,
+                    flags: SHF_ALLOC as u32,
+                });
+            }
+
+            // .rela.dyn
+            let rela_dyn_data = ctx.rela.encode_rela_dyn(true);
+            if !rela_dyn_data.is_empty() {
+                layout_input.push(InputSectionInfo {
+                    name: ".rela.dyn".to_string(),
+                    size: rela_dyn_data.len() as u64,
+                    alignment: 8,
+                    flags: SHF_ALLOC as u32,
+                });
+            }
+
+            // .rela.plt
+            let rela_plt_data = ctx.rela.encode_rela_plt(true);
+            if !rela_plt_data.is_empty() {
+                layout_input.push(InputSectionInfo {
+                    name: ".rela.plt".to_string(),
+                    size: rela_plt_data.len() as u64,
+                    alignment: 8,
+                    flags: SHF_ALLOC as u32,
+                });
+            }
+        }
+
+        // Merged text/exec sections
+        layout_input.extend(merged_rx);
+
+        // .plt (executable, read-only)
+        if let Some(ref ctx) = self.dynamic_context {
+            if !plt_symbols.is_empty() {
+                let plt_size = (PLT0_SIZE + plt_symbols.len() * PLT_ENTRY_SIZE) as u64;
+                layout_input.push(InputSectionInfo {
+                    name: ".plt".to_string(),
+                    size: plt_size,
+                    alignment: 16,
+                    flags: (SHF_ALLOC | SHF_EXECINSTR) as u32,
+                });
+            }
+            let _ = ctx; // keep the borrow alive
+        }
+
+        // --- R segment: read-only data ---
+        layout_input.extend(merged_ro);
+
+        // --- R+W segment: writable data ---
+        if let Some(ref ctx) = self.dynamic_context {
+            // .got.plt (must come first so GOT base is at segment start)
             let got_plt_size = ctx.got.got_plt_size() as u64;
             if got_plt_size > 0 {
                 layout_input.push(InputSectionInfo {
@@ -428,16 +604,36 @@ impl X86_64Linker {
                 });
             }
 
-            if !plt_symbols.is_empty() {
-                let plt_size = (PLT0_SIZE + plt_symbols.len() * PLT_ENTRY_SIZE) as u64;
+            // .got
+            let got_size = ctx.got.encode_got().len() as u64;
+            if got_size > 0 {
                 layout_input.push(InputSectionInfo {
-                    name: ".plt".to_string(),
-                    size: plt_size,
-                    alignment: 16,
-                    flags: (SHF_ALLOC | SHF_EXECINSTR) as u32,
+                    name: ".got".to_string(),
+                    size: got_size,
+                    alignment: 8,
+                    flags: (SHF_ALLOC | SHF_WRITE) as u32,
                 });
             }
         }
+
+        // Merged writable sections (.data, etc.)
+        layout_input.extend(merged_rw);
+
+        // .dynamic (writable)
+        if let Some(ref ctx) = self.dynamic_context {
+            let dynamic_data = ctx.dynamic.encode(true);
+            if !dynamic_data.is_empty() {
+                layout_input.push(InputSectionInfo {
+                    name: ".dynamic".to_string(),
+                    size: dynamic_data.len() as u64,
+                    alignment: 8,
+                    flags: (SHF_ALLOC | SHF_WRITE) as u32,
+                });
+            }
+        }
+
+        // .bss (NOBITS, must be last in the data segment)
+        layout_input.extend(merged_nobits);
 
         let layout = self.linker_script.compute_layout(&layout_input);
 
@@ -472,6 +668,47 @@ impl X86_64Linker {
         // ===================================================================
         // Phase 7: Symbol Address Assignment
         // ===================================================================
+        // Before building the symbol table, relocate all resolved symbol
+        // values from section-relative offsets to absolute virtual addresses.
+        // This is critical: the symbol resolver stores values as
+        // section-relative (value field from the ELF symbol), and we must
+        // add the section's virtual address to get the final absolute address.
+        {
+            // Build section_index_to_name: (object_id, section_index) → output section name
+            let mut sec_idx_to_name: FxHashMap<(u32, u16), String> = FxHashMap::default();
+            let output_secs = self.section_merger.get_ordered_sections();
+            for out_sec in output_secs {
+                for frag in &out_sec.fragments {
+                    let key = (
+                        frag.input_section_ref.object_id,
+                        frag.input_section_ref.section_index as u16,
+                    );
+                    sec_idx_to_name.insert(key, out_sec.name.clone());
+                }
+            }
+
+            // Build AddressMap from the layout.
+            let mut addr_map = crate::backend::linker_common::section_merger::AddressMap {
+                section_addresses: FxHashMap::default(),
+            };
+            for sl in &layout.sections {
+                addr_map.section_addresses.insert(
+                    sl.name.clone(),
+                    crate::backend::linker_common::section_merger::SectionAddress {
+                        virtual_address: sl.virtual_address,
+                        file_offset: sl.file_offset,
+                        size: sl.size,
+                        mem_size: sl.mem_size,
+                    },
+                );
+            }
+
+            self.symbol_resolver
+                .relocate_symbol_addresses(&addr_map, &sec_idx_to_name);
+            self.symbol_resolver
+                .relocate_local_symbol_addresses(&addr_map, &sec_idx_to_name);
+        }
+
         // Build the resolved symbol table and construct a
         // FxHashMap<String, ResolvedSymbol> for relocation resolution.
         // This mirrors the approach in linker_common::link().
@@ -495,6 +732,13 @@ impl X86_64Linker {
         }
 
         // Resolve entry point.
+        //
+        // For dynamically linked executables without an explicit `_start` (no
+        // CRT linked), generate a minimal synthetic stub that calls `main` and
+        // then issues `exit_group` so the process terminates cleanly.
+        let mut synthetic_start_code: Option<Vec<u8>> = None;
+        let mut synthetic_start_vaddr: u64 = 0;
+
         let entry_point = if self.is_shared {
             0u64
         } else {
@@ -504,13 +748,57 @@ impl X86_64Linker {
             }
             match self.linker_script.resolve_entry_point(&entry_symbols) {
                 Ok(addr) => addr,
-                Err(e) => {
-                    diagnostics.emit_error(Span::dummy(), e);
-                    // Fall back to .text start if available.
-                    section_vaddr_map
-                        .get(".text")
-                        .copied()
-                        .unwrap_or(DEFAULT_BASE_ADDRESS)
+                Err(_e) => {
+                    // `_start` is not defined. If `main` is defined, generate a
+                    // synthetic `_start` stub and use its address.
+                    if let Some(main_sym) = symbol_addresses.get("main") {
+                        let main_addr = main_sym.final_address;
+
+                        // Place the synthetic _start after the last laid-out
+                        // section, page-aligned for a new PT_LOAD.
+                        let last_vaddr = layout
+                            .sections
+                            .iter()
+                            .map(|s| s.virtual_address + s.mem_size)
+                            .max()
+                            .unwrap_or(DEFAULT_BASE_ADDRESS);
+                        synthetic_start_vaddr = (last_vaddr + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+
+                        // Generate x86-64 machine code for _start.
+                        // Equivalent to:
+                        //   xor  %ebp, %ebp        ; ABI: clear frame pointer
+                        //   and  $-16, %rsp         ; align stack to 16 bytes
+                        //   push %rax               ; padding for call alignment
+                        //   movabs $main, %rax      ; load main's absolute address
+                        //   call *%rax              ; call main
+                        //   mov  %eax, %edi         ; exit code = main's return
+                        //   mov  $231, %eax         ; SYS_exit_group
+                        //   syscall
+                        let mut code: Vec<u8> = Vec::with_capacity(32);
+                        code.extend_from_slice(&[0x31, 0xed]); // xor %ebp, %ebp
+                        code.extend_from_slice(&[0x48, 0x83, 0xe4, 0xf0]); // and $-16, %rsp
+                        code.push(0x50); // push %rax
+                        code.extend_from_slice(&[0x48, 0xb8]); // movabs $imm64, %rax
+                        code.extend_from_slice(&main_addr.to_le_bytes()); // imm64 = main
+                        code.extend_from_slice(&[0xff, 0xd0]); // call *%rax
+                        code.extend_from_slice(&[0x89, 0xc7]); // mov %eax, %edi
+                        code.extend_from_slice(&[0xb8, 0xe7, 0x00, 0x00, 0x00]); // mov $231, %eax
+                        code.extend_from_slice(&[0x0f, 0x05]); // syscall
+
+                        synthetic_start_code = Some(code);
+                        synthetic_start_vaddr
+                    } else {
+                        // Neither _start nor main — fall back to .text base.
+                        diagnostics.emit_error(
+                            Span::dummy(),
+                            "linker error: neither '_start' nor 'main' symbol is defined"
+                                .to_string(),
+                        );
+                        section_vaddr_map
+                            .get(".text")
+                            .copied()
+                            .unwrap_or(DEFAULT_BASE_ADDRESS)
+                    }
                 }
             }
         };
@@ -553,9 +841,9 @@ impl X86_64Linker {
 
         // Apply relocations.
         match resolved_relocs {
-            Ok(resolved) => {
+            Ok(ref resolved) => {
                 if let Err(errors) = apply_all_relocations(
-                    &resolved,
+                    resolved,
                     &mut section_data_map,
                     &self.reloc_handler,
                     diagnostics,
@@ -585,15 +873,55 @@ impl X86_64Linker {
         }
 
         // ===================================================================
-        // Phase 9: Dynamic Section Finalization
+        // Phase 9: Patch .dynamic with Real Addresses
         // ===================================================================
+        // The DynamicSection was built with placeholder 0 addresses. Now that
+        // the layout is computed, patch them with real virtual addresses.
         if let Some(ref mut ctx) = self.dynamic_context {
-            ctx.finalize();
+            use crate::backend::linker_common::dynamic::{
+                DT_GNU_HASH, DT_JMPREL, DT_PLTGOT, DT_RELA, DT_STRTAB, DT_SYMTAB,
+            };
+
+            if let Some(&addr) = section_vaddr_map.get(".dynstr") {
+                ctx.dynamic.patch_address(DT_STRTAB, addr);
+            }
+            if let Some(&addr) = section_vaddr_map.get(".dynsym") {
+                ctx.dynamic.patch_address(DT_SYMTAB, addr);
+            }
+            if let Some(&addr) = section_vaddr_map.get(".gnu.hash") {
+                ctx.dynamic.patch_address(DT_GNU_HASH, addr);
+            }
+            if let Some(&addr) = section_vaddr_map.get(".rela.dyn") {
+                ctx.dynamic.patch_address(DT_RELA, addr);
+            }
+            if let Some(&addr) = section_vaddr_map.get(".rela.plt") {
+                ctx.dynamic.patch_address(DT_JMPREL, addr);
+            }
+            if let Some(&addr) = section_vaddr_map.get(".got.plt") {
+                ctx.dynamic.patch_address(DT_PLTGOT, addr);
+                // Patch .rela.plt offsets from section-relative to absolute
+                // virtual addresses.  The dynamic linker expects r_offset to
+                // be the VA of the GOT.PLT slot, not a byte offset.
+                ctx.rela.patch_rela_plt_offsets(addr);
+            }
+
+            // Patch DT_NEEDED entries with dynstr offsets for library names.
+            let needed_libs_clone: Vec<String> = ctx.needed_libs.clone();
+            let dynstr_data = ctx.dynsym.encode_dynstr();
+            ctx.dynamic
+                .patch_needed_libs(&needed_libs_clone, &dynstr_data);
         }
 
         // ===================================================================
         // Phase 10: ELF Output Assembly
         // ===================================================================
+        // Build a section-name → (file_offset, virtual_address) map for
+        // setting file_offset_hint on sections passed to the ELF writer.
+        let mut section_layout_map: FxHashMap<String, (u64, u64)> = FxHashMap::default();
+        for sl in &layout.sections {
+            section_layout_map.insert(sl.name.clone(), (sl.file_offset, sl.virtual_address));
+        }
+
         let elf_type = if self.is_shared { ET_DYN } else { ET_EXEC };
         let mut writer = ElfWriter::new(Target::X86_64, elf_type);
         writer.set_entry_point(entry_point);
@@ -612,18 +940,13 @@ impl X86_64Linker {
             });
         }
 
-        // Add PT_INTERP for dynamically-linked executables.
+        // Add .interp section for dynamically-linked executables.
+        // The PT_INTERP program header is handled by the linker script's
+        // segment definitions.
         if let Some(ref ctx) = self.dynamic_context {
             if let Some(interp_bytes) = ctx.get_interp_bytes() {
-                // Find the .interp section layout.
-                let interp_addr = section_vaddr_map.get(".interp").copied().unwrap_or(0);
-                let interp_offset = layout
-                    .sections
-                    .iter()
-                    .find(|s| s.name == ".interp")
-                    .map(|s| s.file_offset)
-                    .unwrap_or(0);
-                let interp_size = interp_bytes.len() as u64;
+                let (interp_off, interp_va) =
+                    section_layout_map.get(".interp").copied().unwrap_or((0, 0));
 
                 writer.add_section(Section {
                     name: ".interp".to_string(),
@@ -631,18 +954,9 @@ impl X86_64Linker {
                     sh_flags: SHF_ALLOC,
                     data: interp_bytes,
                     sh_addralign: 1,
+                    file_offset_hint: interp_off,
+                    virtual_address: interp_va,
                     ..Section::default()
-                });
-
-                writer.add_program_header(Elf64ProgramHeader {
-                    p_type: PT_INTERP,
-                    p_flags: 4, // PF_R
-                    p_offset: interp_offset,
-                    p_vaddr: interp_addr,
-                    p_paddr: interp_addr,
-                    p_filesz: interp_size,
-                    p_memsz: interp_size,
-                    p_align: 1,
                 });
             }
         }
@@ -664,124 +978,97 @@ impl X86_64Linker {
                 sec.section_type
             };
 
+            let (fo, va) = section_layout_map.get(&sec.name).copied().unwrap_or((0, 0));
+
             writer.add_section(Section {
                 name: sec.name.clone(),
                 sh_type,
                 sh_flags: sec.flags,
                 data,
                 sh_addralign: sec.alignment,
+                file_offset_hint: fo,
+                virtual_address: va,
                 ..Section::default()
             });
         }
 
-        // Add GOT/PLT/dynamic sections for shared libraries.
+        // Add GOT/PLT/dynamic sections with correct layout hints.
         if let Some(ref ctx) = self.dynamic_context {
-            // .got section
-            let got_data = ctx.got.encode_got();
-            if !got_data.is_empty() {
-                writer.add_section(Section {
-                    name: ".got".to_string(),
-                    sh_type: SHT_PROGBITS,
-                    sh_flags: SHF_ALLOC | SHF_WRITE,
-                    data: got_data,
-                    sh_addralign: 8,
-                    sh_entsize: GOT_ENTRY_SIZE as u64,
-                    logical_size: 0,
-                    ..Section::default()
-                });
-            }
+            // Helper: look up file offset + vaddr from the layout.
+            let lm = |name: &str| -> (u64, u64) {
+                section_layout_map.get(name).copied().unwrap_or((0, 0))
+            };
 
-            // .got.plt section
-            let plt_addr = section_vaddr_map.get(".plt").copied().unwrap_or(0);
-            let got_plt_data = ctx.got.encode_got_plt(plt_addr);
-            if !got_plt_data.is_empty() {
-                writer.add_section(Section {
-                    name: ".got.plt".to_string(),
-                    sh_type: SHT_PROGBITS,
-                    sh_flags: SHF_ALLOC | SHF_WRITE,
-                    data: got_plt_data,
-                    sh_addralign: 8,
-                    sh_entsize: GOT_ENTRY_SIZE as u64,
-                    logical_size: 0,
-                    ..Section::default()
-                });
-            }
-
-            // .plt section
-            let got_plt_addr = section_vaddr_map.get(".got.plt").copied().unwrap_or(0);
-            let plt_data = ctx.plt.encode(got_plt_addr, plt_addr);
-            if !plt_data.is_empty() {
-                writer.add_section(Section {
-                    name: ".plt".to_string(),
-                    sh_type: SHT_PROGBITS,
-                    sh_flags: SHF_ALLOC | SHF_EXECINSTR,
-                    data: plt_data,
-                    sh_addralign: 16,
-                    sh_entsize: PLT_ENTRY_SIZE as u64,
-                    logical_size: 0,
-                    ..Section::default()
-                });
-            }
-
-            // .dynsym section
-            let dynsym_data = ctx.dynsym.encode_dynsym(&Target::X86_64);
-            if !dynsym_data.is_empty() {
-                writer.add_section(Section {
-                    name: ".dynsym".to_string(),
-                    sh_type: SHT_DYNSYM,
-                    sh_flags: SHF_ALLOC,
-                    data: dynsym_data,
-                    sh_addralign: 8,
-                    sh_entsize: 24, // Elf64Sym size
-                    logical_size: 0,
-                    ..Section::default()
-                });
-            }
-
-            // .dynstr section
-            let dynstr_data = ctx.dynsym.encode_dynstr();
-            if dynstr_data.len() > 1 {
-                writer.add_section(Section {
-                    name: ".dynstr".to_string(),
-                    sh_type: SHT_STRTAB,
-                    sh_flags: SHF_ALLOC,
-                    data: dynstr_data,
-                    sh_addralign: 1,
-                    ..Section::default()
-                });
-            }
-
-            // .gnu.hash section
+            // .gnu.hash
             let gnu_hash_data = ctx.gnu_hash.encode();
             if !gnu_hash_data.is_empty() {
+                let (fo, va) = lm(".gnu.hash");
                 writer.add_section(Section {
                     name: ".gnu.hash".to_string(),
                     sh_type: SHT_GNU_HASH,
                     sh_flags: SHF_ALLOC,
                     data: gnu_hash_data,
                     sh_addralign: 8,
+                    file_offset_hint: fo,
+                    virtual_address: va,
                     ..Section::default()
                 });
             }
 
-            // .rela.dyn section
+            // .dynsym
+            let dynsym_data = ctx.dynsym.encode_dynsym(&Target::X86_64);
+            if !dynsym_data.is_empty() {
+                let (fo, va) = lm(".dynsym");
+                writer.add_section(Section {
+                    name: ".dynsym".to_string(),
+                    sh_type: SHT_DYNSYM,
+                    sh_flags: SHF_ALLOC,
+                    data: dynsym_data,
+                    sh_addralign: 8,
+                    sh_entsize: 24,
+                    file_offset_hint: fo,
+                    virtual_address: va,
+                    ..Section::default()
+                });
+            }
+
+            // .dynstr
+            let dynstr_data = ctx.dynsym.encode_dynstr();
+            if dynstr_data.len() > 1 {
+                let (fo, va) = lm(".dynstr");
+                writer.add_section(Section {
+                    name: ".dynstr".to_string(),
+                    sh_type: SHT_STRTAB,
+                    sh_flags: SHF_ALLOC,
+                    data: dynstr_data,
+                    sh_addralign: 1,
+                    file_offset_hint: fo,
+                    virtual_address: va,
+                    ..Section::default()
+                });
+            }
+
+            // .rela.dyn
             let rela_dyn_data = ctx.rela.encode_rela_dyn(true);
             if !rela_dyn_data.is_empty() {
+                let (fo, va) = lm(".rela.dyn");
                 writer.add_section(Section {
                     name: ".rela.dyn".to_string(),
                     sh_type: SHT_RELA,
                     sh_flags: SHF_ALLOC,
                     data: rela_dyn_data,
                     sh_addralign: 8,
-                    sh_entsize: 24, // Elf64Rela size
-                    logical_size: 0,
+                    sh_entsize: 24,
+                    file_offset_hint: fo,
+                    virtual_address: va,
                     ..Section::default()
                 });
             }
 
-            // .rela.plt section
+            // .rela.plt
             let rela_plt_data = ctx.rela.encode_rela_plt(true);
             if !rela_plt_data.is_empty() {
+                let (fo, va) = lm(".rela.plt");
                 writer.add_section(Section {
                     name: ".rela.plt".to_string(),
                     sh_type: SHT_RELA,
@@ -789,52 +1076,116 @@ impl X86_64Linker {
                     data: rela_plt_data,
                     sh_addralign: 8,
                     sh_entsize: 24,
-                    logical_size: 0,
+                    file_offset_hint: fo,
+                    virtual_address: va,
                     ..Section::default()
                 });
             }
 
-            // .dynamic section
+            // .plt
+            let plt_addr = section_vaddr_map.get(".plt").copied().unwrap_or(0);
+            let got_plt_addr = section_vaddr_map.get(".got.plt").copied().unwrap_or(0);
+            let plt_data = ctx.plt.encode(got_plt_addr, plt_addr);
+            if !plt_data.is_empty() {
+                let (fo, va) = lm(".plt");
+                writer.add_section(Section {
+                    name: ".plt".to_string(),
+                    sh_type: SHT_PROGBITS,
+                    sh_flags: SHF_ALLOC | SHF_EXECINSTR,
+                    data: plt_data,
+                    sh_addralign: 16,
+                    sh_entsize: PLT_ENTRY_SIZE as u64,
+                    file_offset_hint: fo,
+                    virtual_address: va,
+                    ..Section::default()
+                });
+            }
+
+            // .got
+            let got_data = ctx.got.encode_got();
+            if !got_data.is_empty() {
+                let (fo, va) = lm(".got");
+                writer.add_section(Section {
+                    name: ".got".to_string(),
+                    sh_type: SHT_PROGBITS,
+                    sh_flags: SHF_ALLOC | SHF_WRITE,
+                    data: got_data,
+                    sh_addralign: 8,
+                    sh_entsize: GOT_ENTRY_SIZE as u64,
+                    file_offset_hint: fo,
+                    virtual_address: va,
+                    ..Section::default()
+                });
+            }
+
+            // .got.plt
+            let got_plt_data = ctx.got.encode_got_plt(plt_addr);
+            if !got_plt_data.is_empty() {
+                let (fo, va) = lm(".got.plt");
+                writer.add_section(Section {
+                    name: ".got.plt".to_string(),
+                    sh_type: SHT_PROGBITS,
+                    sh_flags: SHF_ALLOC | SHF_WRITE,
+                    data: got_plt_data,
+                    sh_addralign: 8,
+                    sh_entsize: GOT_ENTRY_SIZE as u64,
+                    file_offset_hint: fo,
+                    virtual_address: va,
+                    ..Section::default()
+                });
+            }
+
+            // .dynamic (re-encoded with patched addresses)
             let dynamic_data = ctx.dynamic.encode(true);
             if !dynamic_data.is_empty() {
+                let (fo, va) = lm(".dynamic");
                 writer.add_section(Section {
                     name: ".dynamic".to_string(),
                     sh_type: SHT_DYNAMIC,
                     sh_flags: SHF_ALLOC | SHF_WRITE,
                     data: dynamic_data,
                     sh_addralign: 8,
-                    sh_entsize: 16, // Elf64Dyn size
-                    logical_size: 0,
+                    sh_entsize: 16,
+                    file_offset_hint: fo,
+                    virtual_address: va,
                     ..Section::default()
                 });
 
-                // Add PT_DYNAMIC program header.
-                if let Some(dyn_sl) = layout.sections.iter().find(|s| s.name == ".dynamic") {
-                    writer.add_program_header(Elf64ProgramHeader {
-                        p_type: PT_DYNAMIC,
-                        p_flags: 6, // PF_R | PF_W
-                        p_offset: dyn_sl.file_offset,
-                        p_vaddr: dyn_sl.virtual_address,
-                        p_paddr: dyn_sl.virtual_address,
-                        p_filesz: dyn_sl.size,
-                        p_memsz: dyn_sl.mem_size,
-                        p_align: 8,
-                    });
-                }
+                // PT_DYNAMIC program header is handled by the linker
+                // script's segment definitions — no manual addition needed.
             }
         }
 
-        // Add PT_GNU_STACK (non-executable stack).
-        writer.add_program_header(Elf64ProgramHeader {
-            p_type: PT_GNU_STACK,
-            p_flags: 6, // PF_R | PF_W (no PF_X — NX stack)
-            p_offset: 0,
-            p_vaddr: 0,
-            p_paddr: 0,
-            p_filesz: 0,
-            p_memsz: 0,
-            p_align: 16,
-        });
+        // Add synthetic _start stub if generated.
+        if let Some(code) = &synthetic_start_code {
+            use crate::backend::elf_writer_common::PT_LOAD;
+            writer.add_section(Section {
+                name: ".text._start".to_string(),
+                sh_type: SHT_PROGBITS,
+                sh_flags: SHF_ALLOC | SHF_EXECINSTR,
+                data: code.clone(),
+                sh_addralign: 16,
+                virtual_address: synthetic_start_vaddr,
+                // file_offset_hint: 0 — let ELF writer place it sequentially
+                ..Section::default()
+            });
+            // Add a PT_LOAD segment covering the _start stub so the kernel
+            // maps it into memory.
+            let stub_size = code.len() as u64;
+            writer.add_program_header(Elf64ProgramHeader {
+                p_type: PT_LOAD,
+                p_flags: 5,  // PF_R | PF_X
+                p_offset: 0, // patched below
+                p_vaddr: synthetic_start_vaddr,
+                p_paddr: synthetic_start_vaddr,
+                p_filesz: stub_size,
+                p_memsz: stub_size,
+                p_align: PAGE_SIZE,
+            });
+        }
+
+        // PT_GNU_STACK is handled by the linker script's segment
+        // definitions — no manual addition needed.
 
         // Write the resolved symbols into the ELF symbol table.
         for sym in &symbol_table.symbols {
@@ -851,6 +1202,44 @@ impl X86_64Linker {
                 visibility: sym.visibility,
                 section_index: sym.section_index,
             });
+        }
+
+        // Fix up sh_link and sh_info fields for dynamic sections.
+        // The ELF section header index is vector_index + 1 (section 0 is null).
+        {
+            let sections = writer.sections_mut();
+            // Build section name → ELF section index map.
+            let mut sec_idx_map: FxHashMap<String, u32> = FxHashMap::default();
+            for (i, sec) in sections.iter().enumerate() {
+                sec_idx_map.insert(sec.name.clone(), (i + 1) as u32);
+            }
+
+            let dynstr_idx = sec_idx_map.get(".dynstr").copied().unwrap_or(0);
+            let dynsym_idx = sec_idx_map.get(".dynsym").copied().unwrap_or(0);
+            let got_plt_idx = sec_idx_map.get(".got.plt").copied().unwrap_or(0);
+
+            for sec in sections.iter_mut() {
+                match sec.name.as_str() {
+                    ".dynsym" => {
+                        sec.sh_link = dynstr_idx; // string table for symbol names
+                        sec.sh_info = 1; // index of first non-local symbol
+                    }
+                    ".dynamic" => {
+                        sec.sh_link = dynstr_idx; // string table for DT_NEEDED names
+                    }
+                    ".gnu.hash" => {
+                        sec.sh_link = dynsym_idx; // associated symbol table
+                    }
+                    ".rela.plt" => {
+                        sec.sh_link = dynsym_idx; // associated symbol table
+                        sec.sh_info = got_plt_idx; // applies to .got.plt
+                    }
+                    ".rela.dyn" => {
+                        sec.sh_link = dynsym_idx; // associated symbol table
+                    }
+                    _ => {}
+                }
+            }
         }
 
         // Serialize the complete ELF binary.

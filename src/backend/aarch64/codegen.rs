@@ -1089,6 +1089,7 @@ impl AArch64InstructionSelector {
 
     /// Emit the function prologue: save frame pointer + link register,
     /// set up frame pointer, and save callee-saved registers.
+    #[allow(dead_code)]
     fn emit_prologue(&mut self, layout: &FrameLayout, _func: &IrFunction) {
         if layout.total_size == 0 {
             return;

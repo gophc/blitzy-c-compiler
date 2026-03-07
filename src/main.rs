@@ -858,14 +858,14 @@ fn run_preprocess_only(
             }
         }
 
-        // Add default system include paths so that `#include <stdio.h>` etc. work.
-        let system_paths = [
-            "/usr/include",
-            "/usr/local/include",
-            "/usr/include/x86_64-linux-gnu",
-            "/usr/include/linux",
-        ];
-        for sp in &system_paths {
+        // Add default system include paths appropriate for the selected
+        // target architecture.  Using target-specific multiarch paths
+        // prevents host-architecture headers from being resolved when
+        // cross-compiling (e.g. `stubs-32.h` not found on an x86-64 host
+        // when targeting i686).
+        let target_sys_paths = ctx.target.system_include_paths();
+        let extra_sys_paths: &[&str] = &["/usr/local/include", "/usr/include/linux"];
+        for sp in target_sys_paths.iter().chain(extra_sys_paths.iter()) {
             if std::path::Path::new(sp).is_dir() {
                 pp.add_system_include_path(sp);
             }
@@ -888,10 +888,15 @@ fn run_preprocess_only(
             format!("preprocessing failed for '{}'", input)
         })?;
 
-        // Reconstruct preprocessed output from tokens
+        // Reconstruct preprocessed output from tokens, preserving newlines
+        // so that `-E` output has correct line structure for downstream
+        // tools (e.g. `wc -l`, diff, further compilation).
         let mut output = String::new();
+        use bcc::frontend::preprocessor::PPTokenKind;
         for token in &tokens {
-            if !token.text.is_empty() {
+            if token.kind == PPTokenKind::Newline {
+                output.push('\n');
+            } else if !token.text.is_empty() {
                 output.push_str(&token.text);
                 output.push(' ');
             }
@@ -970,14 +975,13 @@ fn compile_single_file(
             }
         }
     }
-    // Default system include paths.
-    let system_paths = [
-        "/usr/include",
-        "/usr/local/include",
-        "/usr/include/x86_64-linux-gnu",
-        "/usr/include/linux",
-    ];
-    for sp in &system_paths {
+    // Default system include paths — target-aware.
+    // The multiarch path must match the selected --target to avoid
+    // resolving host-specific headers during cross-compilation (e.g.
+    // `stubs-32.h` not found when targeting i686 on an x86-64 host).
+    let target_sys_paths = ctx.target.system_include_paths();
+    let extra_sys_paths: &[&str] = &["/usr/local/include", "/usr/include/linux"];
+    for sp in target_sys_paths.iter().chain(extra_sys_paths.iter()) {
         if std::path::Path::new(sp).is_dir() {
             pp.add_system_include_path(sp);
         }

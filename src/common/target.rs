@@ -410,6 +410,80 @@ impl Target {
     pub fn default_entry_point(&self) -> &'static str {
         "_start"
     }
+
+    /// Returns the ordered list of system include paths appropriate for
+    /// this target architecture.
+    ///
+    /// When cross-compiling (e.g. `--target=i686` on an x86-64 host), the
+    /// architecture-specific multiarch directory (e.g.
+    /// `/usr/include/i386-linux-gnu`) must be used instead of the host's
+    /// directory (e.g. `/usr/include/x86_64-linux-gnu`), because glibc's
+    /// `gnu/stubs.h` conditionally includes architecture-specific stub
+    /// headers (e.g. `stubs-32.h` vs `stubs-64.h`) that are only present
+    /// under the correct multiarch directory.
+    ///
+    /// The order is:
+    /// 1. Architecture-specific multiarch path
+    /// 2. Generic `/usr/include`
+    pub fn system_include_paths(&self) -> Vec<&'static str> {
+        // Primary: target-specific include path.
+        // Fallback: x86_64-linux-gnu path (the host arch) so that when
+        // cross-compiling on an x86-64 host without cross-compilation
+        // headers installed, the host's `bits/` headers are still found.
+        // This matches GCC's behavior of falling back to host headers.
+        match self {
+            Target::X86_64 => vec!["/usr/include/x86_64-linux-gnu", "/usr/include"],
+            Target::I686 => vec![
+                "/usr/include/i386-linux-gnu",
+                "/usr/include/x86_64-linux-gnu",
+                "/usr/include",
+            ],
+            Target::AArch64 => vec![
+                "/usr/include/aarch64-linux-gnu",
+                "/usr/include/x86_64-linux-gnu",
+                "/usr/include",
+            ],
+            Target::RiscV64 => vec![
+                "/usr/include/riscv64-linux-gnu",
+                "/usr/include/x86_64-linux-gnu",
+                "/usr/include",
+            ],
+        }
+    }
+
+    /// Returns the ordered list of system library paths appropriate for
+    /// this target architecture.
+    ///
+    /// Used by the built-in linker to locate shared libraries (e.g.
+    /// `libc.so.6`) when resolving `-l` flags.
+    pub fn system_library_paths(&self) -> Vec<&'static str> {
+        match self {
+            Target::X86_64 => vec![
+                "/usr/lib/x86_64-linux-gnu",
+                "/lib/x86_64-linux-gnu",
+                "/usr/lib64",
+                "/lib64",
+            ],
+            Target::I686 => vec![
+                "/usr/lib/i386-linux-gnu",
+                "/lib/i386-linux-gnu",
+                "/usr/lib32",
+                "/lib32",
+            ],
+            Target::AArch64 => vec![
+                "/usr/lib/aarch64-linux-gnu",
+                "/lib/aarch64-linux-gnu",
+                "/usr/lib",
+                "/lib",
+            ],
+            Target::RiscV64 => vec![
+                "/usr/lib/riscv64-linux-gnu",
+                "/lib/riscv64-linux-gnu",
+                "/usr/lib",
+                "/lib",
+            ],
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

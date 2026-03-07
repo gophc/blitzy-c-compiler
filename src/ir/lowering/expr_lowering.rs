@@ -796,10 +796,18 @@ fn lower_string_literal(
     // Register a global for the string literal with Constant::String initializer.
     let str_global_name = format!(".str.{}", str_id);
     let str_arr_ty = IrType::Array(Box::new(IrType::I8), bytes.len());
-    let gv = GlobalVariable::new(str_global_name, str_arr_ty, Some(Constant::String(bytes)));
+    let gv = GlobalVariable::new(
+        str_global_name.clone(),
+        str_arr_ty,
+        Some(Constant::String(bytes)),
+    );
     ctx.module.add_global(gv);
 
     let result = ctx.builder.fresh_value();
+    // Register the string literal base pointer as a global variable
+    // reference so the backend can emit the correct address relocation
+    // (e.g., RIP-relative on x86-64) instead of an immediate zero.
+    ctx.module.global_var_refs.insert(result, str_global_name);
     let zero = emit_int_const(ctx, 0, IrType::I64, span);
     let (val, gep_inst) = ctx.builder.build_gep(result, vec![zero], IrType::Ptr, span);
     emit_inst(ctx, gep_inst);

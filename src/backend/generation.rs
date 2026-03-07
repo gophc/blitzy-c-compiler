@@ -1184,7 +1184,8 @@ fn write_relocatable_object(
         // undefined (SHN_UNDEF) global symbol.
         let mut extra_undef_symbols: Vec<String> = Vec::new();
         {
-            let mut known: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut known: crate::common::fx_hash::FxHashSet<String> =
+                crate::common::fx_hash::FxHashSet::default();
             for func in functions.iter() {
                 known.insert(func.name.clone());
             }
@@ -1392,6 +1393,21 @@ fn link_to_final_output(
         config.allow_undefined = true;
     }
 
+    // Implicitly link against libc for executables — equivalent to GCC's
+    // default `-lc`.  This is the standard behaviour: unless the user
+    // explicitly passes `-nostdlib` or `-nodefaultlibs`, every C program
+    // is linked against the C standard library.  The built-in linker
+    // produces a dynamically-linked executable with `libc.so.6` as a
+    // `DT_NEEDED` entry and `PT_INTERP` pointing to the system dynamic
+    // linker.  Undefined symbols from libc (printf, malloc, etc.) are
+    // resolved at runtime by `ld-linux`.
+    if output_type == OutputType::Executable {
+        config.needed_libs.push("libc.so.6".to_string());
+        // Allow undefined symbols — they will be resolved at runtime by
+        // the dynamic linker via the DT_NEEDED entry.
+        config.allow_undefined = true;
+    }
+
     // Parse the relocatable ELF object bytes back into linker internal
     // representation: sections, symbols, and relocations.
     let mut input = parse_elf_object_to_linker_input(0, "input.o", object_bytes);
@@ -1430,8 +1446,18 @@ fn link_to_final_output(
     // Create the architecture-specific relocation handler.
     let handler = create_relocation_handler(ctx.target);
 
-    // Invoke the built-in linker with a single unified input.
-    match link(&config, vec![input], handler.as_ref(), diagnostics) {
+    // Invoke the architecture-specific built-in linker.  The arch-specific
+    // linkers handle GOT/PLT stub generation and dynamic linking correctly,
+    // which is required for resolving undefined symbols (e.g. libc functions)
+    // via the runtime dynamic linker.
+    let linker_result: Result<LinkerOutput, String> = match ctx.target {
+        Target::X86_64 => {
+            crate::backend::x86_64::linker::link_x86_64(config.clone(), vec![input], diagnostics)
+        }
+        // Other architectures fall back to the common linker.
+        _ => link(&config, vec![input], handler.as_ref(), diagnostics),
+    };
+    match linker_result {
         Ok(output) => {
             // Validate the linker output.
             let LinkerOutput {
@@ -1503,57 +1529,86 @@ fn inject_crt_start(input: &mut LinkerInput, target: Target) {
     match target {
         Target::X86_64 => {
             // _start stub (16 bytes):
-            //   xor %ebp, %ebp          ; 31 ed
-            //   call main               ; e8 <disp32>
-            //   mov %eax, %edi           ; 89 c7
-            //   mov $60, %eax            ; b8 3c 00 00 00
-            //   syscall                  ; 0f 05
-            let call_site = start_offset + 2; // offset of the E8 opcode
-            let call_next = call_site + 5; // IP after the CALL
-            let disp = (main_offset as i64) - (call_next as i64);
+            //   xor %ebp, %ebp          ; 31 ed           (2 bytes)
+            //   call main               ; e8 <disp32>     (5 bytes)
+            //   mov %eax, %edi           ; 89 c7           (2 bytes)
+            //   call exit               ; e8 <00 00 00 00> (5 bytes, PLT32 reloc)
+            //   ud2                      ; 0f 0b           (2 bytes, unreachable)
+            //
+            // Using `call exit` (libc) instead of raw SYS_exit so that
+            // atexit handlers run and stdio buffers are flushed, which is
+            // required for printf output to appear.
+            let call_main_site = start_offset + 2;
+            let call_main_next = call_main_site + 5;
+            let disp = (main_offset as i64) - (call_main_next as i64);
             let disp_bytes = (disp as i32).to_le_bytes();
             let stub = vec![
                 0x31,
-                0xed,
+                0xed, // xor %ebp, %ebp
                 0xe8,
                 disp_bytes[0],
-                disp_bytes[1],
+                disp_bytes[1], // call main
                 disp_bytes[2],
                 disp_bytes[3],
                 0x89,
-                0xc7,
-                0xb8,
-                0x3c,
+                0xc7, // mov %eax, %edi
+                0xe8,
                 0x00,
                 0x00,
                 0x00,
+                0x00, // call exit (PLT32)
                 0x0f,
-                0x05,
+                0x0b, // ud2
             ];
+            // Add R_X86_64_PLT32 relocation for the `exit` call.
+            // The displacement bytes start at stub offset 10 (from section
+            // start: start_offset + 10).
+            let exit_reloc_offset = (start_offset + 10) as u64;
+            input
+                .relocations
+                .push(crate::backend::linker_common::relocation::Relocation {
+                    offset: exit_reloc_offset,
+                    symbol_name: "exit".to_string(),
+                    sym_index: 0,
+                    rel_type: 4, // R_X86_64_PLT32
+                    addend: -4,
+                    object_id: 0,
+                    section_index: text_idx as u32,
+                    output_section_name: Some(".text".to_string()),
+                });
             input.sections[text_idx].data.extend_from_slice(&stub);
         }
         Target::I686 => {
+            // _start stub for i686 (16 bytes):
+            //   xor %ebp, %ebp          ; 31 ed           (2 bytes)
+            //   call main               ; e8 <disp32>     (5 bytes)
+            //   mov %eax, %ebx           ; 89 c3           (2 bytes, status)
+            //   mov $1, %eax             ; b8 01 00 00 00  (5 bytes, SYS_exit)
+            //   int $0x80                ; cd 80           (2 bytes)
+            //
+            // i686 uses the common linker which does not support PLT, so
+            // we use the raw SYS_exit syscall instead of calling libc exit.
             let call_site = start_offset + 2;
             let call_next = call_site + 5;
             let disp = (main_offset as i64) - (call_next as i64);
             let disp_bytes = (disp as i32).to_le_bytes();
             let stub = vec![
                 0x31,
-                0xed,
+                0xed, // xor %ebp, %ebp
                 0xe8,
                 disp_bytes[0],
-                disp_bytes[1],
+                disp_bytes[1], // call main
                 disp_bytes[2],
                 disp_bytes[3],
                 0x89,
-                0xc3,
+                0xc3, // mov %eax, %ebx
                 0xb8,
                 0x01,
                 0x00,
                 0x00,
-                0x00,
+                0x00, // mov $1, %eax
                 0xcd,
-                0x80,
+                0x80, // int $0x80
             ];
             input.sections[text_idx].data.extend_from_slice(&stub);
         }
@@ -1618,6 +1673,26 @@ fn inject_crt_start(input: &mut LinkerInput, target: Target) {
         section_index: section_original_index as u16,
         object_file_id: input.object_id,
     });
+
+    // For x86-64 (which uses `call exit@PLT` in the _start stub), add
+    // `exit` as an undefined external symbol so the linker creates a PLT
+    // entry.  Other architectures use raw syscalls in _start, so they
+    // don't need this.
+    if target == Target::X86_64 {
+        let has_exit = input.symbols.iter().any(|s| s.name == "exit");
+        if !has_exit {
+            input.symbols.push(InputSymbol {
+                name: "exit".to_string(),
+                value: 0,
+                size: 0,
+                binding: STB_GLOBAL,
+                sym_type: STT_FUNC,
+                visibility: STV_DEFAULT,
+                section_index: 0, // SHN_UNDEF — external
+                object_file_id: input.object_id,
+            });
+        }
+    }
 }
 
 /// Create an architecture-specific relocation handler based on the target.

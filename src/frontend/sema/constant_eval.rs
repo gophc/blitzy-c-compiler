@@ -28,7 +28,7 @@
 //! modules (`common`, `frontend::parser::ast`). It does NOT depend on `ir`,
 //! `passes`, or `backend`.
 
-use std::collections::HashMap;
+use crate::common::fx_hash::FxHashMap;
 
 use crate::common::diagnostics::{Diagnostic, DiagnosticEngine, Severity, Span};
 use crate::common::string_interner::Symbol;
@@ -215,17 +215,17 @@ pub struct ConstantEvaluator<'a> {
     /// Registry of known enum constant values, populated by the semantic
     /// analyser before constant expression evaluation. Maps interned
     /// enum constant names to their integer values.
-    enum_values: HashMap<Symbol, i128>,
+    enum_values: FxHashMap<Symbol, i128>,
     /// Registry of known struct/union tag types with complete field
     /// information, populated by the semantic analyser. Maps tag Symbol
     /// to the fully-resolved CType (with fields), enabling correct sizeof
     /// computation for struct/union types in constant expressions.
-    tag_types: HashMap<Symbol, CType>,
+    tag_types: FxHashMap<Symbol, CType>,
     /// Registry of known variable types, populated by the semantic
     /// analyser before evaluating block-scope constant expressions.
     /// Maps variable name Symbol to its CType, enabling correct sizeof
     /// computation for `sizeof(arr)` where `arr` is a local array.
-    variable_types: HashMap<Symbol, CType>,
+    variable_types: FxHashMap<Symbol, CType>,
 }
 
 impl<'a> ConstantEvaluator<'a> {
@@ -241,9 +241,9 @@ impl<'a> ConstantEvaluator<'a> {
         ConstantEvaluator {
             diagnostics,
             target,
-            enum_values: HashMap::new(),
-            tag_types: HashMap::new(),
-            variable_types: HashMap::new(),
+            enum_values: FxHashMap::default(),
+            tag_types: FxHashMap::default(),
+            variable_types: FxHashMap::default(),
         }
     }
 

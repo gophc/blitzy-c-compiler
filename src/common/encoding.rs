@@ -221,7 +221,7 @@ pub fn read_source_file(path: &Path) -> io::Result<String> {
 
     // Open the file and read with a hard size limit to protect against
     // infinite streams (e.g., /dev/zero) where metadata reports size 0.
-    let mut file = fs::File::open(path)?;
+    let file = fs::File::open(path)?;
     let mut raw_bytes = Vec::new();
     // Read at most MAX_SOURCE_FILE_SIZE + 1 bytes. If we read more than
     // MAX_SOURCE_FILE_SIZE, the file exceeds our limit.

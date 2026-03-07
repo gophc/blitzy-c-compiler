@@ -331,6 +331,21 @@ impl IncludeHandler {
                 return Some(found);
             }
         }
+
+        // Cross-compilation fallback: when targeting a non-native arch,
+        // the host system may not have cross-compilation headers installed.
+        // `gnu/stubs-{32,x32}.h` files are architecture-variant stub
+        // manifests that only define `__stub_FUNCTION` macros — they are
+        // functionally interchangeable across architectures.  Fall back to
+        // any existing stubs variant file from the system include paths.
+        if header.starts_with("gnu/stubs-") && header.ends_with(".h") {
+            for variant in &["gnu/stubs-64.h", "gnu/stubs-32.h", "gnu/stubs-x32.h"] {
+                if let Some(found) = self.search_paths(&self.system_paths, variant) {
+                    return Some(found);
+                }
+            }
+        }
+
         None
     }
 

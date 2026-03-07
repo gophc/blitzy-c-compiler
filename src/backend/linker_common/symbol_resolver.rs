@@ -560,28 +560,33 @@ impl SymbolResolver {
             } else if has_reference {
                 // No definitions at all — symbol is undefined.
                 let is_weak_ref = entries.iter().all(|s| s.is_weak());
-                if is_weak_ref {
-                    // Weak undefined — resolves to 0, not an error.
-                    self.undefined.insert(name.clone());
-                    self.resolved.insert(
-                        name.clone(),
-                        ResolvedSymbol {
-                            name: name.clone(),
-                            final_address: 0,
-                            size: 0,
-                            binding: STB_WEAK,
-                            sym_type: STT_NOTYPE,
-                            visibility: merged_vis,
-                            section_name: String::new(),
-                            is_defined: false,
-                            from_object: 0,
-                            export_dynamic: false,
+                self.undefined.insert(name.clone());
+                // Always add to `resolved` so that the relocation resolver
+                // can look up the symbol (and then check for PLT entries
+                // for dynamically-linked executables).  Without this entry,
+                // PLT-based relocations against libc functions would fail
+                // with "undefined reference" even when `allow_undefined` is
+                // set and the symbol has a PLT stub.
+                let ref_sym = entries.first().unwrap();
+                self.resolved.insert(
+                    name.clone(),
+                    ResolvedSymbol {
+                        name: name.clone(),
+                        final_address: 0,
+                        size: 0,
+                        binding: if is_weak_ref {
+                            STB_WEAK
+                        } else {
+                            ref_sym.binding
                         },
-                    );
-                } else {
-                    // Strong undefined — will be reported in check_undefined.
-                    self.undefined.insert(name.clone());
-                }
+                        sym_type: ref_sym.sym_type,
+                        visibility: merged_vis,
+                        section_name: String::new(),
+                        is_defined: false,
+                        from_object: ref_sym.object_file_id,
+                        export_dynamic: false,
+                    },
+                );
             }
         }
 

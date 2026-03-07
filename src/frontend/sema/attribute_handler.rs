@@ -248,6 +248,63 @@ impl<'a> AttributeHandler<'a> {
                 "const" => self.validate_const(attr.span),
                 "warn_unused_result" => self.validate_warn_unused_result(attr.span),
                 "fallthrough" => self.validate_fallthrough(attr.span),
+
+                // -------------------------------------------------------
+                // Recognized glibc / GCC attributes — accepted silently.
+                //
+                // These attributes appear frequently in system headers
+                // (glibc, Linux kernel headers) and must be recognized to
+                // avoid flooding users with spurious "unknown attribute"
+                // warnings.  They are semantically no-ops at this stage:
+                // BCC acknowledges them but does not enforce their
+                // constraints at compile time.
+                // -------------------------------------------------------
+                "nonnull"
+                | "returns_nonnull"
+                | "sentinel"
+                | "leaf"
+                | "nothrow"
+                | "alloc_size"
+                | "alloc_align"
+                | "assume_aligned"
+                | "may_alias"
+                | "access"
+                | "no_sanitize"
+                | "no_sanitize_address"
+                | "no_sanitize_thread"
+                | "no_sanitize_undefined"
+                | "no_instrument_function"
+                | "no_stack_protector"
+                | "no_split_stack"
+                | "noclone"
+                | "no_reorder"
+                | "nocf_check"
+                | "no_caller_saved_registers"
+                | "flatten"
+                | "gnu_inline"
+                | "artificial"
+                | "externally_visible"
+                | "optimize"
+                | "target"
+                | "error"
+                | "warning"
+                | "cleanup"
+                | "tls_model"
+                | "transparent_union"
+                | "alias"
+                | "weakref"
+                | "ifunc"
+                | "mode"
+                | "nonstring"
+                | "copy"
+                | "retain"
+                | "symver"
+                | "patchable_function_entry"
+                | "warn_unused" => {
+                    // Recognized but no semantic action needed in BCC.
+                    None
+                }
+
                 _ => {
                     // AAP §0.7.6: unknown attributes MUST NOT be silently
                     // ignored — emit a warning diagnostic.

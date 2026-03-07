@@ -543,14 +543,17 @@ impl X86_64CodeGen {
 
         // Orphaned values: referenced but not defined (their sentinel
         // BinOp was removed by optimisation passes).
-        // IMPORTANT: exclude function-reference values — they are NOT integer
-        // constants and must not consume entries from the constant pool.
-        let func_ref_indices: std::collections::HashSet<u32> =
+        // IMPORTANT: exclude function-reference values and global-variable-
+        // reference values — they are NOT integer constants and must not
+        // consume entries from the constant pool.
+        let func_ref_indices: crate::common::fx_hash::FxHashSet<u32> =
             self.func_ref_names.keys().map(|v| v.index()).collect();
+        let global_ref_indices: crate::common::fx_hash::FxHashSet<u32> =
+            self.global_var_refs.keys().map(|v| v.index()).collect();
         let mut orphans: Vec<u32> = referenced
             .difference(&defined)
             .copied()
-            .filter(|idx| !func_ref_indices.contains(idx))
+            .filter(|idx| !func_ref_indices.contains(idx) && !global_ref_indices.contains(idx))
             .collect();
         orphans.sort();
 
@@ -569,8 +572,8 @@ impl X86_64CodeGen {
         int_consts.sort_by_key(|(idx, _)| *idx);
 
         // Pair orphaned values with constants in order.
-        let mut used_const_indices: std::collections::HashSet<usize> =
-            std::collections::HashSet::new();
+        let mut used_const_indices: crate::common::fx_hash::FxHashSet<usize> =
+            crate::common::fx_hash::FxHashSet::default();
         for (pair_idx, (orphan, (_idx, value))) in orphans.iter().zip(int_consts.iter()).enumerate()
         {
             self.constant_cache.insert(Value(*orphan), *value);
@@ -1511,15 +1514,28 @@ impl X86_64CodeGen {
 
                 let mut out = Vec::new();
                 if indices.is_empty() {
-                    out.push(Self::mk_inst(X86Opcode::Mov, Some(dst), &[base_op]));
+                    // When the base is a global symbol, use LEA to load
+                    // the address rather than MOV which loads the value
+                    // at that address. GEP computes an address.
+                    if matches!(&base_op, MachineOperand::GlobalSymbol(_)) {
+                        out.push(Self::mk_inst(X86Opcode::Lea, Some(dst), &[base_op]));
+                    } else {
+                        out.push(Self::mk_inst(X86Opcode::Mov, Some(dst), &[base_op]));
+                    }
                 } else {
                     // Compute the element size from the result type.
                     // result_type is the pointed-to element type; its size_bytes
                     // gives us the stride for each index.
                     let elem_size = result_type.size_bytes(&Target::X86_64).max(1) as i64;
 
-                    // Start with the base pointer.
-                    out.push(Self::mk_inst(X86Opcode::Mov, Some(dst.clone()), &[base_op]));
+                    // Start with the base pointer. For global symbols use
+                    // LEA (load effective address) since GEP needs the
+                    // address of the global, not its contents.
+                    if matches!(&base_op, MachineOperand::GlobalSymbol(_)) {
+                        out.push(Self::mk_inst(X86Opcode::Lea, Some(dst.clone()), &[base_op]));
+                    } else {
+                        out.push(Self::mk_inst(X86Opcode::Mov, Some(dst.clone()), &[base_op]));
+                    }
 
                     for idx_val in indices {
                         // Check constant cache first — compile-time constant

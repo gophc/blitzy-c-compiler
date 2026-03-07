@@ -2227,6 +2227,7 @@ impl<'a> SemanticAnalyzer<'a> {
     }
 
     /// Register a struct/union tag in the tag namespace.
+    #[allow(dead_code)]
     fn register_struct_union_tag(&mut self, spec: &StructOrUnionSpecifier, is_struct: bool) {
         let tag_kind = if is_struct {
             TagKind::Struct
@@ -2260,6 +2261,7 @@ impl<'a> SemanticAnalyzer<'a> {
     }
 
     /// Register an enum tag in the tag namespace.
+    #[allow(dead_code)]
     fn register_enum_tag(&mut self, spec: &EnumSpecifier) {
         if let Some(tag_name) = spec.tag {
             let ty = CType::Enum {

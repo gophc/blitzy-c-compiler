@@ -600,9 +600,9 @@ fn split_i32_lui_addi(val: i64) -> (i64, i64) {
 /// that are later resolved by the register allocator.
 struct ValueMap {
     /// Maps IR Value index → register ID (physical or virtual).
-    regs: std::collections::HashMap<u32, u8>,
+    regs: crate::common::fx_hash::FxHashMap<u32, u8>,
     /// Maps IR Value index → stack frame offset for spilled/alloca'd values.
-    stack_offsets: std::collections::HashMap<u32, i64>,
+    stack_offsets: crate::common::fx_hash::FxHashMap<u32, i64>,
     /// Next virtual register number for allocation.
     next_vreg: u32,
 }
@@ -610,8 +610,8 @@ struct ValueMap {
 impl ValueMap {
     fn new() -> Self {
         ValueMap {
-            regs: std::collections::HashMap::new(),
-            stack_offsets: std::collections::HashMap::new(),
+            regs: crate::common::fx_hash::FxHashMap::default(),
+            stack_offsets: crate::common::fx_hash::FxHashMap::default(),
             next_vreg: 64, // above physical register space (0-63)
         }
     }
@@ -703,7 +703,7 @@ pub struct RiscV64InstructionSelector {
     /// Callee-saved FPRs actually used in this function.
     used_callee_saved_fprs: Vec<u8>,
     /// Block label map: IR BlockId index → string label.
-    block_labels: std::collections::HashMap<usize, String>,
+    block_labels: crate::common::fx_hash::FxHashMap<usize, String>,
     /// Whether the current function makes any calls.
     has_calls: bool,
     /// Constant value cache: maps IR Value index to integer constant value.
@@ -728,7 +728,7 @@ impl RiscV64InstructionSelector {
             alloca_offset: 0,
             used_callee_saved_gprs: Vec::new(),
             used_callee_saved_fprs: Vec::new(),
-            block_labels: std::collections::HashMap::new(),
+            block_labels: crate::common::fx_hash::FxHashMap::default(),
             has_calls: false,
             constant_values: crate::common::fx_hash::FxHashMap::default(),
         }
