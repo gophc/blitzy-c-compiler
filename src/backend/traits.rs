@@ -715,6 +715,13 @@ pub struct MachineFunction {
     /// to correctly look up physical register assignments from the register
     /// allocator (which operates on IR `Value` indices).
     pub vreg_to_ir_value: FxHashMap<u32, Value>,
+
+    /// Virtual registers that represent SSE (XMM) values rather than GPR values.
+    ///
+    /// When these vregs are spilled, the spill code must use an XMM scratch
+    /// register (e.g., XMM15) and MOVSD instructions instead of a GPR scratch
+    /// (R11) and MOV instructions. Populated during instruction selection.
+    pub sse_vregs: crate::common::fx_hash::FxHashSet<u32>,
 }
 
 impl MachineFunction {
@@ -735,6 +742,7 @@ impl MachineFunction {
             callee_saved_regs: Vec::new(),
             is_leaf: true,
             vreg_to_ir_value: FxHashMap::default(),
+            sse_vregs: crate::common::fx_hash::FxHashSet::default(),
         }
     }
 

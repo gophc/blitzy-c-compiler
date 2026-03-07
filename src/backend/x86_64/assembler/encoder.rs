@@ -646,7 +646,7 @@ impl X86_64Encoder {
                 // silently producing NOPs that mask miscompilation.  This
                 // matches the i686 encoder's policy of surfacing errors for
                 // unrecognised opcodes.
-                let result = EncodedInstruction::new(vec![0x0F, 0x0B]);
+                let result = { eprintln!("[UD2] opcode={} ops={:?} res={:?}", inst.opcode, inst.operands, inst.result); EncodedInstruction::new(vec![0x0F, 0x0B]) };
                 self.current_offset += result.bytes.len();
                 return result;
             }
@@ -768,7 +768,7 @@ impl X86_64Encoder {
                     bytes.extend_from_slice(entry.opcode);
                     EncodedInstruction::new(bytes)
                 } else {
-                    EncodedInstruction::new(vec![0x0F, 0x0B])
+                    { eprintln!("[UD2] opcode={} ops={:?} res={:?}", inst.opcode, inst.operands, inst.result); EncodedInstruction::new(vec![0x0F, 0x0B]) }
                 }
             }
             // LoadInd dst, ptr — MOV dst, [ptr]
@@ -779,7 +779,19 @@ impl X86_64Encoder {
                         // MOV r64, [r64]:  encode as reg_mem_op with base=ptr
                         self.encode_reg_mem_op(&[0x8B], *dst, Some(*ptr), None, 1, 0, 8)
                     }
-                    _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
+                    // Spill case: pointer was spilled to stack memory.
+                    // Emit two-instruction sequence:
+                    //   MOV dst, [base+disp]   — load the pointer value from stack
+                    //   MOV dst, [dst]          — dereference the pointer
+                    (Some(MachineOperand::Register(dst)), Some(MachineOperand::Memory { base, index, scale, displacement })) => {
+                        let mut bytes = Vec::new();
+                        let load_ptr = self.encode_reg_mem_op(&[0x8B], *dst, *base, *index, *scale, *displacement, 8);
+                        bytes.extend_from_slice(&load_ptr.bytes);
+                        let deref = self.encode_reg_mem_op(&[0x8B], *dst, Some(*dst), None, 1, 0, 8);
+                        bytes.extend_from_slice(&deref.bytes);
+                        EncodedInstruction::new(bytes)
+                    }
+                    _ => { eprintln!("[UD2] opcode={} ops={:?} res={:?}", inst.opcode, inst.operands, inst.result); EncodedInstruction::new(vec![0x0F, 0x0B]) },
                 }
             }
             // StoreInd ptr, src — MOV [ptr], src (64-bit)
@@ -808,7 +820,23 @@ impl X86_64Encoder {
                         bytes.extend_from_slice(&encode_immediate(*imm, 4));
                         EncodedInstruction::new(bytes)
                     }
-                    _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
+                    // Spill case: pointer address is in stack memory, value in register.
+                    // Use PUSH/MOV/POP sequence: push value, load ptr, pop into [ptr].
+                    (Some(MachineOperand::Memory { base, index, scale, displacement }), Some(MachineOperand::Register(src))) => {
+                        let mut bytes = Vec::new();
+                        // PUSH src — save the value to store onto stack
+                        let push_inst = self.encode_push_pop(0x50, *src);
+                        bytes.extend_from_slice(&push_inst.bytes);
+                        // MOV src, [base+disp] — load the pointer address into src
+                        let load_ptr = self.encode_reg_mem_op(&[0x8B], *src, *base, *index, *scale, *displacement, 8);
+                        bytes.extend_from_slice(&load_ptr.bytes);
+                        // POP [src] — pop saved value directly into memory at [pointer]
+                        // POP m64: opcode 8F /0 with ModR/M, 64-bit default in long mode
+                        let pop_indirect = self.encode_reg_mem_op(&[0x8F], 0, Some(*src), None, 1, 0, 8);
+                        bytes.extend_from_slice(&pop_indirect.bytes);
+                        EncodedInstruction::new(bytes)
+                    }
+                    _ => { eprintln!("[UD2] opcode={} ops={:?} res={:?}", inst.opcode, inst.operands, inst.result); EncodedInstruction::new(vec![0x0F, 0x0B]) },
                 }
             }
 
@@ -820,7 +848,16 @@ impl X86_64Encoder {
                     (Some(MachineOperand::Register(dst)), Some(MachineOperand::Register(ptr))) => {
                         self.encode_reg_mem_op(&[0x8B], *dst, Some(*ptr), None, 1, 0, 4)
                     }
-                    _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
+                    // Spill case: pointer in memory. Load pointer first, then deref.
+                    (Some(MachineOperand::Register(dst)), Some(MachineOperand::Memory { base, index, scale, displacement })) => {
+                        let mut bytes = Vec::new();
+                        let load_ptr = self.encode_reg_mem_op(&[0x8B], *dst, *base, *index, *scale, *displacement, 8);
+                        bytes.extend_from_slice(&load_ptr.bytes);
+                        let deref = self.encode_reg_mem_op(&[0x8B], *dst, Some(*dst), None, 1, 0, 4);
+                        bytes.extend_from_slice(&deref.bytes);
+                        EncodedInstruction::new(bytes)
+                    }
+                    _ => { eprintln!("[UD2] opcode={} ops={:?} res={:?}", inst.opcode, inst.operands, inst.result); EncodedInstruction::new(vec![0x0F, 0x0B]) },
                 }
             }
             // LoadInd16: MOVZX r32, word [ptr]
@@ -831,7 +868,16 @@ impl X86_64Encoder {
                         // MOVZX r32, m16: 0F B7 /r
                         self.encode_reg_mem_op(&[0x0F, 0xB7], *dst, Some(*ptr), None, 1, 0, 4)
                     }
-                    _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
+                    // Spill case: pointer in memory.
+                    (Some(MachineOperand::Register(dst)), Some(MachineOperand::Memory { base, index, scale, displacement })) => {
+                        let mut bytes = Vec::new();
+                        let load_ptr = self.encode_reg_mem_op(&[0x8B], *dst, *base, *index, *scale, *displacement, 8);
+                        bytes.extend_from_slice(&load_ptr.bytes);
+                        let deref = self.encode_reg_mem_op(&[0x0F, 0xB7], *dst, Some(*dst), None, 1, 0, 4);
+                        bytes.extend_from_slice(&deref.bytes);
+                        EncodedInstruction::new(bytes)
+                    }
+                    _ => { eprintln!("[UD2] opcode={} ops={:?} res={:?}", inst.opcode, inst.operands, inst.result); EncodedInstruction::new(vec![0x0F, 0x0B]) },
                 }
             }
             // LoadInd8: MOVZX r32, byte [ptr]
@@ -842,7 +888,16 @@ impl X86_64Encoder {
                         // MOVZX r32, m8: 0F B6 /r
                         self.encode_reg_mem_op(&[0x0F, 0xB6], *dst, Some(*ptr), None, 1, 0, 4)
                     }
-                    _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
+                    // Spill case: pointer in memory.
+                    (Some(MachineOperand::Register(dst)), Some(MachineOperand::Memory { base, index, scale, displacement })) => {
+                        let mut bytes = Vec::new();
+                        let load_ptr = self.encode_reg_mem_op(&[0x8B], *dst, *base, *index, *scale, *displacement, 8);
+                        bytes.extend_from_slice(&load_ptr.bytes);
+                        let deref = self.encode_reg_mem_op(&[0x0F, 0xB6], *dst, Some(*dst), None, 1, 0, 4);
+                        bytes.extend_from_slice(&deref.bytes);
+                        EncodedInstruction::new(bytes)
+                    }
+                    _ => { eprintln!("[UD2] opcode={} ops={:?} res={:?}", inst.opcode, inst.operands, inst.result); EncodedInstruction::new(vec![0x0F, 0x0B]) },
                 }
             }
 
@@ -872,7 +927,7 @@ impl X86_64Encoder {
                         bytes.extend_from_slice(&encode_immediate(*imm, 4));
                         EncodedInstruction::new(bytes)
                     }
-                    _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
+                    _ => { eprintln!("[UD2] opcode={} ops={:?} res={:?}", inst.opcode, inst.operands, inst.result); EncodedInstruction::new(vec![0x0F, 0x0B]) },
                 }
             }
             // StoreInd16: MOV word [ptr], r16
@@ -883,7 +938,7 @@ impl X86_64Encoder {
                         // 66 prefix + MOV [m], r16
                         self.encode_mem_reg_op(&[0x89], Some(*ptr), None, 1, 0, *src, 2)
                     }
-                    _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
+                    _ => { eprintln!("[UD2] opcode={} ops={:?} res={:?}", inst.opcode, inst.operands, inst.result); EncodedInstruction::new(vec![0x0F, 0x0B]) },
                 }
             }
             // StoreInd8: MOV byte [ptr], r8
@@ -910,12 +965,15 @@ impl X86_64Encoder {
                         bytes.push(*imm as u8);
                         EncodedInstruction::new(bytes)
                     }
-                    _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
+                    _ => { eprintln!("[UD2] opcode={} ops={:?} res={:?}", inst.opcode, inst.operands, inst.result); EncodedInstruction::new(vec![0x0F, 0x0B]) },
                 }
             }
 
             // Catch-all
-            _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
+            _ => {
+                eprintln!("[ENCODER-DEBUG] ud2 from catch-all: opcode={}, operands={:?}, result={:?}", inst.opcode, inst.operands, inst.result);
+                { eprintln!("[UD2] opcode={} ops={:?} res={:?}", inst.opcode, inst.operands, inst.result); EncodedInstruction::new(vec![0x0F, 0x0B]) }
+            }
         };
 
         self.current_offset += result.bytes.len();
@@ -1259,7 +1317,7 @@ impl X86_64Encoder {
                 bytes.extend_from_slice(&encode_immediate(imm, imm_size));
                 EncodedInstruction::new(bytes)
             }
-            _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
+            _ => { eprintln!("[UD2] opcode={} ops={:?} res={:?}", inst.opcode, inst.operands, inst.result); EncodedInstruction::new(vec![0x0F, 0x0B]) },
         }
     }
 
@@ -1371,7 +1429,7 @@ impl X86_64Encoder {
                 bytes.extend_from_slice(&imm_val.to_le_bytes());
                 EncodedInstruction::new(bytes)
             }
-            _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
+            _ => { eprintln!("[UD2] opcode={} ops={:?} res={:?}", inst.opcode, inst.operands, inst.result); EncodedInstruction::new(vec![0x0F, 0x0B]) },
         }
     }
 
@@ -1470,7 +1528,7 @@ impl X86_64Encoder {
                 );
                 EncodedInstruction::with_relocations(bytes, vec![reloc])
             }
-            _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
+            _ => { eprintln!("[UD2] opcode={} ops={:?} res={:?}", inst.opcode, inst.operands, inst.result); EncodedInstruction::new(vec![0x0F, 0x0B]) },
         }
     }
 
@@ -1493,7 +1551,7 @@ impl X86_64Encoder {
             (Some(MachineOperand::Register(reg)), Some(MachineOperand::GlobalSymbol(sym))) => {
                 self.encode_rip_relative(&[0x8D], *reg, sym, 0)
             }
-            _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
+            _ => { eprintln!("[UD2] opcode={} ops={:?} res={:?}", inst.opcode, inst.operands, inst.result); EncodedInstruction::new(vec![0x0F, 0x0B]) },
         }
     }
 
@@ -1532,7 +1590,7 @@ impl X86_64Encoder {
                 }
                 EncodedInstruction::new(bytes)
             }
-            _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
+            _ => { eprintln!("[UD2] opcode={} ops={:?} res={:?}", inst.opcode, inst.operands, inst.result); EncodedInstruction::new(vec![0x0F, 0x0B]) },
         }
     }
 
@@ -1577,7 +1635,7 @@ impl X86_64Encoder {
                 bytes.extend_from_slice(&mem_enc.displacement);
                 EncodedInstruction::new(bytes)
             }
-            _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
+            _ => { eprintln!("[UD2] opcode={} ops={:?} res={:?}", inst.opcode, inst.operands, inst.result); EncodedInstruction::new(vec![0x0F, 0x0B]) },
         }
     }
 
@@ -1719,7 +1777,7 @@ impl X86_64Encoder {
                 }
                 EncodedInstruction::new(bytes)
             }
-            _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
+            _ => { eprintln!("[UD2] opcode={} ops={:?} res={:?}", inst.opcode, inst.operands, inst.result); EncodedInstruction::new(vec![0x0F, 0x0B]) },
         }
     }
 
@@ -1779,7 +1837,7 @@ impl X86_64Encoder {
                 bytes.extend_from_slice(&mem_enc.displacement);
                 EncodedInstruction::new(bytes)
             }
-            _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
+            _ => { eprintln!("[UD2] opcode={} ops={:?} res={:?}", inst.opcode, inst.operands, inst.result); EncodedInstruction::new(vec![0x0F, 0x0B]) },
         }
     }
 
@@ -1828,7 +1886,7 @@ impl X86_64Encoder {
                 bytes.extend_from_slice(&mem_enc.displacement);
                 EncodedInstruction::new(bytes)
             }
-            _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
+            _ => { eprintln!("[UD2] opcode={} ops={:?} res={:?}", inst.opcode, inst.operands, inst.result); EncodedInstruction::new(vec![0x0F, 0x0B]) },
         }
     }
 
@@ -1874,7 +1932,7 @@ impl X86_64Encoder {
                 );
                 EncodedInstruction::with_relocations(bytes, vec![reloc])
             }
-            _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
+            _ => { eprintln!("[UD2] opcode={} ops={:?} res={:?}", inst.opcode, inst.operands, inst.result); EncodedInstruction::new(vec![0x0F, 0x0B]) },
         }
     }
 
@@ -1926,7 +1984,7 @@ impl X86_64Encoder {
                 bytes.push(modrm_byte(0b11, 4, hw_encoding(*reg) & 0x7));
                 EncodedInstruction::new(bytes)
             }
-            _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
+            _ => { eprintln!("[UD2] opcode={} ops={:?} res={:?}", inst.opcode, inst.operands, inst.result); EncodedInstruction::new(vec![0x0F, 0x0B]) },
         }
     }
 
@@ -1985,7 +2043,7 @@ impl X86_64Encoder {
                 bytes.extend_from_slice(&mem_enc.displacement);
                 EncodedInstruction::new(bytes)
             }
-            _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
+            _ => { eprintln!("[UD2] opcode={} ops={:?} res={:?}", inst.opcode, inst.operands, inst.result); EncodedInstruction::new(vec![0x0F, 0x0B]) },
         }
     }
 
@@ -2036,7 +2094,7 @@ impl X86_64Encoder {
                 bytes.extend_from_slice(&mem_enc.displacement);
                 EncodedInstruction::new(bytes)
             }
-            _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
+            _ => { eprintln!("[UD2] opcode={} ops={:?} res={:?}", inst.opcode, inst.operands, inst.result); EncodedInstruction::new(vec![0x0F, 0x0B]) },
         }
     }
 
@@ -2216,7 +2274,7 @@ impl X86_64Encoder {
                 bytes.extend_from_slice(&mem_enc.displacement);
                 EncodedInstruction::new(bytes)
             }
-            _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
+            _ => { eprintln!("[UD2] opcode={} ops={:?} res={:?}", inst.opcode, inst.operands, inst.result); EncodedInstruction::new(vec![0x0F, 0x0B]) },
         }
     }
 
@@ -2337,7 +2395,7 @@ impl X86_64Encoder {
                 bytes.extend_from_slice(&mem_enc.displacement);
                 EncodedInstruction::new(bytes)
             }
-            _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
+            _ => { eprintln!("[UD2] opcode={} ops={:?} res={:?}", inst.opcode, inst.operands, inst.result); EncodedInstruction::new(vec![0x0F, 0x0B]) },
         }
     }
 
@@ -2385,7 +2443,7 @@ impl X86_64Encoder {
                 bytes.extend_from_slice(&mem_enc.displacement);
                 EncodedInstruction::new(bytes)
             }
-            _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
+            _ => { eprintln!("[UD2] opcode={} ops={:?} res={:?}", inst.opcode, inst.operands, inst.result); EncodedInstruction::new(vec![0x0F, 0x0B]) },
         }
     }
 
@@ -2440,7 +2498,7 @@ impl X86_64Encoder {
                 bytes.extend_from_slice(&mem_enc.displacement);
                 EncodedInstruction::new(bytes)
             }
-            _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
+            _ => { eprintln!("[UD2] opcode={} ops={:?} res={:?}", inst.opcode, inst.operands, inst.result); EncodedInstruction::new(vec![0x0F, 0x0B]) },
         }
     }
 
@@ -2465,7 +2523,7 @@ impl X86_64Encoder {
                 ));
                 EncodedInstruction::new(bytes)
             }
-            _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
+            _ => { eprintln!("[UD2] opcode={} ops={:?} res={:?}", inst.opcode, inst.operands, inst.result); EncodedInstruction::new(vec![0x0F, 0x0B]) },
         }
     }
 
@@ -2490,7 +2548,7 @@ impl X86_64Encoder {
                 ));
                 EncodedInstruction::new(bytes)
             }
-            _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
+            _ => { eprintln!("[UD2] opcode={} ops={:?} res={:?}", inst.opcode, inst.operands, inst.result); EncodedInstruction::new(vec![0x0F, 0x0B]) },
         }
     }
 } // end impl X86_64Encoder
