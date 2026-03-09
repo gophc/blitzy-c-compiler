@@ -1099,6 +1099,8 @@ mod tests {
             is_definition: is_def,
             constant_values: crate::common::fx_hash::FxHashMap::default(),
             float_constant_values: crate::common::fx_hash::FxHashMap::default(),
+            func_ref_map: crate::common::fx_hash::FxHashMap::default(),
+            global_var_refs: crate::common::fx_hash::FxHashMap::default(),
         }
     }
 

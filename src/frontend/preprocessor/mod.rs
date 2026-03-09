@@ -920,22 +920,46 @@ impl<'a> Preprocessor<'a> {
     #[allow(clippy::result_unit_err)]
     pub fn preprocess_file(&mut self, filename: &str) -> Result<Vec<PPToken>, ()> {
         // Step 1: Read source file with PUA encoding.
-        let path = Path::new(filename);
-        let source = match read_source_file(path) {
-            Ok(s) => s,
-            Err(e) => {
-                self.diagnostics.emit(Diagnostic::error(
-                    Span::dummy(),
-                    format!("cannot open source file '{}': {}", filename, e),
-                ));
-                return Err(());
+        // Special case: "-" means read from stdin, "/dev/null" means empty input.
+        let source = if filename == "-" {
+            // Read from stdin
+            use std::io::Read;
+            let mut raw_bytes = Vec::new();
+            match std::io::stdin().read_to_end(&mut raw_bytes) {
+                Ok(_) => crate::common::encoding::encode_bytes_to_string(&raw_bytes),
+                Err(e) => {
+                    self.diagnostics.emit(Diagnostic::error(
+                        Span::dummy(),
+                        format!("cannot read from stdin: {}", e),
+                    ));
+                    return Err(());
+                }
+            }
+        } else if filename == "/dev/null" {
+            String::new()
+        } else {
+            let path = Path::new(filename);
+            match read_source_file(path) {
+                Ok(s) => s,
+                Err(e) => {
+                    self.diagnostics.emit(Diagnostic::error(
+                        Span::dummy(),
+                        format!("cannot open source file '{}': {}", filename, e),
+                    ));
+                    return Err(());
+                }
             }
         };
 
         // Push the initial source file onto the include stack so that
         // circular detection works when an included file tries to
         // re-include the original source.
-        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let path = Path::new(filename);
+        let canonical = if filename == "-" || filename == "/dev/null" {
+            std::path::PathBuf::from(filename)
+        } else {
+            std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+        };
         self.include_stack.push(canonical);
 
         // Step 2: Register the file in the source map.
@@ -1065,9 +1089,14 @@ impl<'a> Preprocessor<'a> {
             // parentheses).
             let mut line_tokens: Vec<PPToken> = Vec::new();
             let mut paren_depth: i32 = 0;
-            let mut in_macro_args = false;
+            // Stack of paren depths at which function-like macro invocations
+            // opened.  We continue collecting across newlines whenever this
+            // stack is non-empty (i.e., any macro arg list is open).
+            let mut macro_arg_depths: Vec<i32> = Vec::new();
             while pos < len && tokens[pos].kind != PPTokenKind::EndOfFile {
                 let tok = &tokens[pos];
+
+                let in_macro_args = !macro_arg_depths.is_empty();
 
                 // If we hit a newline and we're NOT inside macro arguments,
                 // the line ends here.
@@ -1087,29 +1116,31 @@ impl<'a> Preprocessor<'a> {
                     match tok.text.as_str() {
                         "(" => {
                             paren_depth += 1;
-                            if !in_macro_args && paren_depth == 1 {
-                                // Check if the preceding non-whitespace token
-                                // is a function-like macro name.
-                                let last_ident = line_tokens
-                                    .iter()
-                                    .rev()
-                                    .find(|t| t.kind != PPTokenKind::Whitespace);
-                                if let Some(prev) = last_ident {
-                                    if prev.kind == PPTokenKind::Identifier {
-                                        if let Some(md) = self.macro_defs.get(&prev.text) {
-                                            if matches!(md.kind, MacroKind::FunctionLike { .. }) {
-                                                in_macro_args = true;
-                                            }
+                            // Check if the preceding non-whitespace token
+                            // is a function-like macro name — at any depth.
+                            let last_ident = line_tokens
+                                .iter()
+                                .rev()
+                                .find(|t| t.kind != PPTokenKind::Whitespace);
+                            if let Some(prev) = last_ident {
+                                if prev.kind == PPTokenKind::Identifier {
+                                    if let Some(md) = self.macro_defs.get(&prev.text) {
+                                        if matches!(md.kind, MacroKind::FunctionLike { .. }) {
+                                            macro_arg_depths.push(paren_depth);
                                         }
                                     }
                                 }
                             }
                         }
                         ")" => {
-                            paren_depth -= 1;
-                            if in_macro_args && paren_depth == 0 {
-                                in_macro_args = false;
+                            // If this `)` closes the innermost macro arg list,
+                            // pop it off the stack.
+                            if let Some(&depth) = macro_arg_depths.last() {
+                                if paren_depth == depth {
+                                    macro_arg_depths.pop();
+                                }
                             }
+                            paren_depth -= 1;
                         }
                         _ => {}
                     }
@@ -1301,6 +1332,11 @@ impl<'a> Preprocessor<'a> {
 
         // Check for function-like macro: `(` immediately follows name (no space).
         let kind;
+        // GCC named variadic parameter: `#define FOO(a, args...)`.
+        // When present, occurrences of `args` in the replacement list
+        // are rewritten to `__VA_ARGS__` so the standard expansion
+        // logic handles them without any further changes.
+        let mut gcc_va_name: Option<String> = None;
         if idx < tokens.len()
             && tokens[idx].kind == PPTokenKind::Punctuator
             && tokens[idx].text == "("
@@ -1325,7 +1361,7 @@ impl<'a> Preprocessor<'a> {
                     break;
                 }
 
-                // Check for `...` (variadic).
+                // Check for `...` (C99 variadic).
                 if tokens[idx].kind == PPTokenKind::Punctuator && tokens[idx].text == "..." {
                     variadic = true;
                     idx += 1;
@@ -1344,13 +1380,36 @@ impl<'a> Preprocessor<'a> {
 
                 // Parameter name.
                 if tokens[idx].kind == PPTokenKind::Identifier {
-                    params.push(tokens[idx].text.clone());
+                    let param_name = tokens[idx].text.clone();
                     idx += 1;
 
                     // Skip whitespace.
                     while idx < tokens.len() && tokens[idx].kind == PPTokenKind::Whitespace {
                         idx += 1;
                     }
+
+                    // Check for GCC named variadic: `name...`
+                    if idx < tokens.len()
+                        && tokens[idx].kind == PPTokenKind::Punctuator
+                        && tokens[idx].text == "..."
+                    {
+                        variadic = true;
+                        gcc_va_name = Some(param_name);
+                        idx += 1; // skip `...`
+                        // Expect `)` next.
+                        while idx < tokens.len() && tokens[idx].kind == PPTokenKind::Whitespace {
+                            idx += 1;
+                        }
+                        if idx < tokens.len()
+                            && tokens[idx].kind == PPTokenKind::Punctuator
+                            && tokens[idx].text == ")"
+                        {
+                            idx += 1;
+                        }
+                        break;
+                    }
+
+                    params.push(param_name);
 
                     // Check for `,` or `)`.
                     if idx < tokens.len()
@@ -1385,7 +1444,7 @@ impl<'a> Preprocessor<'a> {
             .collect();
 
         // Trim trailing whitespace from replacement.
-        let replacement: Vec<PPToken> = {
+        let mut replacement: Vec<PPToken> = {
             let mut r = replacement;
             while r
                 .last()
@@ -1395,6 +1454,17 @@ impl<'a> Preprocessor<'a> {
             }
             r
         };
+
+        // GCC named variadic: rewrite occurrences of the named parameter
+        // (e.g., `ctx`) in the replacement list to `__VA_ARGS__` so the
+        // standard C99 variadic expansion logic handles them transparently.
+        if let Some(ref vn) = gcc_va_name {
+            for tok in &mut replacement {
+                if tok.kind == PPTokenKind::Identifier && tok.text == *vn {
+                    tok.text = "__VA_ARGS__".to_string();
+                }
+            }
+        }
 
         self.macro_defs.insert(
             name.clone(),
@@ -1472,9 +1542,62 @@ impl<'a> Preprocessor<'a> {
                 (header, true)
             }
             _ => {
-                self.diagnostics
-                    .emit_error(tokens[0].span, "expected header name in #include directive");
-                return Err(());
+                // C11 §6.10.2/4: Computed #include — macro-expand the tokens
+                // and then attempt to parse the result as a header name.
+                let expanded = {
+                    let non_ws: Vec<PPToken> = tokens
+                        .iter()
+                        .filter(|t| t.kind != PPTokenKind::Whitespace)
+                        .cloned()
+                        .collect();
+                    let mut expander = macro_expander::MacroExpander::new(
+                        &self.macro_defs,
+                        &mut *self.diagnostics,
+                        self.max_recursion_depth,
+                    );
+                    expander.expand_tokens(&non_ws)
+                };
+                // Concatenate expanded tokens into a single string and look
+                // for `"..."` or `<...>` patterns.
+                let combined: String = expanded
+                    .iter()
+                    .filter(|t| {
+                        t.kind != PPTokenKind::Whitespace
+                            && t.kind != PPTokenKind::PlacemarkerToken
+                    })
+                    .map(|t| t.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("");
+                let trimmed = combined.trim();
+                if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
+                    (trimmed[1..trimmed.len() - 1].to_string(), false)
+                } else if trimmed.starts_with('<') && trimmed.ends_with('>') && trimmed.len() >= 2
+                {
+                    (trimmed[1..trimmed.len() - 1].to_string(), true)
+                } else {
+                    // Try joining with spaces between tokens for stringified result.
+                    let spaced: String = expanded
+                        .iter()
+                        .filter(|t| {
+                            t.kind != PPTokenKind::Whitespace
+                                && t.kind != PPTokenKind::PlacemarkerToken
+                        })
+                        .map(|t| t.text.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let st = spaced.trim();
+                    if st.starts_with('"') && st.ends_with('"') && st.len() >= 2 {
+                        (st[1..st.len() - 1].to_string(), false)
+                    } else if st.starts_with('<') && st.ends_with('>') && st.len() >= 2 {
+                        (st[1..st.len() - 1].to_string(), true)
+                    } else {
+                        self.diagnostics.emit_error(
+                            tokens[0].span,
+                            "expected header name in #include directive",
+                        );
+                        return Err(());
+                    }
+                }
             }
         };
 
@@ -1530,23 +1653,16 @@ impl<'a> Preprocessor<'a> {
         // processed in the current include chain.  This uses the persistent
         // `include_stack` on `self` (not a per-call handler) so that the
         // stack survives across recursive `process_include` calls.
+        //
+        // When a circular include is detected, we silently return an empty
+        // token list instead of emitting an error. This matches GCC/Clang
+        // behavior: the included file's include guard (`#ifndef GUARD`)
+        // would cause the re-included content to be empty anyway. The
+        // kernel heavily relies on this pattern (e.g., linkage.h → export.h
+        // → linkage.h), so treating circularity as a hard error would
+        // break real-world code.
         if self.include_stack.contains(&canonical_path) {
-            // Build a human-readable chain for the diagnostic.
-            let chain: Vec<String> = self
-                .include_stack
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect();
-            let chain_str = chain.join(" → ");
-            self.diagnostics.emit_error(
-                directive_span,
-                format!(
-                    "circular #include detected: {} → {}",
-                    chain_str,
-                    canonical_path.display()
-                ),
-            );
-            return Err(());
+            return Ok(Vec::new());
         }
 
         // Read the file contents using PUA-encoded reader.

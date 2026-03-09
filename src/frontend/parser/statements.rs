@@ -304,6 +304,30 @@ pub fn parse_compound_statement(parser: &mut Parser<'_>) -> Result<CompoundState
 
     // Parse block items until closing brace or EOF.
     while !parser.check(&TokenKind::RightBrace) && !parser.current.is_eof() {
+        // Bail if the parser has accumulated too many errors — continuing
+        // to parse is futile and risks pathological performance on large
+        // inputs with many cascading errors (e.g., kernel headers with
+        // unexpanded macros).
+        if parser.too_many_errors() {
+            // Skip to the matching closing brace.
+            let mut brace_depth: u32 = 1;
+            while !parser.current.is_eof() {
+                if parser.check(&TokenKind::LeftBrace) {
+                    brace_depth = brace_depth.saturating_add(1);
+                    parser.advance();
+                } else if parser.check(&TokenKind::RightBrace) {
+                    brace_depth = brace_depth.saturating_sub(1);
+                    if brace_depth == 0 {
+                        break;
+                    }
+                    parser.advance();
+                } else {
+                    parser.advance();
+                }
+            }
+            break;
+        }
+
         // Record the span before this block item for error recovery context.
         let _item_start = parser.current_span();
 

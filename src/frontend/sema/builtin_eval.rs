@@ -178,6 +178,15 @@ impl<'a> BuiltinEvaluator<'a> {
             BuiltinKind::MulOverflow => {
                 self.eval_overflow_arith("__builtin_mul_overflow", args, span)
             }
+            BuiltinKind::ObjectSize => {
+                // __builtin_object_size(ptr, type) — returns size_t.
+                // At compile time we can't determine the size, so treat
+                // it as a runtime call returning size_t.
+                Ok(BuiltinResult::RuntimeCall {
+                    builtin: BuiltinKind::ObjectSize,
+                    result_type: CType::ULong,
+                })
+            }
         }
     }
 
@@ -280,6 +289,9 @@ impl<'a> BuiltinEvaluator<'a> {
             BuiltinKind::AddOverflow | BuiltinKind::SubOverflow | BuiltinKind::MulOverflow => {
                 CType::Bool
             }
+
+            // __builtin_object_size returns size_t.
+            BuiltinKind::ObjectSize => self.size_t_type(),
         }
     }
 

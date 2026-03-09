@@ -1187,12 +1187,48 @@ impl X86_64Linker {
         // PT_GNU_STACK is handled by the linker script's segment
         // definitions — no manual addition needed.
 
+        // Build a mapping from output section virtual-address ranges to their
+        // ELF section header indices so that defined symbols get the correct
+        // st_shndx value.  The ELF section header index is `vector_index + 1`
+        // because section 0 is the mandatory null section.
+        let sec_ranges: Vec<(u64, u64, u16)> = {
+            let secs = writer.sections_mut();
+            secs.iter()
+                .enumerate()
+                .filter_map(|(i, s)| {
+                    let va = s.virtual_address;
+                    let sz = if s.logical_size > 0 {
+                        s.logical_size
+                    } else {
+                        s.data.len() as u64
+                    };
+                    if va > 0 || sz > 0 {
+                        Some((va, va.saturating_add(sz), (i + 1) as u16))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+
         // Write the resolved symbols into the ELF symbol table.
         for sym in &symbol_table.symbols {
             let final_addr = symbol_addresses
                 .get(&sym.name)
                 .map(|s| s.final_address)
                 .unwrap_or(sym.value);
+
+            // For defined symbols, resolve the correct output section index.
+            let out_shndx = if sym.section_index != SHN_UNDEF && final_addr > 0 {
+                sec_ranges
+                    .iter()
+                    .find(|(lo, hi, _)| final_addr >= *lo && final_addr < *hi)
+                    .map(|(_, _, idx)| *idx)
+                    .unwrap_or(sym.section_index)
+            } else {
+                sym.section_index
+            };
+
             writer.add_symbol(ElfSymbol {
                 name: sym.name.clone(),
                 value: final_addr,
@@ -1200,7 +1236,7 @@ impl X86_64Linker {
                 binding: sym.binding,
                 sym_type: sym.sym_type,
                 visibility: sym.visibility,
-                section_index: sym.section_index,
+                section_index: out_shndx,
             });
         }
 

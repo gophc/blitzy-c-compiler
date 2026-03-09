@@ -21,3 +21,6 @@
 # OS-specific
 .DS_Store
 Thumbs.db
+
+# External test dependencies (NEVER commit)
+/external/

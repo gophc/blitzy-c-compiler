@@ -138,7 +138,9 @@ pub struct StmtLoweringContext<'a> {
     /// Enum constant name → integer value mapping.
     pub enum_constants: &'a FxHashMap<String, i128>,
     /// Static local variable name → mangled global name mapping.
-    pub static_locals: &'a FxHashMap<String, String>,
+    pub static_locals: &'a mut FxHashMap<String, String>,
+    /// Struct/union tag → full CType definition registry.
+    pub struct_defs: &'a FxHashMap<String, CType>,
 }
 
 // ===========================================================================
@@ -308,11 +310,15 @@ fn lower_compound_statement(
                 current_block = lower_statement(ctx, stmt);
             }
             ast::BlockItem::Declaration(decl) => {
-                // Allocas are already created in the entry block by the
-                // parent lowering driver. Here we emit Store instructions
-                // for each declarator's initializer so that the initial
-                // values are recorded in the alloca slots. The subsequent
-                // mem2reg pass (Phase 7) promotes these to SSA registers.
+                // Ensure allocas exist for ALL declarators in this
+                // declaration.  The top-level function lowering driver
+                // pre-scans the AST for locals, but cannot see into
+                // GCC statement expressions, so variables declared
+                // inside nested compound statements (e.g. inside
+                // `do { } while(0)` in percpu macros) may be missing.
+                // We create allocas on demand here before processing
+                // initializers so that every variable has a slot.
+                ensure_allocas_for_declaration(ctx, decl);
                 lower_declaration_initializers(ctx, decl);
             }
         }
@@ -340,6 +346,134 @@ fn lower_compound_statement(
 ///
 /// Declarations without initializers (e.g., `int x;`) are no-ops — the alloca
 /// already exists and the value is undefined until a later assignment.
+/// Ensure every declarator in `decl` has an alloca in `ctx.local_vars`.
+///
+/// The top-level function lowering pre-scans the AST body to collect all
+/// local variables, but that scan cannot see through expression boundaries
+/// into GCC statement expressions.  Variables declared in nested compound
+/// statements (e.g. `do { const void *__vpp_verify = …; } while(0)` inside
+/// a `VERIFY_PERCPU_PTR` macro expansion) are therefore missing.
+///
+/// This function creates allocas on demand for any declarator that is not
+/// already present in `ctx.local_vars`, so that subsequent initializer
+/// lowering and identifier lookups can find every variable.
+fn ensure_allocas_for_declaration(ctx: &mut StmtLoweringContext<'_>, decl: &ast::Declaration) {
+    // Skip typedef declarations — they don't produce any runtime code.
+    if matches!(
+        decl.specifiers.storage_class,
+        Some(ast::StorageClass::Typedef)
+    ) {
+        return;
+    }
+
+    // Handle extern declarations: register as external globals so they can
+    // be referenced by name during identifier lowering.
+    if matches!(
+        decl.specifiers.storage_class,
+        Some(ast::StorageClass::Extern)
+    ) {
+        for init_decl in &decl.declarators {
+            let var_name = match extract_decl_name(&init_decl.declarator, ctx.name_table) {
+                Some(name) => name,
+                None => continue,
+            };
+            // If already known as a global, skip.
+            if ctx.module.get_global(&var_name).is_some() {
+                continue;
+            }
+            let c_type = decl_lowering::resolve_declaration_type(
+                &decl.specifiers,
+                &init_decl.declarator,
+                ctx.target,
+                ctx.name_table,
+            );
+            let ir_type = IrType::from_ctype(&c_type, ctx.target);
+            let mut global =
+                crate::ir::module::GlobalVariable::new(var_name.clone(), ir_type, None);
+            global.linkage = crate::ir::module::Linkage::External;
+            global.is_definition = false;
+            ctx.module.add_global(global);
+        }
+        return;
+    }
+
+    // Handle static/thread-local declarations: create mangled globals (like
+    // lower_static_local in decl_lowering). This handles static variables
+    // declared inside statement expressions that aren't pre-scanned.
+    if matches!(
+        decl.specifiers.storage_class,
+        Some(ast::StorageClass::Static) | Some(ast::StorageClass::ThreadLocal)
+    ) {
+        for init_decl in &decl.declarators {
+            let var_name = match extract_decl_name(&init_decl.declarator, ctx.name_table) {
+                Some(name) => name,
+                None => continue,
+            };
+            // If already registered as a static local, skip.
+            if ctx.static_locals.contains_key(&var_name) {
+                continue;
+            }
+            let c_type = decl_lowering::resolve_declaration_type(
+                &decl.specifiers,
+                &init_decl.declarator,
+                ctx.target,
+                ctx.name_table,
+            );
+            let ir_type = IrType::from_ctype(&c_type, ctx.target);
+            let func_name = &ctx.function.name;
+            let mangled_name = format!("{}.{}", func_name, var_name);
+
+            // Evaluate constant initializer if present.
+            let constant = if let Some(ast::Initializer::Expression(expr)) =
+                init_decl.initializer.as_ref()
+            {
+                match &**expr {
+                    ast::Expression::IntegerLiteral { value, .. } => {
+                        Some(crate::ir::module::Constant::Integer(*value as i128))
+                    }
+                    _ => Some(crate::ir::module::Constant::ZeroInit),
+                }
+            } else {
+                Some(crate::ir::module::Constant::ZeroInit)
+            };
+
+            let mut global =
+                crate::ir::module::GlobalVariable::new(mangled_name.clone(), ir_type, constant);
+            global.linkage = crate::ir::module::Linkage::Internal;
+            global.is_definition = true;
+            ctx.module.add_global(global);
+            ctx.static_locals
+                .insert(var_name.clone(), mangled_name.clone());
+        }
+        return;
+    }
+
+    // Regular (auto/register) declarations: create allocas on-demand.
+    for init_decl in &decl.declarators {
+        let var_name = match extract_decl_name(&init_decl.declarator, ctx.name_table) {
+            Some(name) => name,
+            None => continue,
+        };
+
+        // If the variable already has an alloca, nothing to do.
+        if ctx.local_vars.contains_key(&var_name) {
+            continue;
+        }
+
+        // Resolve the C type and create an alloca in the entry block.
+        let c_type = decl_lowering::resolve_declaration_type(
+            &decl.specifiers,
+            &init_decl.declarator,
+            ctx.target,
+            ctx.name_table,
+        );
+        let ir_type = IrType::from_ctype(&c_type, ctx.target);
+        let (alloca_val, alloca_inst) = ctx.builder.build_alloca(ir_type, decl.span);
+        ctx.function.entry_block_mut().push_instruction(alloca_inst);
+        ctx.local_vars.insert(var_name.clone(), alloca_val);
+    }
+}
+
 pub fn lower_declaration_initializers(ctx: &mut StmtLoweringContext<'_>, decl: &ast::Declaration) {
     // Skip extern declarations — they don't allocate stack storage.
     if matches!(
@@ -404,6 +538,7 @@ pub fn lower_declaration_initializers(ctx: &mut StmtLoweringContext<'_>, decl: &
             local_types: ctx.local_types,
             enum_constants: ctx.enum_constants,
             static_locals: ctx.static_locals,
+            struct_defs: ctx.struct_defs,
         };
         decl_lowering::lower_local_initializer(alloca_val, initializer, &var_type, &mut expr_ctx);
     }
@@ -703,9 +838,9 @@ fn lower_for_loop(
                 let _val = lower_expr_via_context(ctx, expr);
             }
             ast::ForInit::Declaration(decl) => {
-                // Emit Store instructions for for-loop init declarations
-                // (e.g., `for (int i = 0; ...)`). The alloca was already
-                // created in the entry block by the parent driver.
+                // Ensure allocas exist (may be missing for statement
+                // expression scopes) and emit Store instructions.
+                ensure_allocas_for_declaration(ctx, decl);
                 lower_declaration_initializers(ctx, decl);
             }
         }
@@ -1464,6 +1599,7 @@ fn lower_expr_via_context(ctx: &mut StmtLoweringContext<'_>, expr: &ast::Express
         local_types: ctx.local_types,
         enum_constants: ctx.enum_constants,
         static_locals: ctx.static_locals,
+        struct_defs: ctx.struct_defs,
     };
     lower_expression(&mut expr_ctx, expr)
 }

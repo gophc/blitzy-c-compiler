@@ -279,7 +279,7 @@ fn validate_constraint(
                 matches!(ch, 'w' | 'x' | 'z' | 'Q' | 'U')
             }
             Target::RiscV64 => {
-                matches!(ch, 'f' | 'J' | 'K' | 'I')
+                matches!(ch, 'f' | 'J' | 'K' | 'I' | 'A' | 'S' | 'v' | 'c')
             }
         };
 

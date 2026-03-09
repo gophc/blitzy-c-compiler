@@ -631,7 +631,7 @@ mod tests {
     #[test]
     fn test_allocatable_gprs_count() {
         assert_eq!(ALLOCATABLE_GPRS.len(), 13); // R11 reserved for spill scratch
-        // Must not contain RSP or RBP
+                                                // Must not contain RSP or RBP
         assert!(!ALLOCATABLE_GPRS.contains(&RSP));
         assert!(!ALLOCATABLE_GPRS.contains(&RBP));
         // Must contain all other GPRs exactly once
@@ -657,10 +657,7 @@ mod tests {
     #[test]
     fn test_caller_saved_gprs_set() {
         assert_eq!(CALLER_SAVED_GPRS.len(), 8);
-        assert_eq!(
-            CALLER_SAVED_GPRS,
-            [RAX, RCX, RDX, RSI, RDI, R8, R9, R10]
-        );
+        assert_eq!(CALLER_SAVED_GPRS, [RAX, RCX, RDX, RSI, RDI, R8, R9, R10]);
     }
 
     #[test]

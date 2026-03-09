@@ -724,11 +724,68 @@ fn x86_opcode_mnemonic(opcode: u32) -> &'static str {
 /// AT&T syntax uses `mnemonic src, dst` order. `MachineInstruction` stores
 /// `result` as the destination and `operands` as sources. We combine them
 /// in the correct AT&T order: sources first, destination last.
+/// Substitute `%0`, `%1`, … in an inline assembly template with the
+/// corresponding operand's representation.  `%%` → `%`.
+///
+/// For inline asm, `"i"` (immediate) operands are emitted as bare numbers
+/// (not `$42`), and register operands use AT&T syntax (`%rax`).
+fn substitute_asm_operands(template: &str, operands: &[MachineOperand]) -> String {
+    let mut result = String::with_capacity(template.len());
+    let bytes = template.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len {
+        if bytes[i] == b'%' && i + 1 < len {
+            if bytes[i + 1] == b'%' {
+                // Escaped percent — emit a single %.
+                result.push('%');
+                i += 2;
+            } else if bytes[i + 1].is_ascii_digit() {
+                // Operand reference: %0, %1, %12, etc.
+                let start = i + 1;
+                let mut end = start;
+                while end < len && bytes[end].is_ascii_digit() {
+                    end += 1;
+                }
+                let idx: usize = template[start..end].parse().unwrap_or(0);
+                if idx < operands.len() {
+                    result.push_str(&format_asm_operand(&operands[idx]));
+                } else {
+                    // Out-of-range operand — emit literal placeholder.
+                    result.push_str(&template[i..end]);
+                }
+                i = end;
+            } else {
+                result.push('%');
+                i += 1;
+            }
+        } else {
+            result.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    result
+}
+
+/// Format a machine operand for inline assembly substitution.
+/// Immediates are bare numbers (no `$` prefix), registers use AT&T names.
+fn format_asm_operand(op: &MachineOperand) -> String {
+    match op {
+        MachineOperand::Immediate(imm) => format!("{}", imm),
+        _ => format_operand_att(op),
+    }
+}
+
 fn format_x86_instruction(inst: &MachineInstruction) -> String {
     let mnemonic = x86_opcode_mnemonic(inst.opcode);
 
-    // Inline assembly: emit template string verbatim.
-    if mnemonic == "# inline asm" {
+    // Inline assembly: emit template with operand substitution.
+    // The template is stored in `asm_template` and may contain %0, %1, etc.
+    // operands bound from the IR.
+    if let Some(ref template) = inst.asm_template {
+        return substitute_asm_operands(template, &inst.operands);
+    }
+    if mnemonic == "# inline asm" || mnemonic == "<inline-asm>" {
         if let Some(MachineOperand::GlobalSymbol(ref template)) = inst.operands.first() {
             return template.clone();
         }
@@ -854,7 +911,7 @@ mod tests {
 
         // 14 allocatable GPRs (16 - RSP - RBP)
         assert_eq!(info.allocatable_gpr.len(), 13); // R11 reserved as spill scratch
-        // 16 allocatable SSE registers
+                                                    // 16 allocatable SSE registers
         assert_eq!(info.allocatable_fpr.len(), 16);
         // 5 callee-saved GPRs: RBX, R12, R13, R14, R15
         assert_eq!(info.callee_saved.len(), 5);

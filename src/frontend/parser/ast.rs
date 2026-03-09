@@ -1027,6 +1027,8 @@ pub enum BuiltinKind {
     MulOverflow,
     /// `__builtin_prefetch(addr, ...)` — data prefetch hint.
     PrefetchData,
+    /// `__builtin_object_size(ptr, type)` — object size at compile time.
+    ObjectSize,
 }
 
 // ===========================================================================

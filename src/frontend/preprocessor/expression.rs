@@ -702,13 +702,27 @@ impl<'a> ExprParser<'a> {
                 parse_char_constant(&text, span, self.diagnostics)
             }
 
-            // --- Identifier: defined, true, false, or other → 0 ---
+            // --- Identifier: defined, __has_attribute, __has_builtin, etc. ---
             PPTokenKind::Identifier => {
                 self.advance();
 
                 if text == "defined" {
                     // Parse `defined(X)` or `defined X`.
                     self.parse_defined_operator(span)
+                } else if text == "__has_attribute" {
+                    self.parse_has_attribute_operator(span)
+                } else if text == "__has_builtin" {
+                    self.parse_has_builtin_operator(span)
+                } else if text == "__has_include"
+                    || text == "__has_include_next"
+                {
+                    self.parse_has_include_operator(span)
+                } else if text == "__has_feature"
+                    || text == "__has_extension"
+                {
+                    // GCC/Clang feature/extension checks — return 0 for
+                    // unrecognized features, which is the safe default.
+                    self.parse_has_feature_operator(span)
                 } else if text == "true" {
                     Ok(PPValue::Signed(1))
                 } else if text == "false" {
@@ -788,6 +802,332 @@ impl<'a> ExprParser<'a> {
         // this evaluator.  If it reaches here, the macro is not defined.
         Ok(PPValue::Signed(0))
     }
+
+    // ---- `__has_attribute` operator ----
+
+    /// Parse `__has_attribute(attr_name)` — checks if the compiler supports
+    /// a given `__attribute__` name. Returns 1 for supported attributes, 0 otherwise.
+    fn parse_has_attribute_operator(&mut self, _kw_span: Span) -> Result<PPValue, ()> {
+        if !self.eat_punct("(") {
+            let span = self.current_span();
+            self.diagnostics.emit(Diagnostic::error(
+                span,
+                "expected '(' after '__has_attribute'",
+            ));
+            return Err(());
+        }
+
+        let attr_name = if !self.at_end() && self.peek_token().kind == PPTokenKind::Identifier {
+            let name = self.peek_token().text.clone();
+            self.advance();
+            name
+        } else {
+            let span = self.current_span();
+            self.diagnostics.emit(Diagnostic::error(
+                span,
+                "expected attribute name in '__has_attribute(...)'",
+            ));
+            return Err(());
+        };
+
+        if !self.eat_punct(")") {
+            let span = self.current_span();
+            self.diagnostics.emit(Diagnostic::error(
+                span,
+                "expected ')' after '__has_attribute(name'",
+            ));
+            return Err(());
+        }
+
+        // Return 1 for attributes BCC supports (GCC-compatible set).
+        let supported = is_supported_attribute(&attr_name);
+        Ok(PPValue::Signed(if supported { 1 } else { 0 }))
+    }
+
+    // ---- `__has_builtin` operator ----
+
+    /// Parse `__has_builtin(builtin_name)` — checks if the compiler provides
+    /// a given builtin function. Returns 1 for supported builtins, 0 otherwise.
+    fn parse_has_builtin_operator(&mut self, _kw_span: Span) -> Result<PPValue, ()> {
+        if !self.eat_punct("(") {
+            let span = self.current_span();
+            self.diagnostics.emit(Diagnostic::error(
+                span,
+                "expected '(' after '__has_builtin'",
+            ));
+            return Err(());
+        }
+
+        let builtin_name = if !self.at_end() && self.peek_token().kind == PPTokenKind::Identifier {
+            let name = self.peek_token().text.clone();
+            self.advance();
+            name
+        } else {
+            let span = self.current_span();
+            self.diagnostics.emit(Diagnostic::error(
+                span,
+                "expected builtin name in '__has_builtin(...)'",
+            ));
+            return Err(());
+        };
+
+        if !self.eat_punct(")") {
+            let span = self.current_span();
+            self.diagnostics.emit(Diagnostic::error(
+                span,
+                "expected ')' after '__has_builtin(name'",
+            ));
+            return Err(());
+        }
+
+        let supported = is_supported_builtin(&builtin_name);
+        Ok(PPValue::Signed(if supported { 1 } else { 0 }))
+    }
+
+    // ---- `__has_include` / `__has_include_next` operator ----
+
+    /// Parse `__has_include(<header>)` or `__has_include("header")`.
+    /// Returns 1 if the header file exists in the include search paths, 0 otherwise.
+    fn parse_has_include_operator(&mut self, _kw_span: Span) -> Result<PPValue, ()> {
+        if !self.eat_punct("(") {
+            let span = self.current_span();
+            self.diagnostics.emit(Diagnostic::error(
+                span,
+                "expected '(' after '__has_include'",
+            ));
+            return Err(());
+        }
+
+        // Consume tokens until we find the closing ')'
+        // We don't actually resolve the include — just consume the argument.
+        let mut depth = 1u32;
+        while !self.at_end() && depth > 0 {
+            let tok = self.peek_token();
+            if tok.kind == PPTokenKind::Punctuator && tok.text == "(" {
+                depth += 1;
+            } else if tok.kind == PPTokenKind::Punctuator && tok.text == ")" {
+                depth -= 1;
+                if depth == 0 {
+                    self.advance();
+                    break;
+                }
+            }
+            self.advance();
+        }
+
+        // Conservative: return 0 (header not found) since we don't have
+        // include path context in the expression evaluator.
+        Ok(PPValue::Signed(0))
+    }
+
+    // ---- `__has_feature` / `__has_extension` operator ----
+
+    /// Parse `__has_feature(feature_name)` or `__has_extension(ext_name)`.
+    /// These are primarily Clang extensions; GCC doesn't have them but
+    /// some code checks for them. Return 0 for most features.
+    fn parse_has_feature_operator(&mut self, _kw_span: Span) -> Result<PPValue, ()> {
+        if !self.eat_punct("(") {
+            let span = self.current_span();
+            self.diagnostics.emit(Diagnostic::error(
+                span,
+                "expected '(' after '__has_feature'/'__has_extension'",
+            ));
+            return Err(());
+        }
+
+        if !self.at_end() && self.peek_token().kind == PPTokenKind::Identifier {
+            self.advance(); // consume feature name
+        }
+
+        if !self.eat_punct(")") {
+            let span = self.current_span();
+            self.diagnostics.emit(Diagnostic::error(
+                span,
+                "expected ')' after '__has_feature(name'",
+            ));
+            return Err(());
+        }
+
+        // Return 0 for all features (not Clang).
+        Ok(PPValue::Signed(0))
+    }
+}
+
+// ===========================================================================
+// Attribute and builtin support tables
+// ===========================================================================
+
+/// Check if an attribute name is supported by BCC.
+/// This covers the GCC attributes commonly used by the Linux kernel and
+/// other real-world C code.
+fn is_supported_attribute(name: &str) -> bool {
+    // Strip leading/trailing underscores for canonical form:
+    // __aligned__ → aligned, __packed__ → packed, etc.
+    let canonical = name
+        .strip_prefix("__")
+        .and_then(|s| s.strip_suffix("__"))
+        .unwrap_or(name);
+
+    matches!(
+        canonical,
+        "aligned"
+            | "packed"
+            | "section"
+            | "used"
+            | "unused"
+            | "weak"
+            | "alias"
+            | "constructor"
+            | "destructor"
+            | "visibility"
+            | "deprecated"
+            | "noreturn"
+            | "noinline"
+            | "always_inline"
+            | "cold"
+            | "hot"
+            | "format"
+            | "format_arg"
+            | "malloc"
+            | "pure"
+            | "const"
+            | "warn_unused_result"
+            | "fallthrough"
+            | "nonnull"
+            | "returns_nonnull"
+            | "sentinel"
+            | "mode"
+            | "transparent_union"
+            | "may_alias"
+            | "cleanup"
+            | "noclone"
+            | "no_instrument_function"
+            | "no_profile_instrument_function"
+            | "no_sanitize"
+            | "no_sanitize_address"
+            | "no_sanitize_thread"
+            | "no_sanitize_undefined"
+            | "no_stack_protector"
+            | "no_caller_saved_registers"
+            | "error"
+            | "warning"
+            | "externally_visible"
+            | "gnu_inline"
+            | "artificial"
+            | "flatten"
+            | "leaf"
+            | "assume_aligned"
+            | "alloc_size"
+            | "alloc_align"
+            | "copy"
+            | "designated_init"
+            | "nonstring"
+            | "noplt"
+            | "optimize"
+            | "target"
+            | "counted_by"
+            | "btf_type_tag"
+            | "diagnose_as_builtin"
+            | "noipa"
+            | "access"
+            | "fd_arg"
+            | "tainted_args"
+            | "disable_sanitizer_instrumentation"
+            | "no_stack_limit"
+            | "nocf_check"
+            | "force_align_arg_pointer"
+            | "naked"
+            | "regparm"
+            | "stdcall"
+            | "cdecl"
+            | "fastcall"
+    )
+}
+
+/// Check if a builtin function name is supported by BCC.
+fn is_supported_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "__builtin_expect"
+            | "__builtin_expect_with_probability"
+            | "__builtin_unreachable"
+            | "__builtin_constant_p"
+            | "__builtin_offsetof"
+            | "__builtin_types_compatible_p"
+            | "__builtin_choose_expr"
+            | "__builtin_clz"
+            | "__builtin_clzl"
+            | "__builtin_clzll"
+            | "__builtin_ctz"
+            | "__builtin_ctzl"
+            | "__builtin_ctzll"
+            | "__builtin_popcount"
+            | "__builtin_popcountl"
+            | "__builtin_popcountll"
+            | "__builtin_bswap16"
+            | "__builtin_bswap32"
+            | "__builtin_bswap64"
+            | "__builtin_ffs"
+            | "__builtin_ffsl"
+            | "__builtin_ffsll"
+            | "__builtin_va_start"
+            | "__builtin_va_end"
+            | "__builtin_va_copy"
+            | "__builtin_va_arg"
+            | "__builtin_va_list"
+            | "__builtin_frame_address"
+            | "__builtin_return_address"
+            | "__builtin_trap"
+            | "__builtin_assume_aligned"
+            | "__builtin_add_overflow"
+            | "__builtin_sub_overflow"
+            | "__builtin_mul_overflow"
+            | "__builtin_object_size"
+            | "__builtin_memcpy"
+            | "__builtin_memset"
+            | "__builtin_memmove"
+            | "__builtin_memcmp"
+            | "__builtin_strlen"
+            | "__builtin_strcmp"
+            | "__builtin_strncmp"
+            | "__builtin_strcpy"
+            | "__builtin_strncpy"
+            | "__builtin_strncat"
+            | "__builtin_abs"
+            | "__builtin_labs"
+            | "__builtin_llabs"
+            | "__builtin_huge_val"
+            | "__builtin_huge_valf"
+            | "__builtin_inf"
+            | "__builtin_inff"
+            | "__builtin_nan"
+            | "__builtin_nanf"
+            | "__builtin_prefetch"
+            | "__builtin_alloca"
+            | "__builtin_classify_type"
+            | "__builtin_LINE"
+            | "__builtin_FUNCTION"
+            | "__builtin_FILE"
+            | "__builtin___clear_cache"
+            | "__builtin_sadd_overflow"
+            | "__builtin_saddl_overflow"
+            | "__builtin_saddll_overflow"
+            | "__builtin_uadd_overflow"
+            | "__builtin_uaddl_overflow"
+            | "__builtin_uaddll_overflow"
+            | "__builtin_ssub_overflow"
+            | "__builtin_ssubl_overflow"
+            | "__builtin_ssubll_overflow"
+            | "__builtin_usub_overflow"
+            | "__builtin_usubl_overflow"
+            | "__builtin_usubll_overflow"
+            | "__builtin_smul_overflow"
+            | "__builtin_smull_overflow"
+            | "__builtin_smulll_overflow"
+            | "__builtin_umul_overflow"
+            | "__builtin_umull_overflow"
+            | "__builtin_umulll_overflow"
+    )
 }
 
 // ===========================================================================

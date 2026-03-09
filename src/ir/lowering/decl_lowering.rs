@@ -184,7 +184,14 @@ pub fn lower_function_definition(
         }
     };
 
-    let return_c_type = resolve_base_type(specifiers, target);
+    // Resolve the return type from specifiers, then apply pointer
+    // indirection from the declarator.  In C, `void *foo(void)` has
+    // specifiers `void` and declarator `*foo(void)`, so the pointer `*`
+    // makes the return type `void *`, not bare `void`.
+    let mut return_c_type = resolve_base_type_fast(specifiers, name_table);
+    if let Some(ref ptr) = declarator.pointer {
+        return_c_type = apply_pointer_layers(return_c_type, ptr);
+    }
     let return_ir_type = IrType::from_ctype(&return_c_type, target);
 
     let (param_declarations, is_variadic) = extract_function_params(declarator);
@@ -328,9 +335,21 @@ pub fn lower_function_definition(
         }
     }
 
+    // --- Pre-scan for labels to support forward references in asm goto ---
+    let mut label_blocks: FxHashMap<String, BlockId> = FxHashMap::default();
+    {
+        let body_stmt = ast::Statement::Compound(func_def.body.clone());
+        let mut label_names: Vec<String> = Vec::new();
+        collect_label_names(&body_stmt, &mut label_names, name_table);
+        for lname in label_names {
+            let block_id = builder.create_block();
+            ir_function.ensure_block(block_id);
+            label_blocks.insert(lname, block_id);
+        }
+    }
+
     // --- Lower the function body statements ---
     {
-        let mut label_blocks: FxHashMap<String, BlockId> = FxHashMap::default();
         let body_stmt = ast::Statement::Compound(func_def.body.clone());
         let mut stmt_ctx = stmt_lowering::StmtLoweringContext {
             builder: &mut builder,
@@ -348,7 +367,8 @@ pub fn lower_function_definition(
             name_table,
             local_types: &local_types,
             enum_constants,
-            static_locals: &static_locals,
+            static_locals: &mut static_locals,
+            struct_defs,
         };
         stmt_lowering::lower_statement(&mut stmt_ctx, &body_stmt);
     }
@@ -384,7 +404,7 @@ pub fn lower_function_declaration(
             None => continue,
         };
 
-        let return_c_type = resolve_base_type(specifiers, target);
+        let return_c_type = resolve_base_type_fast(specifiers, name_table);
         let return_ir_type = IrType::from_ctype(&return_c_type, target);
 
         let (param_decls, is_variadic) = extract_function_params(declarator);
@@ -986,6 +1006,61 @@ fn collect_local_variables(body: &ast::Statement, name_table: &[String]) -> Vec<
     locals
 }
 
+/// Recursively collect all C label names from a statement tree.
+///
+/// Pre-scanning for labels enables forward references in `asm goto`
+/// statements — the label block is created before the function body
+/// is lowered, so `wire_asm_goto_targets` can always find the block.
+fn collect_label_names(
+    stmt: &ast::Statement,
+    labels: &mut Vec<String>,
+    name_table: &[String],
+) {
+    match stmt {
+        ast::Statement::Labeled {
+            label, statement, ..
+        } => {
+            // Use the same naming convention as lower_label in stmt_lowering.rs:
+            // format!("label_{}", label.as_u32())
+            labels.push(format!("label_{}", label.as_u32()));
+            let _ = name_table; // suppress unused
+            collect_label_names(statement, labels, name_table);
+        }
+        ast::Statement::Compound(compound) => {
+            for item in &compound.items {
+                match item {
+                    ast::BlockItem::Statement(s) => collect_label_names(s, labels, name_table),
+                    ast::BlockItem::Declaration(_) => {}
+                }
+            }
+        }
+        ast::Statement::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_label_names(then_branch, labels, name_table);
+            if let Some(ref e) = else_branch {
+                collect_label_names(e, labels, name_table);
+            }
+        }
+        ast::Statement::While { body, .. }
+        | ast::Statement::DoWhile { body, .. }
+        | ast::Statement::Switch { body, .. } => {
+            collect_label_names(body, labels, name_table);
+        }
+        ast::Statement::For { body, .. } => {
+            collect_label_names(body, labels, name_table);
+        }
+        ast::Statement::Case { statement, .. }
+        | ast::Statement::Default { statement, .. }
+        | ast::Statement::CaseRange { statement, .. } => {
+            collect_label_names(statement, labels, name_table);
+        }
+        _ => {}
+    }
+}
+
 fn collect_locals_recursive(
     stmt: &ast::Statement,
     locals: &mut Vec<LocalVarInfo>,
@@ -1289,14 +1364,23 @@ fn extract_section_attribute(
 /// Extract struct/union fields from the AST `StructOrUnionSpecifier` into
 /// `StructField` entries that can be used in `CType::Struct` / `CType::Union`.
 pub fn extract_struct_union_fields(spec: &ast::StructOrUnionSpecifier) -> Vec<StructField> {
-    // Use thread-local name table for symbol resolution
+    // Clone the thread-local name table once for this call (fallback path).
     let name_table =
         super::INTERNER_SNAPSHOT.with(|snap| snap.borrow().as_ref().cloned().unwrap_or_default());
+    extract_struct_union_fields_fast(spec, &name_table)
+}
+
+/// Performance-optimized struct/union field extraction.
+/// Uses the provided `name_table` reference instead of cloning the interner snapshot.
+pub fn extract_struct_union_fields_fast(
+    spec: &ast::StructOrUnionSpecifier,
+    name_table: &[String],
+) -> Vec<StructField> {
     let mut fields = Vec::new();
     if let Some(ref members) = spec.members {
         for member in members {
             // Resolve base type from the member's specifier-qualifier list
-            let member_base = resolve_base_type_from_sqlist(&member.specifiers);
+            let member_base = resolve_base_type_from_sqlist_fast(&member.specifiers, name_table);
             if member.declarators.is_empty() {
                 // Anonymous struct/union member (no declarators)
                 fields.push(StructField {
@@ -1311,10 +1395,10 @@ pub fn extract_struct_union_fields(spec: &ast::StructOrUnionSpecifier) -> Vec<St
                         .as_ref()
                         .and_then(|e| evaluate_const_int_expr(e).map(|v| v as u32));
                     if let Some(ref declarator) = sd.declarator {
-                        let name = extract_declarator_name(declarator, &name_table);
+                        let name = extract_declarator_name(declarator, name_table);
                         // Apply pointer/array modifiers from declarator
                         let member_type =
-                            apply_declarator_type(member_base.clone(), declarator, &name_table);
+                            apply_declarator_type(member_base.clone(), declarator, name_table);
                         fields.push(StructField {
                             name,
                             ty: member_type,
@@ -1366,14 +1450,26 @@ fn resolve_struct_forward_ref(ctype: &mut CType, struct_defs: &FxHashMap<String,
 
 /// Resolve a base C type from a specifier-qualifier list (used for struct members).
 pub fn resolve_base_type_from_sqlist(sqlist: &ast::SpecifierQualifierList) -> CType {
+    // Fallback for callers without a name_table — clones the interner snapshot.
+    let name_table =
+        super::INTERNER_SNAPSHOT.with(|snap| snap.borrow().as_ref().cloned().unwrap_or_default());
+    resolve_base_type_from_sqlist_fast(sqlist, &name_table)
+}
+
+/// Performance-optimized specifier-qualifier list resolution.
+/// Uses the provided `name_table` reference to avoid O(n) cloning.
+fn resolve_base_type_from_sqlist_fast(
+    sqlist: &ast::SpecifierQualifierList,
+    name_table: &[String],
+) -> CType {
     let type_specs = &sqlist.type_specifiers;
     if type_specs.is_empty() {
         return CType::Int;
     }
     if type_specs.len() == 1 {
-        return map_single_type_specifier(&type_specs[0]);
+        return map_single_type_specifier_fast(&type_specs[0], name_table);
     }
-    resolve_multi_word_type(type_specs)
+    resolve_multi_word_type_fast(type_specs, name_table)
 }
 
 fn extract_alignment_attribute(
@@ -1411,14 +1507,27 @@ fn collect_all_attributes(
 // ===========================================================================
 
 fn resolve_base_type(specifiers: &ast::DeclarationSpecifiers, _target: &Target) -> CType {
+    // Fallback for callers without a name_table — clones the interner snapshot.
+    let name_table =
+        super::INTERNER_SNAPSHOT.with(|snap| snap.borrow().as_ref().cloned().unwrap_or_default());
+    resolve_base_type_fast(specifiers, &name_table)
+}
+
+/// Performance-optimized base type resolution.
+/// Uses the provided `name_table` reference to avoid O(n) cloning per call.
+#[inline]
+fn resolve_base_type_fast(
+    specifiers: &ast::DeclarationSpecifiers,
+    name_table: &[String],
+) -> CType {
     let type_specs = &specifiers.type_specifiers;
     if type_specs.is_empty() {
         return CType::Int;
     }
     if type_specs.len() == 1 {
-        return map_single_type_specifier(&type_specs[0]);
+        return map_single_type_specifier_fast(&type_specs[0], name_table);
     }
-    resolve_multi_word_type(type_specs)
+    resolve_multi_word_type_fast(type_specs, name_table)
 }
 
 /// Resolve a Symbol to its actual string name using the name_table.
@@ -1434,10 +1543,19 @@ fn sym_to_string(sym: &crate::common::string_interner::Symbol, name_table: &[Str
 }
 
 fn map_single_type_specifier(spec: &ast::TypeSpecifier) -> CType {
-    // Use thread-local name table for symbol resolution
+    // Delegate to the name_table-aware version using the thread-local snapshot.
+    // NOTE: This clones the snapshot — callers in hot paths should prefer
+    // `map_single_type_specifier_with_names` with an already-borrowed table.
     let name_table =
         super::INTERNER_SNAPSHOT.with(|snap| snap.borrow().as_ref().cloned().unwrap_or_default());
     map_single_type_specifier_with_names(spec, &name_table)
+}
+
+/// Performance-optimized base type resolution for a single type specifier.
+/// Uses the provided `name_table` reference to avoid cloning the interner snapshot.
+#[inline]
+fn map_single_type_specifier_fast(spec: &ast::TypeSpecifier, name_table: &[String]) -> CType {
+    map_single_type_specifier_with_names(spec, name_table)
 }
 
 fn map_single_type_specifier_with_names(spec: &ast::TypeSpecifier, name_table: &[String]) -> CType {
@@ -1485,6 +1603,14 @@ fn map_single_type_specifier_with_names(spec: &ast::TypeSpecifier, name_table: &
 }
 
 fn resolve_multi_word_type(specs: &[ast::TypeSpecifier]) -> CType {
+    let name_table =
+        super::INTERNER_SNAPSHOT.with(|snap| snap.borrow().as_ref().cloned().unwrap_or_default());
+    resolve_multi_word_type_fast(specs, &name_table)
+}
+
+/// Performance-optimized multi-word type resolution.
+/// Avoids cloning the interner snapshot per call by using a borrowed name_table.
+fn resolve_multi_word_type_fast(specs: &[ast::TypeSpecifier], name_table: &[String]) -> CType {
     let mut has_unsigned = false;
     let mut has_signed = false;
     let mut long_count = 0u32;
@@ -1505,7 +1631,7 @@ fn resolve_multi_word_type(specs: &[ast::TypeSpecifier]) -> CType {
             ast::TypeSpecifier::Double => has_double = true,
             ast::TypeSpecifier::Float => has_float = true,
             ast::TypeSpecifier::Complex => has_complex = true,
-            other => return map_single_type_specifier(other),
+            other => return map_single_type_specifier_fast(other, name_table),
         }
     }
 
@@ -1568,10 +1694,10 @@ fn resolve_multi_word_type(specs: &[ast::TypeSpecifier]) -> CType {
 pub fn resolve_declaration_type(
     specifiers: &ast::DeclarationSpecifiers,
     declarator: &ast::Declarator,
-    target: &Target,
+    _target: &Target,
     name_table: &[String],
 ) -> CType {
-    let base = resolve_base_type(specifiers, target);
+    let base = resolve_base_type_fast(specifiers, name_table);
     apply_declarator_type(base, declarator, name_table)
 }
 
@@ -1621,15 +1747,35 @@ fn apply_direct_declarator(
             is_variadic,
             ..
         } => {
-            let return_type = apply_direct_declarator(base, inner_dd, name_table);
             let param_types: Vec<CType> = params
                 .iter()
                 .map(|p| resolve_param_type(p, &Target::X86_64, name_table))
                 .collect();
-            CType::Function {
-                return_type: Box::new(return_type),
-                params: param_types,
-                variadic: *is_variadic,
+            // C declarator syntax is inside-out. For function pointers like
+            // `int (*op)(int, int)`, the AST has:
+            //   Function { base: Parenthesized(Declarator{pointer:*, direct:Ident("op")}), params }
+            //
+            // The pointer `*` wraps the FUNCTION type, NOT the return type.
+            // So we must first construct the function type with `base` as its
+            // return type, then apply the inner declarator's modifiers (pointer,
+            // array, etc.) to the completed function type.
+            match inner_dd.as_ref() {
+                ast::DirectDeclarator::Parenthesized(inner_decl) => {
+                    let func_type = CType::Function {
+                        return_type: Box::new(base),
+                        params: param_types,
+                        variadic: *is_variadic,
+                    };
+                    apply_declarator_type(func_type, inner_decl, name_table)
+                }
+                _ => {
+                    let return_type = apply_direct_declarator(base, inner_dd, name_table);
+                    CType::Function {
+                        return_type: Box::new(return_type),
+                        params: param_types,
+                        variadic: *is_variadic,
+                    }
+                }
             }
         }
     }
@@ -1667,10 +1813,10 @@ fn extract_param_name(param: &ast::ParameterDeclaration, name_table: &[String]) 
 
 fn resolve_param_type(
     param: &ast::ParameterDeclaration,
-    target: &Target,
+    _target: &Target,
     name_table: &[String],
 ) -> CType {
-    let base = resolve_base_type(&param.specifiers, target);
+    let base = resolve_base_type_fast(&param.specifiers, name_table);
     if let Some(ref declarator) = param.declarator {
         apply_declarator_type(base, declarator, name_table)
     } else {
@@ -1735,24 +1881,162 @@ fn evaluate_const_int_expr(expr: &ast::Expression) -> Option<usize> {
 
 /// Evaluate sizeof for a type expression (simplified heuristic).
 fn evaluate_sizeof_expr(
-    _expr: &ast::Expression,
-    _target: &Target,
-    _type_builder: &TypeBuilder,
+    expr: &ast::Expression,
+    target: &Target,
+    type_builder: &TypeBuilder,
 ) -> u64 {
-    // In a full implementation, this would evaluate sizeof(type) using the target.
-    // For now, return a reasonable default for the most common case (pointer size).
-    8
+    match expr {
+        ast::Expression::SizeofType { type_name, .. } => {
+            let cty = resolve_base_type_from_sqlist(&type_name.specifier_qualifiers);
+            let cty = if let Some(ref abs) = type_name.abstract_declarator {
+                apply_abstract_declarator_to_type(cty, abs)
+            } else {
+                cty
+            };
+            // Resolve forward-referenced struct/union using thread-local struct_defs.
+            let resolved = resolve_sizeof_struct_ref(cty, target);
+            type_builder.sizeof_type(&resolved) as u64
+        }
+        ast::Expression::SizeofExpr { operand, .. } => {
+            // For sizeof(expr), try to infer the expression type.
+            // Common cases: sizeof(variable), sizeof(*ptr), sizeof(literal).
+            match operand.as_ref() {
+                ast::Expression::IntegerLiteral { .. } => {
+                    // sizeof(integer_literal) — type is int
+                    type_builder.sizeof_type(&CType::Int) as u64
+                }
+                _ => {
+                    // Default to pointer width for unknown expression types.
+                    target.pointer_width() as u64
+                }
+            }
+        }
+        _ => target.pointer_width() as u64,
+    }
 }
 
-/// Evaluate alignof for a type expression (simplified heuristic).
+/// Apply abstract declarator (pointer/array/function) layers to a base type
+/// for constant expression evaluation (global initializers).
+fn apply_abstract_declarator_to_type(
+    base: CType,
+    abs: &ast::AbstractDeclarator,
+) -> CType {
+    let mut result = if let Some(ref pointer) = abs.pointer {
+        let quals = crate::common::types::TypeQualifiers::default();
+        let mut current = CType::Pointer(Box::new(base), quals);
+        fn apply_ptr(current: CType, inner: &Option<Box<ast::Pointer>>) -> CType {
+            if let Some(ref next) = inner {
+                let quals = crate::common::types::TypeQualifiers::default();
+                let wrapped = CType::Pointer(Box::new(current), quals);
+                apply_ptr(wrapped, &next.inner)
+            } else {
+                current
+            }
+        }
+        current = apply_ptr(current, &pointer.inner);
+        current
+    } else {
+        base
+    };
+
+    if let Some(ref direct) = abs.direct {
+        result = apply_direct_abstract_decl_to_type(result, direct);
+    }
+    result
+}
+
+fn apply_direct_abstract_decl_to_type(
+    base: CType,
+    direct: &ast::DirectAbstractDeclarator,
+) -> CType {
+    match direct {
+        ast::DirectAbstractDeclarator::Parenthesized(inner) => {
+            apply_abstract_declarator_to_type(base, inner)
+        }
+        ast::DirectAbstractDeclarator::Array { size, .. } => {
+            let len = size
+                .as_ref()
+                .and_then(|e| {
+                    if let ast::Expression::IntegerLiteral { value, .. } = e.as_ref() {
+                        Some(*value as usize)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
+            CType::Array(Box::new(base), Some(len))
+        }
+        ast::DirectAbstractDeclarator::Function { .. } => {
+            CType::Pointer(
+                Box::new(base),
+                crate::common::types::TypeQualifiers::default(),
+            )
+        }
+    }
+}
+
+/// Resolve a struct/union forward reference for sizeof evaluation.
+/// Uses SIZEOF_STRUCT_DEFS thread-local when available, otherwise
+/// falls back to the struct_defs from the lowering context.
+fn resolve_sizeof_struct_ref(mut cty: CType, _target: &Target) -> CType {
+    // Use thread-local struct defs registry if available
+    super::SIZEOF_STRUCT_DEFS.with(|cell| {
+        let guard = cell.borrow();
+        if let Some(ref map) = *guard {
+            resolve_sizeof_forward_ref(&mut cty, map);
+        }
+    });
+    cty
+}
+
+/// Recursively resolve forward-referenced struct/union types in a CType tree.
+fn resolve_sizeof_forward_ref(ctype: &mut CType, struct_defs: &FxHashMap<String, CType>) {
+    match ctype {
+        CType::Struct {
+            name: Some(ref tag),
+            ref fields,
+            ..
+        } if fields.is_empty() => {
+            let tag_owned = tag.clone();
+            if let Some(full_def) = struct_defs.get(&tag_owned) {
+                *ctype = full_def.clone();
+            }
+        }
+        CType::Union {
+            name: Some(ref tag),
+            ref fields,
+            ..
+        } if fields.is_empty() => {
+            let tag_owned = tag.clone();
+            if let Some(full_def) = struct_defs.get(&tag_owned) {
+                *ctype = full_def.clone();
+            }
+        }
+        CType::Pointer(inner, _) => resolve_sizeof_forward_ref(inner, struct_defs),
+        CType::Array(inner, _) => resolve_sizeof_forward_ref(inner, struct_defs),
+        _ => {}
+    }
+}
+
+/// Evaluate alignof for a type expression.
 fn evaluate_alignof_expr(
-    _expr: &ast::Expression,
-    _target: &Target,
-    _type_builder: &TypeBuilder,
+    expr: &ast::Expression,
+    target: &Target,
+    type_builder: &TypeBuilder,
 ) -> u64 {
-    // In a full implementation, this would evaluate alignof(type) using the target.
-    // For now, return a reasonable default.
-    8
+    match expr {
+        ast::Expression::AlignofType { type_name, .. } => {
+            let cty = resolve_base_type_from_sqlist(&type_name.specifier_qualifiers);
+            let cty = if let Some(ref abs) = type_name.abstract_declarator {
+                apply_abstract_declarator_to_type(cty, abs)
+            } else {
+                cty
+            };
+            let resolved = resolve_sizeof_struct_ref(cty, target);
+            type_builder.alignof_type(&resolved) as u64
+        }
+        _ => target.pointer_width() as u64,
+    }
 }
 
 // ===========================================================================

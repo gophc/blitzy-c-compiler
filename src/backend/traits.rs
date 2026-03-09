@@ -319,6 +319,14 @@ pub struct MachineInstruction {
     /// which registers must be saved across the call.
     pub is_call: bool,
 
+    /// `true` if this instruction is part of a call argument setup sequence.
+    ///
+    /// Set by `select_call()` on MOV instructions that place values into
+    /// argument registers for an upcoming CALL.  The conflict resolver uses
+    /// this flag to distinguish call-arg MOVs from parameter copies that
+    /// happen to target the same registers.
+    pub is_call_arg_setup: bool,
+
     /// `true` if this instruction transfers control to another basic block.
     ///
     /// Branch instructions (conditional and unconditional) and switch
@@ -339,6 +347,24 @@ pub struct MachineInstruction {
     /// allocation — it is filled during the assembly encoding phase by
     /// the architecture-specific encoder.
     pub encoded_bytes: Vec<u8>,
+
+    /// Inline assembly template string (AT&T syntax).
+    ///
+    /// When this instruction represents an inline assembly statement, this
+    /// field contains the template string with `%0`, `%1`, etc. placeholders
+    /// that must be substituted with the physical registers assigned during
+    /// register allocation.  The assembler processes this template after
+    /// register allocation to emit the corresponding machine code.
+    ///
+    /// `None` for all non-inline-assembly instructions.
+    pub asm_template: Option<String>,
+
+    /// Inline assembly clobber registers.
+    ///
+    /// Physical register numbers clobbered by the inline assembly statement.
+    /// The register allocator treats these registers as unavailable across
+    /// this instruction. Empty for non-inline-asm instructions.
+    pub asm_clobbers: Vec<String>,
 }
 
 impl MachineInstruction {
@@ -353,9 +379,12 @@ impl MachineInstruction {
             result: None,
             is_terminator: false,
             is_call: false,
+            is_call_arg_setup: false,
             is_branch: false,
             operand_size: 0,
             encoded_bytes: Vec::new(),
+            asm_template: None,
+            asm_clobbers: Vec::new(),
         }
     }
 

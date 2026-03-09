@@ -617,7 +617,12 @@ impl X86_64CodeGen {
         for block in func.blocks() {
             for inst in block.instructions() {
                 if let Instruction::BinOp {
-                    result, op, lhs, rhs, ty, ..
+                    result,
+                    op,
+                    lhs,
+                    rhs,
+                    ty,
+                    ..
                 } = inst
                 {
                     let is_sentinel = (*op == BinOp::Add || *op == BinOp::FAdd)
@@ -749,6 +754,13 @@ impl X86_64CodeGen {
         // the address of a global variable.  Return a GlobalSymbol so
         // the load/store handlers can emit RIP-relative addressing.
         if let Some(name) = self.global_var_refs.get(&val) {
+            return MachineOperand::GlobalSymbol(name.clone());
+        }
+        // Check function reference map — the value may represent the
+        // address of a function (function pointer decay).  Return a
+        // GlobalSymbol so the encoder emits the function's address via
+        // LEA with RIP-relative addressing.
+        if let Some(name) = self.func_ref_names.get(&val) {
             return MachineOperand::GlobalSymbol(name.clone());
         }
         MachineOperand::Immediate(0)
@@ -1099,7 +1111,7 @@ impl X86_64CodeGen {
         // constant-sentinel BinOp instructions can be resolved to immediates.
         self.populate_constant_cache(func, globals);
 
-                // 1. Compute frame layout.
+        // 1. Compute frame layout.
         let frame = self.compute_frame_layout(func);
         self.frame = Some(frame);
 
@@ -1391,16 +1403,9 @@ impl X86_64CodeGen {
                         match &src {
                             MachineOperand::Immediate(_) => {
                                 let tmp = self.new_vreg();
-                                let mov_imm = Self::mk_inst(
-                                    X86Opcode::Mov,
-                                    Some(tmp.clone()),
-                                    &[src],
-                                );
-                                let store = Self::mk_inst(
-                                    X86Opcode::Mov,
-                                    None,
-                                    &[mem, tmp],
-                                );
+                                let mov_imm =
+                                    Self::mk_inst(X86Opcode::Mov, Some(tmp.clone()), &[src]);
+                                let store = Self::mk_inst(X86Opcode::Mov, None, &[mem, tmp]);
                                 vec![mov_imm, store]
                             }
                             _ => {
@@ -1909,10 +1914,10 @@ impl X86_64CodeGen {
             // ---------------------------------------------------------------
             Instruction::InlineAsm {
                 result,
-                template: _,
-                constraints: _,
+                template,
+                constraints,
                 operands,
-                clobbers: _,
+                clobbers,
                 has_side_effects,
                 is_volatile,
                 goto_targets: _,
@@ -1921,10 +1926,50 @@ impl X86_64CodeGen {
                 let dst = self.new_vreg();
                 self.set_value(*result, dst.clone());
 
+                // Parse constraints to determine which operands use
+                // immediate ("i"/"n") vs register ("r"/etc.) constraints.
+                // The constraint string format is comma-separated: e.g.
+                // "=r,i" for one output register + one immediate input.
+                let constraint_parts: Vec<&str> = constraints.split(',').collect();
+                // Count output constraints (those starting with '=' or '+')
+                let _num_outputs = constraint_parts
+                    .iter()
+                    .filter(|c| {
+                        let t = c.trim();
+                        t.starts_with('=') || t.starts_with('+')
+                    })
+                    .count();
+
                 let mut asm_operands = Vec::new();
-                // Bind input operands.
-                for op_val in operands {
-                    asm_operands.push(self.get_value(*op_val));
+                // Bind operands, respecting constraint types.
+                for (idx, op_val) in operands.iter().enumerate() {
+                    // Determine the constraint for this operand.
+                    // Output operands come first, then input operands.
+                    let constraint_idx = idx;
+                    let is_immediate_constraint =
+                        if constraint_idx < constraint_parts.len() {
+                            let c = constraint_parts[constraint_idx].trim();
+                            // Strip output modifiers ('=', '+')
+                            let c = c.trim_start_matches(|ch: char| ch == '=' || ch == '+');
+                            c.contains('i') || c.contains('n') || c.contains('I')
+                        } else {
+                            false
+                        };
+
+                    if is_immediate_constraint {
+                        // For immediate constraints, look up the constant
+                        // value directly from the constant cache, bypassing
+                        // the value_map (which would give a register).
+                        if let Some(&imm) = self.constant_cache.get(op_val) {
+                            asm_operands.push(MachineOperand::Immediate(imm));
+                        } else {
+                            // Fallback: use get_value which may return a
+                            // register if the constant wasn't cached.
+                            asm_operands.push(self.get_value(*op_val));
+                        }
+                    } else {
+                        asm_operands.push(self.get_value(*op_val));
+                    }
                 }
 
                 let mut inst = MachineInstruction::new(X86Opcode::InlineAsm.as_u32());
@@ -1932,6 +1977,10 @@ impl X86_64CodeGen {
                 for op in &asm_operands {
                     inst.operands.push(op.clone());
                 }
+                // Store the inline assembly template and clobbers for the
+                // assembler to process after register allocation.
+                inst.asm_template = Some(template.clone());
+                inst.asm_clobbers = clobbers.clone();
                 // Mark as having side effects to prevent elimination.
                 if *has_side_effects || *is_volatile {
                     inst.is_call = true; // Conservatively treat as call-like.
@@ -2345,6 +2394,12 @@ impl X86_64CodeGen {
         for arg_val in args {
             let arg_op = self.get_value(*arg_val);
 
+            // Determine if this value is a function reference (function
+            // pointer decay).  Function references must use LEA (to
+            // compute the address) rather than MOV (which would load
+            // the first bytes of the function's machine code).
+            let is_func_ref = self.func_ref_names.contains_key(arg_val);
+
             // Classify the argument as FP or integer by consulting the
             // value_types map (populated from IR instruction result types).
             // F32, F64, and F80 arguments are routed to XMM0–XMM7 per the
@@ -2357,19 +2412,27 @@ impl X86_64CodeGen {
 
             if is_fp && sse_idx < SSE_ARG_REGS.len() {
                 let reg = SSE_ARG_REGS[sse_idx];
-                out.push(Self::mk_inst(
+                let mut inst = Self::mk_inst(
                     X86Opcode::Movsd,
                     Some(MachineOperand::Register(reg)),
                     &[arg_op],
-                ));
+                );
+                inst.is_call_arg_setup = true;
+                out.push(inst);
                 sse_idx += 1;
             } else if !is_fp && gpr_idx < INTEGER_ARG_REGS.len() {
                 let reg = INTEGER_ARG_REGS[gpr_idx];
-                out.push(Self::mk_inst(
-                    X86Opcode::Mov,
-                    Some(MachineOperand::Register(reg)),
-                    &[arg_op],
-                ));
+                // For function references, use LEA to load the address
+                // of the function rather than MOV which would dereference it.
+                let opcode = if is_func_ref {
+                    X86Opcode::Lea
+                } else {
+                    X86Opcode::Mov
+                };
+                let mut inst =
+                    Self::mk_inst(opcode, Some(MachineOperand::Register(reg)), &[arg_op]);
+                inst.is_call_arg_setup = true;
+                out.push(inst);
                 gpr_idx += 1;
             } else {
                 // Stack argument — push in right-to-left order.

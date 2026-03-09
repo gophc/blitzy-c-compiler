@@ -32,7 +32,7 @@
 
 use crate::common::diagnostics::{Diagnostic, DiagnosticEngine, Severity, Span};
 use crate::common::fx_hash::FxHashMap;
-use crate::common::string_interner::Symbol;
+use crate::common::string_interner::{Interner, Symbol};
 use crate::common::types::CType;
 use crate::frontend::sema::symbol_table::SymbolId;
 
@@ -402,6 +402,25 @@ impl ScopeStack {
         for scope in self.scopes.iter().rev() {
             if let Some(entry) = scope.tags.get(&name) {
                 return Some(entry);
+            }
+        }
+        None
+    }
+
+    /// Look up a tag by its string name, using the interner to compare
+    /// each Symbol key against the provided name.
+    ///
+    /// This is used when we have a tag name as a `&str` (e.g. from
+    /// `CType::Struct { name: Some("foo"), .. }`) but only an immutable
+    /// reference to the interner — so we cannot call `interner.intern()`
+    /// to obtain a `Symbol`. Instead we iterate visible tags and match
+    /// by resolved string equality.
+    pub fn lookup_tag_by_str(&self, name: &str, interner: &Interner) -> Option<&TagEntry> {
+        for scope in self.scopes.iter().rev() {
+            for (sym, entry) in &scope.tags {
+                if interner.resolve(*sym) == name {
+                    return Some(entry);
+                }
             }
         }
         None

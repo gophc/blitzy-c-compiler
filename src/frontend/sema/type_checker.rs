@@ -637,6 +637,7 @@ impl<'a> TypeChecker<'a> {
                 Ok(CType::Bool)
             }
             BuiltinKind::PrefetchData => Ok(CType::Void),
+            BuiltinKind::ObjectSize => Ok(self.size_t_type()),
         }
     }
 

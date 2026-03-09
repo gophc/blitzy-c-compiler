@@ -1485,44 +1485,122 @@ impl RiscV64InstructionSelector {
     /// The template string and constraints are preserved for the assembler
     /// to process. This is critical for Linux kernel builds which use
     /// extensive inline assembly.
-    pub fn emit_inline_asm(
+    /// Emit an already-substituted inline assembly template.
+    pub fn emit_inline_asm_substituted(
         &mut self,
-        template: &str,
+        substituted_template: &str,
         constraints: &str,
-        operand_regs: &[u8],
         clobbers: &[String],
-        goto_targets: &[String],
     ) {
-        let mut inst = RvInstruction {
+        let inst = RvInstruction {
             opcode: RvOpcode::INLINE_ASM,
             rd: None,
             rs1: None,
             rs2: None,
             rs3: None,
             imm: 0,
-            symbol: Some(template.to_string()),
+            symbol: Some(substituted_template.to_string()),
             is_fp: false,
             comment: Some(format!(
-                "asm: constraints={}, clobbers=[{}], operands={}, gotos={}",
+                "asm: constraints={}, clobbers=[{}]",
                 constraints,
                 clobbers.join(","),
-                operand_regs.len(),
-                goto_targets.len(),
             )),
         };
-
-        // Encode operand registers in the instruction for the assembler
-        if let Some(&r) = operand_regs.first() {
-            inst.rs1 = Some(r);
-        }
-        if operand_regs.len() > 1 {
-            inst.rs2 = Some(operand_regs[1]);
-        }
-        if operand_regs.len() > 2 {
-            inst.rs3 = Some(operand_regs[2]);
-        }
-
         self.emit(inst);
+    }
+
+    /// Get RISC-V ABI register name for a physical register index.
+    fn rv_reg_name(&self, reg: u8) -> String {
+        match reg {
+            0 => "zero".to_string(),
+            1 => "ra".to_string(),
+            2 => "sp".to_string(),
+            3 => "gp".to_string(),
+            4 => "tp".to_string(),
+            5 => "t0".to_string(),
+            6 => "t1".to_string(),
+            7 => "t2".to_string(),
+            8 => "s0".to_string(),
+            9 => "s1".to_string(),
+            10 => "a0".to_string(),
+            11 => "a1".to_string(),
+            12 => "a2".to_string(),
+            13 => "a3".to_string(),
+            14 => "a4".to_string(),
+            15 => "a5".to_string(),
+            16 => "a6".to_string(),
+            17 => "a7".to_string(),
+            18 => "s2".to_string(),
+            19 => "s3".to_string(),
+            20 => "s4".to_string(),
+            21 => "s5".to_string(),
+            22 => "s6".to_string(),
+            23 => "s7".to_string(),
+            24 => "s8".to_string(),
+            25 => "s9".to_string(),
+            26 => "s10".to_string(),
+            27 => "s11".to_string(),
+            28 => "t3".to_string(),
+            29 => "t4".to_string(),
+            30 => "t5".to_string(),
+            31 => "t6".to_string(),
+            _ => format!("r{}", reg),
+        }
+    }
+
+    /// Substitute %0, %1, ... (and %l0, %l1, ...) in an inline assembly template.
+    fn substitute_template(
+        template: &str,
+        operand_reprs: &[String],
+        goto_labels: &[String],
+    ) -> String {
+        let mut result = String::with_capacity(template.len());
+        let bytes = template.as_bytes();
+        let len = bytes.len();
+        let mut i = 0;
+        while i < len {
+            if bytes[i] == b'%' && i + 1 < len {
+                if bytes[i + 1] == b'%' {
+                    result.push('%');
+                    i += 2;
+                } else if bytes[i + 1] == b'l' && i + 2 < len && bytes[i + 2].is_ascii_digit() {
+                    // Goto label reference: %l0, %l1, ...
+                    let start = i + 2;
+                    let mut end = start;
+                    while end < len && bytes[end].is_ascii_digit() {
+                        end += 1;
+                    }
+                    let idx: usize = template[start..end].parse().unwrap_or(0);
+                    if idx < goto_labels.len() {
+                        result.push_str(&goto_labels[idx]);
+                    } else {
+                        result.push_str(&template[i..end]);
+                    }
+                    i = end;
+                } else if bytes[i + 1].is_ascii_digit() {
+                    let start = i + 1;
+                    let mut end = start;
+                    while end < len && bytes[end].is_ascii_digit() {
+                        end += 1;
+                    }
+                    let idx: usize = template[start..end].parse().unwrap_or(0);
+                    if idx < operand_reprs.len() {
+                        result.push_str(&operand_reprs[idx]);
+                    } else {
+                        result.push_str(&template[i..end]);
+                    }
+                    i = end;
+                } else {
+                    result.push('%');
+                    i += 1;
+                }
+            } else {
+                result.push(bytes[i] as char);
+                i += 1;
+            }
+        }
+        result
     }
 
     // ===================================================================
@@ -2381,18 +2459,35 @@ impl RiscV64InstructionSelector {
                 goto_targets,
                 span: _,
             } => {
-                let operand_regs: Vec<u8> = operands.iter().map(|op| self.src_reg(*op)).collect();
+                // Parse constraints to identify immediate ("i"/"n"/"I") vs register operands.
+                let constraint_parts: Vec<&str> = constraints.split(',').collect();
+                let mut operand_reprs: Vec<String> = Vec::new();
+                for (idx, op_val) in operands.iter().enumerate() {
+                    let is_imm = if let Some(cstr) = constraint_parts.get(idx) {
+                        let c = cstr.trim_start_matches('=').trim_start_matches('+');
+                        c.contains('i') || c.contains('n') || c.contains('I')
+                    } else {
+                        false
+                    };
+                    if is_imm {
+                        // For immediate constraints, use constant value directly.
+                        if let Some(&imm) = self.constant_values.get(&op_val.index()) {
+                            operand_reprs.push(format!("{}", imm));
+                        } else {
+                            operand_reprs.push(format!("{}", self.src_reg(*op_val)));
+                        }
+                    } else {
+                        let reg = self.src_reg(*op_val);
+                        operand_reprs.push(self.rv_reg_name(reg));
+                    }
+                }
                 let target_labels: Vec<String> = goto_targets
                     .iter()
                     .map(|blk| self.block_label(blk.index()))
                     .collect();
-                self.emit_inline_asm(
-                    template,
-                    constraints,
-                    &operand_regs,
-                    clobbers,
-                    &target_labels,
-                );
+                // Substitute %0, %1, ... in template with operand representations.
+                let substituted = Self::substitute_template(template, &operand_reprs, &target_labels);
+                self.emit_inline_asm_substituted(&substituted, constraints, clobbers);
             }
         }
 

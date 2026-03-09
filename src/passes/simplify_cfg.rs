@@ -674,9 +674,7 @@ fn eliminate_empty_blocks(func: &mut IrFunction) -> bool {
                         }
                         // val is what E currently provides to T's phi.
                         for &p_idx in &e_preds {
-                            let resolved_val = if let Some(pred_map) =
-                                phi_resolution.get(&val)
-                            {
+                            let resolved_val = if let Some(pred_map) = phi_resolution.get(&val) {
                                 pred_map.get(&p_idx).copied().unwrap_or(val)
                             } else {
                                 val
@@ -1130,9 +1128,7 @@ fn recompute_cfg_and_cleanup_phis(func: &mut IrFunction) -> bool {
                         succs.push(else_block.index());
                     }
                 }
-                Instruction::Switch {
-                    default, cases, ..
-                } => {
+                Instruction::Switch { default, cases, .. } => {
                     succs.push(default.index());
                     for &(_val, blk) in cases {
                         if !succs.contains(&blk.index()) {
@@ -1157,15 +1153,19 @@ fn recompute_cfg_and_cleanup_phis(func: &mut IrFunction) -> bool {
     }
 
     // Step 3: Update predecessor and successor lists.
-    for block_idx in 0..num_blocks {
-        func.blocks[block_idx].successors = actual_succs[block_idx].clone();
-        func.blocks[block_idx].predecessors = actual_preds[block_idx].clone();
+    for (block_idx, (succ, pred)) in actual_succs
+        .iter()
+        .zip(actual_preds.iter())
+        .enumerate()
+        .take(num_blocks)
+    {
+        func.blocks[block_idx].successors = succ.clone();
+        func.blocks[block_idx].predecessors = pred.clone();
     }
 
     // Step 4: Remove stale phi incoming entries.
     let mut any_removed = false;
-    for block_idx in 0..num_blocks {
-        let preds = &actual_preds[block_idx];
+    for (block_idx, preds) in actual_preds.iter().enumerate().take(num_blocks) {
         let instructions = func.blocks[block_idx].instructions_mut();
         for inst in instructions.iter_mut() {
             if let Instruction::Phi { incoming, .. } = inst {

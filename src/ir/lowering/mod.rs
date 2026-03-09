@@ -80,6 +80,11 @@ thread_local! {
     // Symbol handles to real C identifier strings without threading a borrow of
     // the interner through deeply nested call chains.
     static INTERNER_SNAPSHOT: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+
+    // Struct/union definitions registry, populated once at the start of
+    // `lower_translation_unit` so that sizeof/alignof evaluation in global
+    // constant expressions can resolve forward-referenced struct types.
+    static SIZEOF_STRUCT_DEFS: RefCell<Option<FxHashMap<String, CType>>> = const { RefCell::new(None) };
 }
 
 // ============================================================================
@@ -703,8 +708,49 @@ pub fn lower_translation_unit(
         INTERNER_SNAPSHOT.with(|snap| snap.borrow().as_ref().cloned().unwrap_or_default());
 
     // ====================================================================
+    // Pass 0 — Collect struct/union/enum definitions before global lowering
+    // ====================================================================
+    let _t0 = std::time::Instant::now();
+    // Struct/union definitions at file scope (or embedded in declarations)
+    // populate a registry mapping tag name → CType.  This MUST run before
+    // global variable lowering so that constant expressions like
+    // `sizeof(struct S)` in global initializers can resolve the full type.
+    let struct_defs: FxHashMap<String, CType> = {
+        let mut map = FxHashMap::default();
+        for ext_decl in &translation_unit.declarations {
+            match ext_decl {
+                ast::ExternalDeclaration::Declaration(decl) => {
+                    collect_struct_defs_from_specifiers(
+                        &decl.specifiers.type_specifiers,
+                        &name_table,
+                        &mut map,
+                    );
+                }
+                ast::ExternalDeclaration::FunctionDefinition(func_def) => {
+                    collect_struct_defs_from_specifiers(
+                        &func_def.specifiers.type_specifiers,
+                        &name_table,
+                        &mut map,
+                    );
+                }
+                _ => {}
+            }
+        }
+        map
+    };
+
+    eprintln!("[BCC-TIMING] ir-pass0-struct-collect: {:.3}s", _t0.elapsed().as_secs_f64());
+    // Populate the thread-local struct definitions registry so that
+    // sizeof/alignof evaluation in global constant expressions can
+    // resolve forward-referenced struct/union types.
+    SIZEOF_STRUCT_DEFS.with(|defs| {
+        *defs.borrow_mut() = Some(struct_defs.clone());
+    });
+
+    // ====================================================================
     // Pass 1 — Global declarations, function prototypes, file-scope asm
     // ====================================================================
+    let _t1 = std::time::Instant::now();
     for ext_decl in &translation_unit.declarations {
         match ext_decl {
             ast::ExternalDeclaration::Declaration(decl) => {
@@ -766,9 +812,11 @@ pub fn lower_translation_unit(
         }
     }
 
+    eprintln!("[BCC-TIMING] ir-pass1-globals: {:.3}s", _t1.elapsed().as_secs_f64());
     // ====================================================================
     // Pass 1.5 — Collect enum constants from the AST
     // ====================================================================
+    let _t15 = std::time::Instant::now();
     // Enum constants are file-scope integer constants that must be
     // resolvable during expression lowering (e.g., `return RED;`).
     // We scan all top-level declarations for enum definitions and
@@ -797,37 +845,7 @@ pub fn lower_translation_unit(
         map
     };
 
-    // ====================================================================
-    // Pass 1.6 — Collect struct/union type definitions from the AST
-    // ====================================================================
-    // Struct/union definitions at file scope (or embedded in declarations)
-    // populate a registry mapping tag name → CType. This allows references
-    // like `struct S s;` inside function bodies to resolve the full struct
-    // layout, even when the AST specifier only contains the tag name.
-    let struct_defs: FxHashMap<String, CType> = {
-        let mut map = FxHashMap::default();
-        for ext_decl in &translation_unit.declarations {
-            match ext_decl {
-                ast::ExternalDeclaration::Declaration(decl) => {
-                    collect_struct_defs_from_specifiers(
-                        &decl.specifiers.type_specifiers,
-                        &name_table,
-                        &mut map,
-                    );
-                }
-                ast::ExternalDeclaration::FunctionDefinition(func_def) => {
-                    collect_struct_defs_from_specifiers(
-                        &func_def.specifiers.type_specifiers,
-                        &name_table,
-                        &mut map,
-                    );
-                }
-                _ => {}
-            }
-        }
-        map
-    };
-
+    eprintln!("[BCC-TIMING] ir-pass1.5-enums: {:.3}s", _t15.elapsed().as_secs_f64());
     // ====================================================================
     // Pass 2 — Function definitions (alloca-first pattern)
     // ====================================================================
@@ -1064,7 +1082,8 @@ fn collect_struct_defs_from_specifiers(
                     let tag_name_idx = tag.as_u32() as usize;
                     if tag_name_idx < name_table.len() {
                         let tag_name = name_table[tag_name_idx].clone();
-                        let fields = decl_lowering::extract_struct_union_fields(s);
+                        let fields =
+                            decl_lowering::extract_struct_union_fields_fast(s, name_table);
                         let ctype = CType::Struct {
                             name: Some(tag_name.clone()),
                             fields,
@@ -1080,7 +1099,8 @@ fn collect_struct_defs_from_specifiers(
                     let tag_name_idx = tag.as_u32() as usize;
                     if tag_name_idx < name_table.len() {
                         let tag_name = name_table[tag_name_idx].clone();
-                        let fields = decl_lowering::extract_struct_union_fields(u);
+                        let fields =
+                            decl_lowering::extract_struct_union_fields_fast(u, name_table);
                         let ctype = CType::Union {
                             name: Some(tag_name.clone()),
                             fields,

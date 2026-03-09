@@ -393,12 +393,16 @@ fn generate_for_arch<A: ArchCodegen>(
         }
 
         // Step 1: Instruction selection — IR → MachineFunction
+        //
+        // Use the per-function ref maps (scoped to this function's Value IDs)
+        // rather than the module-level maps which contain Values from ALL
+        // functions and suffer from cross-function Value-ID collisions.
         let mut mf = match arch.lower_function(
             func,
             diagnostics,
             module.globals(),
-            &module.func_ref_map,
-            &module.global_var_refs,
+            &func.func_ref_map,
+            &func.global_var_refs,
         ) {
             Ok(mf) => mf,
             Err(e) => {
@@ -796,7 +800,7 @@ fn apply_allocation_result(mf: &mut MachineFunction, alloc: &AllocationResult) {
         }
     }
     for (val, &slot_idx) in &alloc.spill_map {
-        let vreg = val.index() as u32;
+        let vreg = val.index();
         let offset = -((base_offset as i64) + 8 * (slot_idx as i64 + 1));
         vreg_spill_offset.entry(vreg).or_insert(offset);
     }
@@ -984,15 +988,6 @@ fn apply_allocation_result(mf: &mut MachineFunction, alloc: &AllocationResult) {
 ///    the sequence, save the conflicted value to R11 before it is
 ///    overwritten and fix the later MOV to read from R11.
 fn resolve_call_arg_conflicts(mf: &mut MachineFunction) {
-    use crate::backend::x86_64::registers;
-
-    // Set of integer argument registers (targets of call-argument MOVs).
-    let arg_regs: crate::common::fx_hash::FxHashSet<u16> =
-        registers::ARG_GPRS.iter().copied().collect();
-    // Also include SSE argument registers.
-    let sse_arg_regs: crate::common::fx_hash::FxHashSet<u16> =
-        registers::ARG_SSE.iter().copied().collect();
-
     const MOV_OPCODE: u32 = 0; // X86Opcode::Mov
     const SPILL_SCRATCH: u16 = 11; // R11
 
@@ -1012,22 +1007,18 @@ fn resolve_call_arg_conflicts(mf: &mut MachineFunction) {
             }
 
             // The CALL is at the end of new_insts.  Walk backwards to
-            // find consecutive MOVs whose result is an argument register.
+            // find the call-argument-setup MOV sequence.  Only instructions
+            // explicitly marked `is_call_arg_setup = true` by the codegen
+            // are included.  This prevents parameter copies (which may
+            // also target argument registers) from being included in the
+            // shuffle sequence and causing false conflict detection.
             let call_pos = new_insts.len() - 1;
             let mut seq_start = call_pos;
             while seq_start > 0 {
                 let prev = seq_start - 1;
                 let prev_inst = &new_insts[prev];
-                if prev_inst.opcode != MOV_OPCODE {
-                    break;
-                }
-                let is_arg_mov = match &prev_inst.result {
-                    Some(MachineOperand::Register(r)) => {
-                        arg_regs.contains(r) || sse_arg_regs.contains(r)
-                    }
-                    _ => false,
-                };
-                if !is_arg_mov {
+                // Only include instructions explicitly marked as call arg setup.
+                if !prev_inst.is_call_arg_setup {
                     break;
                 }
                 seq_start = prev;
@@ -1046,15 +1037,15 @@ fn resolve_call_arg_conflicts(mf: &mut MachineFunction) {
             let mut written_so_far: crate::common::fx_hash::FxHashSet<u16> =
                 crate::common::fx_hash::FxHashSet::default();
 
-            for idx in seq_start..call_pos {
-                for op in &new_insts[idx].operands {
+            for inst in new_insts.iter().take(call_pos).skip(seq_start) {
+                for op in &inst.operands {
                     if let MachineOperand::Register(src) = op {
                         if written_so_far.contains(src) && saved_reg.is_none() {
                             saved_reg = Some(*src);
                         }
                     }
                 }
-                if let Some(MachineOperand::Register(dst)) = &new_insts[idx].result {
+                if let Some(MachineOperand::Register(dst)) = &inst.result {
                     written_so_far.insert(*dst);
                 }
             }
@@ -1064,14 +1055,13 @@ fn resolve_call_arg_conflicts(mf: &mut MachineFunction) {
                 // and replace all later reads of conflict_reg with R11.
                 let mut save = MachineInstruction::new(MOV_OPCODE);
                 save.result = Some(MachineOperand::Register(SPILL_SCRATCH));
-                save.operands
-                    .push(MachineOperand::Register(conflict_reg));
+                save.operands.push(MachineOperand::Register(conflict_reg));
                 new_insts.insert(seq_start, save);
 
                 // The sequence shifted right by 1; update indices.
                 let call_pos_new = call_pos + 1;
-                for idx in (seq_start + 1)..call_pos_new {
-                    for op in &mut new_insts[idx].operands {
+                for inst in new_insts.iter_mut().take(call_pos_new).skip(seq_start + 1) {
+                    for op in &mut inst.operands {
                         if let MachineOperand::Register(r) = op {
                             if *r == conflict_reg {
                                 *r = SPILL_SCRATCH;
@@ -2434,12 +2424,13 @@ fn emit_assembly_text<A: ArchCodegen>(
         output.push_str(&format!("{}:\n", func.name));
 
         // Perform instruction selection for assembly text output.
+        // Use per-function ref maps to avoid cross-function Value-ID collisions.
         let mut mf = match arch.lower_function(
             func,
             diagnostics,
             module.globals(),
-            &module.func_ref_map,
-            &module.global_var_refs,
+            &func.func_ref_map,
+            &func.global_var_refs,
         ) {
             Ok(mf) => mf,
             Err(e) => {

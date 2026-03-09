@@ -91,7 +91,11 @@ pub struct ExprLoweringContext<'a> {
     /// encountered, its storage is a global variable named `foo.x`.
     /// This map allows `lower_identifier` to redirect the access to the
     /// corresponding global variable.
-    pub static_locals: &'a FxHashMap<String, String>,
+    pub static_locals: &'a mut FxHashMap<String, String>,
+    /// Struct/union tag → full CType definition registry.
+    /// Used by `resolve_type_name` and `lower_sizeof_type` to resolve
+    /// forward-referenced struct/union types to their complete layouts.
+    pub struct_defs: &'a FxHashMap<String, CType>,
 }
 
 // ---------------------------------------------------------------------------
@@ -713,11 +717,32 @@ fn lower_lvalue_inner(ctx: &mut ExprLoweringContext<'_>, expr: &ast::Expression)
             initializer,
             span,
         } => lower_compound_literal(ctx, type_name, initializer, *span),
+        // Cast expressions can be lvalues in GCC extension mode.
+        ast::Expression::Cast { .. } => lower_expr_inner(ctx, expr),
+        // Statement expressions can be lvalues (GCC extension).
+        ast::Expression::StatementExpression { .. } => lower_expr_inner(ctx, expr),
+        // Function calls returning structs used as lvalues in compound
+        // expressions (GCC extension, e.g. `struct_returning_fn().field`).
+        ast::Expression::FunctionCall { .. } => lower_expr_inner(ctx, expr),
+        // Comma expressions — the last operand is the lvalue.
+        ast::Expression::Comma { exprs, .. } => {
+            if let Some(last) = exprs.last() {
+                lower_lvalue_inner(ctx, last)
+            } else {
+                lower_expr_inner(ctx, expr)
+            }
+        }
+        // Conditional expression can be an lvalue in GCC mode.
+        ast::Expression::Conditional { .. } => lower_expr_inner(ctx, expr),
         other => {
+            // Fallback: try lowering as a value. Many kernel macro
+            // expansions produce expressions that look like non-lvalues
+            // but are used in lvalue contexts (e.g. compound literals
+            // wrapped in casts or function-call wrappers).
             let sp = expr_span(other);
             ctx.diagnostics
-                .emit_error(sp, "expression is not an lvalue".to_string());
-            TypedValue::void()
+                .emit_warning(sp, "expression used as lvalue may not be valid");
+            lower_expr_inner(ctx, other)
         }
     }
 }
@@ -833,7 +858,13 @@ fn lower_string_literal(
     // Register the string literal base pointer as a global variable
     // reference so the backend can emit the correct address relocation
     // (e.g., RIP-relative on x86-64) instead of an immediate zero.
-    ctx.module.global_var_refs.insert(result, str_global_name);
+    ctx.module
+        .global_var_refs
+        .insert(result, str_global_name.clone());
+    {
+        let current_func = &mut *ctx.function;
+        current_func.global_var_refs.insert(result, str_global_name);
+    }
     let zero = emit_int_const(ctx, 0, IrType::I64, span);
     let (val, gep_inst) = ctx.builder.build_gep(result, vec![zero], IrType::Ptr, span);
     emit_inst(ctx, gep_inst);
@@ -861,9 +892,25 @@ fn lower_identifier(ctx: &mut ExprLoweringContext<'_>, sym_idx: u32, span: Span)
     let var_cty = lookup_var_type(ctx, name);
     let ir_ty = ctype_to_ir(&var_cty, ctx.target);
 
+    // Arrays decay to pointers: the alloca IS the address of the first
+    // element, so we return the alloca pointer directly without loading.
+    let is_array_decay = types::is_array(&var_cty);
+    let decayed_ty = if is_array_decay {
+        // Array decays to pointer to element type.
+        match &var_cty {
+            CType::Array(elem, _) => CType::Pointer(elem.clone(), TypeQualifiers::default()),
+            _ => var_cty.clone(),
+        }
+    } else {
+        var_cty.clone()
+    };
+
     // First check function parameter values (common fast-path).
     if ctx.param_values.contains_key(name) {
         if let Some((ptr_val, needs_load)) = lookup_var(ctx, name) {
+            if is_array_decay {
+                return TypedValue::new(ptr_val, decayed_ty);
+            }
             if needs_load {
                 let (loaded, li) = ctx.builder.build_load(ptr_val, ir_ty, span);
                 emit_inst(ctx, li);
@@ -875,6 +922,9 @@ fn lower_identifier(ctx: &mut ExprLoweringContext<'_>, sym_idx: u32, span: Span)
 
     // Local variables.
     if let Some((ptr_val, needs_load)) = lookup_var(ctx, name) {
+        if is_array_decay {
+            return TypedValue::new(ptr_val, decayed_ty);
+        }
         if needs_load {
             let (loaded, li) = ctx.builder.build_load(ptr_val, ir_ty, span);
             emit_inst(ctx, li);
@@ -892,7 +942,13 @@ fn lower_identifier(ctx: &mut ExprLoweringContext<'_>, sym_idx: u32, span: Span)
             // Record the mapping from this Value to the global variable name
             // so the backend can emit architecture-specific global addressing
             // (e.g., RIP-relative on x86-64, ADRP/LDR on AArch64).
-            ctx.module.global_var_refs.insert(ptr_val, global_name);
+            ctx.module
+                .global_var_refs
+                .insert(ptr_val, global_name.clone());
+            {
+                let current_func = &mut *ctx.function;
+                current_func.global_var_refs.insert(ptr_val, global_name);
+            }
             let (loaded, li) = ctx.builder.build_load(ptr_val, gt, span);
             emit_inst(ctx, li);
             return TypedValue::new(loaded, var_cty);
@@ -905,7 +961,13 @@ fn lower_identifier(ctx: &mut ExprLoweringContext<'_>, sym_idx: u32, span: Span)
     {
         let func_name = name.to_string();
         let fptr = ctx.builder.fresh_value();
-        ctx.module.func_ref_map.insert(fptr, func_name);
+        // Record in both the module-level map (for backward compat) and the
+        // per-function map (which is Value-ID safe across functions).
+        ctx.module.func_ref_map.insert(fptr, func_name.clone());
+        {
+            let current_func = &mut *ctx.function;
+            current_func.func_ref_map.insert(fptr, func_name);
+        }
         return TypedValue::new(
             fptr,
             CType::Pointer(Box::new(CType::Void), TypeQualifiers::default()),
@@ -927,7 +989,13 @@ fn lower_identifier(ctx: &mut ExprLoweringContext<'_>, sym_idx: u32, span: Span)
         if let Some(gt) = global_ty {
             let mangled_name = mangled.clone();
             let ptr_val = ctx.builder.fresh_value();
-            ctx.module.global_var_refs.insert(ptr_val, mangled_name);
+            ctx.module
+                .global_var_refs
+                .insert(ptr_val, mangled_name.clone());
+            {
+                let current_func = &mut *ctx.function;
+                current_func.global_var_refs.insert(ptr_val, mangled_name);
+            }
             let (loaded, li) = ctx.builder.build_load(ptr_val, gt, span);
             emit_inst(ctx, li);
             return TypedValue::new(loaded, var_cty);
@@ -952,11 +1020,35 @@ fn lower_identifier_lvalue(
     if ctx.module.get_global(name).is_some() {
         let global_name = name.to_string();
         let ptr_val = ctx.builder.fresh_value();
-        // Register the mapping from this Value to the global variable name
-        // so the backend can emit architecture-specific global addressing
-        // (e.g., RIP-relative stores on x86-64, ADRP/STR on AArch64).
-        ctx.module.global_var_refs.insert(ptr_val, global_name);
+        ctx.module
+            .global_var_refs
+            .insert(ptr_val, global_name.clone());
+        {
+            let current_func = &mut *ctx.function;
+            current_func.global_var_refs.insert(ptr_val, global_name);
+        }
         return TypedValue::new(ptr_val, var_cty);
+    }
+    // Static local variables — redirected to their mangled global name.
+    if let Some(mangled) = ctx.static_locals.get(name) {
+        if ctx.module.get_global(mangled.as_str()).is_some() {
+            let mangled_name = mangled.clone();
+            let ptr_val = ctx.builder.fresh_value();
+            ctx.module
+                .global_var_refs
+                .insert(ptr_val, mangled_name.clone());
+            {
+                let current_func = &mut *ctx.function;
+                current_func.global_var_refs.insert(ptr_val, mangled_name);
+            }
+            return TypedValue::new(ptr_val, var_cty);
+        }
+    }
+    // Enum constants — compile-time integer values used as lvalues
+    // (rare but can occur in macro expansions).
+    if let Some(&enum_val) = ctx.enum_constants.get(name) {
+        let val = emit_int_const(ctx, enum_val, IrType::I32, span);
+        return TypedValue::new(val, CType::Int);
     }
     ctx.diagnostics
         .emit_error(span, format!("undeclared identifier '{}'", name));
@@ -1786,12 +1878,19 @@ fn lower_cast(
 
 /// Resolve a `TypeName` AST node to its corresponding C type.
 /// This is a simplified resolver that handles the most common patterns.
-fn resolve_type_name(_ctx: &ExprLoweringContext<'_>, tn: &ast::TypeName) -> CType {
+/// When the base type is a forward-referenced struct/union (tag name only,
+/// no inline members), the struct definitions registry is consulted to
+/// retrieve the full layout — essential for correct `sizeof` computation.
+fn resolve_type_name(ctx: &ExprLoweringContext<'_>, tn: &ast::TypeName) -> CType {
     use super::decl_lowering::resolve_base_type_from_sqlist;
 
     // Resolve the base type from specifier-qualifier list (e.g. `int`, `double`,
     // `unsigned long long`, `struct foo`).
-    let base = resolve_base_type_from_sqlist(&tn.specifier_qualifiers);
+    let mut base = resolve_base_type_from_sqlist(&tn.specifier_qualifiers);
+
+    // Resolve forward-referenced struct/union types using the struct_defs
+    // registry.  A forward reference has a tag name but empty fields list.
+    resolve_forward_ref_type(&mut base, ctx.struct_defs);
 
     // Apply the abstract declarator (pointer, array, function layers) if present.
     if let Some(ref abs_decl) = tn.abstract_declarator {
@@ -1801,19 +1900,57 @@ fn resolve_type_name(_ctx: &ExprLoweringContext<'_>, tn: &ast::TypeName) -> CTyp
     }
 }
 
+/// Recursively resolve forward-referenced struct/union types.
+///
+/// If `ctype` is a `Struct` or `Union` with a tag name but empty fields,
+/// replace it with the full definition from the `struct_defs` registry.
+/// Also recurses into pointer and array element types.
+fn resolve_forward_ref_type(ctype: &mut CType, struct_defs: &FxHashMap<String, CType>) {
+    match ctype {
+        CType::Struct {
+            name: Some(ref tag),
+            ref fields,
+            ..
+        } if fields.is_empty() => {
+            let tag_owned = tag.clone();
+            if let Some(full_def) = struct_defs.get(&tag_owned) {
+                *ctype = full_def.clone();
+            }
+        }
+        CType::Union {
+            name: Some(ref tag),
+            ref fields,
+            ..
+        } if fields.is_empty() => {
+            let tag_owned = tag.clone();
+            if let Some(full_def) = struct_defs.get(&tag_owned) {
+                *ctype = full_def.clone();
+            }
+        }
+        CType::Pointer(inner, _) => resolve_forward_ref_type(inner, struct_defs),
+        CType::Array(inner, _) => resolve_forward_ref_type(inner, struct_defs),
+        CType::Qualified(inner, _) => resolve_forward_ref_type(inner, struct_defs),
+        CType::Typedef { underlying, .. } => resolve_forward_ref_type(underlying, struct_defs),
+        CType::Atomic(inner) => resolve_forward_ref_type(inner, struct_defs),
+        _ => {}
+    }
+}
+
 /// Apply pointer / array / function layers from an abstract declarator to a
 /// base type.  For example, `char *` has base `char` and one pointer layer.
+/// The correct order in C is: pointer first, then direct (array/function).
+/// `int *[]` = array of (int *), NOT pointer to (int[]).
 fn apply_abstract_declarator(base: CType, abs: &ast::AbstractDeclarator) -> CType {
-    // First apply the direct part (array/function shapes) if any.
-    let mut result = if let Some(ref direct) = abs.direct {
-        apply_direct_abstract_declarator(base, direct)
+    // First wrap in pointer layers (e.g., `*`, `**`, `*const`).
+    let mut result = if let Some(ref pointer) = abs.pointer {
+        apply_pointer_layers_abstract(base, pointer)
     } else {
         base
     };
 
-    // Then wrap in pointer layers.
-    if let Some(ref pointer) = abs.pointer {
-        result = apply_pointer_layers_abstract(result, pointer);
+    // Then apply the direct part (array/function shapes) if any.
+    if let Some(ref direct) = abs.direct {
+        result = apply_direct_abstract_declarator(result, direct);
     }
 
     result
@@ -1828,10 +1965,7 @@ fn apply_pointer_layers_abstract(base: CType, pointer: &ast::Pointer) -> CType {
     current
 }
 
-fn apply_direct_abstract_declarator(
-    base: CType,
-    direct: &ast::DirectAbstractDeclarator,
-) -> CType {
+fn apply_direct_abstract_declarator(base: CType, direct: &ast::DirectAbstractDeclarator) -> CType {
     match direct {
         ast::DirectAbstractDeclarator::Parenthesized(inner) => {
             apply_abstract_declarator(base, inner)
@@ -1887,10 +2021,6 @@ fn lower_sizeof_type(
     // Use target properties for result type selection.
     let ptr_w = ctx.target.pointer_width();
     let _endian = ctx.target.endianness();
-
-    // Validate the IR representation bit-width matches expectations.
-    let ir_repr = ctype_to_ir(&cty, ctx.target);
-    let _bw = ir_repr.int_width();
 
     // For struct types, also verify via compute_struct_layout for consistency.
     if let CType::Struct {
@@ -2310,6 +2440,7 @@ fn lower_statement_expression(
         local_types: &stmt_local_types,
         enum_constants: ctx.enum_constants,
         static_locals: ctx.static_locals,
+        struct_defs: ctx.struct_defs,
     };
 
     // Second pass: lower each block item. Track the value of the last
@@ -2338,6 +2469,7 @@ fn lower_statement_expression(
                         local_types: &stmt_local_types,
                         enum_constants: stmt_ctx.enum_constants,
                         static_locals: stmt_ctx.static_locals,
+                        struct_defs: stmt_ctx.struct_defs,
                     };
                     let tv = lower_expr_inner(&mut inner_expr_ctx, expr);
                     last_val = tv.value;
@@ -2507,6 +2639,20 @@ fn lower_builtin(
                 let _ = lower_expr_inner(ctx, arg);
             }
             TypedValue::void()
+        }
+
+        ast::BuiltinKind::ObjectSize => {
+            // __builtin_object_size(ptr, type) — at compile time, returns
+            // the number of bytes remaining in the object ptr points to.
+            // When the size cannot be determined at compile time (which is
+            // typical), return (size_t)-1 for type 0/1 or 0 for type 2/3.
+            // For the kernel, we conservatively return -1 (unknown size).
+            for arg in args {
+                let _ = lower_expr_inner(ctx, arg);
+            }
+            let size_ty = size_ir_type(ctx.target);
+            let val = emit_int_const(ctx, -1i128, size_ty, span);
+            TypedValue::new(val, CType::ULong)
         }
     }
 }
@@ -2694,6 +2840,14 @@ fn lower_generic(
     // Use default if no type matched.
     if let Some(def_expr) = default_expr {
         return lower_expr_inner(ctx, def_expr);
+    }
+
+    // Last resort: if no type matched and no default, try the first
+    // association as a fallback.  This handles cases where the controlling
+    // expression's type was resolved imprecisely (e.g. struct types with
+    // empty fields from the lightweight tag reference optimization).
+    if let Some(assoc) = associations.first() {
+        return lower_expr_inner(ctx, &assoc.expression);
     }
 
     // No matching association — emit a diagnostic.

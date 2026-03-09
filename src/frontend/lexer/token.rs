@@ -341,6 +341,8 @@ pub enum TokenKind {
     BuiltinSubOverflow,
     /// `__builtin_mul_overflow`
     BuiltinMulOverflow,
+    /// `__builtin_object_size`
+    BuiltinObjectSize,
 
     // =======================================================================
     // Identifiers
@@ -640,6 +642,7 @@ impl TokenKind {
             | TokenKind::BuiltinAddOverflow
             | TokenKind::BuiltinSubOverflow
             | TokenKind::BuiltinMulOverflow
+            | TokenKind::BuiltinObjectSize
         )
     }
 
@@ -851,6 +854,7 @@ impl TokenKind {
             TokenKind::BuiltinAddOverflow => Some("__builtin_add_overflow"),
             TokenKind::BuiltinSubOverflow => Some("__builtin_sub_overflow"),
             TokenKind::BuiltinMulOverflow => Some("__builtin_mul_overflow"),
+            TokenKind::BuiltinObjectSize => Some("__builtin_object_size"),
             _ => None,
         }
     }
@@ -1133,7 +1137,7 @@ pub fn lookup_keyword(s: &str) -> Option<TokenKind> {
         "while" => Some(TokenKind::While),
         // C11-specific keywords (underscore-prefixed)
         "_Alignas" => Some(TokenKind::Alignas),
-        "_Alignof" => Some(TokenKind::Alignof),
+        "_Alignof" | "__alignof__" | "__alignof" => Some(TokenKind::Alignof),
         "_Atomic" => Some(TokenKind::Atomic),
         "_Bool" => Some(TokenKind::Bool),
         "_Complex" => Some(TokenKind::Complex),
@@ -1202,6 +1206,7 @@ pub fn lookup_keyword(s: &str) -> Option<TokenKind> {
         "__builtin_add_overflow" => Some(TokenKind::BuiltinAddOverflow),
         "__builtin_sub_overflow" => Some(TokenKind::BuiltinSubOverflow),
         "__builtin_mul_overflow" => Some(TokenKind::BuiltinMulOverflow),
+        "__builtin_object_size" => Some(TokenKind::BuiltinObjectSize),
 
         // Not a keyword — the lexer should treat it as a plain identifier.
         _ => None,

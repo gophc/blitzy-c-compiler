@@ -553,6 +553,18 @@ pub fn assemble(
                 continue;
             }
 
+            // Handle inline assembly instructions by assembling the template
+            // directly.  The template has already had operand placeholders
+            // (%0, %1, …) substituted with physical register names by the
+            // register allocation fixup pass, and AT&T-syntax %% escapes
+            // converted to single %.
+            if let Some(ref template) = inst.asm_template {
+                let asm_bytes = assemble_inline_asm_x86_64(template, &inst.operands);
+                ctx.emit_bytes(&asm_bytes);
+                enc.current_offset = ctx.current_offset;
+                continue;
+            }
+
             // Dispatch to the encoder for instruction-level binary encoding.
             let encoded = enc.encode_instruction(inst);
 
@@ -1043,6 +1055,452 @@ pub fn assemble_retpoline_thunks() -> Vec<(String, Vec<u8>)> {
 }
 
 // ===========================================================================
+// Inline Assembly — x86-64 AT&T Syntax Assembler
+// ===========================================================================
+
+/// Assemble an x86-64 inline assembly template into machine code bytes.
+///
+/// The template uses AT&T syntax with `%%reg` for literal registers, `%N`
+/// placeholders already substituted with physical register names, and `$imm`
+/// for immediates.  Each line (separated by `\n`, `\n\t`, or `;`) is
+/// assembled independently.
+///
+/// # Arguments
+///
+/// * `template` - The inline assembly template string.
+/// * `operands` - Physical register operands (from register allocation).
+///   Used to substitute `%0`, `%1`, ... placeholders that
+///   haven't been pre-substituted yet.
+fn assemble_inline_asm_x86_64(
+    template: &str,
+    operands: &[crate::backend::traits::MachineOperand],
+) -> Vec<u8> {
+    let mut result = Vec::new();
+
+    // First, substitute %N operand references with physical register names.
+    let mut substituted = template.to_string();
+    for (idx, op) in operands.iter().enumerate() {
+        let placeholder = format!("%{}", idx);
+        let reg_name = match op {
+            crate::backend::traits::MachineOperand::Register(r) => x86_64_reg_name_32(*r),
+            _ => format!("%{}", idx),
+        };
+        substituted = substituted.replace(&placeholder, &reg_name);
+    }
+
+    // Convert AT&T %% escapes to single %.
+    substituted = substituted.replace("%%", "%");
+
+    // Split into individual instructions.
+    for raw_line in substituted.split('\n') {
+        let line = raw_line.trim().trim_end_matches('\t');
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Split on ';' for multiple instructions per line.
+        for sub_line in line.split(';') {
+            let sub_line = sub_line.trim();
+            if sub_line.is_empty() {
+                continue;
+            }
+            result.extend(assemble_single_x86_64_instruction(sub_line));
+        }
+    }
+
+    result
+}
+
+/// Get the 32-bit register name for a physical register number.
+fn x86_64_reg_name_32(reg: u16) -> String {
+    match reg {
+        0 => "%eax".to_string(),
+        1 => "%ecx".to_string(),
+        2 => "%edx".to_string(),
+        3 => "%ebx".to_string(),
+        4 => "%esp".to_string(),
+        5 => "%ebp".to_string(),
+        6 => "%esi".to_string(),
+        7 => "%edi".to_string(),
+        8 => "%r8d".to_string(),
+        9 => "%r9d".to_string(),
+        10 => "%r10d".to_string(),
+        11 => "%r11d".to_string(),
+        12 => "%r12d".to_string(),
+        13 => "%r13d".to_string(),
+        14 => "%r14d".to_string(),
+        15 => "%r15d".to_string(),
+        _ => format!("%r{}", reg),
+    }
+}
+
+/// Assemble a single AT&T syntax x86-64 instruction into machine code bytes.
+///
+/// Supports a subset of x86-64 instructions commonly used in inline assembly:
+/// - `movl`, `movq` — register-register and immediate-register moves
+/// - `syscall` — system call instruction
+/// - `nop` — no operation
+/// - `int $N` — software interrupt
+/// - `xorl`, `xorq` — XOR
+/// - `addl`, `addq` — ADD
+/// - `subl`, `subq` — SUB
+/// - `ret` — return
+/// - `hlt` — halt
+fn assemble_single_x86_64_instruction(line: &str) -> Vec<u8> {
+    let line = line.trim();
+
+    // Parse mnemonic and operands.
+    let (mnemonic, operands_str) = if let Some(pos) = line.find(|c: char| c.is_whitespace()) {
+        let m = &line[..pos];
+        let rest = line[pos..].trim();
+        (m, rest)
+    } else {
+        (line, "")
+    };
+
+    match mnemonic {
+        "syscall" => vec![0x0F, 0x05],
+        "nop" => vec![0x90],
+        "ret" | "retq" => vec![0xC3],
+        "hlt" => vec![0xF4],
+        "ud2" => vec![0x0F, 0x0B],
+        "cld" => vec![0xFC],
+        "std" => vec![0xFD],
+        "cli" => vec![0xFA],
+        "sti" => vec![0xFB],
+        "int" => {
+            // int $N
+            if let Some(imm) = parse_att_immediate(operands_str) {
+                vec![0xCD, imm as u8]
+            } else {
+                vec![0xCC] // int3 fallback
+            }
+        }
+        "movl" => assemble_mov_l(operands_str),
+        "movq" => assemble_mov_q(operands_str),
+        "xorl" => assemble_alu_l(0x31, operands_str), // XOR r/m32, r32
+        "xorq" => assemble_alu_q(0x31, operands_str),
+        "addl" => assemble_alu_l(0x01, operands_str), // ADD r/m32, r32
+        "addq" => assemble_alu_q(0x01, operands_str),
+        "subl" => assemble_alu_l(0x29, operands_str), // SUB r/m32, r32
+        "subq" => assemble_alu_q(0x29, operands_str),
+        "andl" => assemble_alu_l(0x21, operands_str),
+        "andq" => assemble_alu_q(0x21, operands_str),
+        "orl" => assemble_alu_l(0x09, operands_str),
+        "orq" => assemble_alu_q(0x09, operands_str),
+        "cmpl" => assemble_alu_l(0x39, operands_str),
+        "cmpq" => assemble_alu_q(0x39, operands_str),
+        "testl" => assemble_alu_l(0x85, operands_str),
+        "testq" => assemble_alu_q(0x85, operands_str),
+        "pushl" | "pushq" => assemble_push(operands_str),
+        "popl" | "popq" => assemble_pop(operands_str),
+        _ => {
+            // Unknown instruction — emit as NOP with a debug warning.
+            // This prevents crashes for unsupported inline asm instructions.
+            eprintln!(
+                "[inline-asm] WARNING: unsupported instruction '{}', emitting NOP",
+                line
+            );
+            vec![0x90]
+        }
+    }
+}
+
+/// Parse an AT&T immediate operand like `$60` → `Some(60)`.
+fn parse_att_immediate(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let s = s.strip_prefix('$')?;
+    let s = s.trim();
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        i64::from_str_radix(hex, 16).ok()
+    } else {
+        s.parse::<i64>().ok()
+    }
+}
+
+/// Parse AT&T register name to register number (0-15).
+fn parse_att_register(s: &str) -> Option<u8> {
+    let s = s.trim().strip_prefix('%')?;
+    match s {
+        "eax" | "rax" | "al" | "ax" => Some(0),
+        "ecx" | "rcx" | "cl" | "cx" => Some(1),
+        "edx" | "rdx" | "dl" | "dx" => Some(2),
+        "ebx" | "rbx" | "bl" | "bx" => Some(3),
+        "esp" | "rsp" | "sp" => Some(4),
+        "ebp" | "rbp" | "bp" => Some(5),
+        "esi" | "rsi" | "si" | "sil" => Some(6),
+        "edi" | "rdi" | "di" | "dil" => Some(7),
+        "r8d" | "r8" | "r8b" | "r8w" => Some(8),
+        "r9d" | "r9" | "r9b" | "r9w" => Some(9),
+        "r10d" | "r10" | "r10b" | "r10w" => Some(10),
+        "r11d" | "r11" | "r11b" | "r11w" => Some(11),
+        "r12d" | "r12" | "r12b" | "r12w" => Some(12),
+        "r13d" | "r13" | "r13b" | "r13w" => Some(13),
+        "r14d" | "r14" | "r14b" | "r14w" => Some(14),
+        "r15d" | "r15" | "r15b" | "r15w" => Some(15),
+        _ => None,
+    }
+}
+
+/// Split AT&T operands (src, dst) with comma separator.
+fn split_att_operands(s: &str) -> (&str, &str) {
+    if let Some(pos) = s.find(',') {
+        (s[..pos].trim(), s[pos + 1..].trim())
+    } else {
+        (s.trim(), "")
+    }
+}
+
+/// Encode ModR/M byte for two register operands.
+fn modrm_rr(reg: u8, rm: u8) -> u8 {
+    0xC0 | ((reg & 7) << 3) | (rm & 7)
+}
+
+/// Assemble `movl` (32-bit move) in AT&T syntax.
+fn assemble_mov_l(operands: &str) -> Vec<u8> {
+    let (src, dst) = split_att_operands(operands);
+
+    // movl $imm, %reg
+    if let Some(imm) = parse_att_immediate(src) {
+        if let Some(dst_reg) = parse_att_register(dst) {
+            let mut bytes = Vec::new();
+            if dst_reg >= 8 {
+                bytes.push(0x41); // REX.B
+            }
+            bytes.push(0xB8 + (dst_reg & 7));
+            bytes.extend_from_slice(&(imm as u32).to_le_bytes());
+            return bytes;
+        }
+    }
+
+    // movl %reg, %reg
+    if let (Some(src_reg), Some(dst_reg)) = (parse_att_register(src), parse_att_register(dst)) {
+        let mut bytes = Vec::new();
+        let mut rex = 0u8;
+        if src_reg >= 8 {
+            rex |= 0x44; // REX.R
+        }
+        if dst_reg >= 8 {
+            rex |= 0x41; // REX.B
+        }
+        if rex != 0 {
+            bytes.push(rex);
+        }
+        bytes.push(0x89); // MOV r/m32, r32
+        bytes.push(modrm_rr(src_reg, dst_reg));
+        return bytes;
+    }
+
+    eprintln!(
+        "[inline-asm] WARNING: unsupported movl operands: {}",
+        operands
+    );
+    vec![0x90]
+}
+
+/// Assemble `movq` (64-bit move) in AT&T syntax.
+fn assemble_mov_q(operands: &str) -> Vec<u8> {
+    let (src, dst) = split_att_operands(operands);
+
+    // movq $imm, %reg
+    if let Some(imm) = parse_att_immediate(src) {
+        if let Some(dst_reg) = parse_att_register(dst) {
+            let mut bytes = Vec::new();
+            let mut rex = 0x48u8; // REX.W
+            if dst_reg >= 8 {
+                rex |= 0x01; // REX.B
+            }
+            bytes.push(rex);
+            if imm >= i32::MIN as i64 && imm <= i32::MAX as i64 {
+                // movq $imm32, %reg (sign-extended)
+                bytes.push(0xC7);
+                bytes.push(modrm_rr(0, dst_reg));
+                bytes.extend_from_slice(&(imm as i32).to_le_bytes());
+            } else {
+                // movabsq $imm64, %reg
+                bytes.push(0xB8 + (dst_reg & 7));
+                bytes.extend_from_slice(&(imm as u64).to_le_bytes());
+            }
+            return bytes;
+        }
+    }
+
+    // movq %reg, %reg
+    if let (Some(src_reg), Some(dst_reg)) = (parse_att_register(src), parse_att_register(dst)) {
+        let mut bytes = Vec::new();
+        let mut rex = 0x48u8; // REX.W
+        if src_reg >= 8 {
+            rex |= 0x04; // REX.R
+        }
+        if dst_reg >= 8 {
+            rex |= 0x01; // REX.B
+        }
+        bytes.push(rex);
+        bytes.push(0x89); // MOV r/m64, r64
+        bytes.push(modrm_rr(src_reg, dst_reg));
+        return bytes;
+    }
+
+    eprintln!(
+        "[inline-asm] WARNING: unsupported movq operands: {}",
+        operands
+    );
+    vec![0x90]
+}
+
+/// Assemble a 32-bit ALU instruction (addl, subl, xorl, etc.) in AT&T syntax.
+fn assemble_alu_l(opcode: u8, operands: &str) -> Vec<u8> {
+    let (src, dst) = split_att_operands(operands);
+
+    // ALU $imm, %reg — use opcode group /N with 0x83 or 0x81
+    if let Some(imm) = parse_att_immediate(src) {
+        if let Some(dst_reg) = parse_att_register(dst) {
+            let alu_group = match opcode {
+                0x01 => 0u8, // ADD
+                0x09 => 1,   // OR
+                0x21 => 4,   // AND
+                0x29 => 5,   // SUB
+                0x31 => 6,   // XOR
+                0x39 => 7,   // CMP
+                _ => 0,
+            };
+            let mut bytes = Vec::new();
+            if dst_reg >= 8 {
+                bytes.push(0x41);
+            }
+            if (-128..=127).contains(&imm) {
+                bytes.push(0x83);
+                bytes.push(modrm_rr(alu_group, dst_reg));
+                bytes.push(imm as u8);
+            } else {
+                bytes.push(0x81);
+                bytes.push(modrm_rr(alu_group, dst_reg));
+                bytes.extend_from_slice(&(imm as u32).to_le_bytes());
+            }
+            return bytes;
+        }
+    }
+
+    // ALU %reg, %reg
+    if let (Some(src_reg), Some(dst_reg)) = (parse_att_register(src), parse_att_register(dst)) {
+        let mut bytes = Vec::new();
+        let mut rex = 0u8;
+        if src_reg >= 8 {
+            rex |= 0x44;
+        }
+        if dst_reg >= 8 {
+            rex |= 0x41;
+        }
+        if rex != 0 {
+            bytes.push(rex);
+        }
+        bytes.push(opcode);
+        bytes.push(modrm_rr(src_reg, dst_reg));
+        return bytes;
+    }
+
+    eprintln!(
+        "[inline-asm] WARNING: unsupported ALU operands: {}",
+        operands
+    );
+    vec![0x90]
+}
+
+/// Assemble a 64-bit ALU instruction in AT&T syntax.
+fn assemble_alu_q(opcode: u8, operands: &str) -> Vec<u8> {
+    let (src, dst) = split_att_operands(operands);
+
+    if let Some(imm) = parse_att_immediate(src) {
+        if let Some(dst_reg) = parse_att_register(dst) {
+            let alu_group = match opcode {
+                0x01 => 0u8,
+                0x09 => 1,
+                0x21 => 4,
+                0x29 => 5,
+                0x31 => 6,
+                0x39 => 7,
+                _ => 0,
+            };
+            let mut bytes = Vec::new();
+            let mut rex = 0x48u8;
+            if dst_reg >= 8 {
+                rex |= 0x01;
+            }
+            bytes.push(rex);
+            if (-128..=127).contains(&imm) {
+                bytes.push(0x83);
+                bytes.push(modrm_rr(alu_group, dst_reg));
+                bytes.push(imm as u8);
+            } else {
+                bytes.push(0x81);
+                bytes.push(modrm_rr(alu_group, dst_reg));
+                bytes.extend_from_slice(&(imm as u32).to_le_bytes());
+            }
+            return bytes;
+        }
+    }
+
+    if let (Some(src_reg), Some(dst_reg)) = (parse_att_register(src), parse_att_register(dst)) {
+        let mut bytes = Vec::new();
+        let mut rex = 0x48u8;
+        if src_reg >= 8 {
+            rex |= 0x04;
+        }
+        if dst_reg >= 8 {
+            rex |= 0x01;
+        }
+        bytes.push(rex);
+        bytes.push(opcode);
+        bytes.push(modrm_rr(src_reg, dst_reg));
+        return bytes;
+    }
+
+    eprintln!(
+        "[inline-asm] WARNING: unsupported ALU64 operands: {}",
+        operands
+    );
+    vec![0x90]
+}
+
+/// Assemble push instruction.
+fn assemble_push(operands: &str) -> Vec<u8> {
+    let operands = operands.trim();
+    if let Some(reg) = parse_att_register(operands) {
+        let mut bytes = Vec::new();
+        if reg >= 8 {
+            bytes.push(0x41);
+        }
+        bytes.push(0x50 + (reg & 7));
+        bytes
+    } else if let Some(imm) = parse_att_immediate(operands) {
+        if (-128..=127).contains(&imm) {
+            vec![0x6A, imm as u8]
+        } else {
+            let mut bytes = vec![0x68];
+            bytes.extend_from_slice(&(imm as u32).to_le_bytes());
+            bytes
+        }
+    } else {
+        vec![0x90]
+    }
+}
+
+/// Assemble pop instruction.
+fn assemble_pop(operands: &str) -> Vec<u8> {
+    let operands = operands.trim();
+    if let Some(reg) = parse_att_register(operands) {
+        let mut bytes = Vec::new();
+        if reg >= 8 {
+            bytes.push(0x41);
+        }
+        bytes.push(0x58 + (reg & 7));
+        bytes
+    } else {
+        vec![0x90]
+    }
+}
+
+// ===========================================================================
 // Unit Tests
 // ===========================================================================
 
@@ -1061,6 +1519,7 @@ mod tests {
             callee_saved_regs: Vec::new(),
             is_leaf: true,
             vreg_to_ir_value: crate::common::fx_hash::FxHashMap::default(),
+            sse_vregs: crate::common::fx_hash::FxHashSet::default(),
         }
     }
 

@@ -309,11 +309,12 @@ pub fn register_predefined_macros(macro_defs: &mut FxHashMap<String, MacroDef>, 
     // -------------------------------------------------------------------
     // 4. GCC compatibility version macros
     // -------------------------------------------------------------------
-    register_object_macro(macro_defs, "__GNUC__", "4");
+    register_object_macro(macro_defs, "__GNUC__", "12");
     register_object_macro(macro_defs, "__GNUC_MINOR__", "2");
-    register_object_macro(macro_defs, "__GNUC_PATCHLEVEL__", "1");
+    register_object_macro(macro_defs, "__GNUC_PATCHLEVEL__", "0");
     register_object_macro(macro_defs, "__VERSION__", "\"BCC 0.1.0 (GCC compatible)\"");
     register_object_macro(macro_defs, "__GCC_HAVE_DWARF2_CFI_ASM", "1");
+    register_object_macro(macro_defs, "__GNUC_STDC_INLINE__", "1");
 
     // -------------------------------------------------------------------
     // 5. Byte order macros
@@ -919,11 +920,11 @@ mod tests {
         let mut defs = FxHashMap::default();
         register_predefined_macros(&mut defs, &Target::X86_64);
         assert!(defs.contains_key("__GNUC__"));
-        assert_eq!(defs["__GNUC__"].replacement[0].text, "4");
+        assert_eq!(defs["__GNUC__"].replacement[0].text, "12");
         assert!(defs.contains_key("__GNUC_MINOR__"));
         assert_eq!(defs["__GNUC_MINOR__"].replacement[0].text, "2");
         assert!(defs.contains_key("__GNUC_PATCHLEVEL__"));
-        assert_eq!(defs["__GNUC_PATCHLEVEL__"].replacement[0].text, "1");
+        assert_eq!(defs["__GNUC_PATCHLEVEL__"].replacement[0].text, "0");
         assert!(defs.contains_key("__VERSION__"));
     }
 

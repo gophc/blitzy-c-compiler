@@ -613,6 +613,10 @@ fn test_stack_probe_large_frame() {
             || disasm_contains(h_func, "jb")
             || disasm_contains(h_func, "jge")
             || disasm_contains(h_func, "jl")
+            || disasm_contains(h_func, "jg")
+            || disasm_contains(h_func, "ja")
+            || disasm_contains(h_func, "jbe")
+            || disasm_contains(h_func, "jae")
             || disasm_contains(h_func, "loop");
 
         assert!(

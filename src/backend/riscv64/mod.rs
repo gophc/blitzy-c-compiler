@@ -392,6 +392,16 @@ impl RiscV64Codegen {
         let opcode = rv.opcode as u32;
         let mut mi = MachineInstruction::new(opcode);
 
+        // For INLINE_ASM, the substituted template is stored in the symbol
+        // field.  Transfer it to asm_template so format_instruction() can
+        // emit it verbatim.
+        if rv.opcode == codegen::RvOpcode::INLINE_ASM {
+            if let Some(ref template) = rv.symbol {
+                mi.asm_template = Some(template.clone());
+            }
+            return mi;
+        }
+
         // Destination register (result).
         if let Some(rd) = rv.rd {
             mi = mi.with_result(MachineOperand::Register(rd as u16));
@@ -808,34 +818,12 @@ impl ArchCodegen for RiscV64Codegen {
             String,
         >,
     ) -> Result<MachineFunction, String> {
-        // Build constant cache from globals (same mechanism as x86-64/i686/aarch64).
+        // Build constant cache from the IR function's constant_values map.
+        // This was populated during IR lowering for every integer constant,
+        // providing a reliable Value → i64 mapping without fragile heuristics.
         let mut constant_values = crate::common::fx_hash::FxHashMap::default();
-        {
-            let mut const_vals: Vec<i64> = Vec::new();
-            for gv in _globals {
-                if gv.name.starts_with(".Lconst.i.") {
-                    if let Some(crate::ir::module::Constant::Integer(v)) = &gv.initializer {
-                        const_vals.push(*v as i64);
-                    }
-                }
-            }
-            let mut ci = 0;
-            for block in &func.blocks {
-                for inst in block.instructions() {
-                    if let crate::ir::instructions::Instruction::BinOp {
-                        result, lhs, rhs, ..
-                    } = inst
-                    {
-                        if *lhs == *result
-                            && *rhs == crate::ir::instructions::Value::UNDEF
-                            && ci < const_vals.len()
-                        {
-                            constant_values.insert(result.index(), const_vals[ci]);
-                            ci += 1;
-                        }
-                    }
-                }
-            }
+        for (&val, &imm) in &func.constant_values {
+            constant_values.insert(val.index(), imm);
         }
 
         // Create the instruction selector for this function.
@@ -934,6 +922,19 @@ impl ArchCodegen for RiscV64Codegen {
     #[inline]
     fn target(&self) -> Target {
         Target::RiscV64
+    }
+
+    /// Format a machine instruction for `-S` assembly text output.
+    ///
+    /// For INLINE_ASM instructions, the already-substituted template is
+    /// emitted verbatim (operand substitution was performed during
+    /// instruction selection).  For all other opcodes, a generic
+    /// pseudo-assembly notation is produced.
+    fn format_instruction(&self, inst: &MachineInstruction) -> String {
+        if let Some(ref template) = inst.asm_template {
+            return template.clone();
+        }
+        format!("{}", inst)
     }
 
     /// Returns the RISC-V 64 register set information for the register

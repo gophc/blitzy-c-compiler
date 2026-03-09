@@ -366,6 +366,21 @@ pub struct IrFunction {
     /// float value for potential constant-folding.
     pub float_constant_values:
         crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, (String, f64)>,
+
+    /// Per-function map from SSA `Value` to function name for function
+    /// references (function pointer decay).
+    ///
+    /// This is scoped to this function — unlike `IrModule::func_ref_map`
+    /// which is global and suffers from Value-ID collisions across
+    /// different functions (since each function starts numbering from 0).
+    /// The backend uses this to distinguish function address loads (LEA)
+    /// from normal value moves (MOV) during call argument setup.
+    pub func_ref_map: crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>,
+
+    /// Per-function map from SSA `Value` to global variable name.
+    ///
+    /// Scoped to this function for the same reason as `func_ref_map`.
+    pub global_var_refs: crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>,
 }
 
 // ===========================================================================
@@ -431,6 +446,8 @@ impl IrFunction {
             is_definition: true,
             constant_values: crate::common::fx_hash::FxHashMap::default(),
             float_constant_values: crate::common::fx_hash::FxHashMap::default(),
+            func_ref_map: crate::common::fx_hash::FxHashMap::default(),
+            global_var_refs: crate::common::fx_hash::FxHashMap::default(),
         }
     }
 }
@@ -504,6 +521,25 @@ impl IrFunction {
         block.index = index;
         self.blocks.push(block);
         index
+    }
+
+    /// Ensures that the blocks vector contains a block for the given `BlockId`.
+    ///
+    /// If the blocks vector is not large enough, empty `BasicBlock` entries
+    /// are pushed until `block_id.0` is a valid index. This is used during
+    /// label pre-scanning to pre-allocate blocks for forward references
+    /// (e.g., `asm goto` labels that reference labels defined later in the
+    /// function body).
+    ///
+    /// # Parameters
+    ///
+    /// - `block_id`: The block ID that must become a valid index.
+    pub fn ensure_block(&mut self, block_id: crate::ir::instructions::BlockId) {
+        let idx = block_id.0 as usize;
+        while self.blocks.len() <= idx {
+            let new_idx = self.blocks.len();
+            self.blocks.push(BasicBlock::new(new_idx));
+        }
     }
 
     /// Returns an immutable reference to a basic block by its index.

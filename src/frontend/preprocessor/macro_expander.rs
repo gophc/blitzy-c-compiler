@@ -622,7 +622,12 @@ impl<'a> MacroExpander<'a> {
                     if adjacent {
                         // Adjacent to ## → use unexpanded variadic args.
                         let va = self.get_va_args_tokens(unexpanded_args, params);
-                        if va.is_empty() {
+                        let is_va_empty = va.is_empty()
+                            || va.iter().all(|t| {
+                                t.is_whitespace()
+                                    || t.kind == PPTokenKind::PlacemarkerToken
+                            });
+                        if is_va_empty {
                             result.push(PPToken::placemarker(invocation_span));
                         } else {
                             for t in &va {
@@ -657,7 +662,14 @@ impl<'a> MacroExpander<'a> {
                         } else {
                             &[][..]
                         };
-                        if arg.is_empty() {
+                        // An argument is considered empty (placemarker) if it
+                        // has no tokens or contains only whitespace tokens.
+                        let is_arg_empty = arg.is_empty()
+                            || arg.iter().all(|t| {
+                                t.is_whitespace()
+                                    || t.kind == PPTokenKind::PlacemarkerToken
+                            });
+                        if is_arg_empty {
                             result.push(PPToken::placemarker(invocation_span));
                         } else {
                             for t in arg {
@@ -760,6 +772,17 @@ impl<'a> MacroExpander<'a> {
             }
 
             let right = &tokens[i];
+
+            // GCC comma elision extension: `, ## __VA_ARGS__` where
+            // __VA_ARGS__ is empty (placemarker) removes the preceding comma.
+            if left.kind == PPTokenKind::Punctuator
+                && left.text == ","
+                && right.kind == PPTokenKind::PlacemarkerToken
+            {
+                // Drop both the comma and the placemarker.
+                i += 1;
+                continue;
+            }
 
             match paste_tokens(&left, right) {
                 Ok(pasted) => {

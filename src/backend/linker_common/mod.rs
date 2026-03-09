@@ -80,7 +80,7 @@ pub use symbol_resolver::{InputSymbol, OutputSymbol, ResolvedSymbol, SymbolResol
 // ============================================================================
 
 use crate::common::diagnostics::{Diagnostic, DiagnosticEngine, Span};
-use crate::common::fx_hash::FxHashMap;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::target::Target;
 
 use crate::backend::elf_writer_common::{ElfSymbol, ElfWriter, Section, ET_DYN, ET_EXEC};
@@ -623,11 +623,26 @@ pub fn link(
     // and PT_DYNAMIC program headers so the runtime dynamic linker resolves
     // undefined symbols at load time.
     if config.is_shared() || !config.needed_libs.is_empty() {
+        // Collect the set of symbol names actually referenced by relocations.
+        // For executables, only these symbols should appear as imports in the
+        // dynamic symbol table (.dynsym). Without this filter, every
+        // declared-but-unused libc symbol from headers would end up in
+        // .dynsym, causing "undefined symbol" errors at runtime when the
+        // dynamic linker tries to resolve them.
+        let mut referenced_symbols: FxHashSet<String> = FxHashSet::default();
+        for input in &inputs {
+            for reloc in &input.relocations {
+                if !reloc.symbol_name.is_empty() {
+                    referenced_symbols.insert(reloc.symbol_name.clone());
+                }
+            }
+        }
         generate_dynamic_sections(
             config,
             &sym_table,
             &mut section_data_map,
             &address_map,
+            &referenced_symbols,
             diagnostics,
         );
     }
@@ -765,11 +780,14 @@ fn generate_dynamic_sections(
     sym_table: &symbol_resolver::SymbolTable,
     section_data_map: &mut FxHashMap<String, Vec<u8>>,
     _address_map: &section_merger::AddressMap,
+    referenced_symbols: &FxHashSet<String>,
     _diagnostics: &mut DiagnosticEngine,
 ) {
     // Build lists of exported and imported symbols for the dynamic linker.
     let mut exported: Vec<dynamic::ExportedSymbol> = Vec::new();
     let mut imported: Vec<dynamic::ImportedSymbol> = Vec::new();
+
+    let is_executable = config.is_executable();
 
     for sym in &sym_table.symbols {
         let is_defined = sym.section_index != symbol_resolver::SHN_UNDEF;
@@ -777,16 +795,30 @@ fn generate_dynamic_sections(
             sym.binding == symbol_resolver::STB_GLOBAL || sym.binding == symbol_resolver::STB_WEAK;
 
         if is_defined && is_global_or_weak && !sym.name.is_empty() {
-            exported.push(dynamic::ExportedSymbol {
-                name: sym.name.clone(),
-                value: sym.value,
-                size: sym.size,
-                binding: sym.binding,
-                sym_type: sym.sym_type,
-                visibility: sym.visibility,
-                section_index: sym.section_index,
-            });
+            // For executables, do NOT export defined symbols into .dynsym
+            // unless they have default visibility and the user requested
+            // -export-dynamic (not yet implemented). For shared libraries,
+            // export all defined global/weak symbols so consumers can link
+            // against them.
+            if !is_executable {
+                exported.push(dynamic::ExportedSymbol {
+                    name: sym.name.clone(),
+                    value: sym.value,
+                    size: sym.size,
+                    binding: sym.binding,
+                    sym_type: sym.sym_type,
+                    visibility: sym.visibility,
+                    section_index: sym.section_index,
+                });
+            }
         } else if !is_defined && is_global_or_weak && !sym.name.is_empty() {
+            // For executables, only import symbols that are actually
+            // referenced by relocations. Declared-but-unused symbols
+            // (e.g. from stdio.h) must NOT appear in .dynsym, otherwise
+            // the dynamic linker will try and fail to resolve them.
+            if is_executable && !referenced_symbols.contains(&sym.name) {
+                continue;
+            }
             imported.push(dynamic::ImportedSymbol {
                 name: sym.name.clone(),
                 binding: sym.binding,
@@ -1097,8 +1129,44 @@ fn write_elf_output(
         }
     }
 
+    // Build a mapping from output section virtual-address ranges to their
+    // ELF section header indices so that defined symbols receive the
+    // correct st_shndx value.  ELF section header index = vector_index + 1
+    // because section 0 is the mandatory null section.
+    let sec_ranges: Vec<(u64, u64, u16)> = {
+        let secs = writer.sections_mut();
+        secs.iter()
+            .enumerate()
+            .filter_map(|(i, s)| {
+                let va = s.virtual_address;
+                let sz = if s.logical_size > 0 {
+                    s.logical_size
+                } else {
+                    s.data.len() as u64
+                };
+                if va > 0 || sz > 0 {
+                    Some((va, va.saturating_add(sz), (i + 1) as u16))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+
     // Add symbols to the output symbol table.
     for sym in &sym_table.symbols {
+        // For defined symbols, resolve the correct output section index
+        // by finding which section's address range contains the symbol.
+        let out_shndx = if sym.section_index != symbol_resolver::SHN_UNDEF && sym.value > 0 {
+            sec_ranges
+                .iter()
+                .find(|(lo, hi, _)| sym.value >= *lo && sym.value < *hi)
+                .map(|(_, _, idx)| *idx)
+                .unwrap_or(sym.section_index)
+        } else {
+            sym.section_index
+        };
+
         let elf_sym = ElfSymbol {
             name: sym.name.clone(),
             value: sym.value,
@@ -1106,7 +1174,7 @@ fn write_elf_output(
             binding: sym.binding,
             sym_type: sym.sym_type,
             visibility: sym.visibility,
-            section_index: sym.section_index,
+            section_index: out_shndx,
         };
         writer.add_symbol(elf_sym);
     }

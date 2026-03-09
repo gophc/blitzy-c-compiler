@@ -442,9 +442,7 @@ pub fn compute_live_intervals(func: &IrFunction) -> Vec<LiveInterval> {
         // falls strictly within the interval's [start, end) range.
         // (The result of the call itself is defined AT the call index,
         // so we use `> start` to avoid flagging the call's own result.)
-        let crosses = call_positions
-            .iter()
-            .any(|&cp| cp > start && cp < end);
+        let crosses = call_positions.iter().any(|&cp| cp > start && cp < end);
         intervals.push(LiveInterval {
             vreg: *value,
             start,
@@ -570,15 +568,8 @@ pub fn allocate_registers(
         // by the call, so assigning one would produce incorrect code.
         let chosen_reg = if intervals[i].crosses_call {
             // Search the pool for a callee-saved register.
-            let callee_pos = pool
-                .iter()
-                .position(|r| reg_info.callee_saved.contains(r));
-            if let Some(pos) = callee_pos {
-                Some(pool.remove(pos))
-            } else {
-                // No callee-saved register available — will spill below.
-                None
-            }
+            let callee_pos = pool.iter().position(|r| reg_info.callee_saved.contains(r));
+            callee_pos.map(|pos| pool.remove(pos))
         } else {
             pool.pop()
         };

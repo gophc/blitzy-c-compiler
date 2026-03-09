@@ -146,6 +146,18 @@ struct CliArgs {
     library_paths: Vec<String>,
     /// `-l<lib>`: libraries to link (multiple allowed).
     libraries: Vec<String>,
+    /// `-include <file>`: force-included headers (processed before main source).
+    forced_includes: Vec<String>,
+    /// `-MD` / `-MMD`: generate dependency file alongside compilation.
+    gen_depfile: bool,
+    /// `-MF <file>`: explicit dependency file output path.
+    depfile_path: Option<String>,
+    /// `-MT <target>`: dependency file target name.
+    depfile_target: Option<String>,
+    /// `-MP`: emit phony targets for each dependency.
+    depfile_phony: bool,
+    /// `-nostdinc`: suppress default system include paths.
+    nostdinc: bool,
 }
 
 impl Default for CliArgs {
@@ -168,6 +180,12 @@ impl Default for CliArgs {
             undefs: Vec::new(),
             library_paths: Vec::new(),
             libraries: Vec::new(),
+            forced_includes: Vec::new(),
+            gen_depfile: false,
+            depfile_path: None,
+            depfile_target: None,
+            depfile_phony: false,
+            nostdinc: false,
         }
     }
 }
@@ -212,9 +230,13 @@ struct CompilationContext {
     library_paths: Vec<String>,
     /// Libraries to link from `-l` flags.
     libraries: Vec<String>,
+    /// Force-included headers from `-include` flags.
+    forced_includes: Vec<String>,
     /// Maximum recursion depth for parser and macro expander.
     /// Fixed at 512 per AAP §0.7.3.
     max_recursion_depth: usize,
+    /// Whether to suppress default system include paths (`-nostdinc`).
+    nostdinc: bool,
 }
 
 impl CompilationContext {
@@ -235,7 +257,9 @@ impl CompilationContext {
             undefs: args.undefs.clone(),
             library_paths: args.library_paths.clone(),
             libraries: args.libraries.clone(),
+            forced_includes: args.forced_includes.clone(),
             max_recursion_depth: MAX_RECURSION_DEPTH,
+            nostdinc: args.nostdinc,
         }
     }
 }
@@ -471,6 +495,47 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
             continue;
         }
 
+        // -Wp,<flags> — pass flags to preprocessor (GCC compat).
+        // Must be checked before generic -W handler below.
+        if arg.starts_with("-Wp,") {
+            let sub_flags = &arg[4..];
+            let parts: Vec<&str> = sub_flags.split(',').collect();
+            let mut j = 0;
+            while j < parts.len() {
+                if parts[j] == "-MMD" || parts[j] == "-MD" {
+                    cli.gen_depfile = true;
+                    if j + 1 < parts.len() {
+                        cli.depfile_path = Some(parts[j + 1].to_string());
+                        j += 1;
+                    }
+                } else if parts[j] == "-MP" {
+                    cli.depfile_phony = true;
+                } else if parts[j] == "-MT" {
+                    if j + 1 < parts.len() {
+                        cli.depfile_target = Some(parts[j + 1].to_string());
+                        j += 1;
+                    }
+                }
+                j += 1;
+            }
+            i += 1;
+            continue;
+        }
+
+        // -Wl,<flags> — pass flags to linker (GCC compat).
+        // Must be checked before generic -W handler below.
+        if arg.starts_with("-Wl,") {
+            i += 1;
+            continue;
+        }
+
+        // -Wa,<flags> — pass flags to assembler (GCC compat).
+        // Must be checked before generic -W handler below.
+        if arg.starts_with("-Wa,") {
+            i += 1;
+            continue;
+        }
+
         // -Wall, -Wextra, -Werror, -W<anything> — accepted silently for GCC compat
         if arg.starts_with("-W") {
             i += 1;
@@ -483,8 +548,36 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
             continue;
         }
 
-        // -m32, -m64, -march=, -mtune= — accepted silently for GCC compat
+        // -m32, -m64, -march=, -mtune=, -mabi= — accepted for GCC compat.
+        // Additionally, -march= and -mabi= are used to infer the target
+        // architecture when --target= is not explicitly provided.
         if arg.starts_with("-m") && arg != "-mretpoline" {
+            // Infer target from -march=rv64... or -march=rv32...
+            if let Some(march_val) = arg.strip_prefix("-march=") {
+                if march_val.starts_with("rv64") {
+                    if cli.target == Target::X86_64 {
+                        // Only override if target hasn't been explicitly set
+                        cli.target = Target::RiscV64;
+                    }
+                } else if march_val.starts_with("rv32") {
+                    // 32-bit RISC-V — not fully supported but detect it
+                    if cli.target == Target::X86_64 {
+                        cli.target = Target::RiscV64; // best effort
+                    }
+                } else if march_val.starts_with("armv8") || march_val.starts_with("aarch64") {
+                    if cli.target == Target::X86_64 {
+                        cli.target = Target::AArch64;
+                    }
+                }
+            }
+            // Infer from -mabi=lp64 (RISC-V LP64D ABI) or -mabi=ilp32
+            if let Some(mabi_val) = arg.strip_prefix("-mabi=") {
+                if mabi_val.starts_with("lp64") && cli.target == Target::X86_64 {
+                    cli.target = Target::RiscV64;
+                } else if mabi_val.starts_with("ilp32") && cli.target == Target::X86_64 {
+                    cli.target = Target::I686;
+                }
+            }
             i += 1;
             continue;
         }
@@ -508,12 +601,15 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
             continue;
         }
 
-        // -nostdinc, -nostdlib, -nodefaultlibs — accepted silently
-        if arg == "-nostdinc"
-            || arg == "-nostdlib"
-            || arg == "-nodefaultlibs"
-            || arg == "-nostartfiles"
-        {
+        // -nostdinc — suppress default system include paths
+        if arg == "-nostdinc" {
+            cli.nostdinc = true;
+            i += 1;
+            continue;
+        }
+
+        // -nostdlib, -nodefaultlibs, -nostartfiles — accepted silently
+        if arg == "-nostdlib" || arg == "-nodefaultlibs" || arg == "-nostartfiles" {
             i += 1;
             continue;
         }
@@ -530,9 +626,150 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
             continue;
         }
 
+        // -MD / -MMD — generate dependency file
+        if arg == "-MD" || arg == "-MMD" {
+            cli.gen_depfile = true;
+            i += 1;
+            continue;
+        }
+
+        // -MF <file> — explicit dependency file path
+        if arg == "-MF" {
+            i += 1;
+            if i < args.len() {
+                cli.depfile_path = Some(args[i].clone());
+                cli.gen_depfile = true;
+                i += 1;
+            }
+            continue;
+        }
+
+        // -MT <target> — dependency target name
+        if arg == "-MT" {
+            i += 1;
+            if i < args.len() {
+                cli.depfile_target = Some(args[i].clone());
+                i += 1;
+            }
+            continue;
+        }
+
+        // -MQ <target> — dependency target name (quoted)
+        if arg == "-MQ" {
+            i += 1;
+            if i < args.len() {
+                cli.depfile_target = Some(args[i].clone());
+                i += 1;
+            }
+            continue;
+        }
+
+        // -MP — emit phony targets
+        if arg == "-MP" {
+            cli.depfile_phony = true;
+            i += 1;
+            continue;
+        }
+
+        // -M — generate dependency list only (preprocess mode)
+        if arg == "-M" || arg == "-MM" {
+            cli.gen_depfile = true;
+            i += 1;
+            continue;
+        }
+
+        // -x <language> — specify input language (GCC compat)
+        // Accepted values: c, assembler-with-cpp, assembler, none
+        // BCC treats everything as C, but accepts these for GCC compatibility.
+        if arg == "-x" {
+            i += 1;
+            if i < args.len() {
+                // Consume the language argument
+                i += 1;
+            }
+            continue;
+        }
+        if let Some(_lang) = arg.strip_prefix("-x") {
+            // -xc or -xassembler-with-cpp (attached form)
+            i += 1;
+            continue;
+        }
+
+        // -P — suppress line markers in preprocessor output (GCC compat)
+        if arg == "-P" {
+            i += 1;
+            continue;
+        }
+
+        // -Wa,<flags> — pass flags to assembler (GCC compat, silently accepted)
+        if arg.starts_with("-Wa,") {
+            i += 1;
+            continue;
+        }
+
+        // -Wl,<flags> — pass flags to linker (GCC compat, silently accepted)
+        if arg.starts_with("-Wl,") {
+            i += 1;
+            continue;
+        }
+
+        // -Wp,<flags> — pass flags to preprocessor (GCC compat)
+        // Parse -Wp,-MMD,<path> for dependency file generation.
+        // NOTE: -Wp, handling is now above the generic -W handler (line ~500).
+
+        // --param=<name>=<value> or --param <name>=<value> (GCC compat, silently accepted)
+        if arg == "--param" {
+            i += 1;
+            if i < args.len() {
+                i += 1; // consume the param value
+            }
+            continue;
+        }
+        if arg.starts_with("--param=") {
+            i += 1;
+            continue;
+        }
+
+        // -include <file> — force-include a header before compilation (GCC compat)
+        if arg == "-include" {
+            i += 1;
+            if i < args.len() {
+                cli.forced_includes.push(args[i].clone());
+                i += 1;
+            }
+            continue;
+        }
+
+        // -isystem <dir> — add system include path (GCC compat)
+        if arg == "-isystem" {
+            i += 1;
+            if i < args.len() {
+                cli.include_paths.push(args[i].clone());
+                i += 1;
+            }
+            continue;
+        }
+
+        // -idirafter <dir> — add include path searched after -I (GCC compat)
+        if arg == "-idirafter" {
+            i += 1;
+            if i < args.len() {
+                cli.include_paths.push(args[i].clone());
+                i += 1;
+            }
+            continue;
+        }
+
         // Unknown flags starting with '-' — warn but continue (GCC compat)
         if arg.starts_with('-') && arg != "-" {
             eprintln!("{}: warning: unrecognized flag '{}'", PROGRAM_NAME, arg);
+            i += 1;
+            continue;
+        }
+
+        // "-" as input file means read from stdin
+        if arg == "-" {
+            cli.input_files.push("-".to_string());
             i += 1;
             continue;
         }
@@ -661,6 +898,14 @@ fn resolve_output_path(args: &CliArgs) -> Option<String> {
 /// unreadable file.
 fn validate_input_files(input_files: &[String]) -> Result<(), String> {
     for input in input_files {
+        // "-" means read from stdin — always valid, skip file checks
+        if input == "-" {
+            continue;
+        }
+        // "/dev/null" — special file, always valid for kernel build compat
+        if input == "/dev/null" {
+            continue;
+        }
         let path = Path::new(input);
         if !path.exists() {
             return Err(format!("'{}': No such file or directory", input));
@@ -830,44 +1075,44 @@ fn run_preprocess_only(
             pp.add_include_path(path);
         }
 
-        // Add compiler-builtin include path (for stdarg.h, stddef.h, etc.).
-        // Locate the `include/` directory relative to the bcc binary.
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(exe_dir) = exe.parent() {
-                let builtin = exe_dir.join("../../include");
-                if builtin.is_dir() {
-                    if let Some(s) = builtin
-                        .canonicalize()
-                        .ok()
-                        .and_then(|p| p.to_str().map(|s| s.to_string()))
-                    {
-                        pp.add_system_include_path(&s);
+        // When -nostdinc is NOT active, add compiler-builtin and system paths.
+        if !ctx.nostdinc {
+            // Add compiler-builtin include path (for stdarg.h, stddef.h, etc.).
+            // Locate the `include/` directory relative to the bcc binary.
+            if let Ok(exe) = std::env::current_exe() {
+                if let Some(exe_dir) = exe.parent() {
+                    let builtin = exe_dir.join("../../include");
+                    if builtin.is_dir() {
+                        if let Some(s) = builtin
+                            .canonicalize()
+                            .ok()
+                            .and_then(|p| p.to_str().map(|s| s.to_string()))
+                        {
+                            pp.add_system_include_path(&s);
+                        }
                     }
-                }
-                // Also try directly next to executable.
-                let builtin2 = exe_dir.join("include");
-                if builtin2.is_dir() {
-                    if let Some(s) = builtin2
-                        .canonicalize()
-                        .ok()
-                        .and_then(|p| p.to_str().map(|s| s.to_string()))
-                    {
-                        pp.add_system_include_path(&s);
+                    // Also try directly next to executable.
+                    let builtin2 = exe_dir.join("include");
+                    if builtin2.is_dir() {
+                        if let Some(s) = builtin2
+                            .canonicalize()
+                            .ok()
+                            .and_then(|p| p.to_str().map(|s| s.to_string()))
+                        {
+                            pp.add_system_include_path(&s);
+                        }
                     }
                 }
             }
-        }
 
-        // Add default system include paths appropriate for the selected
-        // target architecture.  Using target-specific multiarch paths
-        // prevents host-architecture headers from being resolved when
-        // cross-compiling (e.g. `stubs-32.h` not found on an x86-64 host
-        // when targeting i686).
-        let target_sys_paths = ctx.target.system_include_paths();
-        let extra_sys_paths: &[&str] = &["/usr/local/include", "/usr/include/linux"];
-        for sp in target_sys_paths.iter().chain(extra_sys_paths.iter()) {
-            if std::path::Path::new(sp).is_dir() {
-                pp.add_system_include_path(sp);
+            // Add default system include paths appropriate for the selected
+            // target architecture.
+            let target_sys_paths = ctx.target.system_include_paths();
+            let extra_sys_paths: &[&str] = &["/usr/local/include", "/usr/include/linux"];
+            for sp in target_sys_paths.iter().chain(extra_sys_paths.iter()) {
+                if std::path::Path::new(sp).is_dir() {
+                    pp.add_system_include_path(sp);
+                }
             }
         }
 
@@ -882,11 +1127,22 @@ fn run_preprocess_only(
             pp.add_undef(name);
         }
 
+        // Process forced-include files (-include <file>) before the main source.
+        for forced in &ctx.forced_includes {
+            if pp.preprocess_file(forced).is_err() {
+                diagnostics.print_all(&source_map);
+                return Err(format!("forced include '{}' failed", forced));
+            }
+        }
+
         // Run preprocessor
-        let tokens = pp.preprocess_file(input).map_err(|_| {
-            diagnostics.print_all(&source_map);
-            format!("preprocessing failed for '{}'", input)
-        })?;
+        let tokens = match pp.preprocess_file(input) {
+            Ok(t) => t,
+            Err(()) => {
+                diagnostics.print_all(&source_map);
+                return Err(format!("preprocessing failed for '{}'", input));
+            }
+        };
 
         // Reconstruct preprocessed output from tokens, preserving newlines
         // so that `-E` output has correct line structure for downstream
@@ -950,40 +1206,40 @@ fn compile_single_file(
     for path in &ctx.include_paths {
         pp.add_include_path(path);
     }
-    // Compiler-builtin include path (for stdarg.h, stddef.h, etc.).
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(exe_dir) = exe.parent() {
-            let builtin = exe_dir.join("../../include");
-            if builtin.is_dir() {
-                if let Some(s) = builtin
-                    .canonicalize()
-                    .ok()
-                    .and_then(|p| p.to_str().map(|s| s.to_string()))
-                {
-                    pp.add_system_include_path(&s);
+    // When -nostdinc is NOT active, add compiler-builtin and system paths.
+    if !ctx.nostdinc {
+        // Compiler-builtin include path (for stdarg.h, stddef.h, etc.).
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(exe_dir) = exe.parent() {
+                let builtin = exe_dir.join("../../include");
+                if builtin.is_dir() {
+                    if let Some(s) = builtin
+                        .canonicalize()
+                        .ok()
+                        .and_then(|p| p.to_str().map(|s| s.to_string()))
+                    {
+                        pp.add_system_include_path(&s);
+                    }
                 }
-            }
-            let builtin2 = exe_dir.join("include");
-            if builtin2.is_dir() {
-                if let Some(s) = builtin2
-                    .canonicalize()
-                    .ok()
-                    .and_then(|p| p.to_str().map(|s| s.to_string()))
-                {
-                    pp.add_system_include_path(&s);
+                let builtin2 = exe_dir.join("include");
+                if builtin2.is_dir() {
+                    if let Some(s) = builtin2
+                        .canonicalize()
+                        .ok()
+                        .and_then(|p| p.to_str().map(|s| s.to_string()))
+                    {
+                        pp.add_system_include_path(&s);
+                    }
                 }
             }
         }
-    }
-    // Default system include paths — target-aware.
-    // The multiarch path must match the selected --target to avoid
-    // resolving host-specific headers during cross-compilation (e.g.
-    // `stubs-32.h` not found when targeting i686 on an x86-64 host).
-    let target_sys_paths = ctx.target.system_include_paths();
-    let extra_sys_paths: &[&str] = &["/usr/local/include", "/usr/include/linux"];
-    for sp in target_sys_paths.iter().chain(extra_sys_paths.iter()) {
-        if std::path::Path::new(sp).is_dir() {
-            pp.add_system_include_path(sp);
+        // Default system include paths — target-aware.
+        let target_sys_paths = ctx.target.system_include_paths();
+        let extra_sys_paths: &[&str] = &["/usr/local/include", "/usr/include/linux"];
+        for sp in target_sys_paths.iter().chain(extra_sys_paths.iter()) {
+            if std::path::Path::new(sp).is_dir() {
+                pp.add_system_include_path(sp);
+            }
         }
     }
     for (name, value) in &ctx.defines {
@@ -996,10 +1252,21 @@ fn compile_single_file(
         pp.add_undef(name);
     }
 
-    let pp_tokens = pp.preprocess_file(input).map_err(|_| {
-        diagnostics.print_all(&source_map);
-        format!("preprocessing failed for '{}'", input)
-    })?;
+    // Process forced-include files (-include <file>) before the main source.
+    for forced in &ctx.forced_includes {
+        if pp.preprocess_file(forced).is_err() {
+            diagnostics.print_all(&source_map);
+            return Err(format!("forced include '{}' failed", forced));
+        }
+    }
+
+    let pp_tokens = match pp.preprocess_file(input) {
+        Ok(t) => t,
+        Err(()) => {
+            diagnostics.print_all(&source_map);
+            return Err(format!("preprocessing failed for '{}'", input));
+        }
+    };
 
     // Check for preprocessing errors
     if diagnostics.has_errors() {
@@ -1034,8 +1301,11 @@ fn compile_single_file(
     // Phase 4: Parsing
     // ========================================================================
 
+    let t_parse_start = std::time::Instant::now();
     let mut parser = Parser::new(lexer, ctx.target);
     let mut translation_unit = parser.parse();
+    let t_parse_elapsed = t_parse_start.elapsed();
+    eprintln!("[BCC-TIMING] parse: {:.3}s", t_parse_elapsed.as_secs_f64());
 
     // Check for parse errors
     if diagnostics.has_errors() {
@@ -1049,6 +1319,7 @@ fn compile_single_file(
 
     // The SemanticAnalyzer borrows `diagnostics` mutably, so we scope its
     // lifetime in a block to release the borrow before checking diagnostics.
+    let t_sema_start = std::time::Instant::now();
     let sema_ok = {
         let mut sema =
             SemanticAnalyzer::new(&mut diagnostics, &type_builder, ctx.target, &interner);
@@ -1058,6 +1329,8 @@ fn compile_single_file(
 
         analyze_result.is_ok() && finalize_result.is_ok()
     };
+    let t_sema_elapsed = t_sema_start.elapsed();
+    eprintln!("[BCC-TIMING] sema: {:.3}s", t_sema_elapsed.as_secs_f64());
     // `sema` is now dropped — mutable borrow of `diagnostics` is released.
 
     if !sema_ok || diagnostics.has_errors() {
@@ -1075,6 +1348,7 @@ fn compile_single_file(
     // Phase 6: IR Lowering (AST → IR with allocas)
     // ========================================================================
 
+    let t_ir_start = std::time::Instant::now();
     let mut ir_module = lower_translation_unit(
         &translation_unit,
         &symbol_table,
@@ -1088,6 +1362,8 @@ fn compile_single_file(
         diagnostics.print_all(&source_map);
         format!("IR lowering failed for '{}': {}", input, e)
     })?;
+    let t_ir_elapsed = t_ir_start.elapsed();
+    eprintln!("[BCC-TIMING] ir-lowering: {:.3}s", t_ir_elapsed.as_secs_f64());
 
     if diagnostics.has_errors() {
         diagnostics.print_all(&source_map);
@@ -1129,11 +1405,14 @@ fn compile_single_file(
         emit_assembly: args.emit_assembly,
     };
 
+    let t_codegen_start = std::time::Instant::now();
     let output_bytes = generate_code(&ir_module, &codegen_ctx, &mut diagnostics, &source_map)
         .map_err(|e| {
             diagnostics.print_all(&source_map);
             format!("code generation failed for '{}': {}", input, e)
         })?;
+    let t_codegen_elapsed = t_codegen_start.elapsed();
+    eprintln!("[BCC-TIMING] codegen: {:.3}s", t_codegen_elapsed.as_secs_f64());
 
     if diagnostics.has_errors() {
         diagnostics.print_all(&source_map);
@@ -1152,6 +1431,33 @@ fn compile_single_file(
             let perms = fs::Permissions::from_mode(0o755);
             let _ = fs::set_permissions(output, perms);
         }
+    }
+
+    // Generate dependency file if -MD/-MMD/-MF was specified.
+    if args.gen_depfile {
+        let dep_path = if let Some(ref dp) = args.depfile_path {
+            dp.clone()
+        } else {
+            // Default: replace .o extension with .d
+            let out_path = Path::new(output);
+            let stem = out_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("output");
+            let parent = out_path.parent().unwrap_or(Path::new("."));
+            parent
+                .join(format!(".{}.o.d", stem))
+                .to_string_lossy()
+                .to_string()
+        };
+        let dep_target = args
+            .depfile_target
+            .as_deref()
+            .unwrap_or(output);
+        // Write a minimal dependency file listing the source file.
+        // The kernel build system processes this with fixdep.
+        let dep_content = format!("{}: {}\n", dep_target, input);
+        let _ = fs::write(&dep_path, dep_content);
     }
 
     // Print any accumulated warnings (non-fatal diagnostics)
@@ -1271,6 +1577,57 @@ fn main() {
         print_usage();
         process::exit(1);
     };
+
+    // Handle special flags before normal parsing.
+
+    // `-Wa,--version`: The kernel build system uses this to detect the
+    // assembler version. Output a GNU-assembler-compatible version string
+    // to satisfy `scripts/as-version.sh`, then exit successfully.
+    if args_slice.iter().any(|a| a == "-Wa,--version") {
+        println!("GNU assembler (BCC built-in) 2.42");
+        process::exit(0);
+    }
+
+    // `-print-file-name=<file>`: GCC prints the full path to a file in
+    // its installation. BCC outputs an empty string for unsupported files,
+    // which the kernel build system interprets as "not found."
+    if let Some(arg) = args_slice.iter().find(|a| a.starts_with("-print-file-name=")) {
+        let _name = arg.strip_prefix("-print-file-name=").unwrap_or("");
+        // Return the queried name as-is (like "plugin"), indicating not found
+        println!("{}", _name);
+        process::exit(0);
+    }
+
+    // `-dumpversion`: Print just the version number (used by build systems).
+    if args_slice.iter().any(|a| a == "-dumpversion") {
+        println!("12.2.0");
+        process::exit(0);
+    }
+
+    // `-dumpmachine`: Print the target triple (used by build systems).
+    if args_slice.iter().any(|a| a == "-dumpmachine") {
+        // Default to x86-64; check for --target= in other args
+        let target = args_slice
+            .iter()
+            .find_map(|a| a.strip_prefix("--target="))
+            .unwrap_or("x86-64");
+        let triple = match target {
+            "riscv64" => "riscv64-linux-gnu",
+            "aarch64" => "aarch64-linux-gnu",
+            "i686" => "i686-linux-gnu",
+            _ => "x86_64-linux-gnu",
+        };
+        println!("{}", triple);
+        process::exit(0);
+    }
+
+    // `--version` or `-v`: Print compiler version.
+    if args_slice.iter().any(|a| a == "--version" || a == "-v") {
+        println!("bcc (BCC) {}", VERSION);
+        println!("Copyright (C) 2024 BCC Project");
+        println!("This is free software; see the source for copying conditions.");
+        process::exit(0);
+    }
 
     // Parse command-line arguments
     let cli_args = match parse_args(args_slice) {

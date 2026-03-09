@@ -1029,7 +1029,16 @@ fn parse_parameter_declaration(parser: &mut Parser<'_>) -> Result<ParameterDecla
     // Heuristic: if we see `*`, it could be either. If we see an identifier
     // that's not a type name, it's named. If we see `(` or `[`, it could be
     // abstract. We try named first and fall back.
-    if is_declarator_start(parser) {
+    //
+    // Special case: if the specifiers already contain type specifiers and the
+    // current token is a typedef name, treat it as a named declarator (the
+    // parameter name shadows the typedef). Example:
+    //   typedef int (*cb_t)(void);
+    //   int foo(cb_t cb_t, void *data);  // second `cb_t` is param name
+    let has_type_specs = !specifiers.type_specifiers.is_empty();
+    let is_typedef_as_name = has_type_specs
+        && matches!(parser.peek(), TokenKind::Identifier(sym) if parser.is_typedef_name(*sym));
+    if is_declarator_start(parser) || is_typedef_as_name {
         let decl = parse_declarator(parser)?;
         let span = parser.make_span(start_span);
         Ok(ParameterDeclaration {
@@ -2040,8 +2049,14 @@ fn extract_declarator_name(direct: &DirectDeclarator) -> Option<Symbol> {
 fn parse_string_literal_value(parser: &mut Parser<'_>) -> Option<Vec<u8>> {
     match &parser.current.kind {
         TokenKind::StringLiteral { value, .. } => {
-            let bytes = value.as_bytes().to_vec();
+            let mut bytes = value.as_bytes().to_vec();
             parser.advance();
+            // Concatenate adjacent string literals (C11 §6.4.5):
+            // _Static_assert(expr, "part1" "part2" "part3");
+            while let TokenKind::StringLiteral { value, .. } = &parser.current.kind {
+                bytes.extend_from_slice(value.as_bytes());
+                parser.advance();
+            }
             Some(bytes)
         }
         _ => {

@@ -474,6 +474,21 @@ impl<'src> Parser<'src> {
         self.lexer.diagnostics().has_errors()
     }
 
+    /// Return the current error count from the diagnostic engine.
+    pub fn error_count(&self) -> usize {
+        self.lexer.diagnostics().error_count()
+    }
+
+    /// Check if we have exceeded the maximum error threshold.
+    ///
+    /// When the parser encounters too many errors (e.g., from unexpanded
+    /// macros in kernel code), continuing to parse is futile and can cause
+    /// pathological O(n) error generation.  This limit prevents hangs on
+    /// large inputs with many cascading parse errors.
+    pub fn too_many_errors(&self) -> bool {
+        self.lexer.diagnostics().error_count() >= 200
+    }
+
     /// Resolve an interned [`Symbol`] back to its string representation.
     pub fn resolve_symbol(&self, sym: Symbol) -> &str {
         self.lexer.interner().resolve(sym)
@@ -589,6 +604,11 @@ impl<'src> Parser<'src> {
         let mut declarations = Vec::new();
 
         while !self.current.is_eof() {
+            // Bail if the parser has accumulated too many errors.
+            if self.too_many_errors() {
+                break;
+            }
+
             // Record the current position so we can detect no-progress loops.
             let pos_before = self.current.span.start;
 
@@ -760,8 +780,14 @@ impl<'src> Parser<'src> {
     fn parse_string_literal_bytes(&mut self) -> Option<Vec<u8>> {
         match &self.current.kind {
             TokenKind::StringLiteral { value, .. } => {
-                let bytes = value.as_bytes().to_vec();
+                let mut bytes = value.as_bytes().to_vec();
                 self.advance();
+                // Concatenate adjacent string literals (C11 §6.4.5):
+                // _Static_assert(expr, "part1" "part2" "part3");
+                while let TokenKind::StringLiteral { value, .. } = &self.current.kind {
+                    bytes.extend_from_slice(value.as_bytes());
+                    self.advance();
+                }
                 Some(bytes)
             }
             _ => {

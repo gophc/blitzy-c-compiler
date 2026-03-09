@@ -422,8 +422,13 @@ fn parse_cast_expression(parser: &mut Parser<'_>) -> Result<Expression, ()> {
     let next = parser.peek_nth(0);
 
     // Case 1: `({ ... })` → GCC statement expression.
+    // We do NOT return early here — instead we let it fall through to
+    // parse_unary → parse_postfix → parse_primary, where the `({`
+    // handler lives.  This ensures that postfix operators like `->`,
+    // `.`, `()`, and `[]` are properly parsed after a statement
+    // expression, e.g. `({ &foo; })->member`.
     if next.is(&TokenKind::LeftBrace) {
-        return gcc_extensions::parse_statement_expression(parser);
+        return parse_unary_expression(parser);
     }
 
     // Case 2 & 3: Check if the token after `(` could start a type name.
@@ -1039,6 +1044,7 @@ fn parse_primary_expression(parser: &mut Parser<'_>) -> Result<Expression, ()> {
         TokenKind::BuiltinAddOverflow => parse_builtin_simple(parser, BuiltinKind::AddOverflow),
         TokenKind::BuiltinSubOverflow => parse_builtin_simple(parser, BuiltinKind::SubOverflow),
         TokenKind::BuiltinMulOverflow => parse_builtin_simple(parser, BuiltinKind::MulOverflow),
+        TokenKind::BuiltinObjectSize => parse_builtin_simple(parser, BuiltinKind::ObjectSize),
 
         // __extension__ — suppress pedantic warnings for the next expr.
         TokenKind::Extension => {
