@@ -620,8 +620,14 @@ impl<'a> TypeChecker<'a> {
             BuiltinKind::Offsetof => Ok(self.size_t_type()),
             BuiltinKind::ChooseExpr => Err(()),
             BuiltinKind::Clz
+            | BuiltinKind::ClzL
+            | BuiltinKind::ClzLL
             | BuiltinKind::Ctz
+            | BuiltinKind::CtzL
+            | BuiltinKind::CtzLL
             | BuiltinKind::Popcount
+            | BuiltinKind::PopcountL
+            | BuiltinKind::PopcountLL
             | BuiltinKind::Ffs
             | BuiltinKind::Ffsll => Ok(CType::Int),
             BuiltinKind::Bswap16 => Ok(CType::UShort),

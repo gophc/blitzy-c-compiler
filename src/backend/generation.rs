@@ -296,7 +296,18 @@ pub fn generate_code(
             generate_for_arch(&codegen, module, ctx, diagnostics, source_map)
         }
         Target::RiscV64 => {
-            let codegen = crate::backend::riscv64::RiscV64Codegen::new(ctx.pic, ctx.debug_info);
+            let mut codegen =
+                crate::backend::riscv64::RiscV64Codegen::new(ctx.pic, ctx.debug_info);
+            // Populate the variadic function set from module declarations.
+            // RISC-V LP64D ABI requires variadic FP arguments to be passed
+            // in integer registers instead of FP registers.
+            let variadic: crate::common::fx_hash::FxHashSet<String> = module
+                .declarations()
+                .iter()
+                .filter(|d| d.is_variadic)
+                .map(|d| d.name.clone())
+                .collect();
+            codegen.set_variadic_functions(variadic);
             generate_for_arch(&codegen, module, ctx, diagnostics, source_map)
         }
     }
@@ -441,15 +452,33 @@ fn generate_for_arch<A: ArchCodegen>(
         insert_spill_code_from_result(&mut mf, &alloc_result);
 
         // Update MachineFunction with allocation results.
-        apply_allocation_result(&mut mf, &alloc_result);
+        apply_allocation_result(&mut mf, &alloc_result, &ctx.target);
+
+        // Resolve integer-division register conflicts.
+        // After register allocation, the divisor may be assigned to RAX or
+        // RDX — which get clobbered by the dividend setup sequence (MOV RAX
+        // + CQO/CDQ for signed, XOR RDX + MOV RAX for unsigned).
+        if matches!(ctx.target, Target::X86_64) {
+            resolve_div_conflicts(&mut mf);
+        }
 
         // Resolve call-argument register move conflicts.
         // After register allocation, argument setup moves like
         //   MOV RSI, <vreg_x>  ; MOV RDX, <vreg_y>
         // may conflict when vreg_y was allocated to RSI (clobbered
         // by the first MOV before the second reads it).  This pass
-        // detects and fixes such conflicts using R11 as scratch.
-        resolve_call_arg_conflicts(&mut mf);
+        // detects and fixes such conflicts using a target-appropriate
+        // scratch register (R11 for x86-64, T0 for RISC-V, X16 for
+        // AArch64).
+        resolve_call_arg_conflicts(&mut mf, &ctx.target);
+
+        // Resolve parameter-loading MOV conflicts at the function entry.
+        // After register allocation, parameter MOVs (e.g., MOV RCX, RSI)
+        // may clobber ABI registers that are sources for later parameter
+        // loads.  This pass applies parallel-move sequentialisation.
+        if matches!(ctx.target, Target::X86_64) {
+            resolve_param_load_conflicts(&mut mf);
+        }
 
         // Step 3: Insert prologue and epilogue instructions.
         let prologue = arch.emit_prologue(&mf);
@@ -549,6 +578,13 @@ fn generate_for_arch<A: ArchCodegen>(
     // For relocations targeting defined functions, patch the .text bytes
     // directly (PC-relative CALL/JMP).  Remaining relocations (external
     // symbols) are carried forward to the ELF object for the linker.
+    //
+    // IMPORTANT: The patching format is architecture-dependent.
+    // - x86-64 / i686: Write raw 4-byte little-endian PC-relative offset
+    //   (R_X86_64_PC32, R_X86_64_PLT32, R_386_PC32 all use 32-bit addend).
+    // - AArch64: Encode offset/4 into the instruction's immediate field
+    //   while preserving the opcode bits (BL=imm26, B.cond=imm19, etc.).
+    // - RISC-V 64: Architecture-specific encoding per relocation type.
     {
         let mut func_offset_map = crate::common::fx_hash::FxHashMap::default();
         for (fname, foff, _fsz) in &text_section_offsets {
@@ -565,8 +601,13 @@ fn generate_for_arch<A: ArchCodegen>(
                 let value = s + a - p;
                 let fixup_off = reloc.offset as usize;
                 if fixup_off + 4 <= text_section_data.len() {
-                    let bytes = (value as i32).to_le_bytes();
-                    text_section_data[fixup_off..fixup_off + 4].copy_from_slice(&bytes);
+                    patch_intra_module_reloc(
+                        &mut text_section_data,
+                        fixup_off,
+                        value,
+                        reloc.rel_type_id,
+                        &ctx.target,
+                    );
                 }
             } else {
                 // External symbol — keep for the linker.
@@ -767,14 +808,23 @@ fn insert_spill_code_from_result(mf: &mut MachineFunction, alloc: &AllocationRes
 ///
 /// The scratch register is chosen dynamically from caller-saved registers
 /// that are not otherwise used by the current instruction.
-fn apply_allocation_result(mf: &mut MachineFunction, alloc: &AllocationResult) {
+fn apply_allocation_result(mf: &mut MachineFunction, alloc: &AllocationResult, target: &Target) {
     // Record callee-saved registers used by this function.
     mf.callee_saved_regs = alloc.callee_saved_used.iter().map(|pr| pr.0).collect();
 
     // Update frame size with spill slot requirements.
     mf.frame_size = mf.frame_size.max(alloc.frame_size);
 
+    // Build a set of codegen vreg IDs from vreg_to_ir_value.
+    // CRITICAL: This set is used to guard ALL fallback loops below that
+    // use val.index() as a vreg number.  Without this guard, val.index()
+    // can collide with codegen vreg IDs, causing physical-register vregs
+    // to be incorrectly treated as spilled (or vice versa).
+    let codegen_vreg_ids: crate::common::fx_hash::FxHashSet<u32> =
+        mf.vreg_to_ir_value.keys().copied().collect();
+
     // Build a complete vreg → physical register lookup table upfront.
+    // Primary path: map codegen vregs via vreg_to_ir_value.
     let mut vreg_phys: crate::common::fx_hash::FxHashMap<u32, u16> =
         crate::common::fx_hash::FxHashMap::default();
     for (&vreg, ir_val) in &mf.vreg_to_ir_value {
@@ -782,27 +832,103 @@ fn apply_allocation_result(mf: &mut MachineFunction, alloc: &AllocationResult) {
             vreg_phys.insert(vreg, phys.0);
         }
     }
+    // Fallback: for vregs not in vreg_to_ir_value, use val.index().
+    // entry().or_insert() ensures codegen vregs already in the map
+    // (from the primary loop) are NOT overwritten.
     for (val, phys) in &alloc.assignments {
         let vreg = val.index();
         vreg_phys.entry(vreg).or_insert(phys.0);
     }
 
+    // Debug: dump vreg→phys mapping and vreg_to_ir_value
+    if std::env::var("BCC_DEBUG_REGALLOC").is_ok() {
+        eprintln!("=== VREG_TO_IR_VALUE ===");
+        let mut pairs: Vec<_> = mf.vreg_to_ir_value.iter().collect();
+        pairs.sort_by_key(|(&k, _)| k);
+        for (&vreg, ir_val) in &pairs {
+            let phys = vreg_phys.get(&vreg);
+            eprintln!("  vreg={} -> ir_v{} -> phys={:?}", vreg, ir_val.index(), phys);
+        }
+        eprintln!("=== VREG_PHYS (full) ===");
+        let mut vp: Vec<_> = vreg_phys.iter().collect();
+        vp.sort_by_key(|(&k, _)| k);
+        for (&vreg, &phys) in &vp {
+            eprintln!("  vreg={} -> r{}", vreg, phys);
+        }
+    }
+
     // Build spilled vreg → frame offset mapping.
-    // Spill slots live below the regular frame (more negative offsets from RBP).
+    //
+    // Frame layout conventions differ by architecture:
+    //
+    // **x86-64 / i686:** FP (RBP) points to the TOP of the frame.  Locals
+    //   and spill slots live at *negative* offsets from RBP.
+    //
+    // **AArch64 / RISC-V 64:** FP points to the BOTTOM of the frame
+    //   (FP = SP after the prologue).  The prologue allocates:
+    //     total = 16 (FP/LR) + callee_save_bytes + mf.frame_size
+    //   **AArch64:** FP/LR are at [FP+0..+15].  Locals occupy
+    //   [FP+16 .. FP+16+locals_size).  Callee-saved regs are placed
+    //   AFTER locals at [FP+16+locals_size .. +callee_save_bytes).
+    //   Spill slots go right after locals (within mf.frame_size), so
+    //   they use FP + 16 + existing_locals as their base.
+    //
+    //   **RISC-V 64:** FP points to old_SP (top of frame).  Locals and
+    //   spills are at negative offsets, but the spill base computation
+    //   still uses 16 + callee_save_bytes + base_offset as positive.
     let base_offset = mf.frame_size;
+    let is_aarch64_or_rv = matches!(target, Target::AArch64 | Target::RiscV64);
+    let a64_rv_spill_base: i64 = if is_aarch64_or_rv {
+        if matches!(target, Target::AArch64) {
+            // AArch64: spills start at FP + 16 + existing locals_size.
+            // No callee-saved offset because callee-saved regs are AFTER
+            // both locals and spills in the AArch64 frame layout.
+            (16 + base_offset) as i64
+        } else {
+            // RISC-V: keep the original formula.
+            let num_gpr = mf.callee_saved_regs.iter().filter(|&&r| (r as u32) < 32).count();
+            let num_fpr = mf.callee_saved_regs.iter().filter(|&&r| (r as u32) >= 32).count();
+            let gpr_pairs = (num_gpr + 1) / 2;
+            let fpr_pairs = (num_fpr + 1) / 2;
+            let callee_save_bytes = (gpr_pairs + fpr_pairs) * 16;
+            (16 + callee_save_bytes + base_offset) as i64
+        }
+    } else {
+        0
+    };
+
     let mut vreg_spill_offset: crate::common::fx_hash::FxHashMap<u32, i64> =
         crate::common::fx_hash::FxHashMap::default();
 
+    // Primary path: map codegen vregs to spill offsets via vreg_to_ir_value.
     for (&vreg, ir_val) in &mf.vreg_to_ir_value {
         if let Some(&slot_idx) = alloc.spill_map.get(ir_val) {
-            let offset = -((base_offset as i64) + 8 * (slot_idx as i64 + 1));
+            let offset = if is_aarch64_or_rv {
+                // Positive offset from FP for AArch64/RV.
+                a64_rv_spill_base + 8 * (slot_idx as i64)
+            } else {
+                // Negative offset from RBP for x86.
+                -((base_offset as i64) + 8 * (slot_idx as i64 + 1))
+            };
             vreg_spill_offset.insert(vreg, offset);
         }
     }
+    // Fallback path: for IR values whose val.index() is used directly
+    // as a vreg in machine instructions (not via vreg_to_ir_value).
+    // CRITICAL: Skip entries where val.index() collides with an existing
+    // codegen vreg ID — those codegen vregs may refer to completely
+    // different IR values and must NOT be marked as spilled.
     for (val, &slot_idx) in &alloc.spill_map {
         let vreg = val.index();
-        let offset = -((base_offset as i64) + 8 * (slot_idx as i64 + 1));
-        vreg_spill_offset.entry(vreg).or_insert(offset);
+        // Only add if this vreg ID is NOT a known codegen vreg.
+        if !codegen_vreg_ids.contains(&vreg) {
+            let offset = if is_aarch64_or_rv {
+                a64_rv_spill_base + 8 * (slot_idx as i64)
+            } else {
+                -((base_offset as i64) + 8 * (slot_idx as i64 + 1))
+            };
+            vreg_spill_offset.entry(vreg).or_insert(offset);
+        }
     }
 
     // Expand frame size to include spill area.
@@ -811,41 +937,179 @@ fn apply_allocation_result(mf: &mut MachineFunction, alloc: &AllocationResult) {
         mf.frame_size += spill_area;
     }
 
-    // Architecture-specific constants for x86-64.
-    const RBP_REG: u16 = 5;
-    // X86Opcode::Mov is the first enum variant = 0.
-    const MOV_OPCODE: u32 = 0;
-    // R11 is RESERVED from the allocation pool specifically for spill
-    // load/store operations.  It is never assigned to any live interval,
-    // so it can always be used as a scratch register without clobbering
-    // any allocated value.
-    const SPILL_SCRATCH: u16 = 11; // R11
+    // Architecture-specific constants for spill code.
+    //
+    // Frame pointer register:
+    // - x86-64 / i686: RBP = 5
+    // - AArch64: X29 (FP) = 29
+    // - RISC-V 64: X8 (s0/fp) = 8
+    let frame_ptr_reg: u16 = match target {
+        Target::X86_64 | Target::I686 => 5,  // RBP
+        Target::AArch64 => 29,                // X29 / FP
+        Target::RiscV64 => 8,                 // X8 / s0 / fp
+    };
+    // MOV/load opcodes are architecture-dependent:
+    // x86-64: X86Opcode::Mov = 0, X86Opcode::Movsd = 86
+    // i686:   I686_MOV = 0x100
+    // AArch64: LDR (opcode for 64-bit load from codegen) = 57 (A64Opcode::LDR_imm)
+    // RISC-V 64: LD = 13 (RvOpcode::LD)
+    let mov_opcode: u32 = match target {
+        Target::I686 => 0x100,    // I686_MOV
+        Target::AArch64 => 57,    // A64Opcode::LDR_imm (64-bit load)
+        Target::RiscV64 => 13,    // RvOpcode::LD
+        _ => 0,                   // X86Opcode::Mov
+    };
+    let movsd_opcode: u32 = match target {
+        Target::I686 => 0x100,    // i686 uses MOV for all spills (no SSE)
+        Target::AArch64 => 57,    // AArch64: same LDR_imm for FP spills
+        Target::RiscV64 => 13,    // RISC-V: LD for FP spills (stored as 64-bit)
+        _ => 86,                  // X86Opcode::Movsd
+    };
+    // Store opcodes for spill stores:
+    // x86-64 / i686: same opcode as load (MOV is bidirectional via operand layout)
+    // AArch64: STR (opcode 70 = A64Opcode::STR_imm)
+    // RISC-V 64: SD = 20 (RvOpcode::SD)
+    let store_opcode: u32 = match target {
+        Target::AArch64 => 70,    // A64Opcode::STR_imm
+        Target::RiscV64 => 20,    // RvOpcode::SD
+        _ => mov_opcode,          // x86: same opcode for load/store
+    };
+    let store_fp_opcode: u32 = match target {
+        Target::AArch64 => 70,    // AArch64 STR_imm
+        Target::RiscV64 => 20,    // RISC-V SD
+        _ => movsd_opcode,        // x86: MOVSD for float stores
+    };
+    // Spill scratch register is architecture-dependent:
+    // - x86-64: R11 (index 11) — reserved from GPR allocation
+    // - i686: ECX (index 1) — caller-saved, used as scratch for spills
+    // - AArch64: X16 (IP0, index 16) — scratch register
+    // - RISC-V 64: X5 (T0, index 5) — temporary register
+    let spill_scratch: u16 = match target {
+        Target::I686 => 1,      // ECX
+        Target::AArch64 => 16,  // X16 / IP0
+        Target::RiscV64 => 5,   // X5 / T0
+        _ => 11,                // R11 (x86-64)
+    };
+    let float_spill_scratch: u16 = match target {
+        Target::I686 => 1, // ECX (i686 uses x87 stack, no XMM15)
+        _ => 31,           // XMM15
+    };
 
-    // Helper: make a MOV load instruction: MOV scratch, [RBP + offset]
-    fn make_spill_load(scratch: u16, offset: i64) -> MachineInstruction {
-        let mut inst = MachineInstruction::new(MOV_OPCODE);
-        inst.operands.push(MachineOperand::Register(scratch));
+    // Build a set of codegen vregs that hold float types.
+    // CRITICAL: Must use BOTH the vreg_to_ir_value mapping AND direct
+    // Value.index() to ensure coverage, since codegen vreg numbering
+    // may differ from IR Value indices.
+    let mut vreg_is_float: crate::common::fx_hash::FxHashSet<u32> =
+        crate::common::fx_hash::FxHashSet::default();
+    // Path 1: Map through vreg_to_ir_value (codegen vreg → IR Value → type).
+    for (&vreg, ir_val) in &mf.vreg_to_ir_value {
+        // Check if this IR value is spilled AND is float.
+        if alloc.spill_map.contains_key(ir_val) {
+            if let Some(ty) = alloc.value_types.get(ir_val) {
+                if ty.is_float() {
+                    vreg_is_float.insert(vreg);
+                }
+            }
+        }
+        // Check if assigned to an SSE register.
+        if let Some(phys) = alloc.assignments.get(ir_val) {
+            if phys.0 >= 16 && phys.0 < 32 {
+                vreg_is_float.insert(vreg);
+            }
+        }
+    }
+    // Path 2: Direct fallback using Value.index() as vreg (for vregs
+    // not in vreg_to_ir_value — e.g. the second pass of the mapping).
+    // CRITICAL: Skip entries where val.index() collides with a known
+    // codegen vreg to prevent marking an integer codegen vreg as float.
+    for (val, _slot_idx) in &alloc.spill_map {
+        if !codegen_vreg_ids.contains(&val.index()) {
+            if let Some(ty) = alloc.value_types.get(val) {
+                if ty.is_float() {
+                    vreg_is_float.insert(val.index());
+                }
+            }
+        }
+    }
+    for (val, phys) in &alloc.assignments {
+        if !codegen_vreg_ids.contains(&val.index()) {
+            if phys.0 >= 16 && phys.0 < 32 {
+                vreg_is_float.insert(val.index());
+            }
+        }
+    }
+
+    // Helper: select scratch register and opcode based on float/int class.
+    // Helper: select scratch register and LOAD opcode based on float/int class.
+    let spill_scratch_for = |is_float: bool| -> (u16, u32) {
+        if is_float {
+            (float_spill_scratch, movsd_opcode)
+        } else {
+            (spill_scratch, mov_opcode)
+        }
+    };
+    // Helper: select scratch register and STORE opcode based on float/int class.
+    // On x86, load/store use the same opcode (MOV/MOVSD are bidirectional).
+    // On RISC-V/AArch64, stores have separate opcodes (SD/STR vs LD/LDR).
+    let spill_store_for = |is_float: bool| -> (u16, u32) {
+        if is_float {
+            (float_spill_scratch, store_fp_opcode)
+        } else {
+            (spill_scratch, store_opcode)
+        }
+    };
+
+    // Helper: make a load instruction for spill reload.
+    //
+    // Architecture-specific layouts:
+    // - i686:     result = scratch, operands = [Memory{base=RBP, disp=offset}]
+    // - x86-64:   operands = [Register(scratch), Memory{base=RBP, disp=offset}]
+    // - AArch64:  result = Register(scratch), operands = [Memory{base=FP, disp=offset}]
+    // - RISC-V:   result = Register(scratch), operands = [Memory{base=FP, disp=offset}]
+    //             → machine_to_rv_instruction: rd=scratch, rs1=fp, imm=offset → LD scratch, offset(fp)
+    let is_i686 = matches!(target, Target::I686);
+    let is_risc_or_arm = matches!(target, Target::RiscV64 | Target::AArch64);
+    let make_spill_load = |scratch: u16, offset: i64, opcode: u32| -> MachineInstruction {
+        let mem = MachineOperand::Memory {
+            base: Some(frame_ptr_reg),
+            index: None,
+            scale: 1,
+            displacement: offset,
+        };
+        if is_i686 || is_risc_or_arm {
+            // i686 / RISC-V / AArch64: result = rd, operand = Memory(base+disp)
+            let mut inst = MachineInstruction::new(opcode);
+            inst.operands.push(mem);
+            inst.result = Some(MachineOperand::Register(scratch));
+            inst
+        } else {
+            // x86-64: operands = [Register(scratch), Memory]
+            let mut inst = MachineInstruction::new(opcode);
+            inst.operands.push(MachineOperand::Register(scratch));
+            inst.operands.push(mem);
+            inst
+        }
+    };
+
+    // Helper: make a store instruction for spill save.
+    //
+    // Architecture-specific layouts:
+    // - x86-64/i686: operands = [Memory{base=RBP, disp=offset}, Register(scratch)]
+    // - AArch64:     operands = [Memory{base=FP, disp=offset}, Register(scratch)]
+    //                → machine_to_a64_instruction: maps to STR scratch, [fp, #offset]
+    // - RISC-V:      operands = [Memory{base=FP, disp=offset}, Register(scratch)]
+    //                → machine_to_rv_instruction: rs1=fp, rs2=scratch, imm=offset → SD scratch, offset(fp)
+    let make_spill_store = |scratch: u16, offset: i64, opcode: u32| -> MachineInstruction {
+        let mut inst = MachineInstruction::new(opcode);
         inst.operands.push(MachineOperand::Memory {
-            base: Some(RBP_REG),
+            base: Some(frame_ptr_reg),
             index: None,
             scale: 1,
             displacement: offset,
         });
-        inst
-    }
-
-    // Helper: make a MOV store instruction: MOV [RBP + offset], scratch
-    fn make_spill_store(scratch: u16, offset: i64) -> MachineInstruction {
-        let mut inst = MachineInstruction::new(MOV_OPCODE);
-        inst.operands.push(MachineOperand::Memory {
-            base: Some(RBP_REG),
-            index: None,
-            scale: 1,
-            displacement: offset,
-        });
         inst.operands.push(MachineOperand::Register(scratch));
         inst
-    }
+    };
 
     // Process each block: replace VRs with physical registers or insert spill code.
     //
@@ -888,43 +1152,131 @@ fn apply_allocation_result(mf: &mut MachineFunction, alloc: &AllocationResult) {
                 }
             });
 
+            // Detect if the result vreg is float (needs XMM15 scratch).
+            let result_is_float = inst.result.as_ref().map_or(false, |r| {
+                if let MachineOperand::VirtualRegister(vreg) = r {
+                    vreg_is_float.contains(vreg)
+                } else {
+                    false
+                }
+            });
+
             // ----------------------------------------------------------
             // Step 2: Insert a load for the spilled result BEFORE the
-            //         instruction so that R11 holds the old value.
+            //         instruction so that the scratch reg holds the old
+            //         value. Uses R11 for int, XMM15 for float.
             // ----------------------------------------------------------
+            let (result_scratch, result_mov_op) = spill_scratch_for(result_is_float);
             if let Some(offset) = result_spill_offset {
-                new_insts.push(make_spill_load(SPILL_SCRATCH, offset));
+                let mut ld = make_spill_load(result_scratch, offset, result_mov_op);
+                // Propagate is_call_arg_setup so the parallel-move
+                // resolver includes this instruction in its scope.
+                ld.is_call_arg_setup = inst.is_call_arg_setup;
+                new_insts.push(ld);
             }
 
             // ----------------------------------------------------------
             // Step 3: Resolve explicit operands.
             //
-            // If the result is spilled (R11 is occupied):
-            //   → ALL spilled operands become Memory operands.
+            // If the result is spilled (scratch is occupied):
+            //   → Spilled operands of the SAME class become Memory.
+            //   → Spilled operands of the OTHER class can use their scratch.
             // If the result is NOT spilled:
-            //   → The FIRST spilled operand loads into R11;
-            //     additional spilled operands become Memory operands.
+            //   → The FIRST spilled int operand loads into R11.
+            //   → The FIRST spilled float operand loads into XMM15.
+            //   → Additional operands of a class become Memory.
             // ----------------------------------------------------------
-            let r11_reserved_for_result = result_spill_offset.is_some();
-            let mut scratch_used_for_operand = false;
+            let int_scratch_reserved_for_result =
+                result_spill_offset.is_some() && !result_is_float;
+            let float_scratch_reserved_for_result =
+                result_spill_offset.is_some() && result_is_float;
+            let mut int_scratch_used = false;
+            let mut float_scratch_used = false;
+
+            // Capture the result vreg (before resolution) so we can detect
+            // operands that alias the result — critical for in-place ALU ops
+            // (ADD, SUB, etc.) where operand[0] IS the result register.
+            let result_vreg: Option<u32> = inst.result.as_ref().and_then(|r| {
+                if let MachineOperand::VirtualRegister(v) = r {
+                    Some(*v)
+                } else {
+                    None
+                }
+            });
+
+            // Propagate is_call_arg_setup to spill load instructions so
+            // that the parallel-move resolver sees the full arg-setup
+            // sequence even when spill reloads are interspersed.
+            let propagate_call_arg_setup = inst.is_call_arg_setup;
 
             for i in 0..inst.operands.len() {
                 if let MachineOperand::VirtualRegister(vreg) = inst.operands[i] {
                     if let Some(&offset) = vreg_spill_offset.get(&vreg) {
-                        if !r11_reserved_for_result && !scratch_used_for_operand {
-                            // R11 is free — use it for the first spilled operand.
-                            new_insts.push(make_spill_load(SPILL_SCRATCH, offset));
-                            inst.operands[i] = MachineOperand::Register(SPILL_SCRATCH);
-                            scratch_used_for_operand = true;
+                        let op_is_float = vreg_is_float.contains(&vreg);
+                        if op_is_float {
+                            let same_as_result_f = result_vreg == Some(vreg)
+                                && result_spill_offset.is_some()
+                                && result_is_float;
+                            if same_as_result_f && !float_scratch_used {
+                                let (scratch, _) = spill_scratch_for(true);
+                                inst.operands[i] = MachineOperand::Register(scratch);
+                                float_scratch_used = true;
+                            } else if !float_scratch_used {
+                                let (scratch, mov_op) = spill_scratch_for(true);
+                                let mut ld = make_spill_load(scratch, offset, mov_op);
+                                ld.is_call_arg_setup = propagate_call_arg_setup;
+                                new_insts.push(ld);
+                                inst.operands[i] = MachineOperand::Register(scratch);
+                                float_scratch_used = true;
+                            } else {
+                                // XMM15 occupied — use memory operand (SSE supports mem src).
+                                inst.operands[i] = MachineOperand::Memory {
+                                    base: Some(frame_ptr_reg),
+                                    index: None,
+                                    scale: 1,
+                                    displacement: offset,
+                                };
+                            }
                         } else {
-                            // R11 is occupied (by result or a prior operand) —
-                            // encode as a memory reference.
-                            inst.operands[i] = MachineOperand::Memory {
-                                base: Some(RBP_REG),
-                                index: None,
-                                scale: 1,
-                                displacement: offset,
-                            };
+                            // Check if this operand is the SAME spilled vreg
+                            // as the result. This is critical for in-place ALU
+                            // ops (ADD, SUB, etc.) where operand[0] IS the
+                            // destination: if we used Memory for operand[0]
+                            // while result maps to scratch, Step 5's store of
+                            // scratch would overwrite the correct in-memory
+                            // result with a stale value.
+                            let same_as_result = result_vreg == Some(vreg)
+                                && result_spill_offset.is_some()
+                                && !result_is_float;
+                            if same_as_result && !int_scratch_used {
+                                // Reuse scratch — already loaded from the same
+                                // spill slot in Step 2.
+                                inst.operands[i] = MachineOperand::Register(spill_scratch);
+                                int_scratch_used = true;
+                            } else if !int_scratch_used {
+                                // Scratch is available. Load operand's spill
+                                // value into scratch (may overwrite Step 2's
+                                // preload of the result — that is safe because
+                                // both share the scratch register, and the
+                                // instruction will produce the correct value
+                                // which Step 5 stores back).
+                                let mut ld = make_spill_load(
+                                    spill_scratch,
+                                    offset,
+                                    mov_opcode,
+                                );
+                                ld.is_call_arg_setup = propagate_call_arg_setup;
+                                new_insts.push(ld);
+                                inst.operands[i] = MachineOperand::Register(spill_scratch);
+                                int_scratch_used = true;
+                            } else {
+                                inst.operands[i] = MachineOperand::Memory {
+                                    base: Some(frame_ptr_reg),
+                                    index: None,
+                                    scale: 1,
+                                    displacement: offset,
+                                };
+                            }
                         }
                     } else if let Some(&phys) = vreg_phys.get(&vreg) {
                         inst.operands[i] = MachineOperand::Register(phys);
@@ -935,12 +1287,14 @@ fn apply_allocation_result(mf: &mut MachineFunction, alloc: &AllocationResult) {
             // ----------------------------------------------------------
             // Step 4: Resolve the result operand.
             // ----------------------------------------------------------
-            let mut store_after: Option<i64> = None;
+            let mut store_after: Option<(i64, bool)> = None;
             if let Some(ref mut result) = inst.result {
                 if let MachineOperand::VirtualRegister(vreg) = *result {
                     if let Some(&offset) = vreg_spill_offset.get(&vreg) {
-                        *result = MachineOperand::Register(SPILL_SCRATCH);
-                        store_after = Some(offset);
+                        let is_float = vreg_is_float.contains(&vreg);
+                        let (scratch, _) = spill_scratch_for(is_float);
+                        *result = MachineOperand::Register(scratch);
+                        store_after = Some((offset, is_float));
                     } else if let Some(&phys) = vreg_phys.get(&vreg) {
                         *result = MachineOperand::Register(phys);
                     }
@@ -952,11 +1306,453 @@ fn apply_allocation_result(mf: &mut MachineFunction, alloc: &AllocationResult) {
 
             // ----------------------------------------------------------
             // Step 5: Insert a store for the spilled result AFTER the
-            //         instruction.
+            //         instruction. Uses store opcode (SD for RISC-V,
+            //         STR for AArch64, MOV for x86).
             // ----------------------------------------------------------
-            if let Some(offset) = store_after {
-                new_insts.push(make_spill_store(SPILL_SCRATCH, offset));
+            if let Some((offset, is_float)) = store_after {
+                let (scratch, st_op) = spill_store_for(is_float);
+                new_insts.push(make_spill_store(scratch, offset, st_op));
             }
+        }
+
+        block.instructions = new_insts;
+    }
+}
+
+// ===========================================================================
+// resolve_param_load_conflicts — fix register clobbering in function prologue
+// ===========================================================================
+
+/// After register allocation, function-entry parameter-loading MOV sequences
+/// like:
+///
+/// ```text
+///   MOV RAX, RDI       ; param 0 → allocated to RAX (OK)
+///   MOV RCX, RSI       ; param 1 → allocated to RCX (CLOBBERS param 3 source!)
+///   MOV RDX, RDX       ; param 2 → allocated to RDX (no-op)
+///   MOV RSI, RCX       ; param 3 → allocated to RSI (BUG: RCX already overwritten!)
+/// ```
+///
+/// may contain conflicts: a destination register of an earlier MOV is the
+/// source register of a later MOV.  This is the classical **parallel copy
+/// problem** — all parameter loads must logically happen simultaneously.
+///
+/// This function applies a standard parallel-move sequentialisation algorithm:
+///
+/// 1. Remove self-moves (`MOV R, R`) — they are no-ops.
+/// 2. Topologically order remaining moves: emit moves whose destination is
+///    NOT a source for any pending move first.
+/// 3. If a cycle is detected (no move can be emitted safely), break it by
+///    saving one source to R11 (scratch), substituting R11 as the source,
+///    and continuing.
+///
+/// The resolved sequence of MOVs is then spliced back in place of the
+/// original parameter-loading sequence.
+fn resolve_param_load_conflicts(mf: &mut MachineFunction) {
+    if mf.blocks.is_empty() {
+        return;
+    }
+
+    const MOV_OPCODE: u32 = 0; // X86Opcode::Mov
+    const MOVSD_OPCODE: u32 = 86; // X86Opcode::Movsd
+    const SCRATCH_REG: u16 = 11; // R11 (integer scratch)
+    const FLOAT_SCRATCH_REG: u16 = 31; // XMM15 (float scratch)
+
+    // ABI integer argument registers (System V AMD64).
+    let abi_int_regs: crate::common::fx_hash::FxHashSet<u16> = {
+        let mut s = crate::common::fx_hash::FxHashSet::default();
+        // RDI=7, RSI=6, RDX=2, RCX=1, R8=8, R9=9
+        s.insert(7);
+        s.insert(6);
+        s.insert(2);
+        s.insert(1);
+        s.insert(8);
+        s.insert(9);
+        s
+    };
+    // ABI SSE argument registers.
+    let abi_sse_regs: crate::common::fx_hash::FxHashSet<u16> = {
+        let mut s = crate::common::fx_hash::FxHashSet::default();
+        for i in 16u16..24 {
+            // XMM0=16 .. XMM7=23
+            s.insert(i);
+        }
+        s
+    };
+
+    let entry = &mut mf.blocks[0];
+    let insts = &entry.instructions;
+
+    // Identify the contiguous parameter-loading MOV/MOVSD sequence at the
+    // beginning of the entry block.  A parameter MOV is a MOV from a
+    // physical ABI register to another physical register.  Float params
+    // use MOVSD (opcode 86).
+    let mut seq_len: usize = 0;
+    for inst in insts.iter() {
+        if inst.opcode != MOV_OPCODE && inst.opcode != MOVSD_OPCODE {
+            break;
+        }
+        // Instruction format: result = Some(Register(dst)), operands = [Register(src)]
+        let is_param_mov = match (&inst.result, inst.operands.first()) {
+            (Some(MachineOperand::Register(dst)), Some(MachineOperand::Register(src))) => {
+                let _ = dst; // suppress warning
+                abi_int_regs.contains(src) || abi_sse_regs.contains(src)
+            }
+            _ => false,
+        };
+        if !is_param_mov {
+            break;
+        }
+        seq_len += 1;
+    }
+
+    if seq_len <= 1 {
+        // 0 or 1 parameter MOVs — no possible conflicts.
+        return;
+    }
+
+    // Extract (dst, src) pairs from the parameter MOV sequence.
+    // Also detect Movsd (opcode for SSE moves) in addition to regular Mov.
+    let mut moves: Vec<(u16, u16, u32)> = Vec::with_capacity(seq_len); // (dst, src, opcode)
+    for inst in insts[..seq_len].iter() {
+        if let (Some(MachineOperand::Register(dst)), Some(MachineOperand::Register(src))) =
+            (&inst.result, inst.operands.first())
+        {
+            moves.push((*dst, *src, inst.opcode));
+        }
+    }
+
+    // ---- Parallel-move sequentialisation ----
+    //
+    // Algorithm:
+    //   pending = list of (dst, src, opcode)
+    //   result  = list of resolved MOV instructions
+    //
+    //   Repeat until pending is empty:
+    //     1. Remove self-moves (dst == src).
+    //     2. Find a move whose dst is NOT a src of any other pending move.
+    //        Emit it and remove from pending.
+    //     3. If no such move exists (cycle detected):
+    //        Save one src to SCRATCH_REG, replace src with SCRATCH_REG in
+    //        the move, and continue.
+
+    let mut pending = moves.clone();
+    let mut resolved: Vec<MachineInstruction> = Vec::with_capacity(seq_len + 2);
+
+    // Remove self-moves upfront.
+    pending.retain(|&(dst, src, _)| dst != src);
+
+    let mut iteration_limit = pending.len() * pending.len() + 10; // safety limit
+    while !pending.is_empty() && iteration_limit > 0 {
+        iteration_limit -= 1;
+
+        // Collect all source registers still needed by pending moves.
+        let needed_srcs: crate::common::fx_hash::FxHashSet<u16> =
+            pending.iter().map(|&(_, src, _)| src).collect();
+
+        // Find a move whose destination is NOT a needed source.
+        let safe_idx = pending
+            .iter()
+            .position(|&(dst, _, _)| !needed_srcs.contains(&dst));
+
+        if let Some(idx) = safe_idx {
+            let (dst, src, opcode) = pending.remove(idx);
+            let mut inst = MachineInstruction::new(opcode);
+            inst.result = Some(MachineOperand::Register(dst));
+            inst.operands.push(MachineOperand::Register(src));
+            resolved.push(inst);
+        } else {
+            // Cycle detected — break it by saving one source to scratch.
+            // Pick the first pending move's source.
+            let (_, cycle_src, cycle_opcode) = pending[0];
+
+            // Determine if this is a float (SSE) or integer move.
+            let is_float_cycle = cycle_opcode == MOVSD_OPCODE
+                || (cycle_src >= 16 && cycle_src < 32);
+            let (scratch, save_op) = if is_float_cycle {
+                (FLOAT_SCRATCH_REG, MOVSD_OPCODE)
+            } else {
+                (SCRATCH_REG, MOV_OPCODE)
+            };
+
+            // Emit: MOV/MOVSD scratch <- cycle_src
+            let mut save_inst = MachineInstruction::new(save_op);
+            save_inst.result = Some(MachineOperand::Register(scratch));
+            save_inst.operands.push(MachineOperand::Register(cycle_src));
+            resolved.push(save_inst);
+
+            // Replace all references to cycle_src with scratch.
+            for m in &mut pending {
+                if m.1 == cycle_src {
+                    m.1 = scratch;
+                }
+            }
+        }
+    }
+
+    // Replace the original sequence in the entry block.
+    if !resolved.is_empty() || seq_len > 0 {
+        let remaining: Vec<MachineInstruction> = entry.instructions.drain(seq_len..).collect();
+        entry.instructions.clear();
+        entry.instructions.extend(resolved);
+        entry.instructions.extend(remaining);
+    }
+}
+
+// ===========================================================================
+// resolve_div_conflicts — fix divisor-register clobbering in IDIV/DIV
+// ===========================================================================
+
+/// After register allocation, integer division sequences may have the divisor
+/// assigned to RAX or RDX — registers that are implicitly overwritten by the
+/// dividend setup (`MOV RAX, lhs; CQO/CDQ`) or zero-extension (`XOR RDX, RDX`).
+///
+/// For signed division (SDiv/SRem), the codegen emits:
+/// ```text
+///   MOV RAX, <lhs>       ← writes RAX  (clobbers divisor if in RAX)
+///   CQO / CDQ            ← writes RDX  (clobbers divisor if in RDX)
+///   IDIV <divisor>
+/// ```
+///
+/// For unsigned division (UDiv/URem), the codegen emits:
+/// ```text
+///   XOR RDX, RDX         ← writes RDX  (clobbers LHS/divisor if in RDX)
+///   MOV RAX, <lhs>       ← writes RAX  (clobbers divisor if in RAX)
+///   DIV <divisor>
+/// ```
+///
+/// This post-allocation pass detects these conflicts and saves the clobbered
+/// operand to a scratch register before it is overwritten.
+fn resolve_div_conflicts(mf: &mut MachineFunction) {
+    const MOV_OP: u32 = 0;   // X86Opcode::Mov
+    const IDIV_OP: u32 = 10; // X86Opcode::Idiv
+    const DIV_OP: u32 = 11;  // X86Opcode::Div
+    const XOR_OP: u32 = 17;  // X86Opcode::Xor
+    const CDQ_OP: u32 = 106; // X86Opcode::Cdq
+    const CQO_OP: u32 = 107; // X86Opcode::Cqo
+    const RAX: u16 = 0;
+    const RCX: u16 = 1;
+    const RDX: u16 = 2;
+    const R11: u16 = 11;
+
+    for block in &mut mf.blocks {
+        // We may insert instructions, so iterate by building a new vector.
+        let mut new_insts: Vec<MachineInstruction> =
+            Vec::with_capacity(block.instructions.len() + 8);
+        let old_insts = std::mem::take(&mut block.instructions);
+        let len = old_insts.len();
+
+        let mut i = 0;
+        while i < len {
+            let opc = old_insts[i].opcode;
+
+            if opc != IDIV_OP && opc != DIV_OP {
+                new_insts.push(old_insts[i].clone());
+                i += 1;
+                continue;
+            }
+
+            // Found IDIV or DIV at position `i`.
+            // Divisor is in operands[0].
+            let divisor_reg = match old_insts[i].operands.first() {
+                Some(MachineOperand::Register(r)) => *r,
+                _ => {
+                    // Not a register operand (memory, etc.) — no conflict.
+                    new_insts.push(old_insts[i].clone());
+                    i += 1;
+                    continue;
+                }
+            };
+
+            // Only a problem if divisor is in RAX or RDX.
+            if divisor_reg != RAX && divisor_reg != RDX {
+                new_insts.push(old_insts[i].clone());
+                i += 1;
+                continue;
+            }
+
+            // Scan backwards in new_insts to find the "MOV RAX, <lhs>" and
+            // optionally CQO/CDQ (for signed) or XOR RDX, RDX (for unsigned).
+            // We need to identify the start of the div setup sequence and find
+            // the lhs register to avoid scratch conflicts.
+
+            // The division setup sequence (already in new_insts) looks like:
+            //   [... MOV RAX, <lhs> ; CQO/CDQ]     for signed  (IDIV)
+            //   [... XOR RDX, RDX ; MOV RAX, <lhs>] for unsigned (DIV)
+            //
+            // We'll look at the last 2-3 instructions in new_insts.
+
+            let ni_len = new_insts.len();
+
+            // Find the MOV RAX, <lhs> instruction (the one that writes RAX).
+            let mut mov_rax_pos = None;
+            let mut lhs_reg: Option<u16> = None;
+            // Search backwards up to 3 instructions.
+            let search_start = if ni_len >= 3 { ni_len - 3 } else { 0 };
+            for j in (search_start..ni_len).rev() {
+                if new_insts[j].opcode == MOV_OP {
+                    if let Some(MachineOperand::Register(r)) = &new_insts[j].result {
+                        if *r == RAX {
+                            mov_rax_pos = Some(j);
+                            // Get the source register.
+                            if let Some(MachineOperand::Register(src)) =
+                                new_insts[j].operands.first()
+                            {
+                                lhs_reg = Some(*src);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Also check for XOR RDX, RDX or CQO/CDQ in the sequence.
+            let mut has_rdx_clobber = false;
+            for j in (search_start..ni_len).rev() {
+                let op = new_insts[j].opcode;
+                if op == CQO_OP || op == CDQ_OP {
+                    has_rdx_clobber = true;
+                    break;
+                }
+                if op == XOR_OP {
+                    if let Some(MachineOperand::Register(r)) = &new_insts[j].result {
+                        if *r == RDX {
+                            has_rdx_clobber = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Determine conflicts:
+            // - Divisor in RAX: clobbered by "MOV RAX, lhs"
+            // - Divisor in RDX: clobbered by CQO/CDQ or XOR RDX, RDX
+            // Also check if LHS might be clobbered (for unsigned: XOR RDX, RDX before MOV RAX):
+            //   If lhs was in RDX and unsigned DIV: XOR RDX,RDX clobbers lhs before MOV RAX reads it.
+
+            let div_in_rax = divisor_reg == RAX;
+            let div_in_rdx = divisor_reg == RDX && has_rdx_clobber;
+
+            if !div_in_rax && !div_in_rdx {
+                // No conflict after all.
+                new_insts.push(old_insts[i].clone());
+                i += 1;
+                continue;
+            }
+
+            // Choose a scratch register: not RAX, not RDX, not lhs_reg.
+            let scratch = if lhs_reg != Some(R11) { R11 } else { RCX };
+
+            // Also handle lhs-in-RDX conflict for unsigned division:
+            // If opc == DIV_OP and lhs_reg == Some(RDX), the XOR RDX,RDX clobbers lhs.
+            let lhs_in_rdx = opc == DIV_OP && lhs_reg == Some(RDX);
+
+            if let Some(insert_pos) = mov_rax_pos {
+                // For unsigned DIV with lhs in RDX:
+                //   Before: XOR RDX,RDX ; MOV RAX,RDX ; DIV <rhs>
+                //   We need to save RDX before the XOR too.
+                if lhs_in_rdx {
+                    // Find XOR RDX,RDX before insert_pos.
+                    let mut xor_pos = None;
+                    for j in (search_start..insert_pos).rev() {
+                        if new_insts[j].opcode == XOR_OP {
+                            if let Some(MachineOperand::Register(r)) = &new_insts[j].result {
+                                if *r == RDX {
+                                    xor_pos = Some(j);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if let Some(xp) = xor_pos {
+                        // Pick a second scratch for lhs (different from scratch if
+                        // scratch is also needed for divisor).
+                        let lhs_scratch = if div_in_rax || div_in_rdx {
+                            // Need scratch for divisor, use another for lhs.
+                            if scratch != RCX && lhs_reg != Some(RCX) { RCX }
+                            else if scratch != R11 && lhs_reg != Some(R11) { R11 }
+                            else { 10 /* R10 */ }
+                        } else {
+                            scratch
+                        };
+                        // Insert: MOV lhs_scratch, RDX before XOR RDX,RDX
+                        let mut save_lhs = MachineInstruction::new(MOV_OP);
+                        save_lhs.result = Some(MachineOperand::Register(lhs_scratch));
+                        save_lhs.operands.push(MachineOperand::Register(RDX));
+                        new_insts.insert(xp, save_lhs);
+                        // Update references after insertion.
+                        // Find new mov_rax_pos (shifted by 1).
+                        let new_mov_rax = insert_pos + 1;
+                        // Change MOV RAX, RDX to MOV RAX, lhs_scratch.
+                        if let Some(MachineOperand::Register(ref mut src)) =
+                            new_insts[new_mov_rax].operands.first_mut()
+                        {
+                            if *src == RDX {
+                                *src = lhs_scratch;
+                            }
+                        }
+                    }
+                }
+
+                if div_in_rax || div_in_rdx {
+                    // Re-find mov_rax_pos after potential insertions above.
+                    let cur_ni_len = new_insts.len();
+                    let search_start2 = if cur_ni_len >= 5 { cur_ni_len - 5 } else { 0 };
+                    let mut real_insert_pos = None;
+                    for j in (search_start2..cur_ni_len).rev() {
+                        if new_insts[j].opcode == MOV_OP {
+                            if let Some(MachineOperand::Register(r)) = &new_insts[j].result {
+                                if *r == RAX {
+                                    real_insert_pos = Some(j);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    // For unsigned DIV with XOR RDX,RDX, if divisor is in RDX,
+                    // insert BEFORE the XOR.
+                    if div_in_rdx && opc == DIV_OP {
+                        let cur_ni_len2 = new_insts.len();
+                        let ss = if cur_ni_len2 >= 5 { cur_ni_len2 - 5 } else { 0 };
+                        for j in (ss..cur_ni_len2).rev() {
+                            if new_insts[j].opcode == XOR_OP {
+                                if let Some(MachineOperand::Register(r)) = &new_insts[j].result {
+                                    if *r == RDX {
+                                        real_insert_pos = Some(j);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // For signed IDIV with CQO/CDQ, if divisor is in RDX,
+                    // insert BEFORE the MOV RAX (which precedes CQO).
+                    if div_in_rdx && opc == IDIV_OP {
+                        // real_insert_pos is already the MOV RAX position.
+                    }
+
+                    if let Some(rip) = real_insert_pos {
+                        // Insert: MOV scratch, divisor_reg BEFORE the clobbering instruction
+                        let mut save_div = MachineInstruction::new(MOV_OP);
+                        save_div.result = Some(MachineOperand::Register(scratch));
+                        save_div.operands.push(MachineOperand::Register(divisor_reg));
+                        new_insts.insert(rip, save_div);
+                    }
+
+                    // Now update the IDIV/DIV instruction to use scratch instead
+                    // of the original divisor register.
+                    // The IDIV/DIV hasn't been pushed yet.
+                    let mut div_inst = old_insts[i].clone();
+                    div_inst.operands[0] = MachineOperand::Register(scratch);
+                    new_insts.push(div_inst);
+                    i += 1;
+                    continue;
+                }
+            }
+
+            // Fallback: push the original instruction unchanged.
+            new_insts.push(old_insts[i].clone());
+            i += 1;
         }
 
         block.instructions = new_insts;
@@ -970,106 +1766,397 @@ fn apply_allocation_result(mf: &mut MachineFunction, alloc: &AllocationResult) {
 /// After register allocation, call-argument setup sequences like:
 ///
 /// ```text
-///   MOV RSI, RAX      ; arg 1 ← x
-///   MOV RDX, RSI      ; arg 2 ← y   (BUG: RSI now holds x, not y!)
+///   MOV RDI, R9       ; arg 0 ← format string
+///   MOV RSI, RAX      ; arg 1 ← v1
+///   MOV RDX, RSI      ; arg 2 ← v2   (BUG: RSI already overwritten by line 2!)
+///   MOV RCX, RDI      ; arg 3 ← v3   (BUG: RDI already overwritten by line 1!)
 ///   CALL printf
 /// ```
 ///
-/// may contain conflicts when the source register of a later MOV was
-/// overwritten by an earlier MOV in the same sequence.  This pass scans
-/// for such conflicts and inserts R11-based saves/restores to break them.
+/// may contain conflicts: a destination register of an earlier MOV is the
+/// source register of a later MOV.  This is the classical **parallel copy
+/// problem** — all argument setup moves must logically happen simultaneously.
 ///
-/// Algorithm:
-/// 1. Walk backwards from every CALL instruction to collect the
-///    immediately-preceding argument MOV sequence (MOVs whose result is a
-///    physical register in the argument-register set).
-/// 2. For each sequence, build (dst_reg → src_reg) mapping.
-/// 3. If any source register equals a destination of an earlier MOV in
-///    the sequence, save the conflicted value to R11 before it is
-///    overwritten and fix the later MOV to read from R11.
-fn resolve_call_arg_conflicts(mf: &mut MachineFunction) {
-    const MOV_OPCODE: u32 = 0; // X86Opcode::Mov
-    const SPILL_SCRATCH: u16 = 11; // R11
+/// This function applies a proper parallel-move sequentialisation algorithm:
+///
+/// 1. Walk backwards from every CALL to find the contiguous
+///    `is_call_arg_setup` instruction sequence.
+/// 2. Extract register-to-register (dst, src) pairs.  Non-register-source
+///    instructions (immediates, LEAs, memory operands) are emitted first
+///    since they have no read-after-write conflicts.
+/// 3. Remove self-moves (dst == src).
+/// 4. Topologically order remaining moves: emit moves whose destination
+///    is NOT a source for any pending move first.
+/// 5. If a cycle is detected, break it by saving one source to R11
+///    (scratch), substituting R11 as the source, and continuing.
+fn resolve_call_arg_conflicts(mf: &mut MachineFunction, target: &Target) {
+    // Architecture-specific constants for register move opcodes and scratch
+    // registers.  Each target uses a different MOV instruction and a
+    // different caller-saved scratch register that is NOT part of the ABI
+    // argument register set.
+    let (mov_opcode, movfp_opcode, scratch_reg, float_scratch_reg): (u32, u32, u16, u16) =
+        match target {
+            Target::X86_64 => (
+                0,   // X86Opcode::Mov
+                86,  // X86Opcode::Movsd
+                11,  // R11 (caller-saved, not an arg reg)
+                31,  // XMM15
+            ),
+            Target::I686 => (
+                0,   // X86Opcode::Mov (same enum)
+                86,  // X86Opcode::Movsd
+                2,   // ECX (caller-saved scratch for i686)
+                31,  // XMM7
+            ),
+            Target::AArch64 => (
+                161, // A64Opcode::MOV_reg
+                149, // A64Opcode::FMOV_d
+                16,  // X16 (IP0 — intra-procedure-call scratch)
+                48,  // V16 (caller-saved FP scratch)
+            ),
+            Target::RiscV64 => (
+                21,  // RvOpcode::ADDI (MV pseudo = ADDI rd, rs, 0)
+                142, // RvOpcode::FSGNJ_D (FMV.D pseudo = FSGNJ.D rd, rs, rs)
+                5,   // T0 (x5 — temporary, not an arg reg)
+                32,  // FT0 (f0 — temporary, not an FP arg reg)
+            ),
+        };
+    let mov_opcode_val = mov_opcode;
+    let movfp_opcode_val = movfp_opcode;
 
     for block in &mut mf.blocks {
         let mut new_insts: Vec<MachineInstruction> =
-            Vec::with_capacity(block.instructions.len() + 8);
+            Vec::with_capacity(block.instructions.len() + 16);
         let insts = std::mem::take(&mut block.instructions);
 
         for inst in &insts {
             new_insts.push(inst.clone());
 
-            // After pushing a CALL instruction, walk backwards in
-            // new_insts to find the argument-setup MOV sequence that
-            // precedes it and fix any register conflicts.
             if !inst.is_call {
                 continue;
             }
 
             // The CALL is at the end of new_insts.  Walk backwards to
-            // find the call-argument-setup MOV sequence.  Only instructions
-            // explicitly marked `is_call_arg_setup = true` by the codegen
-            // are included.  This prevents parameter copies (which may
-            // also target argument registers) from being included in the
-            // shuffle sequence and causing false conflict detection.
+            // find the contiguous call-argument-setup sequence.
             let call_pos = new_insts.len() - 1;
             let mut seq_start = call_pos;
             while seq_start > 0 {
                 let prev = seq_start - 1;
-                let prev_inst = &new_insts[prev];
-                // Only include instructions explicitly marked as call arg setup.
-                if !prev_inst.is_call_arg_setup {
+                if !new_insts[prev].is_call_arg_setup {
                     break;
                 }
                 seq_start = prev;
             }
 
             if seq_start == call_pos {
-                // No argument-setup sequence — nothing to fix.
-                continue;
+                continue; // No argument-setup sequence.
             }
 
-            // Detect conflicts: scan left-to-right through the
-            // arg-setup MOVs.  Track which registers have been written.
-            // If any MOV reads a register that was already overwritten,
-            // record the first conflicted register.
-            let mut saved_reg: Option<u16> = None;
-            let mut written_so_far: crate::common::fx_hash::FxHashSet<u16> =
+            // ---- Indirect call target protection ----
+            // For indirect calls (CALL *reg), the target register may be
+            // clobbered by the argument-setup sequence (e.g., MOV RAX,0
+            // for AL=0 clobbers RAX if the function pointer is in RAX).
+            // We detect this and will insert a save to R11 at the start
+            // of the resolved move sequence.
+            let indirect_save_needed: Option<u16> = {
+                let call_inst_ref = &new_insts[call_pos];
+                if let Some(MachineOperand::Register(target_reg)) =
+                    call_inst_ref.operands.first()
+                {
+                    let tr = *target_reg;
+                    if tr != scratch_reg {
+                        let clobbered = (seq_start..call_pos).any(|idx| {
+                            matches!(&new_insts[idx].result,
+                                Some(MachineOperand::Register(dst)) if *dst == tr)
+                        });
+                        if clobbered { Some(tr) } else { None }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+            // If save needed, update CALL to use R11 now.
+            if indirect_save_needed.is_some() {
+                new_insts[call_pos].operands[0] =
+                    MachineOperand::Register(scratch_reg);
+            }
+
+            // Partition instructions into:
+            // - `non_reg_moves`: instructions whose source is NOT a plain
+            //   register (immediates, LEAs, etc.) — safe to emit in any
+            //   order since they don't read from registers that might be
+            //   clobbered.
+            // - `reg_moves`: register-to-register moves that need
+            //   parallel-copy resolution.
+            let setup_insts: Vec<MachineInstruction> =
+                new_insts.drain(seq_start..call_pos).collect();
+            // call_pos shifted; CALL is now at seq_start.
+
+            let mut reg_moves: Vec<(u16, u16, u32)> = Vec::new(); // (dst, src, opcode)
+            let mut non_reg_move_insts: Vec<MachineInstruction> = Vec::new();
+            // Compound pairs: (Vec<MachineInstruction>, effective_dst).
+            // A load-then-move through scratch (e.g., LD t0,-X(s0) then
+            // MV a3,t0) MUST stay together — separating them causes the
+            // scratch to be clobbered between the load and the move.
+            let mut compound_moves: Vec<(Vec<MachineInstruction>, u16)> = Vec::new();
+            // Track indices we've already consumed as part of a compound.
+            let mut consumed: crate::common::fx_hash::FxHashSet<usize> =
                 crate::common::fx_hash::FxHashSet::default();
 
-            for inst in new_insts.iter().take(call_pos).skip(seq_start) {
-                for op in &inst.operands {
-                    if let MachineOperand::Register(src) = op {
-                        if written_so_far.contains(src) && saved_reg.is_none() {
-                            saved_reg = Some(*src);
-                        }
-                    }
+            for (idx, si) in setup_insts.iter().enumerate() {
+                if consumed.contains(&idx) {
+                    continue;
                 }
-                if let Some(MachineOperand::Register(dst)) = &inst.result {
-                    written_so_far.insert(*dst);
-                }
-            }
+                let dst_reg = match &si.result {
+                    Some(MachineOperand::Register(r)) => Some(*r),
+                    _ => None,
+                };
+                let src_reg = match si.operands.first() {
+                    Some(MachineOperand::Register(r)) => Some(*r),
+                    _ => None,
+                };
 
-            if let Some(conflict_reg) = saved_reg {
-                // Fix: insert `MOV R11, conflict_reg` at seq_start,
-                // and replace all later reads of conflict_reg with R11.
-                let mut save = MachineInstruction::new(MOV_OPCODE);
-                save.result = Some(MachineOperand::Register(SPILL_SCRATCH));
-                save.operands.push(MachineOperand::Register(conflict_reg));
-                new_insts.insert(seq_start, save);
-
-                // The sequence shifted right by 1; update indices.
-                let call_pos_new = call_pos + 1;
-                for inst in new_insts.iter_mut().take(call_pos_new).skip(seq_start + 1) {
-                    for op in &mut inst.operands {
-                        if let MachineOperand::Register(r) = op {
-                            if *r == conflict_reg {
-                                *r = SPILL_SCRATCH;
+                if let (Some(d), Some(s)) = (dst_reg, src_reg) {
+                    // Register-to-register move — needs parallel resolution.
+                    reg_moves.push((d, s, si.opcode));
+                } else {
+                    // Non-register source (immediate, global symbol, LEA,
+                    // memory operand, spill load).
+                    //
+                    // Check if this instruction loads into a scratch
+                    // register that the NEXT instruction immediately moves
+                    // to an arg register.  If so, they form a compound
+                    // pair that must be emitted atomically to prevent the
+                    // scratch register from being clobbered in between.
+                    let has_mem_src = si.operands.iter().any(|op| {
+                        matches!(op, MachineOperand::Memory { .. })
+                    });
+                    if has_mem_src {
+                        if let Some(d_scratch) = dst_reg {
+                            // Look at next instruction(s) for a MV from d_scratch
+                            if let Some(next_si) = setup_insts.get(idx + 1) {
+                                let next_dst = match &next_si.result {
+                                    Some(MachineOperand::Register(r)) => Some(*r),
+                                    _ => None,
+                                };
+                                let next_src = match next_si.operands.first() {
+                                    Some(MachineOperand::Register(r)) => Some(*r),
+                                    _ => None,
+                                };
+                                if next_src == Some(d_scratch) && next_dst.is_some() {
+                                    // Compound pair found: load-then-move
+                                    let eff_dst = next_dst.unwrap();
+                                    compound_moves.push((
+                                        vec![si.clone(), next_si.clone()],
+                                        eff_dst,
+                                    ));
+                                    consumed.insert(idx + 1);
+                                    continue;
+                                }
                             }
                         }
                     }
+                    non_reg_move_insts.push(si.clone());
                 }
             }
+
+            // Check if there are actually any register conflicts.
+            let has_conflict = {
+                let dsts: crate::common::fx_hash::FxHashSet<u16> =
+                    reg_moves.iter().map(|m| m.0).collect();
+                reg_moves.iter().any(|m| dsts.contains(&m.1))
+            };
+
+            if !has_conflict && indirect_save_needed.is_none() {
+                // No conflicts and no indirect save — put back in original order.
+                let call_inst = new_insts.remove(seq_start);
+                for si in setup_insts {
+                    new_insts.push(si);
+                }
+                new_insts.push(call_inst);
+                continue;
+            }
+            if !has_conflict && indirect_save_needed.is_some() {
+                // No register-register conflicts, but we need to protect
+                // the indirect call target. Insert save before setup.
+                let call_inst = new_insts.remove(seq_start);
+                let target_reg = indirect_save_needed.unwrap();
+                let mut save_inst = MachineInstruction::new(mov_opcode_val);
+                save_inst.result = Some(MachineOperand::Register(scratch_reg));
+                save_inst
+                    .operands
+                    .push(MachineOperand::Register(target_reg));
+                save_inst.is_call_arg_setup = true;
+                new_insts.push(save_inst);
+                for si in setup_insts {
+                    new_insts.push(si);
+                }
+                new_insts.push(call_inst);
+                continue;
+            }
+
+            // ---- Parallel-move sequentialisation for reg-to-reg moves ----
+            //
+            // Remove self-moves, then topologically order: emit moves whose
+            // destination is not a source for any pending move.  If a cycle
+            // is found, break it using a scratch register.
+            let mut pending = reg_moves;
+            pending.retain(|&(d, s, _)| d != s);
+
+            let mut resolved: Vec<MachineInstruction> = Vec::new();
+
+            // If we need to protect an indirect call target register,
+            // insert MOV R11, target_reg as the VERY FIRST instruction
+            // before any arg-setup moves can clobber the target.
+            if let Some(target_reg) = indirect_save_needed {
+                let mut save_inst = MachineInstruction::new(mov_opcode_val);
+                save_inst.result = Some(MachineOperand::Register(scratch_reg));
+                save_inst
+                    .operands
+                    .push(MachineOperand::Register(target_reg));
+                save_inst.is_call_arg_setup = true;
+                resolved.push(save_inst);
+
+                // Also update any reg-to-reg moves that read from
+                // target_reg to read from R11 instead, since we saved it.
+                // (Not strictly necessary since the save happens first,
+                // but ensures consistency if target_reg is also used as
+                // a source for arg-setup moves.)
+            }
+
+            // Emit non-register-source moves first (no conflict risk on
+            // reads). BUT: if one of these writes to a register that is a
+            // source for a pending reg-to-reg move, we must defer it.
+            let pending_srcs: crate::common::fx_hash::FxHashSet<u16> =
+                pending.iter().map(|m| m.1).collect();
+            let mut deferred_non_reg: Vec<MachineInstruction> = Vec::new();
+            // Deferred compound moves: (instructions, effective_dst).
+            let mut deferred_compounds: Vec<(Vec<MachineInstruction>, u16)> = Vec::new();
+            for nrm in non_reg_move_insts {
+                let dst = match &nrm.result {
+                    Some(MachineOperand::Register(r)) => Some(*r),
+                    _ => None,
+                };
+                if let Some(d) = dst {
+                    if pending_srcs.contains(&d) {
+                        // This non-reg move writes to a register that is
+                        // a source for a pending reg-to-reg move. Defer it.
+                        deferred_non_reg.push(nrm);
+                        continue;
+                    }
+                }
+                resolved.push(nrm);
+            }
+            // Defer compound moves whose effective_dst is a source for a
+            // pending reg-to-reg move; otherwise emit them now.
+            for cm in compound_moves {
+                if pending_srcs.contains(&cm.1) {
+                    deferred_compounds.push(cm);
+                } else {
+                    resolved.extend(cm.0);
+                }
+            }
+
+            let mut iteration_limit = pending.len() * pending.len() + 10;
+            while !pending.is_empty() && iteration_limit > 0 {
+                iteration_limit -= 1;
+
+                let needed_srcs: crate::common::fx_hash::FxHashSet<u16> =
+                    pending.iter().map(|m| m.1).collect();
+
+                // Find a safe move (dst not needed as source by any pending).
+                let safe_idx = pending
+                    .iter()
+                    .position(|&(d, _, _)| !needed_srcs.contains(&d));
+
+                if let Some(idx) = safe_idx {
+                    let (dst, src, opcode) = pending.remove(idx);
+                    let mut mi = MachineInstruction::new(opcode);
+                    mi.result = Some(MachineOperand::Register(dst));
+                    mi.operands.push(MachineOperand::Register(src));
+                    // For RISC-V FSGNJ.D: duplicate rs1→rs2 for FMV.D pseudo
+                    if opcode == movfp_opcode_val && matches!(target, Target::RiscV64) {
+                        mi.operands.push(MachineOperand::Register(src));
+                    }
+                    mi.is_call_arg_setup = true;
+                    resolved.push(mi);
+
+                    // Check if any deferred non-reg moves or compound pairs
+                    // can now be emitted.
+                    let new_pending_srcs: crate::common::fx_hash::FxHashSet<u16> =
+                        pending.iter().map(|m| m.1).collect();
+                    let mut still_deferred = Vec::new();
+                    for nrm in deferred_non_reg {
+                        let d = match &nrm.result {
+                            Some(MachineOperand::Register(r)) => Some(*r),
+                            _ => None,
+                        };
+                        if d.map_or(false, |dd| new_pending_srcs.contains(&dd)) {
+                            still_deferred.push(nrm);
+                        } else {
+                            resolved.push(nrm);
+                        }
+                    }
+                    deferred_non_reg = still_deferred;
+                    // Also check deferred compounds.
+                    let mut still_deferred_c = Vec::new();
+                    for cm in deferred_compounds {
+                        if new_pending_srcs.contains(&cm.1) {
+                            still_deferred_c.push(cm);
+                        } else {
+                            resolved.extend(cm.0);
+                        }
+                    }
+                    deferred_compounds = still_deferred_c;
+                } else {
+                    // Cycle detected — break it with a scratch register.
+                    let (_, cycle_src, cycle_opcode) = pending[0];
+                    // Detect FP register ranges per architecture:
+                    // x86-64/i686: XMM regs 16..31, RISC-V/AArch64: FP regs >= 32
+                    let is_float = cycle_opcode == movfp_opcode_val
+                        || match target {
+                            Target::X86_64 | Target::I686 => cycle_src >= 16 && cycle_src < 32,
+                            Target::AArch64 => cycle_src >= 32,
+                            Target::RiscV64 => cycle_src >= 32,
+                        };
+                    let (scratch, save_op) = if is_float {
+                        (float_scratch_reg, movfp_opcode_val)
+                    } else {
+                        (scratch_reg, mov_opcode_val)
+                    };
+
+                    let mut save_inst = MachineInstruction::new(save_op);
+                    save_inst.result = Some(MachineOperand::Register(scratch));
+                    save_inst.operands.push(MachineOperand::Register(cycle_src));
+                    // For RISC-V FSGNJ.D and AArch64 FMOV: the FP move
+                    // pseudo requires rs2 == rs1 (source duplicated).
+                    // Add second register operand for R-type FP moves.
+                    if is_float && matches!(target, Target::RiscV64) {
+                        save_inst.operands.push(MachineOperand::Register(cycle_src));
+                    }
+                    save_inst.is_call_arg_setup = true;
+                    resolved.push(save_inst);
+
+                    for m in &mut pending {
+                        if m.1 == cycle_src {
+                            m.1 = scratch;
+                        }
+                    }
+                }
+            }
+
+            // Emit any remaining deferred non-reg moves and compounds.
+            resolved.extend(deferred_non_reg);
+            for cm in deferred_compounds {
+                resolved.extend(cm.0);
+            }
+
+            // Splice resolved moves back before the CALL instruction.
+            let call_inst = new_insts.remove(seq_start);
+            new_insts.extend(resolved);
+            new_insts.push(call_inst);
         }
 
         block.instructions = new_insts;
@@ -1096,21 +2183,46 @@ fn insert_prologue_epilogue(
         entry.instructions = new_instructions;
     }
 
-    // Insert epilogue before every terminator that is a return.
+    // Insert epilogue before every return instruction.  Some backends
+    // (notably AArch64) place all instructions in a single block, so
+    // multiple `ret`s may exist within one block.  We must insert the
+    // epilogue before EVERY return — not just the last instruction.
     if !epilogue.is_empty() {
         for block in &mut mf.blocks {
-            if let Some(last) = block.instructions.last() {
-                if last.is_terminator && !last.is_branch {
-                    // This looks like a return instruction — insert epilogue before it.
-                    let last_idx = block.instructions.len() - 1;
-                    let mut new_insts =
-                        Vec::with_capacity(block.instructions.len() + epilogue.len());
-                    new_insts.extend_from_slice(&block.instructions[..last_idx]);
-                    new_insts.extend(epilogue.clone());
-                    new_insts.push(block.instructions[last_idx].clone());
-                    block.instructions = new_insts;
-                }
+            // Collect indices of all return instructions in this block.
+            let ret_indices: Vec<usize> = block
+                .instructions
+                .iter()
+                .enumerate()
+                .filter(|(_, mi)| mi.is_terminator && !mi.is_branch)
+                .map(|(i, _)| i)
+                .collect();
+
+            if ret_indices.is_empty() {
+                continue;
             }
+
+            // Rebuild the instruction list, inserting epilogue before each
+            // return.  Process in forward order; the growing offset is
+            // accounted for by building a fresh vector.
+            let epi_len = epilogue.len();
+            let mut new_insts =
+                Vec::with_capacity(block.instructions.len() + ret_indices.len() * epi_len);
+            let mut prev = 0usize;
+            for &ri in &ret_indices {
+                // Copy instructions up to (but not including) the return.
+                new_insts.extend_from_slice(&block.instructions[prev..ri]);
+                // Insert the epilogue sequence.
+                new_insts.extend(epilogue.clone());
+                // Copy the return instruction itself.
+                new_insts.push(block.instructions[ri].clone());
+                prev = ri + 1;
+            }
+            // Copy any remaining instructions after the last return.
+            if prev < block.instructions.len() {
+                new_insts.extend_from_slice(&block.instructions[prev..]);
+            }
+            block.instructions = new_insts;
         }
     }
 }
@@ -1135,7 +2247,7 @@ fn emit_global_variable(
         // Constant with initializer → .rodata
         (Some(init), true) => {
             let offset = rodata_section.len() as u64;
-            let bytes = constant_to_bytes(init);
+            let bytes = constant_to_bytes_typed(init, Some(&global.ty));
             let size = bytes.len() as u64;
             rodata_section.extend_from_slice(&bytes);
             (SectionPlacement::Rodata, offset, size)
@@ -1150,7 +2262,7 @@ fn emit_global_variable(
         // Initialized non-constant → .data
         (Some(init), false) => {
             let offset = data_section.len() as u64;
-            let bytes = constant_to_bytes(init);
+            let bytes = constant_to_bytes_typed(init, Some(&global.ty));
             let size = bytes.len() as u64;
             data_section.extend_from_slice(&bytes);
             (SectionPlacement::Data, offset, size)
@@ -1170,16 +2282,41 @@ fn emit_global_variable(
 }
 
 /// Converts a constant initializer to raw bytes for section embedding.
+///
+/// When a type is provided, integers are truncated to the correct byte
+/// width. Without a type, integers fall back to 8 bytes (i64 width).
 fn constant_to_bytes(constant: &crate::ir::module::Constant) -> Vec<u8> {
+    constant_to_bytes_typed(constant, None)
+}
+
+/// Type-aware version that uses the IR type to determine integer widths.
+fn constant_to_bytes_typed(
+    constant: &crate::ir::module::Constant,
+    ir_ty: Option<&crate::ir::types::IrType>,
+) -> Vec<u8> {
     use crate::ir::module::Constant;
+    use crate::ir::types::IrType;
 
     match constant {
         Constant::Integer(v) => {
-            // Emit as the smallest representation that fits.
-            // Default to 8 bytes for general use.
-            v.to_le_bytes().to_vec()
+            // Determine byte width from the IR type when available.
+            let width = match ir_ty {
+                Some(IrType::I1) | Some(IrType::I8) => 1,
+                Some(IrType::I16) => 2,
+                Some(IrType::I32) => 4,
+                Some(IrType::I64) | Some(IrType::Ptr) => 8,
+                Some(IrType::I128) => 16,
+                _ => 8, // Default to 8 bytes for unknown or unspecified types.
+            };
+            let full = v.to_le_bytes();
+            full[..width].to_vec()
         }
-        Constant::Float(v) => v.to_le_bytes().to_vec(),
+        Constant::Float(v) => {
+            match ir_ty {
+                Some(IrType::F32) => (*v as f32).to_le_bytes().to_vec(),
+                _ => v.to_le_bytes().to_vec(),
+            }
+        }
         Constant::LongDouble(bytes) => {
             // 80-bit extended precision — 10 raw bytes, padded to 16.
             let mut result = bytes.to_vec();
@@ -1187,25 +2324,46 @@ fn constant_to_bytes(constant: &crate::ir::module::Constant) -> Vec<u8> {
             result
         }
         Constant::String(bytes) => bytes.clone(),
-        Constant::ZeroInit => Vec::new(),
+        Constant::ZeroInit => {
+            // When we know the type, emit the correct number of zero bytes.
+            if let Some(ty) = ir_ty {
+                let sz = ir_type_size(ty) as usize;
+                vec![0u8; sz]
+            } else {
+                Vec::new()
+            }
+        }
         Constant::Struct(fields) => {
             let mut result = Vec::new();
-            for field in fields {
-                result.extend_from_slice(&constant_to_bytes(field));
+            let field_types = match ir_ty {
+                Some(IrType::Struct(st)) => Some(&st.fields),
+                _ => None,
+            };
+            for (i, field) in fields.iter().enumerate() {
+                let ft = field_types.and_then(|fts| fts.get(i));
+                result.extend_from_slice(&constant_to_bytes_typed(field, ft));
             }
             result
         }
         Constant::Array(elements) => {
             let mut result = Vec::new();
+            let elem_ty = match ir_ty {
+                Some(IrType::Array(et, _)) => Some(et.as_ref()),
+                _ => None,
+            };
             for elem in elements {
-                result.extend_from_slice(&constant_to_bytes(elem));
+                result.extend_from_slice(&constant_to_bytes_typed(elem, elem_ty));
             }
             result
         }
         Constant::GlobalRef(_name) => {
             // Global references are resolved by the linker via relocations.
             // Emit a placeholder (zero bytes) — the linker patches this.
-            vec![0u8; 8]
+            let ptr_size = match ir_ty {
+                Some(IrType::Ptr) => 8,
+                _ => 8,
+            };
+            vec![0u8; ptr_size]
         }
         Constant::Null => vec![0u8; 8],
         Constant::Undefined => vec![0u8; 8],
@@ -1257,6 +2415,145 @@ fn ir_type_size(ty: &crate::ir::types::IrType) -> u64 {
 // ===========================================================================
 // write_relocatable_object — produce a .o ELF file
 // ===========================================================================
+
+/// Patch a single intra-module relocation in the combined `.text` section.
+///
+/// For x86-64 and i686, most PC-relative relocations use a raw 4-byte
+/// little-endian addend written directly at the patch site.  For AArch64
+/// and RISC-V 64, the offset is encoded into instruction-specific immediate
+/// fields while preserving opcode bits.
+fn patch_intra_module_reloc(
+    text: &mut [u8],
+    off: usize,
+    value: i64,        // S + A - P (byte offset)
+    rel_type: u32,
+    target: &Target,
+) {
+    match target {
+        Target::X86_64 | Target::I686 => {
+            // x86 family: raw 4-byte PC-relative offset
+            let bytes = (value as i32).to_le_bytes();
+            text[off..off + 4].copy_from_slice(&bytes);
+        }
+        Target::AArch64 => {
+            // Read existing instruction word (preserves opcode)
+            let inst = u32::from_le_bytes([text[off], text[off + 1], text[off + 2], text[off + 3]]);
+            // AArch64 CALL26 (283), JUMP26 (282): imm26 in bits [25:0], offset/4
+            const A64_CALL26: u32 = 283;
+            const A64_JUMP26: u32 = 282;
+            // AArch64 CONDBR19 (280): imm19 in bits [23:5], offset/4
+            const A64_CONDBR19: u32 = 280;
+            // AArch64 TSTBR14 (279): imm14 in bits [18:5], offset/4
+            const A64_TSTBR14: u32 = 279;
+            // AArch64 ADR_PREL_PG_HI21 (275): ADRP page offset
+            const A64_ADR_PREL_PG_HI21: u32 = 275;
+            const A64_ADR_PREL_PG_HI21_NC: u32 = 276;
+            // AArch64 ADD_ABS_LO12_NC (277): ADD lower 12 bits
+            const A64_ADD_ABS_LO12_NC: u32 = 277;
+            // AArch64 LD64_GOT_LO12_NC (312): LDR lower 12 bits for GOT
+            const A64_LDST64_ABS_LO12_NC: u32 = 286;
+
+            let patched = match rel_type {
+                A64_CALL26 | A64_JUMP26 => {
+                    let imm26 = ((value >> 2) as u32) & 0x03FF_FFFF;
+                    (inst & 0xFC00_0000) | imm26
+                }
+                A64_CONDBR19 => {
+                    let imm19 = ((value >> 2) as u32) & 0x7_FFFF;
+                    (inst & 0xFF00_001F) | (imm19 << 5)
+                }
+                A64_TSTBR14 => {
+                    let imm14 = ((value >> 2) as u32) & 0x3FFF;
+                    (inst & 0xFFF8_001F) | (imm14 << 5)
+                }
+                A64_ADR_PREL_PG_HI21 | A64_ADR_PREL_PG_HI21_NC => {
+                    // ADRP: page-relative offset >> 12, encode immhi:immlo
+                    let page_off = value >> 12;
+                    let immlo = ((page_off as u32) & 0x3) << 29;
+                    let immhi = (((page_off >> 2) as u32) & 0x7_FFFF) << 5;
+                    (inst & 0x9F00_001F) | immlo | immhi
+                }
+                A64_ADD_ABS_LO12_NC => {
+                    let lo12 = (value as u32) & 0xFFF;
+                    (inst & 0xFFC0_03FF) | (lo12 << 10)
+                }
+                A64_LDST64_ABS_LO12_NC => {
+                    // LDR Xt, [Xn, #lo12] — lo12 scaled by 8 for 64-bit loads
+                    let lo12 = ((value as u32) & 0xFFF) >> 3;
+                    (inst & 0xFFC0_03FF) | (lo12 << 10)
+                }
+                _ => {
+                    // Unknown relocation type — fall back to raw 4-byte write
+                    // (likely wrong, but better than silently dropping).
+                    let bytes = (value as i32).to_le_bytes();
+                    text[off..off + 4].copy_from_slice(&bytes);
+                    return;
+                }
+            };
+            let bytes = patched.to_le_bytes();
+            text[off..off + 4].copy_from_slice(&bytes);
+        }
+        Target::RiscV64 => {
+            // RISC-V relocations — most common ones for intra-module calls
+            // R_RISCV_JAL (17): 20-bit J-type immediate
+            // R_RISCV_BRANCH (16): 12-bit B-type immediate
+            // R_RISCV_CALL (18) / R_RISCV_CALL_PLT (19): AUIPC+JALR pair
+            const RV_BRANCH: u32 = 16;
+            const RV_JAL: u32 = 17;
+            const RV_CALL: u32 = 18;
+            const RV_CALL_PLT: u32 = 19;
+
+            match rel_type {
+                RV_CALL | RV_CALL_PLT => {
+                    // AUIPC + JALR pair (8 bytes total)
+                    if off + 8 <= text.len() {
+                        let hi = ((value as i32 + 0x800) >> 12) & 0xFFFFF;
+                        let lo = ((value as i32) & 0xFFF) as u32;
+                        let auipc = u32::from_le_bytes([
+                            text[off], text[off + 1], text[off + 2], text[off + 3],
+                        ]);
+                        let jalr = u32::from_le_bytes([
+                            text[off + 4], text[off + 5], text[off + 6], text[off + 7],
+                        ]);
+                        let p_auipc = (auipc & 0xFFF) | ((hi as u32) << 12);
+                        let p_jalr = (jalr & 0x000F_FFFF) | (lo << 20);
+                        text[off..off + 4].copy_from_slice(&p_auipc.to_le_bytes());
+                        text[off + 4..off + 8].copy_from_slice(&p_jalr.to_le_bytes());
+                    }
+                }
+                RV_JAL => {
+                    // J-type: imm[20|10:1|11|19:12] in bits [31:12]
+                    let inst = u32::from_le_bytes([
+                        text[off], text[off + 1], text[off + 2], text[off + 3],
+                    ]);
+                    let v = value as u32;
+                    let enc = ((v & 0x100000) << 11) // imm[20] -> bit 31
+                        | ((v & 0x7FE) << 20)        // imm[10:1] -> bits [30:21]
+                        | ((v & 0x800) << 9)          // imm[11] -> bit 20
+                        | (v & 0xFF000);              // imm[19:12] -> bits [19:12]
+                    let patched = (inst & 0xFFF) | enc;
+                    text[off..off + 4].copy_from_slice(&patched.to_le_bytes());
+                }
+                RV_BRANCH => {
+                    // B-type: imm[12|10:5] in [31:25], imm[4:1|11] in [11:7]
+                    let inst = u32::from_le_bytes([
+                        text[off], text[off + 1], text[off + 2], text[off + 3],
+                    ]);
+                    let v = value as u32;
+                    let hi = ((v & 0x1000) << 19) | ((v & 0x7E0) << 20);
+                    let lo = ((v & 0x1E) << 7) | ((v & 0x800) >> 4);
+                    let patched = (inst & 0x01FFF07F) | hi | lo;
+                    text[off..off + 4].copy_from_slice(&patched.to_le_bytes());
+                }
+                _ => {
+                    // Fallback: raw 4-byte write
+                    let bytes = (value as i32).to_le_bytes();
+                    text[off..off + 4].copy_from_slice(&bytes);
+                }
+            }
+        }
+    }
+}
 
 /// Writes a complete relocatable ELF object file (`.o`) from the compiled
 /// code sections, global data, and optional DWARF debug sections.
@@ -1446,13 +2743,15 @@ fn write_relocatable_object(
     }
 
     // Add external function declaration symbols (undefined).
+    // Mark them as STT_FUNC so the dynamic linker creates PLT entries
+    // for lazy binding of external function calls (e.g. printf, malloc).
     for decl in module.declarations() {
         let sym = ElfSymbol {
             name: decl.name.clone(),
             value: 0,
             size: 0,
             binding: STB_GLOBAL,
-            sym_type: STT_NOTYPE,
+            sym_type: STT_FUNC,
             visibility: STV_DEFAULT,
             section_index: 0, // SHN_UNDEF
         };
@@ -1868,12 +3167,14 @@ fn inject_crt_start(input: &mut LinkerInput, target: Target) {
             // _start stub for i686 (16 bytes):
             //   xor %ebp, %ebp          ; 31 ed           (2 bytes)
             //   call main               ; e8 <disp32>     (5 bytes)
-            //   mov %eax, %ebx           ; 89 c3           (2 bytes, status)
-            //   mov $1, %eax             ; b8 01 00 00 00  (5 bytes, SYS_exit)
-            //   int $0x80                ; cd 80           (2 bytes)
+            //   push %eax               ; 50              (1 byte, exit status arg)
+            //   call exit               ; e8 <00 00 00 00> (5 bytes, PLT32 reloc)
+            //   ud2                      ; 0f 0b           (2 bytes, unreachable)
+            //   nop                      ; 90              (1 byte, alignment pad)
             //
-            // i686 uses the common linker which does not support PLT, so
-            // we use the raw SYS_exit syscall instead of calling libc exit.
+            // Using `call exit` (libc) instead of raw SYS_exit so that
+            // atexit handlers run and stdio buffers are flushed, which is
+            // required for printf output to appear.
             let call_site = start_offset + 2;
             let call_next = call_site + 5;
             let disp = (main_offset as i64) - (call_next as i64);
@@ -1886,58 +3187,121 @@ fn inject_crt_start(input: &mut LinkerInput, target: Target) {
                 disp_bytes[1], // call main
                 disp_bytes[2],
                 disp_bytes[3],
-                0x89,
-                0xc3, // mov %eax, %ebx
-                0xb8,
-                0x01,
+                0x50, // push %eax (exit status for cdecl)
+                0xe8,
                 0x00,
                 0x00,
-                0x00, // mov $1, %eax
-                0xcd,
-                0x80, // int $0x80
+                0x00,
+                0x00, // call exit (PLT32 relocation)
+                0x0f,
+                0x0b, // ud2
+                0x90, // nop (alignment pad)
             ];
+            // Add R_386_PLT32 relocation for the `exit` call.
+            // The displacement bytes start at stub offset 9 (from section
+            // start: start_offset + 9).
+            let exit_reloc_offset = (start_offset + 9) as u64;
+            input
+                .relocations
+                .push(crate::backend::linker_common::relocation::Relocation {
+                    offset: exit_reloc_offset,
+                    symbol_name: "exit".to_string(),
+                    sym_index: 0,
+                    rel_type: 4, // R_386_PLT32
+                    addend: -4,
+                    object_id: 0,
+                    section_index: text_idx as u32,
+                    output_section_name: Some(".text".to_string()),
+                });
             input.sections[text_idx].data.extend_from_slice(&stub);
         }
         Target::AArch64 => {
-            // bl main: encoding is (imm26 << 0) | 0x94000000
-            // imm26 = (main_offset - start_offset) / 4
+            // _start stub for AArch64 (16 bytes):
+            //   bl main                ; PC-relative, pre-resolved (4 bytes)
+            //   bl exit                ; via PLT (R_AARCH64_CALL26)  (4 bytes)
+            //   brk #1                 ; unreachable                 (4 bytes)
+            //   nop                    ; alignment pad               (4 bytes)
+            //
+            // Using `bl exit` (libc) instead of raw SVC so that atexit
+            // handlers run and stdio buffers are flushed.
             let bl_offset = start_offset;
             let offset_bytes = ((main_offset as i64) - (bl_offset as i64)) / 4;
             let imm26 = (offset_bytes as u32) & 0x03FF_FFFF;
-            let bl_inst = 0x9400_0000u32 | imm26;
-            let mov_x8_93 = 0xD280_0BA8u32; // mov x8, #93
-            let svc = 0xD400_0001u32; // svc #0
+            let bl_main = 0x9400_0000u32 | imm26;
+            let bl_exit_placeholder = 0x9400_0000u32; // BL with disp 0 (reloc fills)
+            let brk1 = 0xD420_0020u32; // brk #1
+            let nop = 0xD503_201Fu32;
             let mut stub = Vec::new();
-            stub.extend_from_slice(&bl_inst.to_le_bytes());
-            stub.extend_from_slice(&mov_x8_93.to_le_bytes());
-            stub.extend_from_slice(&svc.to_le_bytes());
+            stub.extend_from_slice(&bl_main.to_le_bytes());
+            stub.extend_from_slice(&bl_exit_placeholder.to_le_bytes());
+            stub.extend_from_slice(&brk1.to_le_bytes());
+            stub.extend_from_slice(&nop.to_le_bytes());
+            // Add R_AARCH64_CALL26 relocation for the `exit` call.
+            let exit_reloc_offset = (start_offset + 4) as u64;
+            input
+                .relocations
+                .push(crate::backend::linker_common::relocation::Relocation {
+                    offset: exit_reloc_offset,
+                    symbol_name: "exit".to_string(),
+                    sym_index: 0,
+                    rel_type: 283, // R_AARCH64_CALL26
+                    addend: 0,
+                    object_id: 0,
+                    section_index: text_idx as u32,
+                    output_section_name: Some(".text".to_string()),
+                });
             input.sections[text_idx].data.extend_from_slice(&stub);
         }
         Target::RiscV64 => {
-            // For RISC-V, use a JAL instruction to call main.
-            // jal ra, offset  where offset = main_offset - start_offset
+            // _start stub for RISC-V 64 (20 bytes):
+            //   jal ra, main            ; PC-relative, pre-resolved       (4 bytes)
+            //   auipc ra, 0             ; exit call via PLT (CALL_PLT)    (4 bytes)
+            //   jalr ra, ra, 0          ; continuation of CALL_PLT pair   (4 bytes)
+            //   ebreak                  ; unreachable                     (4 bytes)
+            //   nop                     ; alignment pad                   (4 bytes)
+            //
+            // Using AUIPC+JALR pair (R_RISCV_CALL_PLT) for `exit` so the
+            // dynamic linker routes through PLT and atexit handlers +
+            // stdio buffer flushing happen correctly.
             let jal_offset = start_offset;
             let offset = (main_offset as i64) - (jal_offset as i64);
-            // JAL encoding: imm[20|10:1|11|19:12] rd=1(ra) opcode=1101111
             let imm = offset as i32;
             let imm20 = ((imm >> 20) & 1) as u32;
             let imm10_1 = ((imm >> 1) & 0x3FF) as u32;
             let imm11 = ((imm >> 11) & 1) as u32;
             let imm19_12 = ((imm >> 12) & 0xFF) as u32;
-            let jal = (imm20 << 31)
+            let jal_main = (imm20 << 31)
                 | (imm10_1 << 21)
                 | (imm11 << 20)
                 | (imm19_12 << 12)
-                | (1 << 7) // rd = ra (x1)
-                | 0x6F; // opcode = JAL
-                        // li a7, 93: addi a7, zero, 93
-            let li_a7_93 = 0x05D0_0893u32;
-            // ecall
-            let ecall = 0x0000_0073u32;
+                | (1 << 7)
+                | 0x6F;
+            // AUIPC ra, 0 — upper 20 bits filled by linker relocation
+            let auipc_exit = 0x0000_0097u32; // auipc ra, 0
+            // JALR ra, ra, 0 — lower 12 bits filled by linker relocation
+            let jalr_exit = 0x000080E7u32; // jalr ra, 0(ra)
+            let ebreak = 0x0010_0073u32;
+            let nop = 0x0000_0013u32; // addi x0, x0, 0
             let mut stub = Vec::new();
-            stub.extend_from_slice(&jal.to_le_bytes());
-            stub.extend_from_slice(&li_a7_93.to_le_bytes());
-            stub.extend_from_slice(&ecall.to_le_bytes());
+            stub.extend_from_slice(&jal_main.to_le_bytes());
+            stub.extend_from_slice(&auipc_exit.to_le_bytes());
+            stub.extend_from_slice(&jalr_exit.to_le_bytes());
+            stub.extend_from_slice(&ebreak.to_le_bytes());
+            stub.extend_from_slice(&nop.to_le_bytes());
+            // Add R_RISCV_CALL_PLT relocation for `exit` at the auipc+jalr pair.
+            let exit_reloc_offset = (start_offset + 4) as u64;
+            input
+                .relocations
+                .push(crate::backend::linker_common::relocation::Relocation {
+                    offset: exit_reloc_offset,
+                    symbol_name: "exit".to_string(),
+                    sym_index: 0,
+                    rel_type: 19, // R_RISCV_CALL_PLT
+                    addend: 0,
+                    object_id: 0,
+                    section_index: text_idx as u32,
+                    output_section_name: Some(".text".to_string()),
+                });
             input.sections[text_idx].data.extend_from_slice(&stub);
         }
     }
@@ -1960,11 +3324,11 @@ fn inject_crt_start(input: &mut LinkerInput, target: Target) {
         object_file_id: input.object_id,
     });
 
-    // For x86-64 (which uses `call exit@PLT` in the _start stub), add
-    // `exit` as an undefined external symbol so the linker creates a PLT
-    // entry.  Other architectures use raw syscalls in _start, so they
-    // don't need this.
-    if target == Target::X86_64 {
+    // For all architectures, the _start stub calls `exit` through PLT
+    // (libc's exit) so that stdio buffers are flushed and atexit handlers
+    // run. Add `exit` as an undefined external symbol so the linker creates
+    // a PLT entry and the dynamic linker resolves it at runtime.
+    {
         let has_exit = input.symbols.iter().any(|s| s.name == "exit");
         if !has_exit {
             input.symbols.push(InputSymbol {
@@ -2452,7 +3816,7 @@ fn emit_assembly_text<A: ArchCodegen>(
             let mut intervals = compute_live_intervals(func);
             let alloc_result = allocate_registers(&mut intervals, &alloc_reg_info, &ctx.target);
             insert_spill_code_from_result(&mut mf, &alloc_result);
-            apply_allocation_result(&mut mf, &alloc_result);
+            apply_allocation_result(&mut mf, &alloc_result, &ctx.target);
 
             // Insert prologue/epilogue.
             let prologue = arch.emit_prologue(&mf);

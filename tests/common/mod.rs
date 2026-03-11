@@ -378,9 +378,24 @@ pub fn run_binary(path: &str, target: &str) -> Output {
             // Try direct execution first (works on x86-64 hosts with 32-bit support),
             // fall back to qemu-i386 if direct execution fails
             if let Ok(output) = Command::new(path).output() {
-                output
+                if output.status.success() {
+                    output
+                } else {
+                    // Direct execution failed — retry with QEMU + LD prefix
+                    Command::new("qemu-i386")
+                        .env("QEMU_LD_PREFIX", "/usr/i686-linux-gnu")
+                        .arg(path)
+                        .output()
+                        .unwrap_or_else(|e| {
+                            panic!(
+                                "Failed to run i686 binary '{}' via qemu-i386: {}",
+                                path, e
+                            )
+                        })
+                }
             } else {
                 Command::new("qemu-i386")
+                    .env("QEMU_LD_PREFIX", "/usr/i686-linux-gnu")
                     .arg(path)
                     .output()
                     .unwrap_or_else(|e| {
@@ -392,6 +407,7 @@ pub fn run_binary(path: &str, target: &str) -> Output {
             }
         }
         "aarch64" | "arm64" => Command::new("qemu-aarch64")
+            .env("QEMU_LD_PREFIX", "/usr/aarch64-linux-gnu")
             .arg(path)
             .output()
             .unwrap_or_else(|e| {
@@ -402,6 +418,7 @@ pub fn run_binary(path: &str, target: &str) -> Output {
                 )
             }),
         "riscv64" => Command::new("qemu-riscv64")
+            .env("QEMU_LD_PREFIX", "/usr/riscv64-linux-gnu")
             .arg(path)
             .output()
             .unwrap_or_else(|e| {

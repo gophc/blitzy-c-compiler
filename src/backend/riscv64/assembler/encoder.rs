@@ -433,7 +433,15 @@ impl RiscV64Encoder {
                         continuation: None,
                     })
                 } else {
-                    Ok(make_std(encode_u_type(OP_LUI, rd, imm32)))
+                    // The codegen provides the raw upper 20-bit value (not
+                    // pre-shifted).  encode_u_type expects the value with
+                    // significant bits at positions [31:12], so we shift
+                    // left by 12 here.  NOTE: encode_li has its own shift
+                    // and calls encode_u_type directly, so this only
+                    // affects LUI instructions created by the codegen
+                    // (e.g., from materialize_constant's split_i32_lui_addi).
+                    let shifted = (imm32 as i64) << 12;
+                    Ok(make_std(encode_u_type(OP_LUI, rd, shifted as i32)))
                 }
             }
 
@@ -2346,7 +2354,7 @@ fn make_compressed(half: u16) -> EncodedInstruction {
 /// Compressed instructions use a 3-bit register field that can only
 /// address registers x8 through x15 (s0, s1, a0–a5).
 #[inline]
-fn is_creg(reg: u8) -> bool {
+fn is_creg(reg: u16) -> bool {
     let hw = registers::hw_encoding(reg);
     (8..=15).contains(&hw)
 }
@@ -2359,20 +2367,20 @@ fn is_creg(reg: u8) -> bool {
 ///
 /// Debug-panics if the register is not in the compressed set.
 #[inline]
-fn creg_encode(reg: u8) -> u8 {
+fn creg_encode(reg: u16) -> u16 {
     let hw = registers::hw_encoding(reg);
     debug_assert!(
         (8..=15).contains(&hw),
         "creg_encode: register {} not in x8–x15",
         hw
     );
-    hw - 8
+    (hw - 8) as u16
 }
 
 /// Encode a CB-format branch (C.BEQZ / C.BNEZ).
 ///
 /// Layout: `funct3[15:13] | offset[8|4:3][12:10] | rs1'[9:7] | offset[7:6|2:1|5][6:2] | op[1:0]=01`
-fn encode_cb_branch(funct3: u16, rs1_c: u8, imm: i64) -> u16 {
+fn encode_cb_branch(funct3: u16, rs1_c: u16, imm: i64) -> u16 {
     let off = (imm as u16) & 0x1FF; // 9-bit
                                     // Bit layout in CB:
                                     // [12]=off[8], [11:10]=off[4:3], [9:7]=rs1', [6:5]=off[7:6], [4:3]=off[2:1], [2]=off[5], [1:0]=01
@@ -2419,7 +2427,7 @@ fn encode_cj(imm: i64) -> u16 {
 /// Encode a CA-format ALU operation (C.SUB, C.XOR, C.OR, C.AND).
 ///
 /// [15:10]=100011, [9:7]=rd'/rs1', [6:5]=funct2, [4:2]=rs2', [1:0]=01
-fn encode_ca(funct2: u16, rd_c: u8, rs2_c: u8) -> u16 {
+fn encode_ca(funct2: u16, rd_c: u16, rs2_c: u16) -> u16 {
     (0b100011 << 10) | ((rd_c as u16) << 7) | (funct2 << 5) | ((rs2_c as u16) << 2) | C_OP_Q1
 }
 
@@ -2436,9 +2444,9 @@ mod tests {
     /// Helper to create a minimal instruction for testing.
     fn test_inst(
         opcode: RvOpcode,
-        rd: Option<u8>,
-        rs1: Option<u8>,
-        rs2: Option<u8>,
+        rd: Option<u16>,
+        rs1: Option<u16>,
+        rs2: Option<u16>,
         imm: i64,
     ) -> RvInstruction {
         RvInstruction {
@@ -2451,6 +2459,7 @@ mod tests {
             symbol: None,
             is_fp: false,
             comment: None,
+            is_call_arg_setup: false,
         }
     }
 
@@ -2519,9 +2528,12 @@ mod tests {
     #[test]
     fn test_lui_u_type() {
         // LUI x1, 0x12345 → upper 20 bits = 0x12345
+        // The codegen (split_i32_lui_addi) produces the RAW 20-bit
+        // upper value, NOT pre-shifted.  The encoder shifts it left
+        // by 12 to place it at bits [31:12] for the hardware encoding.
         // Expected: 0x12345000 | (1 << 7) | 0x37 = 0x123450B7
         let encoder = RiscV64Encoder::new();
-        let inst = test_inst(RvOpcode::LUI, Some(1), None, None, 0x12345000);
+        let inst = test_inst(RvOpcode::LUI, Some(1), None, None, 0x12345);
         let enc = encoder.encode(&inst).unwrap();
         assert_eq!(enc.size, 4);
         assert_eq!(inst_to_u32(&enc), 0x123450B7);
@@ -2838,6 +2850,7 @@ mod tests {
             symbol: None,
             is_fp: true,
             comment: None,
+            is_call_arg_setup: false,
         };
         let enc = encoder.encode(&inst).unwrap();
         assert_eq!(enc.size, 4);

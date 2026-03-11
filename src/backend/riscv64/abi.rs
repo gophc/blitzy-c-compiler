@@ -83,24 +83,24 @@ pub const MAX_STRUCT_REG_SIZE: usize = 16;
 /// Integer argument register IDs: a0–a7 (x10–x17).
 ///
 /// Ordered by ABI convention — a0 is used first.
-pub const INT_ARG_REGS: [u8; 8] = [X10, X11, X12, X13, X14, X15, X16, X17];
+pub const INT_ARG_REGS: [u16; 8] = [X10, X11, X12, X13, X14, X15, X16, X17];
 
 /// Floating-point argument register IDs: fa0–fa7 (f10–f17).
 ///
 /// Ordered by ABI convention — fa0 is used first.
-pub const FP_ARG_REGS: [u8; 8] = [F10, F11, F12, F13, F14, F15, F16, F17];
+pub const FP_ARG_REGS: [u16; 8] = [F10, F11, F12, F13, F14, F15, F16, F17];
 
 /// Integer return value registers: a0 (x10), a1 (x11).
 ///
 /// Scalar return values use a0. Two-register returns (e.g., 128-bit values
 /// or struct pairs) use a0 (low) and a1 (high).
-pub const INT_RET_REGS: [u8; 2] = [X10, X11];
+pub const INT_RET_REGS: [u16; 2] = [X10, X11];
 
 /// Floating-point return value registers: fa0 (f10), fa1 (f11).
 ///
 /// Float/double return values use fa0. Struct-of-two-floats returns use
 /// fa0 + fa1.
-pub const FP_RET_REGS: [u8; 2] = [F10, F11];
+pub const FP_RET_REGS: [u16; 2] = [F10, F11];
 
 // ===========================================================================
 // ArgClass — Argument Classification
@@ -605,7 +605,7 @@ impl RiscV64Abi {
     /// s0–s11: x8, x9, x18–x27 (12 registers).
     /// These must be saved/restored by the callee if modified.
     #[inline]
-    pub fn callee_saved_gprs() -> &'static [u8] {
+    pub fn callee_saved_gprs() -> &'static [u16] {
         CALLEE_SAVED_GPRS
     }
 
@@ -613,7 +613,7 @@ impl RiscV64Abi {
     ///
     /// fs0–fs11: f8, f9, f18–f27 (12 registers).
     #[inline]
-    pub fn callee_saved_fprs() -> &'static [u8] {
+    pub fn callee_saved_fprs() -> &'static [u16] {
         CALLEE_SAVED_FPRS
     }
 
@@ -621,7 +621,7 @@ impl RiscV64Abi {
     ///
     /// ra (x1), t0–t6 (x5–x7, x28–x31), a0–a7 (x10–x17) — 16 registers.
     #[inline]
-    pub fn caller_saved_gprs() -> &'static [u8] {
+    pub fn caller_saved_gprs() -> &'static [u16] {
         CALLER_SAVED_GPRS
     }
 
@@ -629,7 +629,7 @@ impl RiscV64Abi {
     ///
     /// ft0–ft7 (f0–f7), fa0–fa7 (f10–f17), ft8–ft11 (f28–f31) — 20 registers.
     #[inline]
-    pub fn caller_saved_fprs() -> &'static [u8] {
+    pub fn caller_saved_fprs() -> &'static [u16] {
         CALLER_SAVED_FPRS
     }
 

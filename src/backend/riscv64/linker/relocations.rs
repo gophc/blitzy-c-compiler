@@ -457,32 +457,56 @@ impl RiscV64RelocationHandler {
     /// of the paired HI20 AUIPC instruction. We look up the full value that
     /// was computed during HI20 processing and extract the lo12 component.
     fn resolve_pcrel_lo12(&self, rel: &ResolvedRelocation) -> Result<i64, RelocationError> {
-        // The "symbol" for PCREL_LO12 points to the AUIPC instruction address.
+        let cache = self.hi20_values.borrow();
+
+        // Strategy 1: The "symbol" for PCREL_LO12 points to the AUIPC
+        // instruction address (standard convention).
         let hi20_addr = rel.symbol_value.wrapping_add(rel.addend as u64);
-        match self.hi20_values.borrow().get(&hi20_addr).copied() {
-            Some(full_value) => {
-                let (_hi, lo) = hi20_lo12_split(full_value);
-                // Sign-extend the 12-bit value to ensure proper signed representation
-                // for the I-type or S-type immediate encoding.
-                Ok(sign_extend((lo as u64) & 0xFFF, 12))
-            }
-            None => {
-                // Fallback: try the symbol_value alone (some toolchains use this).
-                match self.hi20_values.borrow().get(&rel.symbol_value).copied() {
-                    Some(full_value) => {
-                        let (_hi, lo) = hi20_lo12_split(full_value);
-                        Ok(sign_extend((lo as u64) & 0xFFF, 12))
-                    }
-                    None => Err(RelocationError::UndefinedSymbol {
-                        name: format!(
-                            "HI20 pair at 0x{:x} (for LO12 at 0x{:x})",
-                            hi20_addr, rel.patch_address
-                        ),
-                        reloc_name: self.reloc_name(rel.rel_type).to_string(),
-                    }),
+        if let Some(&full_value) = cache.get(&hi20_addr) {
+            let (_hi, lo) = hi20_lo12_split(full_value);
+            return Ok(sign_extend((lo as u64) & 0xFFF, 12));
+        }
+
+        // Strategy 2: Try symbol_value alone (some toolchains).
+        if let Some(&full_value) = cache.get(&rel.symbol_value) {
+            let (_hi, lo) = hi20_lo12_split(full_value);
+            return Ok(sign_extend((lo as u64) & 0xFFF, 12));
+        }
+
+        // Strategy 3: Look for the AUIPC instruction immediately before
+        // this LO12 instruction (AUIPC is at patch_address - 4). This
+        // handles the common LA/CALL pseudo-instruction pattern where
+        // AUIPC + ADDI/JALR are consecutive.
+        let prev_addr = rel.patch_address.wrapping_sub(4);
+        if let Some(&full_value) = cache.get(&prev_addr) {
+            let (_hi, lo) = hi20_lo12_split(full_value);
+            return Ok(sign_extend((lo as u64) & 0xFFF, 12));
+        }
+
+        // Strategy 4: Scan all HI20 entries — the LO12 may refer to any
+        // AUIPC within the same function. Pick the closest preceding one.
+        let mut best: Option<(u64, i64)> = None;
+        for (&addr, &fv) in cache.iter() {
+            if addr <= rel.patch_address {
+                match best {
+                    None => best = Some((addr, fv)),
+                    Some((ba, _)) if addr > ba => best = Some((addr, fv)),
+                    _ => {}
                 }
             }
         }
+        if let Some((_, full_value)) = best {
+            let (_hi, lo) = hi20_lo12_split(full_value);
+            return Ok(sign_extend((lo as u64) & 0xFFF, 12));
+        }
+
+        Err(RelocationError::UndefinedSymbol {
+            name: format!(
+                "HI20 pair at 0x{:x} (for LO12 at 0x{:x})",
+                hi20_addr, rel.patch_address
+            ),
+            reloc_name: self.reloc_name(rel.rel_type).to_string(),
+        })
     }
 }
 
@@ -601,7 +625,7 @@ impl RelocationHandler for RiscV64RelocationHandler {
 
     /// Returns `true` if this relocation type requires a PLT stub.
     fn needs_plt(&self, rel_type: u32) -> bool {
-        matches!(rel_type, R_RISCV_CALL_PLT)
+        matches!(rel_type, R_RISCV_CALL_PLT | R_RISCV_JAL | R_RISCV_CALL)
     }
 
     /// Apply a single resolved relocation by computing the final value and

@@ -42,8 +42,8 @@ use crate::backend::elf_writer_common::{
     SHT_NOBITS, SHT_PROGBITS, SHT_RELA, STB_GLOBAL, STT_FUNC, STT_NOTYPE, STV_DEFAULT,
 };
 use crate::backend::traits::{
-    ArchCodegen, ArgLocation, AssembledFunction, MachineFunction, MachineInstruction,
-    MachineOperand, RegisterInfo, RelocationTypeInfo,
+    ArchCodegen, ArgLocation, AssembledFunction, FunctionRelocation, MachineFunction,
+    MachineInstruction, MachineOperand, RegisterInfo, RelocationTypeInfo,
 };
 use crate::common::target::Target;
 use crate::ir::function::IrFunction;
@@ -245,23 +245,67 @@ impl AArch64Codegen {
         for inst in a64_instructions {
             let mut mi = MachineInstruction::new(inst.opcode as u32);
 
+            // Preserve block label information from NOP pseudo-instructions.
+            // The codegen emits NOP with comment "labelname:" to mark basic
+            // block boundaries. We store this in asm_template so
+            // emit_assembly can call define_label() at the correct offset.
+            if inst.opcode == A64Opcode::NOP {
+                if let Some(ref comment) = inst.comment {
+                    if comment.ends_with(':') {
+                        mi.asm_template = Some(format!("LABEL:{}", &comment[..comment.len() - 1]));
+                    }
+                }
+            }
+
             // Set operand size based on 32-bit vs 64-bit forms.
             mi.operand_size = if inst.is_32bit { 4 } else { 8 };
 
+            // Preserve condition code through the round-trip so that
+            // CSET, B.cond, CSEL, etc. retain their condition after
+            // register allocation.
+            if let Some(cc) = inst.cond {
+                mi.cond_code = Some(cc.encoding());
+            }
+
+            // Preserve shift/rotate encoding through the round-trip
+            // so that MOVZ/MOVK/MOVN halfword shifts and register-
+            // shifted ALU operands survive register allocation.
+            mi.arch_shift = inst.shift;
+
             // Map destination register as the result operand.
+            // Virtual registers (from IR values) use VirtualRegister so
+            // that apply_allocation_result can replace them with physical
+            // registers.  Physical registers (SP, FP, LR, argument regs)
+            // use Register directly.
             if let Some(rd) = inst.rd {
-                mi.result = Some(MachineOperand::Register(rd as u16));
+                if inst.rd_is_virtual() {
+                    mi.result = Some(MachineOperand::VirtualRegister(rd as u32));
+                } else {
+                    mi.result = Some(MachineOperand::Register(rd as u16));
+                }
             }
 
             // Map source registers as input operands.
             if let Some(rn) = inst.rn {
-                mi.operands.push(MachineOperand::Register(rn as u16));
+                if inst.rn_is_virtual() {
+                    mi.operands.push(MachineOperand::VirtualRegister(rn as u32));
+                } else {
+                    mi.operands.push(MachineOperand::Register(rn as u16));
+                }
             }
             if let Some(rm) = inst.rm {
-                mi.operands.push(MachineOperand::Register(rm as u16));
+                if inst.rm_is_virtual() {
+                    mi.operands.push(MachineOperand::VirtualRegister(rm as u32));
+                } else {
+                    mi.operands.push(MachineOperand::Register(rm as u16));
+                }
             }
             if let Some(ra) = inst.ra {
-                mi.operands.push(MachineOperand::Register(ra as u16));
+                if inst.ra_is_virtual() {
+                    mi.operands.push(MachineOperand::VirtualRegister(ra as u32));
+                } else {
+                    mi.operands.push(MachineOperand::Register(ra as u16));
+                }
             }
 
             // Map immediate values.
@@ -292,13 +336,20 @@ impl AArch64Codegen {
                 | A64Opcode::TBNZ => {
                     mi.is_branch = true;
                 }
-                A64Opcode::BL | A64Opcode::BLR => {
+                A64Opcode::BL | A64Opcode::BLR | A64Opcode::CALL => {
                     mi.is_call = true;
                 }
                 A64Opcode::RET => {
                     mi.is_terminator = true;
                 }
                 _ => {}
+            }
+
+            // Propagate the call-argument-setup flag so the post-register-
+            // allocation parallel-move resolver can identify the contiguous
+            // arg-setup window before CALL.
+            if inst.is_call_arg_setup {
+                mi.is_call_arg_setup = true;
             }
 
             result.push(mi);
@@ -594,13 +645,14 @@ impl AArch64Codegen {
         }
 
         // Add external function declaration symbols (undefined references).
+        // Mark them as STT_FUNC so the dynamic linker creates PLT entries.
         for decl in module.declarations() {
             elf.add_symbol(ElfSymbol {
                 name: decl.name.clone(),
                 value: 0,
                 size: 0,
                 binding: STB_GLOBAL,
-                sym_type: STT_NOTYPE,
+                sym_type: STT_FUNC,
                 visibility: STV_DEFAULT,
                 section_index: 0, // SHN_UNDEF
             });
@@ -654,8 +706,8 @@ impl ArchCodegen for AArch64Codegen {
         func: &IrFunction,
         _diag: &mut DiagnosticEngine,
         _globals: &[crate::ir::module::GlobalVariable],
-        _func_ref_map: &crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>,
-        _global_var_refs: &crate::common::fx_hash::FxHashMap<
+        func_ref_map: &crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>,
+        global_var_refs: &crate::common::fx_hash::FxHashMap<
             crate::ir::instructions::Value,
             String,
         >,
@@ -689,7 +741,11 @@ impl ArchCodegen for AArch64Codegen {
                             && *rhs == crate::ir::instructions::Value::UNDEF
                             && ci < const_vals.len()
                         {
-                            constant_values.insert(result.index(), const_vals[ci]);
+                            // Add VREG_BASE (64) to key — codegen.rs reads
+                            // constant_values keyed by vreg number, which is
+                            // Value.index() + 64 to avoid collision with
+                            // AArch64 physical register numbers 0–63.
+                            constant_values.insert(result.index() + 64, const_vals[ci]);
                             ci += 1;
                         }
                     }
@@ -697,10 +753,98 @@ impl ArchCodegen for AArch64Codegen {
             }
         }
 
+        // Also merge constants from func.constant_values (authoritative IR
+        // constant map produced during lowering / SSA construction).  This
+        // ensures GEP indices and other small constants are visible to the
+        // instruction selector for constant-folding and dead-ADD elimination.
+        for (&val, &imm) in &func.constant_values {
+            constant_values.entry(val.index() + 64).or_insert(imm as i64);
+        }
+
+        // Build float constant cache from func.float_constant_values.
+        // This maps IR Values representing float constants to their
+        // rodata symbol names (.Lconst.f.N) for PC-relative loads.
+        let mut float_constant_cache = crate::common::fx_hash::FxHashMap::default();
+        if std::env::var("BCC_DEBUG_A64").is_ok() {
+            eprintln!("=== FLOAT_CONSTANT_VALUES count={} ===", func.float_constant_values.len());
+            for (val, (name, fval)) in &func.float_constant_values {
+                eprintln!("  float_cv: Value({}) -> {} = {}", val.index(), name, fval);
+            }
+        }
+        for (&val, (name, _fval)) in &func.float_constant_values {
+            float_constant_cache.insert(val, name.clone());
+        }
+
+        // Fallback: match orphaned float sentinel BinOps to .Lconst.f.* globals
+        // (same approach as x86-64 for functions where float_constant_values
+        // may not be populated by the lowering phase).
+        if float_constant_cache.is_empty() {
+            // Collect float constant globals sorted by index.
+            let mut float_consts: Vec<(u32, String)> = Vec::new();
+            for gv in _globals {
+                if let Some(idx_str) = gv.name.strip_prefix(".Lconst.f.") {
+                    if let Ok(idx) = idx_str.parse::<u32>() {
+                        float_consts.push((idx, gv.name.clone()));
+                    }
+                }
+            }
+            float_consts.sort_by_key(|(idx, _)| *idx);
+
+            // Find float sentinel BinOps (BinOp where is_float type and
+            // lhs == result, rhs == UNDEF) and map them to float globals.
+            let mut float_sentinel_values: Vec<u32> = Vec::new();
+            for block in &func.blocks {
+                for inst in block.instructions() {
+                    if let crate::ir::instructions::Instruction::BinOp {
+                        result, lhs, rhs, ty, ..
+                    } = inst
+                    {
+                        if *lhs == *result
+                            && *rhs == crate::ir::instructions::Value::UNDEF
+                            && ty.is_float()
+                        {
+                            float_sentinel_values.push(result.index());
+                        }
+                    }
+                }
+            }
+            // Map float sentinels to float globals in order.
+            for (val_idx, (_gidx, gname)) in
+                float_sentinel_values.iter().zip(float_consts.iter())
+            {
+                float_constant_cache.insert(
+                    crate::ir::instructions::Value(*val_idx),
+                    gname.clone(),
+                );
+            }
+        }
+
+        if std::env::var("BCC_DEBUG_A64").is_ok() {
+            eprintln!("=== FINAL float_constant_cache count={} ===", float_constant_cache.len());
+            for (v, n) in &float_constant_cache {
+                eprintln!("  fcc: Value({}) -> {}", v.index(), n);
+            }
+        }
+
         // Perform instruction selection: IR → A64 instructions.
         let mut selector = codegen::AArch64InstructionSelector::new(self.target, self.pic_mode);
         selector.set_constant_values(constant_values);
+        selector.set_func_ref_names(func_ref_map.clone());
+        selector.set_global_var_refs(global_var_refs.clone());
+        selector.set_float_constant_cache(float_constant_cache);
         let a64_instructions = selector.select_function(func, &self.abi);
+
+        // DEBUG: Print the A64 instructions for diagnosis
+        if std::env::var("BCC_DEBUG_A64").is_ok() {
+            eprintln!("=== A64 instructions for '{}' ({} total) ===", func.name, a64_instructions.len());
+            for (i, inst) in a64_instructions.iter().enumerate() {
+                eprintln!("  [{:3}] {:?} rd={:?} rn={:?} rm={:?} imm={} sym={:?} comment={:?}",
+                    i, inst.opcode, inst.rd, inst.rn, inst.rm, inst.imm,
+                    inst.symbol, inst.comment);
+            }
+            eprintln!("=== func_ref_names: {:?} ===", func_ref_map);
+            eprintln!("=== global_var_refs: {:?} ===", global_var_refs);
+        }
 
         // Convert to common MachineInstructions.
         let machine_instructions = Self::convert_instructions(&a64_instructions);
@@ -720,7 +864,29 @@ impl ArchCodegen for AArch64Codegen {
             entry.push_instruction(inst);
         }
 
-        mf.frame_size = 0;
+        // Set frame_size to the locals area size so the prologue allocates
+        // sufficient stack space.  The register allocator may increase this
+        // later to account for spill slots.
+        mf.frame_size = selector.get_locals_size();
+
+        // Build vreg → IR Value mapping so that apply_allocation_result can
+        // translate codegen virtual register numbers back to the register
+        // allocator's Value-indexed assignment table.
+        //
+        // Codegen uses Value.index() + 64 (VREG_BASE) as vreg numbers to
+        // avoid collision with AArch64 physical register IDs 0–63.  The
+        // register allocator indexes assignments by IR Value directly, so
+        // this mapping bridges the two numbering schemes.
+        for block in &func.blocks {
+            for inst in block.instructions() {
+                if let Some(result) = inst.result() {
+                    if result != crate::ir::instructions::Value::UNDEF {
+                        let vreg_id = result.index() as u32 + 64; // VREG_BASE
+                        mf.vreg_to_ir_value.insert(vreg_id, result);
+                    }
+                }
+            }
+        }
 
         Ok(mf)
     }
@@ -732,17 +898,67 @@ impl ArchCodegen for AArch64Codegen {
         // Collect all instructions from all basic blocks and convert
         // MachineInstruction back to A64Instruction for the assembler.
         let mut all_instructions: Vec<A64Instruction> = Vec::new();
+        let debug = std::env::var("BCC_DEBUG_A64").is_ok();
+        if debug {
+            eprintln!("=== emit_assembly for '{}' blocks={} frame_size={} ===",
+                mf.name, mf.blocks.len(), mf.frame_size);
+        }
         for block in &mf.blocks {
-            for mi in &block.instructions {
+            if debug {
+                eprintln!("  Block '{}' instructions={}",
+                    block.label.as_deref().unwrap_or("?"), block.instructions.len());
+            }
+            for (idx, mi) in block.instructions.iter().enumerate() {
+                if debug {
+                    eprintln!("    MI[{:3}] op={} result={:?} operands={:?} is_call={} is_term={} size={} asm_tmpl={:?}",
+                        idx, mi.opcode, mi.result, mi.operands, mi.is_call, mi.is_terminator, mi.operand_size, mi.asm_template);
+                }
+
+                // Check if this MachineInstruction is a block label pseudo-NOP.
+                // These have asm_template = Some("LABEL:labelname") set by
+                // convert_instructions. Emit a NOP with a label comment so
+                // assemble_one() can define the label at the correct offset.
+                if let Some(ref tmpl) = mi.asm_template {
+                    if let Some(label) = tmpl.strip_prefix("LABEL:") {
+                        all_instructions.push(
+                            A64Instruction::new(A64Opcode::NOP)
+                                .with_comment(format!("{}:", label)),
+                        );
+                        if debug {
+                            eprintln!("    -> LABEL NOP for '{}'", label);
+                        }
+                        continue; // Don't also emit the regular NOP
+                    }
+                }
+
                 let a64_inst = Self::mi_to_a64(mi);
+                if debug {
+                    eprintln!("    -> A64 {:?} rd={:?} rn={:?} rm={:?} imm={} sym={:?}",
+                        a64_inst.opcode, a64_inst.rd, a64_inst.rn, a64_inst.rm, a64_inst.imm, a64_inst.symbol);
+                }
                 all_instructions.push(a64_inst);
             }
         }
 
         let result = asm.assemble_function(&all_instructions)?;
+
+        // Convert assembly relocations to FunctionRelocations for the
+        // code generation driver to pass to the linker.
+        let relocations = result
+            .relocations
+            .iter()
+            .map(|r| FunctionRelocation {
+                offset: r.offset,
+                symbol: r.symbol.clone(),
+                rel_type_id: r.reloc_type,
+                addend: r.addend,
+                section: ".text".to_string(),
+            })
+            .collect();
+
         Ok(AssembledFunction {
             bytes: result.code,
-            relocations: Vec::new(),
+            relocations,
         })
     }
 
@@ -778,10 +994,30 @@ impl ArchCodegen for AArch64Codegen {
         let fp = registers::FP_REG as u16;
         let lr = registers::LR as u16;
 
-        let frame_size = Self::align_up(mf.frame_size.max(16), 16);
+        // Compute total frame size:
+        //   16 bytes for FP + LR (stored at [SP, #0])
+        //   + 16 bytes per pair of callee-saved registers
+        //   + mf.frame_size for local spills/temporaries
+        let num_gpr = mf.callee_saved_regs.iter().filter(|&&r| r < 32).count();
+        let num_fpr = mf.callee_saved_regs.iter().filter(|&&r| r >= 32).count();
+        let gpr_pairs = (num_gpr + 1) / 2; // round up for odd count
+        let fpr_pairs = (num_fpr + 1) / 2;
+        let callee_save_bytes: usize = (gpr_pairs + fpr_pairs) * 16;
+        let frame_size = Self::align_up((16 + callee_save_bytes + mf.frame_size).max(16), 16);
 
-        // Step 1: STP X29, X30, [SP, #-frame_size]! (pre-index, decrements SP)
-        {
+        // Step 1 & 2: Allocate frame and save FP/LR.
+        //
+        // The STP pre-index form uses a 7-bit signed offset scaled by 8,
+        // giving a range of −504 to +504.  For frames ≤ 504 we emit:
+        //     STP X29, X30, [SP, #-frame_size]!
+        // For larger frames we split the allocation:
+        //     SUB SP, SP, #frame_size        (handles up to 4095)
+        //     STP X29, X30, [SP]             (offset-form at [SP, #0])
+        // Note: frames > 4095 handled via the ADD/SUB negative-immediate
+        // flip already implemented in the encoder.
+        let stp_pre_limit = 504usize; // max magnitude for 7-bit signed × 8
+        if frame_size <= stp_pre_limit {
+            // Small frame: use STP pre-index.
             let mut mi = MachineInstruction::new(OPCODE_STP_PRE);
             mi.operands.push(MachineOperand::Register(fp));
             mi.operands.push(MachineOperand::Register(lr));
@@ -793,10 +1029,42 @@ impl ArchCodegen for AArch64Codegen {
             });
             mi.operand_size = 8;
             prologue.push(mi);
+        } else {
+            // Large frame: SUB SP first, then STP at [SP, #0].
+            {
+                let mut mi = MachineInstruction::new(OPCODE_SUB_IMM);
+                mi.result = Some(MachineOperand::Register(sp));
+                mi.operands.push(MachineOperand::Register(sp));
+                mi.operands.push(MachineOperand::Immediate(frame_size as i64));
+                mi.operand_size = 8;
+                prologue.push(mi);
+            }
+            {
+                let mut mi = MachineInstruction::new(OPCODE_STP);
+                mi.operands.push(MachineOperand::Register(fp));
+                mi.operands.push(MachineOperand::Register(lr));
+                mi.operands.push(MachineOperand::Memory {
+                    base: Some(sp),
+                    index: None,
+                    scale: 1,
+                    displacement: 0,
+                });
+                mi.operand_size = 8;
+                prologue.push(mi);
+            }
         }
 
-        // Step 2: MOV X29, SP (establish frame pointer)
-        prologue.push(Self::make_mov_reg(fp, sp));
+        // Establish frame pointer: MOV X29, SP.
+        // On AArch64, SP (register 31) cannot be used in ORR-based MOV.
+        // MOV Xd, SP is encoded as ADD Xd, SP, #0.
+        {
+            let mut mi = MachineInstruction::new(OPCODE_ADD_IMM);
+            mi.result = Some(MachineOperand::Register(fp));
+            mi.operands.push(MachineOperand::Register(sp));
+            mi.operands.push(MachineOperand::Immediate(0));
+            mi.operand_size = 8;
+            prologue.push(mi);
+        }
 
         // Step 3: Save callee-saved registers in pairs.
         let mut gpr_saved: Vec<u16> = Vec::new();
@@ -811,7 +1079,9 @@ impl ArchCodegen for AArch64Codegen {
         }
 
         // Save GPRs in pairs.
-        let mut offset = 16i64;
+        // Callee-saved regs are placed AFTER the locals area:
+        //   [FP + 16 + mf.frame_size]  = first callee-saved pair
+        let mut offset = 16i64 + mf.frame_size as i64;
         let mut i = 0;
         while i + 1 < gpr_saved.len() {
             prologue.push(Self::make_stp(
@@ -864,7 +1134,14 @@ impl ArchCodegen for AArch64Codegen {
         let fp = registers::FP_REG as u16;
         let lr = registers::LR as u16;
 
-        let frame_size = Self::align_up(mf.frame_size.max(16), 16);
+        // Must match the prologue calculation exactly.
+        let num_gpr = mf.callee_saved_regs.iter().filter(|&&r| r < 32).count();
+        let num_fpr = mf.callee_saved_regs.iter().filter(|&&r| r >= 32).count();
+        let gpr_pairs = (num_gpr + 1) / 2;
+        let fpr_pairs = (num_fpr + 1) / 2;
+        let callee_save_bytes: usize = (gpr_pairs + fpr_pairs) * 16;
+        let frame_size = Self::align_up((16 + callee_save_bytes + mf.frame_size).max(16), 16);
+        let stp_pre_limit = 504usize;
 
         // Classify callee-saved registers.
         let mut gpr_saved: Vec<u16> = Vec::new();
@@ -878,7 +1155,9 @@ impl ArchCodegen for AArch64Codegen {
         }
 
         // Compute offsets matching prologue layout.
-        let mut offset = 16i64;
+        // Callee-saved regs are placed AFTER the locals area:
+        //   [FP + 16 + mf.frame_size]  = first callee-saved pair
+        let mut offset = 16i64 + mf.frame_size as i64;
         let mut gpr_offsets: Vec<(usize, i64)> = Vec::new();
         let mut i = 0;
         while i + 1 < gpr_saved.len() {
@@ -944,8 +1223,13 @@ impl ArchCodegen for AArch64Codegen {
             }
         }
 
-        // Restore FP and LR, post-index: LDP x29, x30, [SP], #frame_size
-        {
+        // Restore FP/LR and deallocate frame.
+        //
+        // Mirror the prologue: if the frame fitted in the STP pre-index
+        // form (≤ 504 bytes), we can use LDP post-index symmetrically.
+        // Otherwise, LDP at [SP, #0] then ADD SP to restore.
+        if frame_size <= stp_pre_limit {
+            // Small frame: LDP post-index restores and adjusts SP.
             let mut mi = MachineInstruction::new(OPCODE_LDP_POST);
             mi.result = Some(MachineOperand::Register(fp));
             mi.operands.push(MachineOperand::Register(lr));
@@ -957,6 +1241,29 @@ impl ArchCodegen for AArch64Codegen {
             });
             mi.operand_size = 8;
             epilogue.push(mi);
+        } else {
+            // Large frame: LDP at [SP, #0] then ADD SP, SP, #frame_size.
+            {
+                let mut mi = MachineInstruction::new(OPCODE_LDP);
+                mi.result = Some(MachineOperand::Register(fp));
+                mi.operands.push(MachineOperand::Register(lr));
+                mi.operands.push(MachineOperand::Memory {
+                    base: Some(sp),
+                    index: None,
+                    scale: 1,
+                    displacement: 0,
+                });
+                mi.operand_size = 8;
+                epilogue.push(mi);
+            }
+            {
+                let mut mi = MachineInstruction::new(OPCODE_ADD_IMM);
+                mi.result = Some(MachineOperand::Register(sp));
+                mi.operands.push(MachineOperand::Register(sp));
+                mi.operands.push(MachineOperand::Immediate(frame_size as i64));
+                mi.operand_size = 8;
+                epilogue.push(mi);
+            }
         }
 
         // Return via X30 (LR).
@@ -1045,12 +1352,12 @@ impl AArch64Codegen {
                     .operands
                     .first()
                     .and_then(|o| o.as_register())
-                    .unwrap_or(0) as u8;
+                    .unwrap_or(0) as u32;
                 let rt2 = mi
                     .operands
                     .get(1)
                     .and_then(|o| o.as_register())
-                    .unwrap_or(0) as u8;
+                    .unwrap_or(0) as u32;
                 let (base, disp) = Self::extract_memory_operand(&mi.operands);
                 inst.rd = Some(rt1);
                 inst.rm = Some(rt2);
@@ -1065,12 +1372,12 @@ impl AArch64Codegen {
                     .result
                     .as_ref()
                     .and_then(|o| o.as_register())
-                    .unwrap_or(0) as u8;
+                    .unwrap_or(0) as u32;
                 let rt2 = mi
                     .operands
                     .first()
                     .and_then(|o| o.as_register())
-                    .unwrap_or(0) as u8;
+                    .unwrap_or(0) as u32;
                 let (base, disp) = Self::extract_memory_operand(&mi.operands);
                 inst.rd = Some(rt1);
                 inst.rm = Some(rt2);
@@ -1082,11 +1389,69 @@ impl AArch64Codegen {
             _ => {}
         }
 
+        // --- Special handling for STR_imm / STRB_imm / STRH_imm spill stores ----
+        // Spill stores from generation.rs come with:
+        //   result = None
+        //   operands = [Memory{base, displacement}, Register(source)]
+        // The generic mapping would place the Register operand into `rn`,
+        // overwriting the base from Memory.  STR encoding expects:
+        //   rd = source register (Rt), rn = base register, imm = offset.
+        {
+            let opc = mi.opcode;
+            if (opc == A64Opcode::STR_imm as u32
+                || opc == A64Opcode::STRB_imm as u32
+                || opc == A64Opcode::STRH_imm as u32
+                || opc == A64Opcode::STR_fp_imm as u32)
+                && mi.result.is_none()
+                && mi.operands.len() >= 2
+            {
+                let (base, disp) = Self::extract_memory_operand(&mi.operands);
+                inst.rn = Some(base);
+                inst.imm = disp;
+                // Find the Register operand → this is the source (Rt → rd).
+                for op in &mi.operands {
+                    if let Some(reg) = op.as_any_register() {
+                        inst.rd = Some(reg as u32);
+                        break;
+                    }
+                }
+                inst.is_32bit = mi.operand_size == 4;
+                return inst;
+            }
+        }
+
+        // --- Special handling for MOV_reg, NEG_reg, MVN_reg --------------
+        // These pseudo-instructions encode using the `rm` field:
+        //   MOV Xd, Xm → ORR Xd, XZR, Xm   (source in rm)
+        //   NEG Xd, Xm → SUB Xd, XZR, Xm   (source in rm)
+        //   MVN Xd, Xm → ORN Xd, XZR, Xm   (source in rm)
+        // The MachineInstruction stores: result=Rd, operands[0]=Rm.
+        // We must place the source in `rm`, not `rn` (generic default).
+        {
+            let opc = mi.opcode;
+            if opc == A64Opcode::MOV_reg as u32
+                || opc == A64Opcode::NEG_reg as u32
+                || opc == A64Opcode::MVN_reg as u32
+            {
+                if let Some(ref result) = mi.result {
+                    if let Some(reg) = result.as_any_register() {
+                        inst.rd = Some(reg as u32);
+                    }
+                }
+                // First Register operand → rm (source for ORR/SUB/ORN)
+                if let Some(src) = mi.operands.first().and_then(|o| o.as_any_register()) {
+                    inst.rm = Some(src as u32);
+                }
+                inst.is_32bit = mi.operand_size == 4;
+                return inst;
+            }
+        }
+
         // --- Generic operand mapping for non-STP/LDP instructions --------
         // Map result as destination register.
         if let Some(ref result) = mi.result {
-            if let Some(reg) = result.as_register() {
-                inst.rd = Some(reg as u8);
+            if let Some(reg) = result.as_any_register() {
+                inst.rd = Some(reg as u32);
             }
         }
 
@@ -1096,9 +1461,22 @@ impl AArch64Codegen {
             match op {
                 MachineOperand::Register(r) => {
                     match reg_idx {
-                        0 => inst.rn = Some(*r as u8),
-                        1 => inst.rm = Some(*r as u8),
-                        2 => inst.ra = Some(*r as u8),
+                        0 => inst.rn = Some(*r as u32),
+                        1 => inst.rm = Some(*r as u32),
+                        2 => inst.ra = Some(*r as u32),
+                        _ => {}
+                    }
+                    reg_idx += 1;
+                }
+                MachineOperand::VirtualRegister(v) => {
+                    // Surviving virtual register — treat identically
+                    // to a physical register (may occur if allocation
+                    // left some unresolved).
+                    let r = *v as u32;
+                    match reg_idx {
+                        0 => inst.rn = Some(r),
+                        1 => inst.rm = Some(r),
+                        2 => inst.ra = Some(r),
                         _ => {}
                     }
                     reg_idx += 1;
@@ -1114,7 +1492,7 @@ impl AArch64Codegen {
                 } => {
                     if let Some(b) = base {
                         if inst.rn.is_none() {
-                            inst.rn = Some(*b as u8);
+                            inst.rn = Some(*b as u32);
                         }
                     }
                     inst.imm = *displacement;
@@ -1126,18 +1504,29 @@ impl AArch64Codegen {
         // Set the 32-bit flag from operand_size.
         inst.is_32bit = mi.operand_size == 4;
 
+        // Restore condition code from the MachineInstruction.
+        // This is critical for CSET, B_cond, CSEL, CSINC, etc.
+        if let Some(cc_enc) = mi.cond_code {
+            inst.cond = Some(codegen::CondCode::from_encoding(cc_enc));
+        }
+
+        // Restore shift/rotate encoding from the MachineInstruction.
+        // Critical for MOVZ/MOVK/MOVN halfword shifts and register-
+        // shifted ALU instructions.
+        inst.shift = mi.arch_shift;
+
         inst
     }
 
     /// Extract base register and displacement from an operand list containing
     /// a `Memory` operand.
-    fn extract_memory_operand(operands: &[MachineOperand]) -> (u8, i64) {
+    fn extract_memory_operand(operands: &[MachineOperand]) -> (u32, i64) {
         for op in operands {
             if let MachineOperand::Memory {
                 base, displacement, ..
             } = op
             {
-                return (base.unwrap_or(31) as u8, *displacement);
+                return (base.unwrap_or(31) as u32, *displacement);
             }
         }
         (31, 0) // default: SP, offset 0
@@ -1161,8 +1550,13 @@ impl AArch64Codegen {
     }
 
     /// Map a discriminant value back to an A64Opcode via linear scan.
+    ///
+    /// This list MUST contain every variant of `A64Opcode` so that the
+    /// round-trip `A64Instruction → MachineInstruction → A64Instruction`
+    /// is lossless. Missing variants silently degrade to NOP.
     fn discriminant_to_opcode(d: u32) -> A64Opcode {
         let opcodes: &[A64Opcode] = &[
+            // Data Processing — Immediate
             A64Opcode::ADD_imm,
             A64Opcode::ADDS_imm,
             A64Opcode::SUB_imm,
@@ -1176,6 +1570,7 @@ impl AArch64Codegen {
             A64Opcode::ANDS_imm,
             A64Opcode::ADRP,
             A64Opcode::ADR,
+            // Data Processing — Register
             A64Opcode::ADD_reg,
             A64Opcode::ADDS_reg,
             A64Opcode::SUB_reg,
@@ -1199,12 +1594,14 @@ impl AArch64Codegen {
             A64Opcode::LSL_imm,
             A64Opcode::LSR_imm,
             A64Opcode::ASR_imm,
+            // Conditional Select
             A64Opcode::CSEL,
             A64Opcode::CSINC,
             A64Opcode::CSINV,
             A64Opcode::CSNEG,
             A64Opcode::CSET,
             A64Opcode::CSETM,
+            // Bit Manipulation
             A64Opcode::CLZ,
             A64Opcode::CLS,
             A64Opcode::RBIT,
@@ -1220,6 +1617,7 @@ impl AArch64Codegen {
             A64Opcode::SXTW,
             A64Opcode::UXTB,
             A64Opcode::UXTH,
+            // Loads
             A64Opcode::LDR_imm,
             A64Opcode::LDRB_imm,
             A64Opcode::LDRH_imm,
@@ -1233,6 +1631,7 @@ impl AArch64Codegen {
             A64Opcode::LDPSW,
             A64Opcode::LDR_pre,
             A64Opcode::LDR_post,
+            // Stores
             A64Opcode::STR_imm,
             A64Opcode::STRB_imm,
             A64Opcode::STRH_imm,
@@ -1241,10 +1640,12 @@ impl AArch64Codegen {
             A64Opcode::STP_pre,
             A64Opcode::STR_pre,
             A64Opcode::STR_post,
+            // FP/SIMD Loads and Stores
             A64Opcode::LDR_fp_imm,
             A64Opcode::STR_fp_imm,
             A64Opcode::LDP_fp,
             A64Opcode::STP_fp,
+            // Branches
             A64Opcode::B,
             A64Opcode::BL,
             A64Opcode::B_cond,
@@ -1255,7 +1656,94 @@ impl AArch64Codegen {
             A64Opcode::CBNZ,
             A64Opcode::TBZ,
             A64Opcode::TBNZ,
+            // Comparison aliases
+            A64Opcode::CMP_imm,
+            A64Opcode::CMP_reg,
+            A64Opcode::CMN_imm,
+            A64Opcode::CMN_reg,
+            A64Opcode::TST_imm,
+            A64Opcode::TST_reg,
+            A64Opcode::CCMP_imm,
+            A64Opcode::CCMP_reg,
+            // FP Data Processing
+            A64Opcode::FADD_s,
+            A64Opcode::FSUB_s,
+            A64Opcode::FMUL_s,
+            A64Opcode::FDIV_s,
+            A64Opcode::FSQRT_s,
+            A64Opcode::FADD_d,
+            A64Opcode::FSUB_d,
+            A64Opcode::FMUL_d,
+            A64Opcode::FDIV_d,
+            A64Opcode::FSQRT_d,
+            A64Opcode::FNEG_s,
+            A64Opcode::FNEG_d,
+            A64Opcode::FABS_s,
+            A64Opcode::FABS_d,
+            A64Opcode::FMADD_s,
+            A64Opcode::FMSUB_s,
+            A64Opcode::FNMADD_s,
+            A64Opcode::FNMSUB_s,
+            A64Opcode::FMADD_d,
+            A64Opcode::FMSUB_d,
+            A64Opcode::FNMADD_d,
+            A64Opcode::FNMSUB_d,
+            A64Opcode::FMIN_s,
+            A64Opcode::FMAX_s,
+            A64Opcode::FMIN_d,
+            A64Opcode::FMAX_d,
+            // FP Comparison
+            A64Opcode::FCMP_s,
+            A64Opcode::FCMP_d,
+            A64Opcode::FCMPE_s,
+            A64Opcode::FCMPE_d,
+            // FP Conversion
+            A64Opcode::FCVT_sd,
+            A64Opcode::FCVT_ds,
+            A64Opcode::FCVTZS_ws,
+            A64Opcode::FCVTZS_xs,
+            A64Opcode::FCVTZS_wd,
+            A64Opcode::FCVTZS_xd,
+            A64Opcode::FCVTZU_ws,
+            A64Opcode::FCVTZU_xs,
+            A64Opcode::FCVTZU_wd,
+            A64Opcode::FCVTZU_xd,
+            A64Opcode::SCVTF_sw,
+            A64Opcode::SCVTF_sx,
+            A64Opcode::SCVTF_dw,
+            A64Opcode::SCVTF_dx,
+            A64Opcode::UCVTF_sw,
+            A64Opcode::UCVTF_sx,
+            A64Opcode::UCVTF_dw,
+            A64Opcode::UCVTF_dx,
+            // FP Move
+            A64Opcode::FMOV_s,
+            A64Opcode::FMOV_d,
+            A64Opcode::FMOV_gen_to_fp,
+            A64Opcode::FMOV_fp_to_gen,
+            // System
             A64Opcode::NOP,
+            A64Opcode::DMB,
+            A64Opcode::DSB,
+            A64Opcode::ISB,
+            A64Opcode::SVC,
+            A64Opcode::HVC,
+            A64Opcode::SMC,
+            A64Opcode::MRS,
+            A64Opcode::MSR,
+            // Pseudo-instructions
+            A64Opcode::MOV_reg,
+            A64Opcode::MOV_imm,
+            A64Opcode::NEG_reg,
+            A64Opcode::MVN_reg,
+            A64Opcode::LI,
+            A64Opcode::LA,
+            A64Opcode::CALL,
+            A64Opcode::INLINE_ASM,
+            A64Opcode::CNT,
+            A64Opcode::ADDV,
+            A64Opcode::MUL,
+            A64Opcode::SMULL,
         ];
 
         for &op in opcodes {
@@ -1318,7 +1806,7 @@ mod tests {
     fn test_register_info() {
         let codegen = AArch64Codegen::new(false, false);
         let info = codegen.register_info();
-        assert_eq!(info.allocatable_gpr.len(), 29);
+        assert_eq!(info.allocatable_gpr.len(), 28); // X16 reserved as scratch
         assert_eq!(info.allocatable_fpr.len(), 32);
         assert_eq!(info.callee_saved.len(), 18);
         assert_eq!(info.argument_gpr.len(), 8);

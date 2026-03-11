@@ -344,12 +344,18 @@ pub fn compute_live_intervals(func: &IrFunction) -> Vec<LiveInterval> {
 
     // Walk every instruction in RPO linear order.
     idx = 0;
+    let debug_intervals = std::env::var("BCC_DEBUG_INTERVALS").is_ok();
     for &bi in &rpo {
         if bi >= num_blocks {
             continue;
         }
         let block = &func.blocks[bi];
         for inst in block.instructions.iter() {
+            if debug_intervals {
+                let res = inst.result().map(|v| format!("v{}", v.index())).unwrap_or_default();
+                let ops: Vec<String> = inst.operands().iter().map(|v| format!("v{}", v.index())).collect();
+                eprintln!("  IR idx={} block={} result={} ops=[{}] => {}", idx, bi, res, ops.join(","), inst);
+            }
             // Detect call instructions.
             if matches!(inst, Instruction::Call { .. }) {
                 call_positions.push(idx);
@@ -424,6 +430,122 @@ pub fn compute_live_intervals(func: &IrFunction) -> Vec<LiveInterval> {
                         starts.entry(*val).or_insert(0);
                         classes.entry(*val).or_insert(RegClass::Integer);
                         types.entry(*val).or_insert(IrType::I64);
+                    }
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Step 3.5 — Loop back-edge live-range extension
+    // ---------------------------------------------------------------
+    // In a linear-scan register allocator, instruction indices are
+    // assigned in a single linear pass.  Loops cause the same physical
+    // instructions to execute multiple times, but the linear indices
+    // don't reflect this.  A value defined before a loop and used
+    // inside the loop body may have its live interval end before the
+    // end of the loop body, causing its register to be reused by
+    // later instructions in the same loop body.  On the next iteration
+    // the register no longer holds the expected value.
+    //
+    // Fix: detect loop back-edges, compute actual loop membership via
+    // reverse CFG walk, then extend the live interval of any value
+    // whose last use falls inside an actual loop block to span at
+    // least to the end of the back-edge source block.
+    {
+        // Build RPO position map for back-edge detection.
+        let mut rpo_pos: Vec<usize> = vec![usize::MAX; num_blocks];
+        for (pos, &bi) in rpo.iter().enumerate() {
+            if bi < num_blocks {
+                rpo_pos[bi] = pos;
+            }
+        }
+
+        // Build a map from linearized IR index to block index.
+        let max_idx = block_end.iter().copied().max().unwrap_or(0) as usize;
+        let mut idx_to_block: Vec<usize> = vec![usize::MAX; max_idx + 1];
+        for bi in 0..num_blocks {
+            let bs = block_start[bi] as usize;
+            let be = block_end[bi] as usize;
+            for idx in bs..be {
+                if idx < idx_to_block.len() {
+                    idx_to_block[idx] = bi;
+                }
+            }
+        }
+
+        // Scan for back-edges and extend live ranges.
+        for &bi in &rpo {
+            if bi >= num_blocks {
+                continue;
+            }
+            for &succ in func.blocks[bi].successors() {
+                if succ >= num_blocks {
+                    continue;
+                }
+                // A back-edge exists when a block jumps to a block that
+                // appears earlier (or at the same position) in RPO.
+                if rpo_pos[succ] <= rpo_pos[bi] {
+                    let loop_header = succ;
+                    let back_edge_src = bi;
+                    let loop_header_start = block_start[loop_header];
+                    let back_edge_block_end = block_end[back_edge_src];
+                    let loop_body_last_idx = if back_edge_block_end > 0 {
+                        back_edge_block_end - 1
+                    } else {
+                        0
+                    };
+
+                    // Compute loop membership: reverse BFS from
+                    // back-edge source to loop header.  A block X is
+                    // in the loop if there is a path from X to the
+                    // back-edge source that does not leave the loop
+                    // (i.e. X is reachable from the header via blocks
+                    // that can reach the back-edge source).
+                    let mut loop_blocks = std::collections::HashSet::new();
+                    loop_blocks.insert(loop_header);
+                    if back_edge_src != loop_header {
+                        let mut worklist = vec![back_edge_src];
+                        while let Some(b) = worklist.pop() {
+                            if loop_blocks.insert(b) {
+                                for &pred in func.blocks[b].predecessors() {
+                                    if pred < num_blocks
+                                        && !loop_blocks.contains(&pred)
+                                    {
+                                        worklist.push(pred);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Extend values that are live-in to the loop.
+                    // A value is live-in if it was defined before the
+                    // loop header and its live range covers the loop
+                    // header (meaning it's still alive when the loop
+                    // header executes).  Such a value must survive
+                    // through the entire loop body so that on the
+                    // back-edge, its register still holds the correct
+                    // value when the header re-executes.
+                    //
+                    // The key insight: a value's last use might be in
+                    // a block AFTER the loop (e.g., used in both the
+                    // loop header and in code after the loop), but its
+                    // interval still needs to cover the loop body
+                    // because the body executes between iterations of
+                    // the header.
+                    for (_val, start) in starts.iter() {
+                        if *start < loop_header_start {
+                            if let Some(end) = ends.get_mut(_val) {
+                                // Value is live at the loop header if
+                                // its interval reaches the header.
+                                if *end >= loop_header_start
+                                    && *end < loop_body_last_idx
+                                {
+                                    *end = loop_body_last_idx;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -536,6 +658,15 @@ pub fn allocate_registers(
     // Active list: indices into `intervals`, maintained sorted by end point.
     let mut active: Vec<usize> = Vec::new();
 
+    let debug_regalloc = std::env::var("BCC_DEBUG_REGALLOC").is_ok();
+    if debug_regalloc {
+        eprintln!("=== REGALLOC INTERVALS ===");
+        for iv in intervals.iter() {
+            eprintln!("  v{}: [{}, {}] {:?} cross_call={}", iv.vreg.index(), iv.start, iv.end, iv.reg_class, iv.crosses_call);
+        }
+        eprintln!("=== GPR pool: {:?} ===", free_gpr.iter().map(|r| r.0).collect::<Vec<_>>());
+    }
+
     for i in 0..intervals.len() {
         let cur_start = intervals[i].start;
 
@@ -578,6 +709,9 @@ pub fn allocate_registers(
             // Register available — assign it.
             intervals[i].assigned = Some(reg);
             assignments.insert(intervals[i].vreg, reg);
+            if debug_regalloc {
+                eprintln!("  ASSIGN v{} [{},{}] -> r{}", intervals[i].vreg.index(), intervals[i].start, intervals[i].end, reg.0);
+            }
 
             if reg_info.callee_saved.contains(&reg) {
                 callee_saved_used.insert(reg);
@@ -601,6 +735,12 @@ pub fn allocate_registers(
             if let Some(far_idx) = spill_candidate {
                 if intervals[far_idx].end > intervals[i].end {
                     // Spill the farther interval; re-use its register.
+                    if debug_regalloc {
+                        eprintln!("  SPILL-FAR v{} [{},{}] (was r{}), give to v{} [{},{}]",
+                            intervals[far_idx].vreg.index(), intervals[far_idx].start, intervals[far_idx].end,
+                            intervals[far_idx].assigned.unwrap().0,
+                            intervals[i].vreg.index(), intervals[i].start, intervals[i].end);
+                    }
                     let reg = intervals[far_idx].assigned.take().unwrap();
                     assignments.remove(&intervals[far_idx].vreg);
 

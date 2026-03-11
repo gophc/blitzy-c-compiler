@@ -11,8 +11,13 @@
 #include <stdio.h>
 
 int main(void) {
-    /* Computed goto dispatch table — array of label addresses */
-    static void *dispatch[] = { &&step1, &&step2, &&step3, &&done };
+    /* Computed goto dispatch table — local array of label addresses */
+    void *dispatch[4];
+    dispatch[0] = &&step1;
+    dispatch[1] = &&step2;
+    dispatch[2] = &&step3;
+    dispatch[3] = &&done;
+
     int result = 0;
     int idx = 0;
 

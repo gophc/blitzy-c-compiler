@@ -46,78 +46,78 @@ use crate::backend::traits::RegisterInfo;
 // ===========================================================================
 
 /// General-purpose register X0 (64-bit) / W0 (32-bit) — argument/return register 0.
-pub const X0: u8 = 0;
+pub const X0: u32 = 0;
 /// General-purpose register X1 (64-bit) / W1 (32-bit) — argument/return register 1.
-pub const X1: u8 = 1;
+pub const X1: u32 = 1;
 /// General-purpose register X2 (64-bit) / W2 (32-bit) — argument/return register 2.
-pub const X2: u8 = 2;
+pub const X2: u32 = 2;
 /// General-purpose register X3 (64-bit) / W3 (32-bit) — argument/return register 3.
-pub const X3: u8 = 3;
+pub const X3: u32 = 3;
 /// General-purpose register X4 (64-bit) / W4 (32-bit) — argument register 4.
-pub const X4: u8 = 4;
+pub const X4: u32 = 4;
 /// General-purpose register X5 (64-bit) / W5 (32-bit) — argument register 5.
-pub const X5: u8 = 5;
+pub const X5: u32 = 5;
 /// General-purpose register X6 (64-bit) / W6 (32-bit) — argument register 6.
-pub const X6: u8 = 6;
+pub const X6: u32 = 6;
 /// General-purpose register X7 (64-bit) / W7 (32-bit) — argument register 7.
-pub const X7: u8 = 7;
+pub const X7: u32 = 7;
 /// General-purpose register X8 (64-bit) / W8 (32-bit) — indirect result location.
-pub const X8: u8 = 8;
+pub const X8: u32 = 8;
 /// General-purpose register X9 (64-bit) / W9 (32-bit) — temporary/scratch.
-pub const X9: u8 = 9;
+pub const X9: u32 = 9;
 /// General-purpose register X10 (64-bit) / W10 (32-bit) — temporary/scratch.
-pub const X10: u8 = 10;
+pub const X10: u32 = 10;
 /// General-purpose register X11 (64-bit) / W11 (32-bit) — temporary/scratch.
-pub const X11: u8 = 11;
+pub const X11: u32 = 11;
 /// General-purpose register X12 (64-bit) / W12 (32-bit) — temporary/scratch.
-pub const X12: u8 = 12;
+pub const X12: u32 = 12;
 /// General-purpose register X13 (64-bit) / W13 (32-bit) — temporary/scratch.
-pub const X13: u8 = 13;
+pub const X13: u32 = 13;
 /// General-purpose register X14 (64-bit) / W14 (32-bit) — temporary/scratch.
-pub const X14: u8 = 14;
+pub const X14: u32 = 14;
 /// General-purpose register X15 (64-bit) / W15 (32-bit) — temporary/scratch.
-pub const X15: u8 = 15;
+pub const X15: u32 = 15;
 /// General-purpose register X16 (64-bit) / W16 (32-bit) — IP0 intra-procedure-call scratch.
-pub const X16: u8 = 16;
+pub const X16: u32 = 16;
 /// General-purpose register X17 (64-bit) / W17 (32-bit) — IP1 intra-procedure-call scratch.
-pub const X17: u8 = 17;
+pub const X17: u32 = 17;
 /// General-purpose register X18 (64-bit) / W18 (32-bit) — platform register.
-pub const X18: u8 = 18;
+pub const X18: u32 = 18;
 /// General-purpose register X19 (64-bit) / W19 (32-bit) — callee-saved.
-pub const X19: u8 = 19;
+pub const X19: u32 = 19;
 /// General-purpose register X20 (64-bit) / W20 (32-bit) — callee-saved.
-pub const X20: u8 = 20;
+pub const X20: u32 = 20;
 /// General-purpose register X21 (64-bit) / W21 (32-bit) — callee-saved.
-pub const X21: u8 = 21;
+pub const X21: u32 = 21;
 /// General-purpose register X22 (64-bit) / W22 (32-bit) — callee-saved.
-pub const X22: u8 = 22;
+pub const X22: u32 = 22;
 /// General-purpose register X23 (64-bit) / W23 (32-bit) — callee-saved.
-pub const X23: u8 = 23;
+pub const X23: u32 = 23;
 /// General-purpose register X24 (64-bit) / W24 (32-bit) — callee-saved.
-pub const X24: u8 = 24;
+pub const X24: u32 = 24;
 /// General-purpose register X25 (64-bit) / W25 (32-bit) — callee-saved.
-pub const X25: u8 = 25;
+pub const X25: u32 = 25;
 /// General-purpose register X26 (64-bit) / W26 (32-bit) — callee-saved.
-pub const X26: u8 = 26;
+pub const X26: u32 = 26;
 /// General-purpose register X27 (64-bit) / W27 (32-bit) — callee-saved.
-pub const X27: u8 = 27;
+pub const X27: u32 = 27;
 /// General-purpose register X28 (64-bit) / W28 (32-bit) — callee-saved.
-pub const X28: u8 = 28;
+pub const X28: u32 = 28;
 /// General-purpose register X29 (64-bit) / W29 (32-bit) — frame pointer (FP).
-pub const X29: u8 = 29;
+pub const X29: u32 = 29;
 /// General-purpose register X30 (64-bit) / W30 (32-bit) — link register (LR).
-pub const X30: u8 = 30;
+pub const X30: u32 = 30;
 
 /// Stack pointer register. Shares hardware encoding 31 with XZR, but
 /// the distinction is made by instruction context. SP-using instructions
 /// (ADD SP, SUB SP, LDR [SP, #imm], STR [SP, #imm]) interpret register 31
 /// as the stack pointer.
-pub const SP_REG: u8 = 31;
+pub const SP_REG: u32 = 31;
 
 /// Zero register (reads as zero, writes are discarded). Shares hardware
 /// encoding 31 with SP. Non-SP instructions (most ALU, logical, move)
 /// interpret register 31 as the zero register.
-pub const XZR: u8 = 31;
+pub const XZR: u32 = 31;
 
 // ===========================================================================
 // ABI Name Aliases for Special Registers
@@ -126,24 +126,24 @@ pub const XZR: u8 = 31;
 /// Frame pointer — alias for X29 per AAPCS64. The frame pointer points to
 /// the saved FP location on the stack, forming a linked list of stack frames
 /// for unwinding and debugging.
-pub const FP_REG: u8 = X29;
+pub const FP_REG: u32 = X29;
 
 /// Link register — alias for X30. Stores the return address set by BL/BLR
 /// instructions. The RET instruction defaults to branching to the address in LR.
-pub const LR: u8 = X30;
+pub const LR: u32 = X30;
 
 /// Intra-procedure-call scratch register 0 — alias for X16. Used by the
 /// linker for veneers and PLT stubs. May be clobbered between a function
 /// call and its entry into the callee.
-pub const IP0: u8 = X16;
+pub const IP0: u32 = X16;
 
 /// Intra-procedure-call scratch register 1 — alias for X17. Used by the
 /// linker together with IP0 for longer-range veneers.
-pub const IP1: u8 = X17;
+pub const IP1: u32 = X17;
 
 /// Platform register — alias for X18. Reserved on some operating systems
 /// (e.g., macOS, Windows) but usable on Linux. Treated as caller-saved.
-pub const PR: u8 = X18;
+pub const PR: u32 = X18;
 
 // ===========================================================================
 // SIMD/FP Register ID Constants (V0–V31)
@@ -153,69 +153,69 @@ pub const PR: u8 = X18;
 // to hardware register 0, V31 maps to hardware register 31).
 
 /// SIMD/FP register V0 (128-bit) — FP argument/return register 0.
-pub const V0: u8 = 32;
+pub const V0: u32 = 32;
 /// SIMD/FP register V1 (128-bit) — FP argument/return register 1.
-pub const V1: u8 = 33;
+pub const V1: u32 = 33;
 /// SIMD/FP register V2 (128-bit) — FP argument/return register 2.
-pub const V2: u8 = 34;
+pub const V2: u32 = 34;
 /// SIMD/FP register V3 (128-bit) — FP argument/return register 3.
-pub const V3: u8 = 35;
+pub const V3: u32 = 35;
 /// SIMD/FP register V4 (128-bit) — FP argument register 4.
-pub const V4: u8 = 36;
+pub const V4: u32 = 36;
 /// SIMD/FP register V5 (128-bit) — FP argument register 5.
-pub const V5: u8 = 37;
+pub const V5: u32 = 37;
 /// SIMD/FP register V6 (128-bit) — FP argument register 6.
-pub const V6: u8 = 38;
+pub const V6: u32 = 38;
 /// SIMD/FP register V7 (128-bit) — FP argument register 7.
-pub const V7: u8 = 39;
+pub const V7: u32 = 39;
 /// SIMD/FP register V8 (128-bit) — callee-saved (lower 64 bits D8 only).
-pub const V8: u8 = 40;
+pub const V8: u32 = 40;
 /// SIMD/FP register V9 (128-bit) — callee-saved (lower 64 bits D9 only).
-pub const V9: u8 = 41;
+pub const V9: u32 = 41;
 /// SIMD/FP register V10 (128-bit) — callee-saved (lower 64 bits D10 only).
-pub const V10: u8 = 42;
+pub const V10: u32 = 42;
 /// SIMD/FP register V11 (128-bit) — callee-saved (lower 64 bits D11 only).
-pub const V11: u8 = 43;
+pub const V11: u32 = 43;
 /// SIMD/FP register V12 (128-bit) — callee-saved (lower 64 bits D12 only).
-pub const V12: u8 = 44;
+pub const V12: u32 = 44;
 /// SIMD/FP register V13 (128-bit) — callee-saved (lower 64 bits D13 only).
-pub const V13: u8 = 45;
+pub const V13: u32 = 45;
 /// SIMD/FP register V14 (128-bit) — callee-saved (lower 64 bits D14 only).
-pub const V14: u8 = 46;
+pub const V14: u32 = 46;
 /// SIMD/FP register V15 (128-bit) — callee-saved (lower 64 bits D15 only).
-pub const V15: u8 = 47;
+pub const V15: u32 = 47;
 /// SIMD/FP register V16 (128-bit) — temporary/scratch.
-pub const V16: u8 = 48;
+pub const V16: u32 = 48;
 /// SIMD/FP register V17 (128-bit) — temporary/scratch.
-pub const V17: u8 = 49;
+pub const V17: u32 = 49;
 /// SIMD/FP register V18 (128-bit) — temporary/scratch.
-pub const V18: u8 = 50;
+pub const V18: u32 = 50;
 /// SIMD/FP register V19 (128-bit) — temporary/scratch.
-pub const V19: u8 = 51;
+pub const V19: u32 = 51;
 /// SIMD/FP register V20 (128-bit) — temporary/scratch.
-pub const V20: u8 = 52;
+pub const V20: u32 = 52;
 /// SIMD/FP register V21 (128-bit) — temporary/scratch.
-pub const V21: u8 = 53;
+pub const V21: u32 = 53;
 /// SIMD/FP register V22 (128-bit) — temporary/scratch.
-pub const V22: u8 = 54;
+pub const V22: u32 = 54;
 /// SIMD/FP register V23 (128-bit) — temporary/scratch.
-pub const V23: u8 = 55;
+pub const V23: u32 = 55;
 /// SIMD/FP register V24 (128-bit) — temporary/scratch.
-pub const V24: u8 = 56;
+pub const V24: u32 = 56;
 /// SIMD/FP register V25 (128-bit) — temporary/scratch.
-pub const V25: u8 = 57;
+pub const V25: u32 = 57;
 /// SIMD/FP register V26 (128-bit) — temporary/scratch.
-pub const V26: u8 = 58;
+pub const V26: u32 = 58;
 /// SIMD/FP register V27 (128-bit) — temporary/scratch.
-pub const V27: u8 = 59;
+pub const V27: u32 = 59;
 /// SIMD/FP register V28 (128-bit) — temporary/scratch.
-pub const V28: u8 = 60;
+pub const V28: u32 = 60;
 /// SIMD/FP register V29 (128-bit) — temporary/scratch.
-pub const V29: u8 = 61;
+pub const V29: u32 = 61;
 /// SIMD/FP register V30 (128-bit) — temporary/scratch.
-pub const V30: u8 = 62;
+pub const V30: u32 = 62;
 /// SIMD/FP register V31 (128-bit) — temporary/scratch.
-pub const V31: u8 = 63;
+pub const V31: u32 = 63;
 
 // ===========================================================================
 // Register Class Definitions
@@ -247,9 +247,9 @@ pub const NUM_FPRS: usize = 32;
 /// Total register count across both classes (GPR + FPR = 64).
 pub const TOTAL_REGS: usize = NUM_GPRS + NUM_FPRS;
 
-/// Number of allocatable GPRs: X0–X28 (29 registers).
-/// Excludes X29 (FP), X30 (LR), and SP/XZR (31).
-pub const NUM_ALLOCATABLE_GPRS: usize = 29;
+/// Number of allocatable GPRs: X0–X15, X17–X28 (28 registers).
+/// Excludes X16 (IP0/spill scratch), X29 (FP), X30 (LR), and SP/XZR (31).
+pub const NUM_ALLOCATABLE_GPRS: usize = 28;
 
 // ===========================================================================
 // Register Sets for the Register Allocator
@@ -261,12 +261,14 @@ pub const NUM_ALLOCATABLE_GPRS: usize = 29;
 /// temporaries) followed by callee-saved registers. This ordering allows
 /// the register allocator to prefer registers that do not require
 /// save/restore in the prologue/epilogue.
-pub const ALLOCATABLE_GPRS: &[u8] = &[
+pub const ALLOCATABLE_GPRS: &[u32] = &[
     // Caller-saved temporaries (preferred for allocation — no save overhead)
     X0, X1, X2, X3, X4, X5, X6, X7, // argument registers, scratch after use
     X8, // indirect result location register
     X9, X10, X11, X12, X13, X14, X15, // scratch temporaries
-    X16, X17, // IP0, IP1 — intra-procedure scratch
+    // X16 (IP0) is RESERVED as the spill-reload scratch register and
+    // codegen scratch — never allocatable.
+    X17, // IP1 — intra-procedure scratch (allocatable on Linux)
     X18, // platform register (usable on Linux)
     // Callee-saved (allocator will prefer caller-saved first)
     X19, X20, X21, X22, X23, X24, X25, X26, X27, X28,
@@ -277,7 +279,7 @@ pub const ALLOCATABLE_GPRS: &[u8] = &[
 /// Ordered with caller-saved registers first (preferred for short-lived
 /// temporaries) followed by callee-saved registers (V8–V15, of which
 /// only the lower 64 bits D8–D15 are preserved by the callee).
-pub const ALLOCATABLE_FPRS: &[u8] = &[
+pub const ALLOCATABLE_FPRS: &[u32] = &[
     // Caller-saved (argument + scratch — no save overhead)
     V0, V1, V2, V3, V4, V5, V6, V7, // FP argument/return registers
     V16, V17, V18, V19, V20, V21, V22, V23, // scratch temporaries
@@ -295,13 +297,13 @@ pub const ALLOCATABLE_FPRS: &[u8] = &[
 /// These registers must be preserved across function calls. If a function
 /// uses any of these registers, it must save them in the prologue and
 /// restore them in the epilogue.
-pub const CALLEE_SAVED_GPRS: &[u8] = &[X19, X20, X21, X22, X23, X24, X25, X26, X27, X28];
+pub const CALLEE_SAVED_GPRS: &[u32] = &[X19, X20, X21, X22, X23, X24, X25, X26, X27, X28];
 
 /// Callee-saved FP registers per AAPCS64: V8–V15 (8 registers).
 ///
 /// Only the lower 64 bits (D8–D15) are preserved by the callee.
 /// The upper 64 bits of V8–V15 are NOT preserved across calls.
-pub const CALLEE_SAVED_FPRS: &[u8] = &[V8, V9, V10, V11, V12, V13, V14, V15];
+pub const CALLEE_SAVED_FPRS: &[u32] = &[V8, V9, V10, V11, V12, V13, V14, V15];
 
 /// Caller-saved GPRs per AAPCS64: X0–X18, X30 (LR) — 20 registers.
 ///
@@ -313,14 +315,14 @@ pub const CALLEE_SAVED_FPRS: &[u8] = &[V8, V9, V10, V11, V12, V13, V14, V15];
 /// prologue/epilogue, so it does not appear in either set for allocation.
 /// X30 (LR) is caller-saved because the callee may use BL which
 /// overwrites LR.
-pub const CALLER_SAVED_GPRS: &[u8] = &[
+pub const CALLER_SAVED_GPRS: &[u32] = &[
     X0, X1, X2, X3, X4, X5, X6, X7, X8, X9, X10, X11, X12, X13, X14, X15, X16, X17, X18, X30,
 ];
 
 /// Caller-saved FP registers per AAPCS64: V0–V7, V16–V31 — 24 registers.
 ///
 /// These registers may be clobbered by any function call.
-pub const CALLER_SAVED_FPRS: &[u8] = &[
+pub const CALLER_SAVED_FPRS: &[u32] = &[
     V0, V1, V2, V3, V4, V5, V6, V7, V16, V17, V18, V19, V20, V21, V22, V23, V24, V25, V26, V27,
     V28, V29, V30, V31,
 ];
@@ -330,8 +332,9 @@ pub const CALLER_SAVED_FPRS: &[u8] = &[
 /// SP (encoding 31) is the stack pointer and must never be used as a
 /// general-purpose register. X29 (FP) and X30 (LR) are handled
 /// separately by the prologue/epilogue generator but are excluded from
-/// the allocatable set above.
-pub const RESERVED_REGS: &[u8] = &[SP_REG];
+/// the allocatable set above.  X16 (IP0) is reserved as the spill-
+/// reload scratch register used by `apply_allocation_result`.
+pub const RESERVED_REGS: &[u32] = &[SP_REG, X16];
 
 // ===========================================================================
 // Static Name Tables for Register Name Lookups
@@ -396,7 +399,7 @@ const FPR_NAMES_S: [&str; 32] = [
 /// Returns "unknown" for register IDs > 31 (defensive — should not happen
 /// in well-formed code).
 #[inline]
-pub fn gpr_name(reg: u8) -> &'static str {
+pub fn gpr_name(reg: u32) -> &'static str {
     if (reg as usize) < GPR_NAMES_X.len() {
         GPR_NAMES_X[reg as usize]
     } else {
@@ -419,7 +422,7 @@ pub fn gpr_name(reg: u8) -> &'static str {
 ///
 /// The assembly name (e.g., "x0", "x29", "xzr").
 #[inline]
-pub fn gpr_name_or_zr(reg: u8) -> &'static str {
+pub fn gpr_name_or_zr(reg: u32) -> &'static str {
     if (reg as usize) < GPR_NAMES_X_ZR.len() {
         GPR_NAMES_X_ZR[reg as usize]
     } else {
@@ -440,7 +443,7 @@ pub fn gpr_name_or_zr(reg: u8) -> &'static str {
 ///
 /// The V-register assembly name (e.g., "v0", "v15", "v31").
 #[inline]
-pub fn fpr_name(reg: u8) -> &'static str {
+pub fn fpr_name(reg: u32) -> &'static str {
     let idx = reg.wrapping_sub(32) as usize;
     if idx < FPR_NAMES_V.len() {
         FPR_NAMES_V[idx]
@@ -461,7 +464,7 @@ pub fn fpr_name(reg: u8) -> &'static str {
 ///
 /// The D-register assembly name (e.g., "d0", "d15", "d31").
 #[inline]
-pub fn fpr_name_d(reg: u8) -> &'static str {
+pub fn fpr_name_d(reg: u32) -> &'static str {
     let idx = reg.wrapping_sub(32) as usize;
     if idx < FPR_NAMES_D.len() {
         FPR_NAMES_D[idx]
@@ -482,7 +485,7 @@ pub fn fpr_name_d(reg: u8) -> &'static str {
 ///
 /// The S-register assembly name (e.g., "s0", "s15", "s31").
 #[inline]
-pub fn fpr_name_s(reg: u8) -> &'static str {
+pub fn fpr_name_s(reg: u32) -> &'static str {
     let idx = reg.wrapping_sub(32) as usize;
     if idx < FPR_NAMES_S.len() {
         FPR_NAMES_S[idx]
@@ -506,7 +509,7 @@ pub fn fpr_name_s(reg: u8) -> &'static str {
 ///
 /// The register assembly name.
 #[inline]
-pub fn reg_name(reg: u8) -> &'static str {
+pub fn reg_name(reg: u32) -> &'static str {
     if reg < 32 {
         gpr_name(reg)
     } else if reg < 64 {
@@ -527,7 +530,7 @@ pub fn reg_name(reg: u8) -> &'static str {
 ///
 /// * `reg` - Register ID.
 #[inline]
-pub fn is_gpr(reg: u8) -> bool {
+pub fn is_gpr(reg: u32) -> bool {
     reg <= 31
 }
 
@@ -538,7 +541,7 @@ pub fn is_gpr(reg: u8) -> bool {
 ///
 /// * `reg` - Register ID.
 #[inline]
-pub fn is_fpr(reg: u8) -> bool {
+pub fn is_fpr(reg: u32) -> bool {
     (32..=63).contains(&reg)
 }
 
@@ -551,7 +554,7 @@ pub fn is_fpr(reg: u8) -> bool {
 ///
 /// * `reg` - Register ID.
 #[inline]
-pub fn is_callee_saved(reg: u8) -> bool {
+pub fn is_callee_saved(reg: u32) -> bool {
     // GPR callee-saved: X19–X28
     if (X19..=X28).contains(&reg) {
         return true;
@@ -576,7 +579,7 @@ pub fn is_callee_saved(reg: u8) -> bool {
 ///
 /// * `reg` - Register ID.
 #[inline]
-pub fn is_caller_saved(reg: u8) -> bool {
+pub fn is_caller_saved(reg: u32) -> bool {
     // GPR caller-saved: X0–X18, X30 (LR)
     if reg <= X18 || reg == X30 {
         return true;
@@ -599,7 +602,7 @@ pub fn is_caller_saved(reg: u8) -> bool {
 ///
 /// * `reg` - Register ID.
 #[inline]
-pub fn is_reserved(reg: u8) -> bool {
+pub fn is_reserved(reg: u32) -> bool {
     // SP is the only unconditionally reserved register
     // Note: SP_REG == XZR == 31, both use the same encoding
     // In practice, encoding 31 in the GPR space is never allocatable
@@ -615,7 +618,7 @@ pub fn is_reserved(reg: u8) -> bool {
 ///
 /// * `reg` - Register ID.
 #[inline]
-pub fn is_allocatable(reg: u8) -> bool {
+pub fn is_allocatable(reg: u32) -> bool {
     ALLOCATABLE_GPRS.contains(&reg) || ALLOCATABLE_FPRS.contains(&reg)
 }
 
@@ -630,7 +633,7 @@ pub fn is_allocatable(reg: u8) -> bool {
 ///
 /// * `reg` - Register ID.
 #[inline]
-pub fn reg_class(reg: u8) -> RegClass {
+pub fn reg_class(reg: u32) -> RegClass {
     if reg < 32 {
         RegClass::GPR
     } else if reg < 64 {
@@ -658,11 +661,11 @@ pub fn reg_class(reg: u8) -> RegClass {
 ///
 /// The 5-bit hardware encoding (0–31).
 #[inline]
-pub fn hw_encoding(reg: u8) -> u8 {
+pub fn hw_encoding(reg: u32) -> u8 {
     if reg < 32 {
-        reg
+        reg as u8
     } else {
-        reg - 32
+        (reg - 32) as u8
     }
 }
 

@@ -28,10 +28,10 @@ use crate::backend::x86_64::abi::{
     self, RetLocation, X86_64Abi, INTEGER_ARG_REGS, RED_ZONE_SIZE, SSE_ARG_REGS,
 };
 use crate::backend::x86_64::registers::{
-    self, CALLEE_SAVED_GPRS, RAX, RBP, RCX, RDX, RSP, XMM0, XMM1,
+    self, CALLEE_SAVED_GPRS, R10, R11, R8, R9, RAX, RBP, RCX, RDI, RDX, RSI, RSP, XMM0, XMM1,
 };
 use crate::common::diagnostics::{DiagnosticEngine, Span};
-use crate::common::fx_hash::FxHashMap;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::target::Target;
 use crate::ir::function::IrFunction;
 use crate::ir::instructions::{BinOp, FCmpOp, ICmpOp, Instruction, Value};
@@ -227,6 +227,19 @@ pub enum X86Opcode {
     Pause,
     /// `LFENCE` — load fence (used in retpoline).
     Lfence,
+
+    // -- Bit manipulation --
+    /// `BSR dst, src` — Bit Scan Reverse (find highest set bit index).
+    Bsr,
+    /// `BSF dst, src` — Bit Scan Forward (find lowest set bit index).
+    Bsf,
+    /// `POPCNT dst, src` — Population count (number of set bits).
+    Popcnt,
+    /// `BSWAP r` — Byte swap (endianness conversion).
+    Bswap,
+    /// `UD2` — Undefined instruction (trap).
+    Ud2,
+
     /// Inline assembly marker — template is carried in the operands.
     InlineAsm,
 }
@@ -353,6 +366,11 @@ impl X86Opcode {
             X86Opcode::Endbr64,
             X86Opcode::Pause,
             X86Opcode::Lfence,
+            X86Opcode::Bsr,
+            X86Opcode::Bsf,
+            X86Opcode::Popcnt,
+            X86Opcode::Bswap,
+            X86Opcode::Ud2,
             X86Opcode::InlineAsm,
         ];
         TABLE.get(val as usize).copied()
@@ -426,6 +444,13 @@ pub struct FrameLayout {
     pub has_calls: bool,
     /// Callee-saved registers that are used and must be saved/restored.
     pub callee_saved: Vec<u16>,
+    /// RBP-relative offset of the variadic register save area (negative).
+    /// Set only for variadic functions.  The save area holds 6 GPR slots
+    /// (RDI, RSI, RDX, RCX, R8, R9) at consecutive 8-byte offsets.
+    pub va_save_area_offset: Option<i32>,
+    /// Number of named (non-variadic) GPR parameters.  Used by va_start
+    /// to compute the address of the first variadic argument.
+    pub named_gpr_count: usize,
 }
 
 // ===========================================================================
@@ -476,6 +501,34 @@ pub struct X86_64CodeGen {
     /// global variable name.  Used to emit RIP-relative addressing for
     /// global variable loads/stores on x86-64.
     global_var_refs: FxHashMap<Value, String>,
+}
+
+// =========================================================================
+// Variadic argument helpers
+// =========================================================================
+
+/// Load a 64-bit value from a va_list slot.  When the slot is a Memory
+/// operand (stack alloca), we emit `MOV dst, [mem]`.  When it's a register
+/// (pointer to the slot), we emit `LoadInd dst, reg`.
+fn va_load_from_slot(slot: &MachineOperand, dst: MachineOperand) -> MachineInstruction {
+    match slot {
+        MachineOperand::Memory { .. } | MachineOperand::FrameSlot(_) => {
+            X86_64CodeGen::mk_inst(X86Opcode::Mov, Some(dst), &[slot.clone()])
+        }
+        _ => X86_64CodeGen::mk_inst(X86Opcode::LoadInd, Some(dst), &[slot.clone()]),
+    }
+}
+
+/// Store a 64-bit value into a va_list slot.  When the slot is a Memory
+/// operand (stack alloca), we emit `MOV [mem], src`.  When it's a register
+/// (pointer), we emit `StoreInd [reg], src`.
+fn va_store_to_slot(slot: &MachineOperand, src: MachineOperand) -> MachineInstruction {
+    match slot {
+        MachineOperand::Memory { .. } | MachineOperand::FrameSlot(_) => {
+            X86_64CodeGen::mk_inst(X86Opcode::Mov, None, &[slot.clone(), src])
+        }
+        _ => X86_64CodeGen::mk_inst(X86Opcode::StoreInd, None, &[slot.clone(), src]),
+    }
 }
 
 impl X86_64CodeGen {
@@ -899,7 +952,28 @@ impl X86_64CodeGen {
             Vec::new()
         };
 
-        // Spill area starts after local allocas.
+        // For variadic functions: reserve a 48-byte register save area
+        // (6 GPR parameter registers × 8 bytes) so that va_start/va_arg
+        // can walk the variadic arguments.  Count how many named parameters
+        // are passed in GPRs (up to 6).
+        let mut va_save_area_offset: Option<i32> = None;
+        let mut named_gpr_count: usize = 0;
+        if func.is_variadic {
+            // Count named GPR parameters.
+            for p in &func.params {
+                let is_fp = matches!(p.ty, IrType::F32 | IrType::F64 | IrType::F80);
+                if !is_fp {
+                    named_gpr_count += 1;
+                }
+            }
+            // Reserve 48 bytes for the 6 GPR save slots (RDI..R9).
+            current_offset -= 48;
+            // Align to 8.
+            current_offset &= !7;
+            va_save_area_offset = Some(current_offset as i32);
+        }
+
+        // Spill area starts after local allocas (and va save area if any).
         let spill_area_offset = current_offset as i32;
 
         // Total frame size (rounded up to 16-byte alignment).
@@ -921,6 +995,8 @@ impl X86_64CodeGen {
             spill_area_offset,
             has_calls,
             callee_saved,
+            va_save_area_offset,
+            named_gpr_count,
         }
     }
 
@@ -937,7 +1013,7 @@ impl X86_64CodeGen {
     /// sub rsp, <frame_size>   ; if frame_size > 0
     /// ; save callee-saved registers used by the function
     /// ```
-    pub fn emit_prologue(&self, mf: &MachineFunction) -> Vec<MachineInstruction> {
+    pub fn emit_prologue_with_va(&self, mf: &MachineFunction) -> Vec<MachineInstruction> {
         let mut prologue = Vec::new();
         let frame_size = mf.frame_size;
 
@@ -956,6 +1032,7 @@ impl X86_64CodeGen {
         ));
 
         // sub rsp, <frame_size>  (only if non-zero and not pure red-zone)
+        // NOTE: frame_size includes space for callee-saved pushes that follow.
         if frame_size > 0 && (!mf.is_leaf || frame_size > RED_ZONE_SIZE) {
             // Stack probe: if frame_size > 4096, emit a probe loop.
             if frame_size > 4096 {
@@ -1013,13 +1090,39 @@ impl X86_64CodeGen {
             }
         }
 
-        // Save callee-saved registers.
+        // Save callee-saved registers (after SUB RSP, within the allocated frame).
         for &reg in &mf.callee_saved_regs {
             prologue.push(Self::mk_inst(
                 X86Opcode::Push,
                 None,
                 &[MachineOperand::Register(reg)],
             ));
+        }
+
+        // For variadic functions: save the 6 integer parameter registers
+        // (RDI, RSI, RDX, RCX, R8, R9) to the register save area so that
+        // va_start / va_arg can access all variadic arguments uniformly.
+        // Read from MachineFunction (persists across trait boundary).
+        if let Some(va_offset) = mf.va_save_area_offset {
+            let save_regs = [RDI, RSI, RDX, RCX, R8, R9];
+            for (i, &reg) in save_regs.iter().enumerate() {
+                let disp = va_offset as i64 + (i as i64) * 8;
+                // Use Mov with Memory destination (not StoreInd) because
+                // the destination is a known RBP-relative stack slot.
+                prologue.push(Self::mk_inst(
+                    X86Opcode::Mov,
+                    None,
+                    &[
+                        MachineOperand::Memory {
+                            base: Some(RBP),
+                            index: None,
+                            scale: 1,
+                            displacement: disp,
+                        },
+                        MachineOperand::Register(reg),
+                    ],
+                ));
+            }
         }
 
         prologue
@@ -1243,6 +1346,34 @@ impl X86_64CodeGen {
             mf.blocks[0].push_instruction(inst);
         }
 
+        // 3.7  Pre-allocate virtual registers for phi-copy destinations.
+        //       After phi elimination, copies (BitCast instructions) are placed
+        //       in predecessor blocks. A merge block that uses the phi result
+        //       may have a lower block index than the predecessor blocks
+        //       containing the copies. Since the codegen processes blocks in
+        //       sequential order, the USE of the phi result would be encountered
+        //       before the DEFINITION (BitCast).  Pre-allocating vregs here
+        //       ensures that when the merge block references a phi result value,
+        //       the vreg is already present in value_map.
+        {
+            // Collect all unique BitCast destination values (phi copy results).
+            let mut phi_copy_dests: FxHashSet<Value> = FxHashSet::default();
+            for ir_block in func.blocks().iter() {
+                for ir_inst in ir_block.instructions() {
+                    if let Instruction::BitCast { result, .. } = ir_inst {
+                        phi_copy_dests.insert(*result);
+                    }
+                }
+            }
+            // Pre-create a vreg for each unique phi-copy destination.
+            for dest_val in phi_copy_dests {
+                if !self.value_map.contains_key(&dest_val) {
+                    let vr = self.new_vreg();
+                    self.set_value(dest_val, vr);
+                }
+            }
+        }
+
         // 4. Lower each IR basic block.
         for (ir_idx, ir_block) in func.blocks().iter().enumerate() {
             let mach_idx = *self.block_map.get(&ir_idx).unwrap_or(&0);
@@ -1264,6 +1395,8 @@ impl X86_64CodeGen {
             mf.frame_size = frame.total_size;
             mf.is_leaf = !frame.has_calls;
             mf.callee_saved_regs = frame.callee_saved.clone();
+            mf.va_save_area_offset = frame.va_save_area_offset;
+            mf.named_gpr_count = frame.named_gpr_count;
         }
 
         // Mark calls.
@@ -1306,7 +1439,7 @@ impl X86_64CodeGen {
             // ---------------------------------------------------------------
             // Alloca — no codegen; offsets tracked in FrameLayout
             // ---------------------------------------------------------------
-            Instruction::Alloca { result, ty: _, .. } => {
+            Instruction::Alloca { result, ty, .. } => {
                 // Retrieve the RBP-relative offset from the frame layout.
                 if let Some(ref frame) = self.frame {
                     if let Some(&offset) = frame.alloca_offsets.get(result) {
@@ -1703,10 +1836,11 @@ impl X86_64CodeGen {
                         out.push(Self::mk_inst(X86Opcode::Mov, Some(dst), &[base_op]));
                     }
                 } else {
-                    // Compute the element size from the result type.
-                    // result_type is the pointed-to element type; its size_bytes
-                    // gives us the stride for each index.
-                    let elem_size = result_type.size_bytes(&Target::X86_64).max(1) as i64;
+                    // The IR lowering phase pre-computes byte offsets for
+                    // all GEP indices (index * sizeof(element)), so the
+                    // backend treats indices as raw byte displacements
+                    // without additional scaling.
+                    let elem_size: i64 = 1;
 
                     // Start with the base pointer. For global symbols use
                     // LEA (load effective address) since GEP needs the
@@ -1776,20 +1910,47 @@ impl X86_64CodeGen {
                             // use the original base_op which is still
                             // live in its assigned register.
                             {
-                                // Three-operand IMUL: dst = idx * size
-                                // This writes into the GEP result vreg.
-                                out.push(Self::mk_inst(
-                                    X86Opcode::Imul,
-                                    Some(dst.clone()),
-                                    &[idx_op, MachineOperand::Immediate(elem_size)],
-                                ));
-                                // ADD dst, base — add the original
-                                // base address (still in its register).
-                                out.push(Self::mk_inst(
-                                    X86Opcode::Add,
-                                    Some(dst.clone()),
-                                    &[dst.clone(), base_op_saved.clone()],
-                                ));
+                                // When the base is a GlobalSymbol, the IMUL
+                                // will overwrite dst. Save the base LEA
+                                // result to a temp register first.
+                                if matches!(
+                                    &base_op_saved,
+                                    MachineOperand::GlobalSymbol(_)
+                                ) {
+                                    let base_tmp = self.new_vreg();
+                                    out.push(Self::mk_inst(
+                                        X86Opcode::Mov,
+                                        Some(base_tmp.clone()),
+                                        &[dst.clone()],
+                                    ));
+                                    // Three-operand IMUL: dst = idx * size
+                                    out.push(Self::mk_inst(
+                                        X86Opcode::Imul,
+                                        Some(dst.clone()),
+                                        &[idx_op, MachineOperand::Immediate(elem_size)],
+                                    ));
+                                    // ADD dst, base_tmp
+                                    out.push(Self::mk_inst(
+                                        X86Opcode::Add,
+                                        Some(dst.clone()),
+                                        &[dst.clone(), base_tmp],
+                                    ));
+                                } else {
+                                    // Three-operand IMUL: dst = idx * size
+                                    // This writes into the GEP result vreg.
+                                    out.push(Self::mk_inst(
+                                        X86Opcode::Imul,
+                                        Some(dst.clone()),
+                                        &[idx_op, MachineOperand::Immediate(elem_size)],
+                                    ));
+                                    // ADD dst, base — add the original
+                                    // base address (still in its register).
+                                    out.push(Self::mk_inst(
+                                        X86Opcode::Add,
+                                        Some(dst.clone()),
+                                        &[dst.clone(), base_op_saved.clone()],
+                                    ));
+                                }
                             }
                         }
                     }
@@ -1858,6 +2019,7 @@ impl X86_64CodeGen {
                 result,
                 value,
                 to_type: _,
+                from_type,
                 ..
             } => {
                 let src = self.get_value(*value);
@@ -1866,7 +2028,21 @@ impl X86_64CodeGen {
                 // MOVZX for 8→32, 16→32.  For 32→64, a 32-bit MOV
                 // implicitly zero-extends on x86-64.
                 let opcode = X86Opcode::MovZX;
-                vec![Self::mk_inst(opcode, Some(dst), &[src])]
+                let mut inst = Self::mk_inst(opcode, Some(dst), &[src]);
+                // Set operand_size so the encoder knows source width:
+                // 1 = byte source (MOVZBL), 2 = word source (MOVZWL)
+                let src_bytes = match from_type {
+                    IrType::I16 => 2u8,
+                    IrType::I32 => 4u8, // 32→64: MOV implicitly zero-extends
+                    _ => 1u8,           // I8 or default → byte source
+                };
+                inst.operand_size = src_bytes;
+                if src_bytes == 4 {
+                    // 32→64 zero extend: a plain 32-bit MOV zero-extends on x86-64
+                    inst.opcode = X86Opcode::Mov.as_u32();
+                    inst.operand_size = 4;
+                }
+                vec![inst]
             }
 
             // ---------------------------------------------------------------
@@ -1876,12 +2052,20 @@ impl X86_64CodeGen {
                 result,
                 value,
                 to_type: _,
+                from_type,
                 ..
             } => {
                 let src = self.get_value(*value);
                 let dst = self.new_vreg();
                 self.set_value(*result, dst.clone());
-                vec![Self::mk_inst(X86Opcode::MovSX, Some(dst), &[src])]
+                let mut inst = Self::mk_inst(X86Opcode::MovSX, Some(dst), &[src]);
+                let src_bytes = match from_type {
+                    IrType::I16 => 2u8,
+                    IrType::I32 => 4u8,
+                    _ => 1u8,
+                };
+                inst.operand_size = src_bytes;
+                vec![inst]
             }
 
             // ---------------------------------------------------------------
@@ -1926,13 +2110,12 @@ impl X86_64CodeGen {
                 let dst = self.new_vreg();
                 self.set_value(*result, dst.clone());
 
-                // Parse constraints to determine which operands use
-                // immediate ("i"/"n") vs register ("r"/etc.) constraints.
-                // The constraint string format is comma-separated: e.g.
-                // "=r,i" for one output register + one immediate input.
+                // Parse constraints to determine output/input split.
+                // The constraint string is comma-separated: e.g. "=r,r,0"
+                // for one output register + two input registers.
                 let constraint_parts: Vec<&str> = constraints.split(',').collect();
                 // Count output constraints (those starting with '=' or '+')
-                let _num_outputs = constraint_parts
+                let num_outputs = constraint_parts
                     .iter()
                     .filter(|c| {
                         let t = c.trim();
@@ -1940,35 +2123,78 @@ impl X86_64CodeGen {
                     })
                     .count();
 
+                // Build the operand list for the MachineInstruction.
+                // ONLY input operands go here (indices num_outputs.. in the
+                // IR operand list).  Output operands (indices 0..num_outputs)
+                // are alloca pointers handled via the result register;
+                // template `%0..%(num_outputs-1)` map to inst.result,
+                // while `%num_outputs..` map to inst.operands[i - num_outputs].
                 let mut asm_operands = Vec::new();
-                // Bind operands, respecting constraint types.
                 for (idx, op_val) in operands.iter().enumerate() {
-                    // Determine the constraint for this operand.
-                    // Output operands come first, then input operands.
+                    // Skip output pointer operands — they are NOT used in
+                    // template substitution (the result register is used).
+                    if idx < num_outputs {
+                        continue;
+                    }
+                    // Determine constraint type for this input operand.
                     let constraint_idx = idx;
-                    let is_immediate_constraint =
-                        if constraint_idx < constraint_parts.len() {
-                            let c = constraint_parts[constraint_idx].trim();
-                            // Strip output modifiers ('=', '+')
-                            let c = c.trim_start_matches(|ch: char| ch == '=' || ch == '+');
-                            c.contains('i') || c.contains('n') || c.contains('I')
-                        } else {
-                            false
-                        };
+                    let is_immediate_constraint = if constraint_idx < constraint_parts.len() {
+                        let c = constraint_parts[constraint_idx].trim();
+                        let c = c.trim_start_matches(|ch: char| ch == '=' || ch == '+');
+                        c.contains('i') || c.contains('n') || c.contains('I')
+                    } else {
+                        false
+                    };
 
                     if is_immediate_constraint {
-                        // For immediate constraints, look up the constant
-                        // value directly from the constant cache, bypassing
-                        // the value_map (which would give a register).
                         if let Some(&imm) = self.constant_cache.get(op_val) {
                             asm_operands.push(MachineOperand::Immediate(imm));
                         } else {
-                            // Fallback: use get_value which may return a
-                            // register if the constant wasn't cached.
                             asm_operands.push(self.get_value(*op_val));
                         }
                     } else {
                         asm_operands.push(self.get_value(*op_val));
+                    }
+                }
+
+                // For read-write ('+') constraints, the input value must
+                // be pre-loaded into the result register so that the
+                // template's %0 operand already contains the input value
+                // when the inline asm executes.  The IR appends read-write
+                // input values after the regular inputs in the operand
+                // list.  We detect read-write outputs and emit a MOV from
+                // the loaded input into the result register.
+                let mut pre_moves: Vec<MachineInstruction> = Vec::new();
+                {
+                    // Count explicit (non-read-write-implicit) inputs in the
+                    // constraints string.
+                    let num_explicit_inputs = constraint_parts
+                        .iter()
+                        .filter(|c| {
+                            let t = c.trim();
+                            !t.starts_with('=') && !t.starts_with('+')
+                        })
+                        .count();
+                    // Read-write input values start after output pointers and
+                    // explicit inputs in the IR operand list.
+                    let rw_start = num_outputs + num_explicit_inputs;
+                    let mut rw_idx = 0;
+                    for (ci, cp) in constraint_parts.iter().enumerate() {
+                        let t = cp.trim();
+                        if t.starts_with('+') && ci < num_outputs {
+                            // This output is read-write.  Find its loaded
+                            // input value from the operand list.
+                            let op_idx = rw_start + rw_idx;
+                            if op_idx < operands.len() {
+                                let src_op = self.get_value(operands[op_idx]);
+                                let mut mov =
+                                    MachineInstruction::new(X86Opcode::Mov.as_u32());
+                                mov.result = Some(dst.clone());
+                                mov.operands.push(src_op);
+                                pre_moves.push(mov);
+                            }
+                            rw_idx += 1;
+                        }
                     }
                 }
 
@@ -1977,15 +2203,21 @@ impl X86_64CodeGen {
                 for op in &asm_operands {
                     inst.operands.push(op.clone());
                 }
-                // Store the inline assembly template and clobbers for the
-                // assembler to process after register allocation.
+                // Store num_outputs so the assembler can map template
+                // placeholders correctly: %0..%(n-1) → result register,
+                // %n.. → operands[i - n].
+                inst.asm_num_outputs = num_outputs;
                 inst.asm_template = Some(template.clone());
                 inst.asm_clobbers = clobbers.clone();
                 // Mark as having side effects to prevent elimination.
                 if *has_side_effects || *is_volatile {
                     inst.is_call = true; // Conservatively treat as call-like.
                 }
-                vec![inst]
+                // Prepend the pre-copy MOV instructions for read-write
+                // outputs, then the inline asm instruction itself.
+                let mut all_insts = pre_moves;
+                all_insts.push(inst);
+                all_insts
             }
         }
     }
@@ -2255,12 +2487,34 @@ impl X86_64CodeGen {
         lhs: Value,
         rhs: Value,
     ) -> Vec<MachineInstruction> {
-        let lhs_op = self.get_value(lhs);
-        let rhs_op = self.get_value(rhs);
+        let mut lhs_op = self.get_value(lhs);
+        let mut rhs_op = self.get_value(rhs);
         let dst = self.new_vreg();
         self.set_value(result, dst.clone());
 
-        let setcc = match op {
+        // x86 CMP requires a register or memory operand as the first
+        // (destination) operand.  If the LHS resolved to an immediate,
+        // swap the operands and mirror the relational condition so the
+        // semantics are preserved:  CMP(a,b) sets flags for a-b;
+        // CMP(b,a) sets flags for b-a, which inverts inequalities.
+        let mut effective_op = op;
+        if matches!(lhs_op, MachineOperand::Immediate(_)) {
+            std::mem::swap(&mut lhs_op, &mut rhs_op);
+            effective_op = match op {
+                ICmpOp::Eq => ICmpOp::Eq,
+                ICmpOp::Ne => ICmpOp::Ne,
+                ICmpOp::Slt => ICmpOp::Sgt,
+                ICmpOp::Sle => ICmpOp::Sge,
+                ICmpOp::Sgt => ICmpOp::Slt,
+                ICmpOp::Sge => ICmpOp::Sle,
+                ICmpOp::Ult => ICmpOp::Ugt,
+                ICmpOp::Ule => ICmpOp::Uge,
+                ICmpOp::Ugt => ICmpOp::Ult,
+                ICmpOp::Uge => ICmpOp::Ule,
+            };
+        }
+
+        let setcc = match effective_op {
             ICmpOp::Eq => X86Opcode::Sete,
             ICmpOp::Ne => X86Opcode::Setne,
             ICmpOp::Slt => X86Opcode::Setl,
@@ -2350,16 +2604,21 @@ impl X86_64CodeGen {
                     FCmpOp::Oge => X86Opcode::Setae, // CF=0
                     FCmpOp::Uno | FCmpOp::Ord => unreachable!(),
                 };
-                let tmp_parity = self.new_vreg();
+                // Use the physical scratch register R11 for the parity
+                // temporary.  R11 is excluded from the allocatable pool so
+                // there is no conflict with the register allocator, and we
+                // avoid creating an unmapped virtual register that the
+                // allocator cannot resolve.
+                let tmp_parity = MachineOperand::Register(R11);
                 // SETcc  dst  ← primary condition flag
                 out.push(Self::mk_inst(primary_cc, Some(dst.clone()), &[]));
-                // SETNP  tmp  ← PF=0 means NOT NaN
+                // SETNP  R11  ← PF=0 means NOT NaN
                 out.push(Self::mk_inst(
                     X86Opcode::Setnp,
                     Some(tmp_parity.clone()),
                     &[],
                 ));
-                // AND dst, tmp  ← result is true only if (condition AND !NaN)
+                // AND dst, R11  ← result is true only if (condition AND !NaN)
                 out.push(Self::mk_inst(
                     X86Opcode::And,
                     Some(dst.clone()),
@@ -2377,6 +2636,384 @@ impl X86_64CodeGen {
     // Call instruction selection
     // ===================================================================
 
+    // =================================================================
+    // Builtin intrinsic inlining
+    // =================================================================
+
+    /// Attempt to inline a `__builtin_*` call as architecture-specific
+    /// instructions.  Returns `Some(instructions)` if the builtin is
+    /// recognized and inlined, `None` otherwise (fall through to normal
+    /// call).
+    fn try_inline_builtin(
+        &mut self,
+        name: &str,
+        result: Value,
+        args: &[Value],
+    ) -> Option<Vec<MachineInstruction>> {
+        // Helper: ensure an operand is in a register (load from memory if spilled).
+        let ensure_reg = |this: &mut Self, val: Value| -> (MachineOperand, Vec<MachineInstruction>) {
+            let op = this.get_value(val);
+            match &op {
+                MachineOperand::Register(_) => (op, vec![]),
+                _ => {
+                    let tmp = this.new_vreg();
+                    let mov = Self::mk_inst(X86Opcode::Mov, Some(tmp.clone()), &[op]);
+                    (tmp, vec![mov])
+                }
+            }
+        };
+
+        match name {
+            // ---- count leading zeros ----
+            // BSR finds highest set bit index.  CLZ = (width-1) XOR BSR.
+            // Uses physical register RCX for arg, physical RDX for BSR
+            // result, then captures into dst vreg.
+            "__builtin_clz" | "__builtin_clzl" | "__builtin_clzll" => {
+                let xor_val: i64 = if name == "__builtin_clzll" || name == "__builtin_clzl" { 63 } else { 31 };
+                let mut out = Vec::new();
+                let arg = self.get_value(args[0]);
+                let rcx = MachineOperand::Register(RCX);
+                let rdx = MachineOperand::Register(RDX);
+                // MOV RCX, arg
+                out.push(Self::mk_inst(X86Opcode::Mov, Some(rcx.clone()), &[arg]));
+                // BSR RDX, RCX
+                out.push(Self::mk_inst(X86Opcode::Bsr, Some(rdx.clone()), &[rcx]));
+                // XOR RDX, xor_val  (two-address)
+                out.push(Self::mk_inst(
+                    X86Opcode::Xor,
+                    Some(rdx.clone()),
+                    &[rdx.clone(), MachineOperand::Immediate(xor_val)],
+                ));
+                // MOV dst, RDX
+                let dst = self.new_vreg();
+                self.set_value(result, dst.clone());
+                out.push(Self::mk_inst(X86Opcode::Mov, Some(dst), &[rdx]));
+                Some(out)
+            }
+            // ---- count trailing zeros ----
+            // BSF finds lowest set bit index = CTZ directly.
+            "__builtin_ctz" | "__builtin_ctzl" | "__builtin_ctzll" => {
+                let mut out = Vec::new();
+                let arg = self.get_value(args[0]);
+                let rcx = MachineOperand::Register(RCX);
+                // MOV RCX, arg
+                out.push(Self::mk_inst(X86Opcode::Mov, Some(rcx.clone()), &[arg]));
+                // BSF dst_phys, RCX
+                let rdx = MachineOperand::Register(RDX);
+                out.push(Self::mk_inst(X86Opcode::Bsf, Some(rdx.clone()), &[rcx]));
+                // MOV dst, RDX
+                let dst = self.new_vreg();
+                self.set_value(result, dst.clone());
+                out.push(Self::mk_inst(X86Opcode::Mov, Some(dst), &[rdx]));
+                Some(out)
+            }
+            // ---- population count ----
+            "__builtin_popcount" | "__builtin_popcountl" | "__builtin_popcountll" => {
+                let mut out = Vec::new();
+                let arg = self.get_value(args[0]);
+                let rcx = MachineOperand::Register(RCX);
+                // MOV RCX, arg
+                out.push(Self::mk_inst(X86Opcode::Mov, Some(rcx.clone()), &[arg]));
+                // POPCNT RDX, RCX
+                let rdx = MachineOperand::Register(RDX);
+                out.push(Self::mk_inst(X86Opcode::Popcnt, Some(rdx.clone()), &[rcx]));
+                // MOV dst, RDX
+                let dst = self.new_vreg();
+                self.set_value(result, dst.clone());
+                out.push(Self::mk_inst(X86Opcode::Mov, Some(dst), &[rdx]));
+                Some(out)
+            }
+            // ---- find first set (1-indexed, 0 if input is 0) ----
+            // Uses physical registers for intermediates (same pattern as
+            // IDIV codegen) because the register allocator operates at
+            // the IR level and only sees the Call's result Value.
+            // Caller-saved registers are safe because the IR-level Call
+            // instruction tells the allocator these are clobbered.
+            //   MOV RCX, arg         (save arg to RCX)
+            //   BSF RDX, RCX         (RDX = bit index, ZF=1 if arg==0)
+            //   ADD RDX, 1           (1-indexed)
+            //   TEST RCX, RCX        (re-set ZF from arg)
+            //   SETNE R10B           (R10 low byte = 0 or 1)
+            //   MOVZX R10, R10B      (zero-extend)
+            //   IMUL R10, RDX        (R10 = (BSF+1) * (0 or 1))
+            //   MOV dst, R10         (capture result into allocated vreg)
+            "__builtin_ffs" | "__builtin_ffsl" | "__builtin_ffsll" => {
+                let mut out = Vec::new();
+                let arg = self.get_value(args[0]);
+                let rcx = MachineOperand::Register(RCX);
+                let rdx = MachineOperand::Register(RDX);
+                let r10 = MachineOperand::Register(R10);
+
+                // MOV RCX, arg
+                out.push(Self::mk_inst(X86Opcode::Mov, Some(rcx.clone()), &[arg]));
+                // BSF RDX, RCX
+                out.push(Self::mk_inst(X86Opcode::Bsf, Some(rdx.clone()), &[rcx.clone()]));
+                // ADD RDX, 1  (two-address)
+                out.push(Self::mk_inst(
+                    X86Opcode::Add,
+                    Some(rdx.clone()),
+                    &[rdx.clone(), MachineOperand::Immediate(1)],
+                ));
+                // TEST RCX, RCX
+                out.push(Self::mk_inst(X86Opcode::Test, None, &[rcx.clone(), rcx]));
+                // SETNE R10 (byte portion)
+                out.push(Self::mk_inst(X86Opcode::Setne, Some(r10.clone()), &[]));
+                // MOVZX R10, R10
+                out.push(Self::mk_inst(X86Opcode::MovZX, Some(r10.clone()), &[r10.clone()]));
+                // IMUL R10, RDX  → R10 = R10 * RDX
+                out.push(Self::mk_inst(X86Opcode::Imul, Some(r10.clone()), &[rdx]));
+                // MOV dst, R10
+                let dst = self.new_vreg();
+                self.set_value(result, dst.clone());
+                out.push(Self::mk_inst(X86Opcode::Mov, Some(dst), &[r10]));
+                Some(out)
+            }
+            // ---- byte swap ----
+            "__builtin_bswap32" => {
+                let mut out = Vec::new();
+                let arg = self.get_value(args[0]);
+                let rcx = MachineOperand::Register(RCX);
+                // MOV RCX, arg
+                out.push(Self::mk_inst(X86Opcode::Mov, Some(rcx.clone()), &[arg]));
+                // BSWAP32 RCX  (in-place byte swap; encoder uses 32-bit form)
+                let mut bswap = Self::mk_inst(X86Opcode::Bswap, Some(rcx.clone()), &[rcx.clone()]);
+                bswap.operand_size = 4;
+                out.push(bswap);
+                // MOV dst, RCX
+                let dst = self.new_vreg();
+                self.set_value(result, dst.clone());
+                out.push(Self::mk_inst(X86Opcode::Mov, Some(dst), &[rcx]));
+                Some(out)
+            }
+            "__builtin_bswap64" => {
+                let mut out = Vec::new();
+                let arg = self.get_value(args[0]);
+                let rcx = MachineOperand::Register(RCX);
+                // MOV RCX, arg
+                out.push(Self::mk_inst(X86Opcode::Mov, Some(rcx.clone()), &[arg]));
+                // BSWAP RCX  (64-bit in-place byte swap)
+                out.push(Self::mk_inst(X86Opcode::Bswap, Some(rcx.clone()), &[rcx.clone()]));
+                // MOV dst, RCX
+                let dst = self.new_vreg();
+                self.set_value(result, dst.clone());
+                out.push(Self::mk_inst(X86Opcode::Mov, Some(dst), &[rcx]));
+                Some(out)
+            }
+            "__builtin_bswap16" => {
+                let mut out = Vec::new();
+                let arg = self.get_value(args[0]);
+                let rcx = MachineOperand::Register(RCX);
+                // MOV RCX, arg
+                out.push(Self::mk_inst(X86Opcode::Mov, Some(rcx.clone()), &[arg]));
+                // BSWAP32 RCX then SHR 16 for 16-bit swap
+                let mut bswap = Self::mk_inst(X86Opcode::Bswap, Some(rcx.clone()), &[rcx.clone()]);
+                bswap.operand_size = 4;
+                out.push(bswap);
+                out.push(Self::mk_inst(
+                    X86Opcode::Shr,
+                    Some(rcx.clone()),
+                    &[rcx.clone(), MachineOperand::Immediate(16)],
+                ));
+                // MOV dst, RCX
+                let dst = self.new_vreg();
+                self.set_value(result, dst.clone());
+                out.push(Self::mk_inst(X86Opcode::Mov, Some(dst), &[rcx]));
+                Some(out)
+            }
+            // ---- branch-hint passthrough ----
+            "__builtin_expect" => {
+                let arg = self.get_value(args[0]);
+                let dst = self.new_vreg();
+                self.set_value(result, dst.clone());
+                Some(vec![Self::mk_inst(X86Opcode::Mov, Some(dst), &[arg])])
+            }
+            "__builtin_assume_aligned" => {
+                let arg = self.get_value(args[0]);
+                let dst = self.new_vreg();
+                self.set_value(result, dst.clone());
+                Some(vec![Self::mk_inst(X86Opcode::Mov, Some(dst), &[arg])])
+            }
+            // ---- frame/return address ----
+            "__builtin_frame_address" => {
+                let dst = self.new_vreg();
+                self.set_value(result, dst.clone());
+                Some(vec![Self::mk_inst(
+                    X86Opcode::Mov,
+                    Some(dst),
+                    &[MachineOperand::Register(RBP)],
+                )])
+            }
+            "__builtin_return_address" => {
+                let dst = self.new_vreg();
+                self.set_value(result, dst.clone());
+                Some(vec![Self::mk_inst(
+                    X86Opcode::Mov,
+                    Some(dst),
+                    &[MachineOperand::Memory {
+                        base: Some(RBP),
+                        index: None,
+                        scale: 1,
+                        displacement: 8,
+                    }],
+                )])
+            }
+            // ---- trap / unreachable ----
+            "__builtin_trap" | "__builtin_unreachable" => {
+                let dst = self.new_vreg();
+                self.set_value(result, dst.clone());
+                Some(vec![
+                    Self::mk_inst(X86Opcode::Ud2, None, &[]),
+                    Self::mk_inst(X86Opcode::Mov, Some(dst), &[MachineOperand::Immediate(0)]),
+                ])
+            }
+            // ---- overflow arithmetic ----
+            "__builtin_add_overflow" | "__builtin_sub_overflow" | "__builtin_mul_overflow" => {
+                if args.len() < 3 { return None; }
+                let a = self.get_value(args[0]);
+                let b = self.get_value(args[1]);
+                let result_ptr = self.get_value(args[2]);
+                let op = match name {
+                    "__builtin_add_overflow" => X86Opcode::Add,
+                    "__builtin_sub_overflow" => X86Opcode::Sub,
+                    _ => X86Opcode::Imul,
+                };
+                // Copy only `a` into a fresh vreg `va`, then operate
+                // directly with `b` so the register allocator keeps `b`
+                // alive and in a DIFFERENT register than `va`.
+                let mut out = Vec::new();
+                let r10 = MachineOperand::Register(R10);
+                // va = a (copy a).  b is still live → allocator keeps va ≠ b.
+                let va = self.new_vreg();
+                out.push(Self::mk_inst(X86Opcode::Mov, Some(va.clone()), &[a]));
+                // 64-bit ADD/SUB/IMUL: va = va OP b (b used directly).
+                out.push(Self::mk_inst(op, Some(va.clone()), &[va.clone(), b]));
+                // Store low 32 bits to the result pointer.
+                let mut store = Self::mk_inst(X86Opcode::StoreInd32, None, &[result_ptr, va.clone()]);
+                store.operand_size = 4;
+                out.push(store);
+                // Overflow detection: check if the 64-bit result equals its
+                // 32-bit sign-extension.  SHL+SAR by 32 sign-extends low 32.
+                out.push(Self::mk_inst(X86Opcode::Mov, Some(r10.clone()), &[va.clone()]));
+                out.push(Self::mk_inst(X86Opcode::Shl, Some(r10.clone()), &[r10.clone(), MachineOperand::Immediate(32)]));
+                out.push(Self::mk_inst(X86Opcode::Sar, Some(r10.clone()), &[r10.clone(), MachineOperand::Immediate(32)]));
+                // CMP R10, va — if they differ, 32-bit overflow occurred.
+                out.push(Self::mk_inst(X86Opcode::Cmp, None, &[r10, va]));
+                // SETNE captures "overflow" flag.
+                let vr = self.new_vreg();
+                out.push(Self::mk_inst(X86Opcode::Setne, Some(vr.clone()), &[]));
+                let final_dst = self.new_vreg();
+                self.set_value(result, final_dst.clone());
+                out.push(Self::mk_inst(X86Opcode::MovZX, Some(final_dst), &[vr]));
+                Some(out)
+            }
+            // ---- variadic argument builtins ----
+            // These use physical caller-saved registers for intermediates
+            // (same pattern as __builtin_clz/ffs) because the register
+            // allocator only manages vreg→phys mappings from the IR level.
+            //
+            // va_start: compute address of first variadic arg, store to ap.
+            "__builtin_va_start" => {
+                if args.is_empty() { return None; }
+                let ap_slot = self.get_value(args[0]);
+                let mut out = Vec::new();
+                if let Some(ref frame) = self.frame {
+                    if let Some(va_offset) = frame.va_save_area_offset {
+                        let first_va_offset = va_offset as i64 + (frame.named_gpr_count as i64) * 8;
+                        let rcx = MachineOperand::Register(RCX);
+                        // LEA RCX, [RBP + first_va_offset]
+                        out.push(Self::mk_inst(
+                            X86Opcode::Lea,
+                            Some(rcx.clone()),
+                            &[MachineOperand::Memory {
+                                base: Some(RBP),
+                                index: None,
+                                scale: 1,
+                                displacement: first_va_offset,
+                            }],
+                        ));
+                        // Store RCX to the va_list slot.
+                        out.push(va_store_to_slot(&ap_slot, rcx));
+                    }
+                }
+                let dst = self.new_vreg();
+                self.set_value(result, dst.clone());
+                out.push(Self::mk_inst(
+                    X86Opcode::Mov,
+                    Some(dst),
+                    &[MachineOperand::Immediate(0)],
+                ));
+                Some(out)
+            }
+            // va_arg: load current pointer from ap, dereference, advance, store back.
+            // Uses RCX for current pointer, RDX for loaded value, R10 for next.
+            "__builtin_va_arg" => {
+                if args.is_empty() { return None; }
+                let ap_slot = self.get_value(args[0]);
+                let mut out = Vec::new();
+                let rcx = MachineOperand::Register(RCX);
+                let rdx = MachineOperand::Register(RDX);
+                let r10 = MachineOperand::Register(R10);
+                // Load current va_list pointer: RCX = *ap_slot
+                out.push(va_load_from_slot(&ap_slot, rcx.clone()));
+                // Dereference: RDX = *RCX (load the argument value)
+                out.push(Self::mk_inst(X86Opcode::LoadInd, Some(rdx.clone()), &[rcx.clone()]));
+                // Advance: R10 = RCX + 8  (use LEA for non-destructive add)
+                out.push(Self::mk_inst(
+                    X86Opcode::Lea,
+                    Some(r10.clone()),
+                    &[MachineOperand::Memory {
+                        base: Some(RCX),
+                        index: None,
+                        scale: 1,
+                        displacement: 8,
+                    }],
+                ));
+                // Store back: *ap_slot = R10
+                out.push(va_store_to_slot(&ap_slot, r10));
+                // Capture result value into allocated vreg.
+                let dst = self.new_vreg();
+                self.set_value(result, dst.clone());
+                out.push(Self::mk_inst(X86Opcode::Mov, Some(dst), &[rdx]));
+                Some(out)
+            }
+            // va_end: no-op.
+            "__builtin_va_end" => {
+                let dst = self.new_vreg();
+                self.set_value(result, dst.clone());
+                Some(vec![Self::mk_inst(
+                    X86Opcode::Mov,
+                    Some(dst),
+                    &[MachineOperand::Immediate(0)],
+                )])
+            }
+            // va_copy: copy pointer from src slot to dest slot.
+            "__builtin_va_copy" => {
+                if args.len() < 2 { return None; }
+                let dest_slot = self.get_value(args[0]);
+                let src_slot = self.get_value(args[1]);
+                let mut out = Vec::new();
+                let rcx = MachineOperand::Register(RCX);
+                // Load: RCX = *src_slot
+                out.push(va_load_from_slot(&src_slot, rcx.clone()));
+                // Store: *dest_slot = RCX
+                out.push(va_store_to_slot(&dest_slot, rcx));
+                let dst = self.new_vreg();
+                self.set_value(result, dst.clone());
+                out.push(Self::mk_inst(
+                    X86Opcode::Mov,
+                    Some(dst),
+                    &[MachineOperand::Immediate(0)],
+                ));
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+
+    // =================================================================
+    // End of try_inline_builtin
+    // =================================================================
+
     fn select_call(
         &mut self,
         result: Value,
@@ -2385,20 +3022,34 @@ impl X86_64CodeGen {
         return_type: &IrType,
         func: &IrFunction,
     ) -> Vec<MachineInstruction> {
+        // Intercept __builtin_* intrinsic calls and emit inline code.
+        if let Some(fname) = self.func_ref_names.get(&callee).cloned() {
+            if let Some(inlined) = self.try_inline_builtin(&fname, result, args) {
+                return inlined;
+            }
+        }
+
         let mut out = Vec::new();
         let mut gpr_idx: usize = 0;
         let mut sse_idx: usize = 0;
         let mut stack_offset: i32 = 0;
 
         // 1. Place arguments in registers/stack per System V AMD64 ABI.
+        //    Register arguments are emitted immediately; stack arguments
+        //    are collected and pushed in reverse (right-to-left) order so
+        //    that the first stack argument ends up at the lowest address
+        //    as required by the ABI.
+        let mut stack_args: Vec<MachineOperand> = Vec::new();
+
         for arg_val in args {
             let arg_op = self.get_value(*arg_val);
 
             // Determine if this value is a function reference (function
-            // pointer decay).  Function references must use LEA (to
-            // compute the address) rather than MOV (which would load
-            // the first bytes of the function's machine code).
+            // pointer decay) or a global variable address (array-to-pointer
+            // decay).  Both must use LEA (to compute the address) rather
+            // than MOV (which would load the value at that address).
             let is_func_ref = self.func_ref_names.contains_key(arg_val);
+            let is_global_addr = self.global_var_refs.contains_key(arg_val);
 
             // Classify the argument as FP or integer by consulting the
             // value_types map (populated from IR instruction result types).
@@ -2422,9 +3073,10 @@ impl X86_64CodeGen {
                 sse_idx += 1;
             } else if !is_fp && gpr_idx < INTEGER_ARG_REGS.len() {
                 let reg = INTEGER_ARG_REGS[gpr_idx];
-                // For function references, use LEA to load the address
-                // of the function rather than MOV which would dereference it.
-                let opcode = if is_func_ref {
+                // For function references and global variable addresses
+                // (array-to-pointer decay), use LEA to compute the address
+                // rather than MOV which would dereference the symbol.
+                let opcode = if is_func_ref || is_global_addr {
                     X86Opcode::Lea
                 } else {
                     X86Opcode::Mov
@@ -2435,19 +3087,40 @@ impl X86_64CodeGen {
                 out.push(inst);
                 gpr_idx += 1;
             } else {
-                // Stack argument — push in right-to-left order.
-                out.push(Self::mk_inst(X86Opcode::Push, None, &[arg_op]));
+                // Collect stack arguments for reverse-order pushing.
+                stack_args.push(arg_op);
                 stack_offset += 8;
             }
         }
 
-        // 2. For variadic functions, set AL = number of SSE registers used.
-        if func.is_variadic {
-            out.push(Self::mk_inst(
+        // Push stack arguments in reverse order (right-to-left) so the
+        // first stack argument (leftmost in the source) ends up at the
+        // lowest stack address as the ABI requires.
+        for arg_op in stack_args.into_iter().rev() {
+            let mut push_inst = Self::mk_inst(X86Opcode::Push, None, &[arg_op]);
+            push_inst.is_call_arg_setup = true;
+            out.push(push_inst);
+        }
+
+        // 2. Set AL = number of SSE registers used for variadic calls.
+        //    Per the System V AMD64 ABI, AL must contain the count of
+        //    vector (XMM) registers used when calling a variadic function.
+        //    We set AL unconditionally for ALL calls because:
+        //    (a) we may not know at call-site whether the callee is
+        //        variadic (e.g., indirect calls, or a declared-but-not-
+        //        defined function like printf that IS variadic), and
+        //    (b) non-variadic callees simply ignore AL, so this is safe.
+        //    Mark as `is_call_arg_setup` so the parallel-move resolver in
+        //    `resolve_call_arg_conflicts` includes this instruction in the
+        //    contiguous arg-setup window preceding the CALL.
+        {
+            let mut al_inst = Self::mk_inst(
                 X86Opcode::Mov,
                 Some(MachineOperand::Register(RAX)),
                 &[MachineOperand::Immediate(sse_idx as i64)],
-            ));
+            );
+            al_inst.is_call_arg_setup = true;
+            out.push(al_inst);
         }
 
         // 3. Emit CALL instruction.
@@ -2604,7 +3277,9 @@ impl ArchCodegen for X86_64CodeGen {
 
     /// Emit function prologue instructions.
     fn emit_prologue(&self, mf: &MachineFunction) -> Vec<MachineInstruction> {
-        X86_64CodeGen::emit_prologue_static(mf)
+        // Use the instance method (not static) so variadic register saves
+        // from self.frame are included in the prologue.
+        self.emit_prologue_with_va(mf)
     }
 
     /// Emit function epilogue instructions.
@@ -2873,6 +3548,11 @@ impl std::fmt::Display for X86Opcode {
             X86Opcode::Endbr64 => "endbr64",
             X86Opcode::Pause => "pause",
             X86Opcode::Lfence => "lfence",
+            X86Opcode::Bsr => "bsr",
+            X86Opcode::Bsf => "bsf",
+            X86Opcode::Popcnt => "popcnt",
+            X86Opcode::Bswap => "bswap",
+            X86Opcode::Ud2 => "ud2",
             X86Opcode::InlineAsm => "<inline-asm>",
             X86Opcode::LoadInd => "movq_ind_load",
             X86Opcode::LoadInd32 => "movl_ind_load",

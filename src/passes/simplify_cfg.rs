@@ -1075,15 +1075,7 @@ fn propagate_phi_for_chain(
 pub fn run_simplify_cfg(func: &mut IrFunction) -> bool {
     let mut any_changed = false;
 
-    // Pre-pass: recompute predecessor/successor lists from actual terminators
-    // and remove stale phi incoming entries.  This is necessary because branch
-    // folding (in constant_folding.rs) may convert a CondBranch into an
-    // unconditional Branch, removing a CFG edge, without updating the stored
-    // predecessor/successor lists or phi incoming vectors.  Without this
-    // cleanup, stale phi entries can cause block merging to pick the wrong
-    // incoming value when resolving trivial phis.
     any_changed |= recompute_cfg_and_cleanup_phis(func);
-
     any_changed |= simplify_trivial_phis(func);
     any_changed |= merge_blocks(func);
     any_changed |= eliminate_empty_blocks(func);

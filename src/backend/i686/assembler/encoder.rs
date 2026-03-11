@@ -275,6 +275,10 @@ fn encode_mem_raw(
 }
 
 /// Encode a memory operand from a [`MachineOperand`].
+///
+/// For `GlobalSymbol` operands, encodes as `[disp32]` with a placeholder
+/// displacement (the caller must produce a relocation to fill the actual
+/// address at link time).
 fn encode_mem(reg_field: u8, op: &MachineOperand) -> Result<Vec<u8>, String> {
     match op {
         MachineOperand::Memory {
@@ -296,6 +300,11 @@ fn encode_mem(reg_field: u8, op: &MachineOperand) -> Result<Vec<u8>, String> {
             1,
             *off as i64,
         )),
+        MachineOperand::GlobalSymbol(_) => {
+            // [disp32] addressing: mod=00, rm=101 (no base register)
+            // The 4-byte displacement will be patched by a relocation.
+            Ok(encode_mem_raw(reg_field, None, None, 1, 0))
+        }
         _ => Err(format!("Expected memory operand, got {}", op)),
     }
 }
@@ -429,6 +438,14 @@ pub fn encode_instruction(
         codegen::I686_NOP => Ok(enc(vec![0x90])),
         codegen::I686_INT3 => Ok(enc(vec![0xCC])),
         codegen::I686_UD2 => Ok(enc(vec![0x0F, 0x0B])),
+        // Global variable load/store with absolute addressing
+        codegen::I686_MOV_LOAD_GLOBAL => encode_mov_load_global(instr),
+        codegen::I686_MOV_STORE_GLOBAL => encode_mov_store_global(instr),
+        // Register-indirect load/store (pointer in a register)
+        codegen::I686_MOV_LOAD_INDIRECT => encode_mov_load_indirect(instr),
+        codegen::I686_MOV_STORE_INDIRECT => encode_mov_store_indirect(instr),
+        // BSWAP — byte-swap a 32-bit register (0F C8+rd)
+        codegen::I686_BSWAP => encode_bswap(instr),
         _ => Err(format!("i686 encoder: unknown opcode 0x{:X}", instr.opcode)),
     }
 }
@@ -465,6 +482,7 @@ fn encode_mov(instr: &MachineInstruction) -> Result<EncodedInstruction, String> 
             }
             MachineOperand::GlobalSymbol(name) => {
                 // MOV r32, &symbol → 0xB8+rd + R_386_32
+                // Load the address of a symbol into a register.
                 bytes.push(0xB8 + d);
                 let off = bytes.len();
                 bytes.extend_from_slice(&[0; 4]);
@@ -482,34 +500,83 @@ fn encode_mov(instr: &MachineInstruction) -> Result<EncodedInstruction, String> 
         if instr.operands.len() < 2 {
             return Err("MOV store: need [dst_mem, src]".into());
         }
-        let dst = &instr.operands[0];
+        let raw_dst = &instr.operands[0];
         let src = &instr.operands[1];
-        if !is_mem(dst) {
-            return Err(format!("MOV store: dst must be memory, got {}", dst));
-        }
+        // If the destination is a bare Register, treat it as an indirect
+        // store through that register: [reg] with zero displacement.
+        // This happens when a GEP result (pointer in a register) is used
+        // as the Store destination after register allocation.
+        let reg_as_mem;
+        let dst = if let MachineOperand::Register(r) = raw_dst {
+            reg_as_mem = MachineOperand::Memory {
+                base: Some(*r),
+                index: None,
+                scale: 1,
+                displacement: 0,
+            };
+            &reg_as_mem
+        } else if is_mem(raw_dst) {
+            raw_dst
+        } else {
+            return Err(format!("MOV store: dst must be memory, got {}", raw_dst));
+        };
+        // For GlobalSymbol destinations, emit relocation for the address
+        let dst_is_global = matches!(dst, MachineOperand::GlobalSymbol(_));
         match src {
             MachineOperand::Register(s) => {
                 // MOV [mem], r32 → 0x89 ModR/M
                 bytes.push(0x89);
                 bytes.extend(encode_mem(*s as u8, dst)?);
+                if let MachineOperand::GlobalSymbol(name) = dst {
+                    // Patch disp32 at offset 2 (opcode + ModR/M=05 + disp32)
+                    reloc = Some(InstructionRelocation {
+                        offset_in_instruction: 2,
+                        symbol: name.clone(),
+                        rel_type: relocations::R_386_32,
+                        addend: 0,
+                    });
+                }
             }
             MachineOperand::Immediate(v) => {
                 // MOV [mem], imm32 → 0xC7 /0 ModR/M imm32
                 bytes.push(0xC7);
                 bytes.extend(encode_mem(0, dst)?);
+                if dst_is_global {
+                    if let MachineOperand::GlobalSymbol(name) = dst {
+                        reloc = Some(InstructionRelocation {
+                            offset_in_instruction: 2,
+                            symbol: name.clone(),
+                            rel_type: relocations::R_386_32,
+                            addend: 0,
+                        });
+                    }
+                }
                 bytes.extend_from_slice(&emit_i32(*v));
             }
             MachineOperand::GlobalSymbol(name) => {
                 bytes.push(0xC7);
                 bytes.extend(encode_mem(0, dst)?);
+                if let MachineOperand::GlobalSymbol(dst_name) = dst {
+                    reloc = Some(InstructionRelocation {
+                        offset_in_instruction: 2,
+                        symbol: dst_name.clone(),
+                        rel_type: relocations::R_386_32,
+                        addend: 0,
+                    });
+                }
                 let off = bytes.len();
                 bytes.extend_from_slice(&[0; 4]);
-                reloc = Some(InstructionRelocation {
-                    offset_in_instruction: off,
-                    symbol: name.clone(),
-                    rel_type: relocations::R_386_32,
-                    addend: 0,
-                });
+                // Second relocation for the source global symbol is needed
+                // but we only have one slot — use the destination relocation
+                // since it's more critical for correctness.
+                if !dst_is_global {
+                    reloc = Some(InstructionRelocation {
+                        offset_in_instruction: off,
+                        symbol: name.clone(),
+                        rel_type: relocations::R_386_32,
+                        addend: 0,
+                    });
+                }
             }
             other => return Err(format!("MOV store: unsupported src {}", other)),
         }
@@ -518,6 +585,212 @@ fn encode_mov(instr: &MachineInstruction) -> Result<EncodedInstruction, String> 
         bytes,
         relocation: reloc,
     })
+}
+
+/// Encode `MOV r32, [global]` — load from absolute address of a global symbol.
+/// `result = Register(dst)`, `operands = [GlobalSymbol(name)]`.
+/// Produces: `0x8B ModR/M(00, dst, 101) disp32=0` + R_386_32 relocation.
+fn encode_mov_load_global(instr: &MachineInstruction) -> Result<EncodedInstruction, String> {
+    let d = gpr(instr.result.as_ref().ok_or("MOV_LOAD_GLOBAL: no result")?)?;
+    if instr.operands.is_empty() {
+        return Err("MOV_LOAD_GLOBAL: no operand".into());
+    }
+    let name = match &instr.operands[0] {
+        MachineOperand::GlobalSymbol(n) => n.clone(),
+        other => return Err(format!("MOV_LOAD_GLOBAL: expected GlobalSymbol, got {}", other)),
+    };
+    let mut bytes = Vec::new();
+    // MOV r32, [disp32] → 0x8B ModR/M(00, reg, 101=disp32)
+    bytes.push(0x8B);
+    // mod=00, reg=d, rm=101 (absolute disp32 on i686)
+    bytes.push(modrm(0b00, d, 0b101));
+    let off = bytes.len();
+    bytes.extend_from_slice(&[0; 4]); // placeholder for disp32
+    Ok(EncodedInstruction {
+        bytes,
+        relocation: Some(InstructionRelocation {
+            offset_in_instruction: off,
+            symbol: name,
+            rel_type: relocations::R_386_32,
+            addend: 0,
+        }),
+    })
+}
+
+/// Encode `MOV [global], r32` — store to absolute address of a global symbol.
+/// `operands = [GlobalSymbol(name), Register(src)]`.
+/// Produces: `0x89 ModR/M(00, src, 101) disp32=0` + R_386_32 relocation.
+fn encode_mov_store_global(instr: &MachineInstruction) -> Result<EncodedInstruction, String> {
+    if instr.operands.len() < 2 {
+        return Err("MOV_STORE_GLOBAL: need [GlobalSymbol, Register]".into());
+    }
+    let name = match &instr.operands[0] {
+        MachineOperand::GlobalSymbol(n) => n.clone(),
+        other => {
+            return Err(format!(
+                "MOV_STORE_GLOBAL: expected GlobalSymbol as dst, got {}",
+                other
+            ))
+        }
+    };
+    let s = match &instr.operands[1] {
+        MachineOperand::Register(r) => *r as u8,
+        other => {
+            return Err(format!(
+                "MOV_STORE_GLOBAL: expected Register as src, got {}",
+                other
+            ))
+        }
+    };
+    let mut bytes = Vec::new();
+    // MOV [disp32], r32 → 0x89 ModR/M(00, src, 101)
+    bytes.push(0x89);
+    bytes.push(modrm(0b00, s, 0b101));
+    let off = bytes.len();
+    bytes.extend_from_slice(&[0; 4]); // placeholder for disp32
+    Ok(EncodedInstruction {
+        bytes,
+        relocation: Some(InstructionRelocation {
+            offset_in_instruction: off,
+            symbol: name,
+            rel_type: relocations::R_386_32,
+            addend: 0,
+        }),
+    })
+}
+
+/// Encode `MOV_LOAD_INDIRECT` — load value through a pointer held in a
+/// register: `MOV r32, [reg]`.
+///
+/// Layout: `result = dst_register, operands = [src_pointer_register]`.
+/// After register allocation, `operands[0]` is a physical `Register`
+/// holding the memory address to dereference.
+fn encode_mov_load_indirect(instr: &MachineInstruction) -> Result<EncodedInstruction, String> {
+    let d = gpr(instr.result.as_ref().ok_or("MOV_LOAD_INDIRECT: no result")?)?;
+    if instr.operands.is_empty() {
+        return Err("MOV_LOAD_INDIRECT: need source pointer register".into());
+    }
+    let base_reg = match &instr.operands[0] {
+        MachineOperand::Register(r) => *r as u8,
+        op if is_mem(op) => {
+            // Already a memory operand (e.g. spill slot) — just encode normally.
+            let mut b = vec![0x8B];
+            b.extend(encode_mem(d, op)?);
+            return Ok(enc(b));
+        }
+        other => {
+            return Err(format!(
+                "MOV_LOAD_INDIRECT: expected Register or Memory, got {}",
+                other
+            ))
+        }
+    };
+    // Encode MOV r32, [reg] using indirect addressing.
+    // Special cases for x86 addressing:
+    //   - [EBP] (r5) needs ModR/M mode 01 with disp8=0 (mode 00 + r/m=101 = disp32)
+    //   - [ESP] (r4) needs a SIB byte (r/m=100 encodes SIB, not [ESP])
+    let mut b = vec![0x8B]; // MOV r32, r/m32
+    if base_reg == 5 {
+        // [EBP] → ModR/M(01, dst, 101) + disp8(0)
+        b.push(modrm(0b01, d, 5));
+        b.push(0x00);
+    } else if base_reg == 4 {
+        // [ESP] → ModR/M(00, dst, 100) + SIB(00, 100, 100)
+        b.push(modrm(0b00, d, 4));
+        b.push(sib_byte(0, 4, 4)); // scale=1, index=none(ESP), base=ESP
+    } else {
+        // [reg] → ModR/M(00, dst, base)
+        b.push(modrm(0b00, d, base_reg));
+    }
+    Ok(enc(b))
+}
+
+/// Encode `MOV_STORE_INDIRECT` — store a value through a pointer held in a
+/// register: `MOV [reg], src`.
+///
+/// Layout: `operands = [dst_pointer_register, src_value]`.
+/// After register allocation, `operands[0]` is a physical `Register`
+/// holding the memory address to write to.
+fn encode_mov_store_indirect(instr: &MachineInstruction) -> Result<EncodedInstruction, String> {
+    if instr.operands.len() < 2 {
+        return Err("MOV_STORE_INDIRECT: need [ptr_register, src_value]".into());
+    }
+    let base_reg = match &instr.operands[0] {
+        MachineOperand::Register(r) => *r as u8,
+        op if is_mem(op) => {
+            // Already a memory operand — encode as normal MOV store.
+            let s = match &instr.operands[1] {
+                MachineOperand::Register(r) => *r as u8,
+                MachineOperand::Immediate(v) => {
+                    // MOV [mem], imm32 → 0xC7 /0 + mem + imm32
+                    let mut b = vec![0xC7];
+                    b.extend(encode_mem(0, op)?);
+                    b.extend_from_slice(&emit_i32(*v));
+                    return Ok(enc(b));
+                }
+                other => {
+                    return Err(format!(
+                        "MOV_STORE_INDIRECT: expected Register/Imm as src, got {}",
+                        other
+                    ))
+                }
+            };
+            let mut b = vec![0x89];
+            b.extend(encode_mem(s, op)?);
+            return Ok(enc(b));
+        }
+        other => {
+            return Err(format!(
+                "MOV_STORE_INDIRECT: expected Register or Memory as dst ptr, got {}",
+                other
+            ))
+        }
+    };
+    match &instr.operands[1] {
+        MachineOperand::Register(s) => {
+            let src = *s as u8;
+            // MOV [reg], r32 → 0x89 ModR/M(mode, src, base)
+            let mut b = vec![0x89];
+            if base_reg == 5 {
+                // [EBP] → mode 01 + disp8(0)
+                b.push(modrm(0b01, src, 5));
+                b.push(0x00);
+            } else if base_reg == 4 {
+                // [ESP] → mode 00, r/m=100 + SIB
+                b.push(modrm(0b00, src, 4));
+                b.push(sib_byte(0, 4, 4));
+            } else {
+                b.push(modrm(0b00, src, base_reg));
+            }
+            Ok(enc(b))
+        }
+        MachineOperand::Immediate(v) => {
+            // MOV [reg], imm32 → 0xC7 /0 + indirect addressing + imm32
+            let mut b = vec![0xC7];
+            if base_reg == 5 {
+                b.push(modrm(0b01, 0, 5));
+                b.push(0x00);
+            } else if base_reg == 4 {
+                b.push(modrm(0b00, 0, 4));
+                b.push(sib_byte(0, 4, 4));
+            } else {
+                b.push(modrm(0b00, 0, base_reg));
+            }
+            b.extend_from_slice(&emit_i32(*v));
+            Ok(enc(b))
+        }
+        other => Err(format!(
+            "MOV_STORE_INDIRECT: unsupported src operand {}",
+            other
+        )),
+    }
+}
+
+/// Encode `BSWAP r32` — 0F C8+rd.
+fn encode_bswap(instr: &MachineInstruction) -> Result<EncodedInstruction, String> {
+    // The result register IS the operand (in-place swap).
+    let rd = gpr(instr.result.as_ref().ok_or("BSWAP: no result")?)?;
+    Ok(enc(vec![0x0F, 0xC8 + rd]))
 }
 
 /// Encode `MOVZX r32, r/m8` or `MOVZX r32, r/m16`.
@@ -568,8 +841,24 @@ fn encode_lea(instr: &MachineInstruction) -> Result<EncodedInstruction, String> 
     if instr.operands.is_empty() {
         return Err("LEA: no memory operand".into());
     }
+    let op = &instr.operands[0];
+    if let MachineOperand::GlobalSymbol(name) = op {
+        // LEA r32, [symbol] → 0x8D ModRM(00,d,101) disp32 + R_386_32
+        let mut b = vec![0x8D];
+        b.extend(encode_mem_raw(d, None, None, 1, 0));
+        let off = b.len() - 4; // disp32 is the last 4 bytes
+        return Ok(enc_reloc(
+            b,
+            InstructionRelocation {
+                offset_in_instruction: off,
+                symbol: name.clone(),
+                rel_type: relocations::R_386_32,
+                addend: 0,
+            },
+        ));
+    }
     let mut b = vec![0x8D];
-    b.extend(encode_mem(d, &instr.operands[0])?);
+    b.extend(encode_mem(d, op)?);
     Ok(enc(b))
 }
 
@@ -810,12 +1099,22 @@ fn encode_imul(instr: &MachineInstruction) -> Result<EncodedInstruction, String>
         }
     } else {
         // Two-operand: IMUL r32, r/m32 → 0F AF
+        // dst = r32 (destination and first multiplicand), src = r/m32
         let dst = if let Some(ref r) = instr.result {
             gpr(r)?
         } else {
             gpr(&ops[0])?
         };
-        let src_idx = if instr.result.is_some() { 0 } else { 1 };
+        // When `result` is set and there are ≥2 operands, ops[0] is a
+        // copy of the destination register (lhs); the actual source
+        // (rhs multiplicand) is ops[1].
+        let src_idx = if instr.result.is_some() && ops.len() >= 2 {
+            1
+        } else if ops.len() >= 2 {
+            1
+        } else {
+            0
+        };
         let src = &ops[src_idx];
 
         b.push(0x0F);
@@ -1048,18 +1347,11 @@ fn encode_jmp(
         MachineOperand::BlockLabel(id) => {
             let key = label_key(*id);
             if let Some(&off) = label_offsets.get(&key) {
-                // Known target — compute relative displacement.
-                // JMP rel32: 5 bytes (E9 xx xx xx xx)
+                // Known target — always use near JMP (5 bytes: E9 rel32)
+                // to ensure size stability between pass 1 and pass 2.
                 let rel = (off as i64) - (current_offset as i64) - 5;
-                if rel >= -128 && rel + 5 <= 127 + 2 {
-                    // Short jump (2 bytes): EB rel8
-                    let short_rel = (off as i64) - (current_offset as i64) - 2;
-                    b.push(0xEB);
-                    b.push(short_rel as u8);
-                } else {
-                    b.push(0xE9);
-                    b.extend_from_slice(&emit_i32(rel));
-                }
+                b.push(0xE9);
+                b.extend_from_slice(&emit_i32(rel));
             } else {
                 // Unknown target — emit near jump with zero displacement (to be patched).
                 b.push(0xE9);
@@ -1654,6 +1946,7 @@ pub fn compute_instruction_size(instr: &MachineInstruction) -> usize {
         I686_NOP => 1,  // 90
         I686_INT3 => 1, // CC
         I686_UD2 => 2,  // 0F 0B
+        I686_BSWAP => 2, // 0F C8+rd
 
         // Unknown opcode — pessimistic estimate
         _ => 15,

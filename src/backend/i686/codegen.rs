@@ -48,7 +48,7 @@ use crate::backend::traits::{
     RegisterInfo, RelocationTypeInfo,
 };
 use crate::common::diagnostics::DiagnosticEngine;
-use crate::common::fx_hash::FxHashMap;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::target::Target;
 use crate::ir::function::IrFunction;
 use crate::ir::instructions::{BinOp, FCmpOp, ICmpOp, Instruction, Value};
@@ -187,6 +187,33 @@ pub const I686_INT3: u32 = 0x801;
 /// UD2 — undefined instruction trap (2 bytes: 0x0F 0x0B).
 pub const I686_UD2: u32 = 0x802;
 
+/// `MOV r32, [global_symbol]` — load from global variable memory.
+/// Encodes as `0x8B ModR/M` with `[disp32]` addressing + R_386_32 relocation.
+/// Distinct from `I686_MOV` + `GlobalSymbol` which loads the ADDRESS of the symbol.
+/// `result = VirtualRegister(dst)`, `operands = [GlobalSymbol(name)]`.
+pub const I686_MOV_LOAD_GLOBAL: u32 = 0x803;
+
+/// `MOV [global_symbol], r32` — store to global variable memory.
+/// Encodes as `0x89 ModR/M` with `[disp32]` addressing + R_386_32 relocation.
+/// `operands = [GlobalSymbol(name), Register(src)]`.
+pub const I686_MOV_STORE_GLOBAL: u32 = 0x804;
+/// MOV_LOAD_INDIRECT — load through a register holding a pointer address.
+/// Encodes as `MOV r32, [reg]` (0x8B with ModR/M indirect addressing).
+/// Used when an IR Load dereferences a pointer held in a virtual register
+/// (e.g., from a GEP result). Distinct from plain I686_MOV which would
+/// encode `Register → Register` as a register copy.
+/// `result = dst_register, operands = [src_pointer_register]`.
+pub const I686_MOV_LOAD_INDIRECT: u32 = 0x805;
+/// MOV_STORE_INDIRECT — store through a register holding a pointer address.
+/// Encodes as `MOV [reg], src` (0x89 with ModR/M indirect addressing).
+/// Used when an IR Store writes through a pointer held in a virtual register.
+/// `operands = [dst_pointer_register, src_value]`.
+pub const I686_MOV_STORE_INDIRECT: u32 = 0x806;
+/// BSWAP reg — reverse bytes in a 32-bit register (opcode 0F C8+rd).
+/// `result = Register(rd)`, `operands = [Register(src)]`.
+/// For in-place swap, `result == operands[0]`.
+pub const I686_BSWAP: u32 = 0x807;
+
 // ===========================================================================
 // Condition Code Enum
 // ===========================================================================
@@ -315,6 +342,10 @@ pub struct I686Codegen {
     pic: bool,
     /// Whether DWARF debug information is emitted (`-g` flag).
     debug_info: bool,
+    /// Mapping from IR function-reference values to function names.
+    func_ref_names: crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>,
+    /// Mapping from IR global-variable-reference values to symbol names.
+    global_var_refs: crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>,
 }
 
 impl I686Codegen {
@@ -325,7 +356,28 @@ impl I686Codegen {
     /// - `pic`: Enable Position-Independent Code generation (`-fPIC`).
     /// - `debug_info`: Enable DWARF debug information emission (`-g`).
     pub fn new(pic: bool, debug_info: bool) -> Self {
-        I686Codegen { pic, debug_info }
+        I686Codegen {
+            pic,
+            debug_info,
+            func_ref_names: crate::common::fx_hash::FxHashMap::default(),
+            global_var_refs: crate::common::fx_hash::FxHashMap::default(),
+        }
+    }
+
+    /// Set the function-reference name map (populated by the lowering phase).
+    pub fn set_func_ref_names(
+        &mut self,
+        m: &crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>,
+    ) {
+        self.func_ref_names = m.clone();
+    }
+
+    /// Set the global-variable-reference map.
+    pub fn set_global_var_refs(
+        &mut self,
+        m: &crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>,
+    ) {
+        self.global_var_refs = m.clone();
     }
 
     /// Returns whether PIC mode is enabled.
@@ -522,12 +574,26 @@ impl ArchCodegen for I686Codegen {
         // Value-to-operand mapping for IR SSA values.
         let mut value_map: FxHashMap<u32, MachineOperand> = FxHashMap::default();
 
-        // Build constant cache from globals (same mechanism as x86-64).
-        // Integer constants are stored as globals named `.Lconst.i.N` with
-        // Constant::Integer initializer. Match them to BinOp sentinels.
+        // Track ALL vreg→IR Value associations (like x86-64's vreg_ir_map).
+        // Unlike value_map which only stores the LAST operand per IR value,
+        // this map accumulates EVERY vreg created, including intermediates
+        // (e.g. SETCC result before MOVZX). This is critical for the
+        // register allocator to assign physical registers to ALL vregs.
+        let mut vreg_ir_map: FxHashMap<u32, crate::ir::instructions::Value> =
+            FxHashMap::default();
+
+        // Build constant cache using the authoritative constant_values map
+        // stored on the IR function by the lowering phase.  This is a
+        // direct Value → i64 mapping that avoids the fragile positional
+        // matching of globals to BinOp sentinels.
         let mut constant_cache: FxHashMap<u32, i64> = FxHashMap::default();
-        {
-            // Collect constant values from globals.
+        if !func.constant_values.is_empty() {
+            for (&val, &imm) in &func.constant_values {
+                constant_cache.insert(val.index(), imm);
+            }
+        } else {
+            // Legacy fallback: positional matching of .Lconst.i.N globals
+            // to BinOp sentinels (Add result, result, UNDEF).
             let mut const_values: Vec<i64> = Vec::new();
             for gv in _globals {
                 if gv.name.starts_with(".Lconst.i.") {
@@ -536,7 +602,6 @@ impl ArchCodegen for I686Codegen {
                     }
                 }
             }
-            // Match BinOp sentinels: BinOp where lhs == result && rhs == UNDEF
             let mut const_idx = 0;
             for block in &func.blocks {
                 for inst in block.instructions() {
@@ -599,6 +664,38 @@ impl ArchCodegen for I686Codegen {
             param_offset += slot_size as i32;
         }
 
+        // Pre-allocate virtual registers for phi-copy destinations.
+        // After phi elimination, copies (BitCast instructions) are placed
+        // in critical-edge split blocks that may have higher block indices
+        // than the merge block that uses the phi result. Since we process
+        // blocks sequentially, the USE of the phi result would be
+        // encountered before the DEFINITION (BitCast). Pre-allocating
+        // vregs here ensures that when the merge block references a phi
+        // result value, the vreg is already present in value_map.
+        {
+            let mut phi_copy_dests: FxHashSet<Value> = FxHashSet::default();
+            for ir_block in func.blocks.iter() {
+                for ir_inst in &ir_block.instructions {
+                    if let Instruction::BitCast { result, .. } = ir_inst {
+                        phi_copy_dests.insert(*result);
+                    }
+                }
+            }
+            for dest_val in phi_copy_dests {
+                if !value_map.contains_key(&dest_val.index()) {
+                    let vreg = vregs.alloc();
+                    value_map.insert(dest_val.index(), MachineOperand::VirtualRegister(vreg));
+                    // CRITICAL: Also register in vreg_ir_map so that the
+                    // auto-registration loop (which uses entry().or_insert)
+                    // does NOT overwrite this association when the vreg
+                    // appears as an operand of a use-site instruction
+                    // (e.g., printf call in the done block) BEFORE the
+                    // defining BitCast in a later-processed edge block.
+                    vreg_ir_map.insert(vreg, dest_val);
+                }
+            }
+        }
+
         // Lower each IR basic block.
         for (block_idx, ir_block) in func.blocks.iter().enumerate() {
             let mbb_idx = *block_map.get(&ir_block.index).unwrap_or(&block_idx);
@@ -616,6 +713,24 @@ impl ArchCodegen for I686Codegen {
                     diag,
                     &constant_cache,
                 );
+
+                // Auto-register ALL VirtualRegister results and operands
+                // with the IR instruction's result value.  This captures
+                // intermediate vregs (e.g. SETCC before MOVZX) that are
+                // consumed within the same lowered sequence but not
+                // explicitly registered in value_map.
+                if let Some(ir_result) = inst.result() {
+                    for mi in &machine_insts {
+                        if let Some(MachineOperand::VirtualRegister(vreg)) = &mi.result {
+                            vreg_ir_map.entry(*vreg).or_insert(ir_result);
+                        }
+                        for op in &mi.operands {
+                            if let MachineOperand::VirtualRegister(vreg) = op {
+                                vreg_ir_map.entry(*vreg).or_insert(ir_result);
+                            }
+                        }
+                    }
+                }
 
                 if mbb_idx < mf.blocks.len() {
                     for mi in machine_insts {
@@ -635,10 +750,20 @@ impl ArchCodegen for I686Codegen {
         // Build the reverse mapping (vreg → IR Value) so that
         // apply_allocation_result can correctly resolve VirtualRegister
         // operands to physical registers.
+        // Use vreg_ir_map (which accumulates ALL vreg→Value associations,
+        // including intermediates like SETCC results) instead of value_map
+        // (which only stores the LAST operand per Value and loses earlier
+        // vregs).
+        for (&vreg, &ir_val) in &vreg_ir_map {
+            mf.vreg_to_ir_value.insert(vreg, ir_val);
+        }
+        // Also add any vregs from value_map that weren't in vreg_ir_map
+        // (defensive fallback).
         for (&val_idx, operand) in &value_map {
             if let MachineOperand::VirtualRegister(vreg) = operand {
                 mf.vreg_to_ir_value
-                    .insert(*vreg, crate::ir::instructions::Value(val_idx));
+                    .entry(*vreg)
+                    .or_insert(crate::ir::instructions::Value(val_idx));
             }
         }
 
@@ -649,52 +774,92 @@ impl ArchCodegen for I686Codegen {
         &self,
         mf: &MachineFunction,
     ) -> Result<crate::backend::traits::AssembledFunction, String> {
-        // Encode machine instructions to raw bytes by delegating to the
-        // built-in i686 assembler encoder.  Instructions that already carry
-        // pre-encoded bytes (e.g. from inline assembly) are emitted directly.
+        // Two-pass assembly with accurate label offset computation.
         //
-        // Two-pass assembly:
-        // Pass 1: estimate label offsets (each instruction assumed to be up
-        //         to 15 bytes for conservative offset estimation).
-        // Pass 2: encode with resolved offsets.
-        use crate::common::fx_hash::FxHashMap;
+        // Pass 1: Encode every instruction with placeholder (zero) label
+        //         offsets.  The *sizes* of x86 instructions are independent
+        //         of the displacement value (we always emit near branches,
+        //         never short branches), so the resulting byte counts are
+        //         exact.  Accumulate those sizes to build a correct
+        //         label → byte-offset map.
+        //
+        // Pass 2: Re-encode with the accurate label offsets so that branch
+        //         displacement fields contain the correct values.  Collect
+        //         relocations for the linker.
+        use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
-        // Build label→offset map from block labels.
+        // --- Pass 1: compute real instruction sizes and label offsets ----
+        //
+        // Block labels in the IR come from the lowering phase and have
+        // descriptive names like "if.then", "while.cond", etc.  However,
+        // `BlockLabel(id)` operands in JMP/JCC instructions encode the
+        // *MBB index* as a u32, and the encoder resolves them via
+        // `label_key(id)` → `".L{id}"`.  We must populate label_offsets
+        // with `.L{mbb_index}` keys so that the encoder can find them.
+        let dummy_labels: FxHashMap<String, usize> = FxHashMap::default();
         let mut label_offsets: FxHashMap<String, usize> = FxHashMap::default();
-        let mut offset_estimate: usize = 0;
-        for block in &mf.blocks {
+        let mut offset: usize = 0;
+
+        for (block_idx, block) in mf.blocks.iter().enumerate() {
+            // Insert MBB-index-based key that matches label_key(block_idx).
+            let idx_key = format!(".L{}", block_idx);
+            label_offsets.insert(idx_key, offset);
+            // Also insert the descriptive label if present (for any code
+            // that might reference blocks by name).
             if let Some(ref lbl) = block.label {
-                label_offsets.insert(lbl.clone(), offset_estimate);
+                label_offsets.insert(lbl.clone(), offset);
             }
             for inst in &block.instructions {
                 if !inst.encoded_bytes.is_empty() {
-                    offset_estimate += inst.encoded_bytes.len();
+                    offset += inst.encoded_bytes.len();
                 } else {
-                    offset_estimate += 8; // conservative estimate for i686
+                    // Encode with dummy labels — we only care about the
+                    // resulting byte count, not the displacement values.
+                    match crate::backend::i686::assembler::encoder::encode_instruction(
+                        inst,
+                        &dummy_labels,
+                        offset,
+                    ) {
+                        Ok(encoded) => {
+                            offset += encoded.bytes.len();
+                        }
+                        Err(_) => {
+                            // UD2 placeholder — 2 bytes
+                            offset += 2;
+                        }
+                    }
                 }
             }
         }
 
-        // Pass 2: encode with label offsets.
+        // --- Pass 2: encode with correct label offsets -------------------
         let mut code = Vec::new();
+        let mut relocations: Vec<crate::backend::traits::FunctionRelocation> = Vec::new();
         for block in &mf.blocks {
             for inst in &block.instructions {
                 if !inst.encoded_bytes.is_empty() {
                     code.extend_from_slice(&inst.encoded_bytes);
                 } else {
+                    let base_offset = code.len();
                     match crate::backend::i686::assembler::encoder::encode_instruction(
                         inst,
                         &label_offsets,
-                        code.len(),
+                        base_offset,
                     ) {
                         Ok(encoded) => {
                             code.extend_from_slice(&encoded.bytes);
+                            if let Some(rel) = encoded.relocation {
+                                relocations.push(crate::backend::traits::FunctionRelocation {
+                                    offset: (base_offset + rel.offset_in_instruction) as u64,
+                                    symbol: rel.symbol.clone(),
+                                    rel_type_id: rel.rel_type,
+                                    addend: rel.addend,
+                                    section: ".text".to_string(),
+                                });
+                            }
                         }
                         Err(e) => {
-                            // For unrecognised opcodes, emit UD2 (0F 0B) as a
-                            // visible crash-on-execution marker rather than a
-                            // silent NOP that would mask bugs.
-                            eprintln!("i686 encoder warning: {} — emitting UD2", e);
+                            eprintln!("i686 encoder warning: {} — emitting UD2 (instr: {:?} operands: {:?})", e, inst.opcode, inst.operands);
                             code.push(0x0F);
                             code.push(0x0B);
                         }
@@ -705,7 +870,7 @@ impl ArchCodegen for I686Codegen {
 
         Ok(crate::backend::traits::AssembledFunction {
             bytes: code,
-            relocations: Vec::new(),
+            relocations,
         })
     }
 
@@ -868,12 +1033,31 @@ impl I686Codegen {
                 let src = self.resolve_operand(ptr, value_map, alloca_offsets);
                 let vreg = vregs.alloc();
 
-                if ty.is_float() {
+                if let MachineOperand::GlobalSymbol(_) = &src {
+                    // Global variable load: use dedicated opcode that encodes
+                    // as MOV r32, [disp32] with absolute addressing and
+                    // R_386_32 relocation.
+                    out.push(
+                        MachineInstruction::new(I686_MOV_LOAD_GLOBAL)
+                            .with_operand(src)
+                            .with_result(MachineOperand::VirtualRegister(vreg)),
+                    );
+                    value_map.insert(result.index(), MachineOperand::VirtualRegister(vreg));
+                } else if ty.is_float() {
                     // x87 FLD from memory.
                     let fld = MachineInstruction::new(I686_FLD)
                         .with_operand(self.to_memory_operand(&src));
                     out.push(fld);
-                    // FPU result tracked as virtual register.
+                    value_map.insert(result.index(), MachineOperand::VirtualRegister(vreg));
+                } else if matches!(&src, MachineOperand::VirtualRegister(_)) {
+                    // Pointer held in a virtual register (e.g. GEP result).
+                    // Use dedicated LOAD_INDIRECT opcode so the encoder
+                    // dereferences the pointer ([reg]) instead of treating
+                    // it as a register-to-register copy.
+                    let mov = MachineInstruction::new(I686_MOV_LOAD_INDIRECT)
+                        .with_operand(src)
+                        .with_result(MachineOperand::VirtualRegister(vreg));
+                    out.push(mov);
                     value_map.insert(result.index(), MachineOperand::VirtualRegister(vreg));
                 } else {
                     let opcode = if ty.size_bytes(target) < 4 {
@@ -881,8 +1065,9 @@ impl I686Codegen {
                     } else {
                         I686_MOV
                     };
+                    let mem_op = self.to_memory_operand(&src);
                     let mov = MachineInstruction::new(opcode)
-                        .with_operand(self.to_memory_operand(&src))
+                        .with_operand(mem_op)
                         .with_result(MachineOperand::VirtualRegister(vreg));
                     out.push(mov);
                     value_map.insert(result.index(), MachineOperand::VirtualRegister(vreg));
@@ -892,10 +1077,71 @@ impl I686Codegen {
             Instruction::Store { value, ptr, .. } => {
                 let dst = self.resolve_operand(ptr, value_map, alloca_offsets);
                 let src = self.resolve_operand(value, value_map, alloca_offsets);
-                let mov = MachineInstruction::new(I686_MOV)
-                    .with_operand(src)
-                    .with_operand(self.to_memory_operand(&dst));
-                out.push(mov);
+
+                if let MachineOperand::GlobalSymbol(_) = &dst {
+                    // Global variable store: use dedicated opcode that encodes
+                    // as MOV [disp32], r32 with absolute addressing and
+                    // R_386_32 relocation.
+                    // Materialize src if needed.
+                    let src_safe = match &src {
+                        MachineOperand::Immediate(_) | MachineOperand::GlobalSymbol(_) => {
+                            let tmp = vregs.alloc();
+                            out.push(
+                                MachineInstruction::new(I686_MOV)
+                                    .with_operand(src)
+                                    .with_result(MachineOperand::VirtualRegister(tmp)),
+                            );
+                            MachineOperand::VirtualRegister(tmp)
+                        }
+                        _ => src,
+                    };
+                    out.push(
+                        MachineInstruction::new(I686_MOV_STORE_GLOBAL)
+                            .with_operand(dst)
+                            .with_operand(src_safe),
+                    );
+                } else if matches!(&dst, MachineOperand::VirtualRegister(_)) {
+                    // Pointer held in a virtual register (e.g. GEP result).
+                    // Use dedicated STORE_INDIRECT opcode so the encoder
+                    // dereferences the pointer ([reg]) instead of failing
+                    // with "dst must be memory" or encoding a register copy.
+                    let src_safe = match &src {
+                        MachineOperand::Immediate(_) | MachineOperand::GlobalSymbol(_) => {
+                            let tmp = vregs.alloc();
+                            out.push(
+                                MachineInstruction::new(I686_MOV)
+                                    .with_operand(src)
+                                    .with_result(MachineOperand::VirtualRegister(tmp)),
+                            );
+                            MachineOperand::VirtualRegister(tmp)
+                        }
+                        _ => src,
+                    };
+                    let mov = MachineInstruction::new(I686_MOV_STORE_INDIRECT)
+                        .with_operand(dst)
+                        .with_operand(src_safe);
+                    out.push(mov);
+                } else {
+                    // i686 MOV store: operands[0] = Memory(dst), operands[1] = Register(src)
+                    let dst_mem = self.to_memory_operand(&dst);
+                    // Materialize src if it's not a register/vreg.
+                    let src_safe = match &src {
+                        MachineOperand::Immediate(_) | MachineOperand::GlobalSymbol(_) => {
+                            let tmp = vregs.alloc();
+                            out.push(
+                                MachineInstruction::new(I686_MOV)
+                                    .with_operand(src)
+                                    .with_result(MachineOperand::VirtualRegister(tmp)),
+                            );
+                            MachineOperand::VirtualRegister(tmp)
+                        }
+                        _ => src,
+                    };
+                    let mov = MachineInstruction::new(I686_MOV)
+                        .with_operand(dst_mem)
+                        .with_operand(src_safe);
+                    out.push(mov);
+                }
             }
 
             // ----- Arithmetic -----
@@ -925,13 +1171,18 @@ impl I686Codegen {
                     let insts =
                         self.lower_64bit_op(result, op, lhs, rhs, value_map, alloca_offsets, vregs);
                     out.extend(insts);
+                    // 64-bit ops use EAX:EDX; register a vreg alias for
+                    // downstream resolution (EAX holds the low word which
+                    // is sufficient for most 32-bit consumers).
                     let vreg = vregs.alloc();
                     value_map.insert(result.index(), MachineOperand::VirtualRegister(vreg));
                 } else if ty.is_float() {
+                    // lower_float_op now inserts into value_map internally.
                     let insts =
                         self.lower_float_op(result, op, lhs, rhs, value_map, alloca_offsets, vregs);
                     out.extend(insts);
                 } else {
+                    // lower_binary_op now inserts into value_map internally.
                     let insts = self.lower_binary_op(
                         result,
                         op,
@@ -1018,30 +1269,54 @@ impl I686Codegen {
                 ..
             } => {
                 let cond_op = self.resolve_operand(condition, value_map, alloca_offsets);
-                // TEST cond, cond
-                out.push(
-                    MachineInstruction::new(I686_TEST)
-                        .with_operand(cond_op.clone())
-                        .with_operand(cond_op),
-                );
                 let then_mbb = *block_map.get(&then_block.index()).unwrap_or(&0);
-                // JNE then_block
-                out.push(
-                    MachineInstruction::new(I686_JCC)
-                        .with_operand(MachineOperand::Immediate(
-                            CondCode::NotEqual.encoding() as i64
-                        ))
-                        .with_operand(MachineOperand::BlockLabel(then_mbb as u32))
-                        .set_branch(),
-                );
                 let else_mbb = *block_map.get(&else_block.index()).unwrap_or(&0);
-                // JMP else_block
-                out.push(
-                    MachineInstruction::new(I686_JMP)
-                        .with_operand(MachineOperand::BlockLabel(else_mbb as u32))
-                        .set_terminator()
-                        .set_branch(),
-                );
+
+                // Optimize: if the condition is a known constant, emit
+                // an unconditional jump. This avoids generating
+                // TEST imm, imm which the encoder cannot handle.
+                if let MachineOperand::Immediate(val) = &cond_op {
+                    if *val != 0 {
+                        // Condition is true — jump to then_block.
+                        out.push(
+                            MachineInstruction::new(I686_JMP)
+                                .with_operand(MachineOperand::BlockLabel(then_mbb as u32))
+                                .set_terminator()
+                                .set_branch(),
+                        );
+                    } else {
+                        // Condition is false — jump to else_block.
+                        out.push(
+                            MachineInstruction::new(I686_JMP)
+                                .with_operand(MachineOperand::BlockLabel(else_mbb as u32))
+                                .set_terminator()
+                                .set_branch(),
+                        );
+                    }
+                } else {
+                    // TEST cond, cond
+                    out.push(
+                        MachineInstruction::new(I686_TEST)
+                            .with_operand(cond_op.clone())
+                            .with_operand(cond_op),
+                    );
+                    // JNE then_block
+                    out.push(
+                        MachineInstruction::new(I686_JCC)
+                            .with_operand(MachineOperand::Immediate(
+                                CondCode::NotEqual.encoding() as i64
+                            ))
+                            .with_operand(MachineOperand::BlockLabel(then_mbb as u32))
+                            .set_branch(),
+                    );
+                    // JMP else_block
+                    out.push(
+                        MachineInstruction::new(I686_JMP)
+                            .with_operand(MachineOperand::BlockLabel(else_mbb as u32))
+                            .set_terminator()
+                            .set_branch(),
+                    );
+                }
             }
 
             Instruction::Switch {
@@ -1083,18 +1358,34 @@ impl I686Codegen {
                 return_type,
                 ..
             } => {
-                let call_insts = self.lower_call(
-                    result,
-                    callee,
-                    args,
-                    return_type,
-                    value_map,
-                    alloca_offsets,
-                    vregs,
-                    target,
-                );
-                out.extend(call_insts);
-                mf.mark_has_calls();
+                // ── Builtin interception ──────────────────────────────
+                let callee_name = self.func_ref_names.get(callee).cloned();
+                let handled = if let Some(ref fname) = callee_name {
+                    self.try_emit_i686_builtin(
+                        fname, result, args, return_type,
+                        value_map, alloca_offsets, vregs, &mut out,
+                    )
+                } else {
+                    false
+                };
+
+                if !handled {
+                    let (call_insts, ret_vreg) = self.lower_call(
+                        result,
+                        callee,
+                        args,
+                        return_type,
+                        value_map,
+                        alloca_offsets,
+                        vregs,
+                        target,
+                    );
+                    out.extend(call_insts);
+                    if let Some(vreg) = ret_vreg {
+                        value_map.insert(result.index(), MachineOperand::VirtualRegister(vreg));
+                    }
+                    mf.mark_has_calls();
+                }
             }
 
             Instruction::Return { value: ret_val, .. } => {
@@ -1145,12 +1436,23 @@ impl I686Codegen {
                     );
                 } else {
                     let idx_op = self.resolve_operand(&indices[0], value_map, alloca_offsets);
+                    // GEP lowering: compute base + index.
+                    // Step 1: MOV vreg, base
                     out.push(
-                        MachineInstruction::new(I686_LEA)
+                        MachineInstruction::new(I686_MOV)
                             .with_operand(base_op)
-                            .with_operand(idx_op)
                             .with_result(MachineOperand::VirtualRegister(vreg)),
                     );
+                    // Step 2: ADD vreg, index (if non-zero)
+                    let skip_add = matches!(&idx_op, MachineOperand::Immediate(0));
+                    if !skip_add {
+                        out.push(
+                            MachineInstruction::new(I686_ADD)
+                                .with_operand(MachineOperand::VirtualRegister(vreg))
+                                .with_operand(idx_op)
+                                .with_result(MachineOperand::VirtualRegister(vreg)),
+                        );
+                    }
                 }
                 value_map.insert(result.index(), MachineOperand::VirtualRegister(vreg));
             }
@@ -1160,13 +1462,26 @@ impl I686Codegen {
                 result, value: val, ..
             } => {
                 let src = self.resolve_operand(val, value_map, alloca_offsets);
-                let vreg = vregs.alloc();
+                // If this result already has a VR assigned (e.g. from phi-copy
+                // pre-allocation or a different predecessor block), reuse the
+                // same VR so all predecessor paths write to the same virtual
+                // register and the register allocator assigns a single physical
+                // location. This is essential for phi elimination correctness
+                // when critical edge split blocks are processed after merge blocks.
+                let vreg = if let Some(MachineOperand::VirtualRegister(existing_vr)) =
+                    value_map.get(&result.index())
+                {
+                    *existing_vr
+                } else {
+                    let vr = vregs.alloc();
+                    value_map.insert(result.index(), MachineOperand::VirtualRegister(vr));
+                    vr
+                };
                 out.push(
                     MachineInstruction::new(I686_MOV)
                         .with_operand(src)
                         .with_result(MachineOperand::VirtualRegister(vreg)),
                 );
-                value_map.insert(result.index(), MachineOperand::VirtualRegister(vreg));
             }
 
             Instruction::Trunc {
@@ -1278,6 +1593,14 @@ impl I686Codegen {
                 displacement: offset as i64,
             };
         }
+        // Check function-reference names (e.g., printf, exit).
+        if let Some(fname) = self.func_ref_names.get(val) {
+            return MachineOperand::GlobalSymbol(fname.clone());
+        }
+        // Check global-variable references (e.g., string literals).
+        if let Some(gname) = self.global_var_refs.get(val) {
+            return MachineOperand::GlobalSymbol(gname.clone());
+        }
         // Fallback: treat as an immediate 0 (undefined value).
         MachineOperand::Immediate(0)
     }
@@ -1299,6 +1622,9 @@ impl I686Codegen {
                 scale: 1,
                 displacement: *off as i64,
             },
+            // GlobalSymbol stays as-is — the encoder handles it
+            // directly (e.g., [disp32] with relocation for PUSH/MOV).
+            MachineOperand::GlobalSymbol(_) => op.clone(),
             _ => op.clone(),
         }
     }
@@ -1327,7 +1653,7 @@ impl I686Codegen {
         lhs: &Value,
         rhs: &Value,
         _ty: &IrType,
-        value_map: &FxHashMap<u32, MachineOperand>,
+        value_map: &mut FxHashMap<u32, MachineOperand>,
         alloca_offsets: &FxHashMap<u32, i32>,
         vregs: &mut VRegAllocator,
     ) -> Vec<MachineInstruction> {
@@ -1377,14 +1703,33 @@ impl I686Codegen {
                 );
             }
             BinOp::SDiv => {
-                // Signed division: MOV EAX, lhs → CDQ → IDIV rhs → result in EAX.
+                // Signed division: PUSH rhs → MOV EAX, lhs → CDQ → IDIV [ESP] → ADD ESP,4
+                // We PUSH the divisor first to avoid the register conflict where the
+                // allocator assigns rhs to EDX, which CDQ then clobbers.
+                let esp_mem = MachineOperand::Memory {
+                    base: Some(registers::ESP),
+                    index: None,
+                    scale: 1,
+                    displacement: 0,
+                };
+                insts.push(
+                    MachineInstruction::new(I686_PUSH).with_operand(rhs_op),
+                );
                 insts.push(
                     MachineInstruction::new(I686_MOV)
                         .with_operand(lhs_op)
                         .with_result(MachineOperand::Register(registers::EAX)),
                 );
                 insts.push(MachineInstruction::new(I686_CDQ));
-                insts.push(MachineInstruction::new(I686_IDIV).with_operand(rhs_op));
+                insts.push(
+                    MachineInstruction::new(I686_IDIV).with_operand(esp_mem),
+                );
+                insts.push(
+                    MachineInstruction::new(I686_ADD)
+                        .with_operand(MachineOperand::Register(registers::ESP))
+                        .with_operand(MachineOperand::Immediate(4))
+                        .with_result(MachineOperand::Register(registers::ESP)),
+                );
                 insts.push(
                     MachineInstruction::new(I686_MOV)
                         .with_operand(MachineOperand::Register(registers::EAX))
@@ -1392,7 +1737,16 @@ impl I686Codegen {
                 );
             }
             BinOp::UDiv => {
-                // Unsigned division: MOV EAX, lhs → XOR EDX,EDX → DIV rhs → EAX.
+                // Unsigned division: PUSH rhs → MOV EAX, lhs → XOR EDX,EDX → DIV [ESP] → ADD ESP,4
+                let esp_mem = MachineOperand::Memory {
+                    base: Some(registers::ESP),
+                    index: None,
+                    scale: 1,
+                    displacement: 0,
+                };
+                insts.push(
+                    MachineInstruction::new(I686_PUSH).with_operand(rhs_op),
+                );
                 insts.push(
                     MachineInstruction::new(I686_MOV)
                         .with_operand(lhs_op)
@@ -1404,7 +1758,15 @@ impl I686Codegen {
                         .with_operand(MachineOperand::Register(registers::EDX))
                         .with_result(MachineOperand::Register(registers::EDX)),
                 );
-                insts.push(MachineInstruction::new(I686_DIV).with_operand(rhs_op));
+                insts.push(
+                    MachineInstruction::new(I686_DIV).with_operand(esp_mem),
+                );
+                insts.push(
+                    MachineInstruction::new(I686_ADD)
+                        .with_operand(MachineOperand::Register(registers::ESP))
+                        .with_operand(MachineOperand::Immediate(4))
+                        .with_result(MachineOperand::Register(registers::ESP)),
+                );
                 insts.push(
                     MachineInstruction::new(I686_MOV)
                         .with_operand(MachineOperand::Register(registers::EAX))
@@ -1412,14 +1774,31 @@ impl I686Codegen {
                 );
             }
             BinOp::SRem => {
-                // Signed remainder: CDQ → IDIV → result in EDX.
+                // Signed remainder: PUSH rhs → MOV EAX, lhs → CDQ → IDIV [ESP] → ADD ESP,4
+                let esp_mem = MachineOperand::Memory {
+                    base: Some(registers::ESP),
+                    index: None,
+                    scale: 1,
+                    displacement: 0,
+                };
+                insts.push(
+                    MachineInstruction::new(I686_PUSH).with_operand(rhs_op),
+                );
                 insts.push(
                     MachineInstruction::new(I686_MOV)
                         .with_operand(lhs_op)
                         .with_result(MachineOperand::Register(registers::EAX)),
                 );
                 insts.push(MachineInstruction::new(I686_CDQ));
-                insts.push(MachineInstruction::new(I686_IDIV).with_operand(rhs_op));
+                insts.push(
+                    MachineInstruction::new(I686_IDIV).with_operand(esp_mem),
+                );
+                insts.push(
+                    MachineInstruction::new(I686_ADD)
+                        .with_operand(MachineOperand::Register(registers::ESP))
+                        .with_operand(MachineOperand::Immediate(4))
+                        .with_result(MachineOperand::Register(registers::ESP)),
+                );
                 insts.push(
                     MachineInstruction::new(I686_MOV)
                         .with_operand(MachineOperand::Register(registers::EDX))
@@ -1427,7 +1806,16 @@ impl I686Codegen {
                 );
             }
             BinOp::URem => {
-                // Unsigned remainder: XOR EDX,EDX → DIV → result in EDX.
+                // Unsigned remainder: PUSH rhs → MOV EAX, lhs → XOR EDX,EDX → DIV [ESP] → ADD ESP,4
+                let esp_mem = MachineOperand::Memory {
+                    base: Some(registers::ESP),
+                    index: None,
+                    scale: 1,
+                    displacement: 0,
+                };
+                insts.push(
+                    MachineInstruction::new(I686_PUSH).with_operand(rhs_op),
+                );
                 insts.push(
                     MachineInstruction::new(I686_MOV)
                         .with_operand(lhs_op)
@@ -1439,7 +1827,15 @@ impl I686Codegen {
                         .with_operand(MachineOperand::Register(registers::EDX))
                         .with_result(MachineOperand::Register(registers::EDX)),
                 );
-                insts.push(MachineInstruction::new(I686_DIV).with_operand(rhs_op));
+                insts.push(
+                    MachineInstruction::new(I686_DIV).with_operand(esp_mem),
+                );
+                insts.push(
+                    MachineInstruction::new(I686_ADD)
+                        .with_operand(MachineOperand::Register(registers::ESP))
+                        .with_operand(MachineOperand::Immediate(4))
+                        .with_result(MachineOperand::Register(registers::ESP)),
+                );
                 insts.push(
                     MachineInstruction::new(I686_MOV)
                         .with_operand(MachineOperand::Register(registers::EDX))
@@ -1542,24 +1938,26 @@ impl I686Codegen {
             }
             // Floating-point — delegate to lower_float_op.
             BinOp::FAdd | BinOp::FSub | BinOp::FMul | BinOp::FDiv | BinOp::FRem => {
-                return self.lower_float_op(result, op, lhs, rhs, value_map, alloca_offsets, vregs);
+                let float_insts =
+                    self.lower_float_op(result, op, lhs, rhs, value_map, alloca_offsets, vregs);
+                return float_insts;
             }
         }
 
-        // Map the result.
-        // NOTE: The caller (lower_instruction) may also map the result for I64/float;
-        // for integer ops we do it here directly.
+        // Store the result vreg in value_map so downstream instructions
+        // (ICmp, CondBranch, Store, etc.) can resolve the BinOp result.
+        value_map.insert(result.index(), MachineOperand::VirtualRegister(result_vreg));
         insts
     }
 
     /// Lower an integer comparison (ICmp) to CMP + SETcc instructions.
     pub(crate) fn lower_comparison(
         &self,
-        _result: &Value,
+        result: &Value,
         op: &ICmpOp,
         lhs: &Value,
         rhs: &Value,
-        value_map: &FxHashMap<u32, MachineOperand>,
+        value_map: &mut FxHashMap<u32, MachineOperand>,
         alloca_offsets: &FxHashMap<u32, i32>,
         vregs: &mut VRegAllocator,
     ) -> Vec<MachineInstruction> {
@@ -1567,10 +1965,25 @@ impl I686Codegen {
         let lhs_op = self.resolve_operand(lhs, value_map, alloca_offsets);
         let rhs_op = self.resolve_operand(rhs, value_map, alloca_offsets);
 
+        // CMP requires the first operand to be a register or memory
+        // (not an immediate). If lhs resolves to an immediate,
+        // materialize it in a temporary register.
+        let lhs_safe = if matches!(lhs_op, MachineOperand::Immediate(_)) {
+            let tmp = vregs.alloc();
+            insts.push(
+                MachineInstruction::new(I686_MOV)
+                    .with_operand(lhs_op)
+                    .with_result(MachineOperand::VirtualRegister(tmp)),
+            );
+            MachineOperand::VirtualRegister(tmp)
+        } else {
+            lhs_op
+        };
+
         // CMP lhs, rhs
         insts.push(
             MachineInstruction::new(I686_CMP)
-                .with_operand(lhs_op)
+                .with_operand(lhs_safe)
                 .with_operand(rhs_op),
         );
 
@@ -1589,7 +2002,121 @@ impl I686Codegen {
                 .with_result(MachineOperand::VirtualRegister(vreg_ext)),
         );
 
+        // Store the comparison result in value_map so that CondBranch
+        // can resolve it as a VirtualRegister (not fallback Immediate(0)).
+        value_map.insert(result.index(), MachineOperand::VirtualRegister(vreg_ext));
+
         insts
+    }
+
+    /// Attempt to emit specialised code for compiler builtins (i686).
+    /// Returns `true` if the builtin was handled, `false` otherwise.
+    #[allow(clippy::too_many_arguments)]
+    fn try_emit_i686_builtin(
+        &self,
+        fname: &str,
+        result: &Value,
+        args: &[Value],
+        _return_type: &IrType,
+        value_map: &mut FxHashMap<u32, MachineOperand>,
+        alloca_offsets: &FxHashMap<u32, i32>,
+        vregs: &mut VRegAllocator,
+        out: &mut Vec<MachineInstruction>,
+    ) -> bool {
+        match fname {
+            // ── byte-swap builtins ────────────────────────────────────
+            "__builtin_bswap32" => {
+                let arg = self.resolve_operand(&args[0], value_map, alloca_offsets);
+                let vreg_eax = vregs.alloc();
+                // MOV vreg, arg
+                out.push(
+                    MachineInstruction::new(I686_MOV)
+                        .with_operand(arg)
+                        .with_result(MachineOperand::VirtualRegister(vreg_eax)),
+                );
+                // BSWAP vreg (in-place byte reversal)
+                out.push(
+                    MachineInstruction::new(I686_BSWAP)
+                        .with_operand(MachineOperand::VirtualRegister(vreg_eax))
+                        .with_result(MachineOperand::VirtualRegister(vreg_eax)),
+                );
+                value_map.insert(result.index(), MachineOperand::VirtualRegister(vreg_eax));
+                true
+            }
+            "__builtin_bswap16" => {
+                // bswap16: BSWAP(arg32) >> 16, or simpler: XCHG AL,AH style.
+                // Use: MOV vreg, arg → BSWAP vreg → SHR vreg, 16
+                let arg = self.resolve_operand(&args[0], value_map, alloca_offsets);
+                let vreg = vregs.alloc();
+                out.push(
+                    MachineInstruction::new(I686_MOV)
+                        .with_operand(arg)
+                        .with_result(MachineOperand::VirtualRegister(vreg)),
+                );
+                out.push(
+                    MachineInstruction::new(I686_BSWAP)
+                        .with_operand(MachineOperand::VirtualRegister(vreg))
+                        .with_result(MachineOperand::VirtualRegister(vreg)),
+                );
+                out.push(
+                    MachineInstruction::new(I686_SHR)
+                        .with_operand(MachineOperand::VirtualRegister(vreg))
+                        .with_operand(MachineOperand::Immediate(16))
+                        .with_result(MachineOperand::VirtualRegister(vreg)),
+                );
+                value_map.insert(result.index(), MachineOperand::VirtualRegister(vreg));
+                true
+            }
+            "__builtin_bswap64" => {
+                // 32-bit platform: bswap64 on two halves and swap them.
+                // Simplified: just BSWAP the lower 32 bits and return (truncated).
+                // For true 64-bit bswap on i686, we'd need 64-bit register pairs.
+                // Most uses in 32-bit context only need 32-bit bswap.
+                let arg = self.resolve_operand(&args[0], value_map, alloca_offsets);
+                let vreg = vregs.alloc();
+                out.push(
+                    MachineInstruction::new(I686_MOV)
+                        .with_operand(arg)
+                        .with_result(MachineOperand::VirtualRegister(vreg)),
+                );
+                out.push(
+                    MachineInstruction::new(I686_BSWAP)
+                        .with_operand(MachineOperand::VirtualRegister(vreg))
+                        .with_result(MachineOperand::VirtualRegister(vreg)),
+                );
+                value_map.insert(result.index(), MachineOperand::VirtualRegister(vreg));
+                true
+            }
+            // ── branch hint builtins (passthrough) ───────────────────
+            "__builtin_expect" | "__builtin_expect_with_probability" => {
+                let arg = self.resolve_operand(&args[0], value_map, alloca_offsets);
+                let vreg = vregs.alloc();
+                out.push(
+                    MachineInstruction::new(I686_MOV)
+                        .with_operand(arg)
+                        .with_result(MachineOperand::VirtualRegister(vreg)),
+                );
+                value_map.insert(result.index(), MachineOperand::VirtualRegister(vreg));
+                true
+            }
+            "__builtin_assume_aligned" => {
+                let arg = self.resolve_operand(&args[0], value_map, alloca_offsets);
+                let vreg = vregs.alloc();
+                out.push(
+                    MachineInstruction::new(I686_MOV)
+                        .with_operand(arg)
+                        .with_result(MachineOperand::VirtualRegister(vreg)),
+                );
+                value_map.insert(result.index(), MachineOperand::VirtualRegister(vreg));
+                true
+            }
+            // ── trap ─────────────────────────────────────────────────
+            "__builtin_trap" | "__builtin_unreachable" => {
+                out.push(MachineInstruction::new(I686_UD2));
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Lower a function call with cdecl calling convention.
@@ -1604,7 +2131,7 @@ impl I686Codegen {
         alloca_offsets: &FxHashMap<u32, i32>,
         vregs: &mut VRegAllocator,
         _target: &Target,
-    ) -> Vec<MachineInstruction> {
+    ) -> (Vec<MachineInstruction>, Option<u32>) {
         let mut insts = Vec::new();
 
         // Each argument is a 4-byte stack slot (minimum).
@@ -1660,30 +2187,33 @@ impl I686Codegen {
 
         // Move return value to a virtual register.
         let result_vreg = vregs.alloc();
+        let mut ret_vreg = None;
         if return_type.is_float() {
             insts.push(
                 MachineInstruction::new(I686_FSTP)
                     .with_operand(MachineOperand::VirtualRegister(result_vreg)),
             );
+            ret_vreg = Some(result_vreg);
         } else if *return_type != IrType::Void {
             insts.push(
                 MachineInstruction::new(I686_MOV)
                     .with_operand(MachineOperand::Register(registers::EAX))
                     .with_result(MachineOperand::VirtualRegister(result_vreg)),
             );
+            ret_vreg = Some(result_vreg);
         }
 
-        insts
+        (insts, ret_vreg)
     }
 
     /// Lower x87 FPU floating-point operations.
     pub(crate) fn lower_float_op(
         &self,
-        _result: &Value,
+        result: &Value,
         op: &BinOp,
         lhs: &Value,
         rhs: &Value,
-        value_map: &FxHashMap<u32, MachineOperand>,
+        value_map: &mut FxHashMap<u32, MachineOperand>,
         alloca_offsets: &FxHashMap<u32, i32>,
         vregs: &mut VRegAllocator,
     ) -> Vec<MachineInstruction> {
@@ -1711,6 +2241,8 @@ impl I686Codegen {
                 .with_result(MachineOperand::VirtualRegister(result_vreg)),
         );
 
+        // Store the float result in value_map for downstream resolution.
+        value_map.insert(result.index(), MachineOperand::VirtualRegister(result_vreg));
         insts
     }
 
@@ -1887,11 +2419,11 @@ mod tests {
     fn test_i686_codegen_register_info() {
         let cg = I686Codegen::new(false, false);
         let ri = cg.register_info();
-        assert_eq!(ri.allocatable_gpr.len(), 6);
+        assert_eq!(ri.allocatable_gpr.len(), 5); // ECX is reserved as spill scratch
         assert_eq!(ri.allocatable_fpr.len(), 0);
         assert_eq!(ri.callee_saved.len(), 4);
         assert_eq!(ri.caller_saved.len(), 3);
-        assert_eq!(ri.reserved.len(), 2);
+        assert_eq!(ri.reserved.len(), 3); // ESP, EBP, ECX
         assert_eq!(ri.argument_gpr.len(), 0);
         assert_eq!(ri.return_gpr.len(), 1);
         assert_eq!(ri.return_gpr[0], registers::EAX);

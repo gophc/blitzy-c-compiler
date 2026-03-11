@@ -395,7 +395,24 @@ impl I686Assembler {
     fn pass2_encode(&mut self, mf: &MachineFunction) -> Result<(), String> {
         self.current_offset = 0;
 
-        for block in &mf.blocks {
+        if std::env::var("BCC_DEBUG_ASM").is_ok() {
+            eprintln!("[i686-asm] pass2 label_offsets:");
+            let mut labels: Vec<_> = self.label_offsets.iter().collect();
+            labels.sort_by_key(|(_, v)| **v);
+            for (k, v) in &labels {
+                eprintln!("  {} = 0x{:x}", k, v);
+            }
+        }
+
+        for (block_idx, block) in mf.blocks.iter().enumerate() {
+            if std::env::var("BCC_DEBUG_ASM").is_ok() {
+                eprintln!(
+                    "[i686-asm] pass2 block {} (label={:?}) at offset 0x{:x}",
+                    block_idx,
+                    block.label,
+                    self.current_offset
+                );
+            }
             for instr in &block.instructions {
                 let instr_start = self.current_offset;
 

@@ -36,7 +36,7 @@ use crate::ir::basic_block::BasicBlock;
 use crate::ir::builder::IrBuilder;
 use crate::ir::function::IrFunction;
 use crate::ir::instructions::{BlockId, Instruction, Value};
-use crate::ir::lowering::expr_lowering::{lower_expression, ExprLoweringContext};
+use crate::ir::lowering::expr_lowering::{lower_expression, lower_lvalue, ExprLoweringContext};
 use crate::ir::module::IrModule;
 use crate::ir::types::IrType;
 
@@ -297,19 +297,26 @@ fn lower_compound_statement(
     let mut current_block = ctx.builder.get_insert_block();
 
     for item in &compound.items {
-        // If we're in a terminated block, skip remaining items (unreachable).
-        if current_block.is_none() {
-            break;
-        }
-        if is_block_terminated(ctx) {
-            break;
-        }
+        // If the current block is terminated (e.g. by a goto, return, break),
+        // non-label items are unreachable.  BUT labeled statements are always
+        // reachable (via goto / computed goto) — they create new blocks.
+        // So we must NOT break; instead skip only non-label items.
+        let terminated = current_block.is_none() || is_block_terminated(ctx);
 
         match item {
             ast::BlockItem::Statement(stmt) => {
+                // Labeled statements (including case/default) start new
+                // blocks and must always be lowered, even after a
+                // terminator.  All other statements are unreachable.
+                if terminated && !is_label_like(stmt) {
+                    continue;
+                }
                 current_block = lower_statement(ctx, stmt);
             }
             ast::BlockItem::Declaration(decl) => {
+                if terminated {
+                    continue;
+                }
                 // Ensure allocas exist for ALL declarators in this
                 // declaration.  The top-level function lowering driver
                 // pre-scans the AST for locals, but cannot see into
@@ -325,6 +332,19 @@ fn lower_compound_statement(
     }
 
     current_block
+}
+
+/// Returns `true` if the statement introduces a new block (label-like).
+/// These must be lowered even when the current block is terminated because
+/// they are reachable through jumps (goto, computed goto, switch dispatch).
+fn is_label_like(stmt: &ast::Statement) -> bool {
+    matches!(
+        stmt,
+        ast::Statement::Labeled { .. }
+            | ast::Statement::Case { .. }
+            | ast::Statement::Default { .. }
+            | ast::Statement::CaseRange { .. }
+    )
 }
 
 // ===========================================================================
@@ -354,6 +374,61 @@ fn lower_compound_statement(
 /// statements (e.g. `do { const void *__vpp_verify = …; } while(0)` inside
 /// a `VERIFY_PERCPU_PTR` macro expansion) are therefore missing.
 ///
+/// Infer the size of an unsized array declaration from its initializer.
+///
+/// For declarations like `char data[] = "hello"` or `int arr[] = {1,2,3}`,
+/// the C type has `Array(elem, None)`. This function counts elements in
+/// the initializer and returns a sized `Array(elem, Some(n))`.
+///
+/// If the type is not an unsized array, or there's no initializer, the
+/// original type is returned unchanged.
+fn infer_array_size_from_init(
+    c_type: &CType,
+    initializer: Option<&ast::Initializer>,
+    name_table: &[String],
+) -> CType {
+    let _ = name_table;
+    match c_type {
+        CType::Array(elem, None) => {
+            if let Some(init) = initializer {
+                match init {
+                    ast::Initializer::Expression(expr) => {
+                        // String initializer: `char d[] = "hello"`
+                        // Count the string length (including null terminator).
+                        if let Some(len) = string_literal_length(expr) {
+                            CType::Array(elem.clone(), Some(len))
+                        } else {
+                            c_type.clone()
+                        }
+                    }
+                    ast::Initializer::List { designators_and_initializers, .. } => {
+                        // Brace-init list: `int a[] = {1,2,3}` → size=3
+                        CType::Array(elem.clone(), Some(designators_and_initializers.len()))
+                    }
+                }
+            } else {
+                c_type.clone()
+            }
+        }
+        _ => c_type.clone(),
+    }
+}
+
+/// Count characters in a string literal expression (including null terminator).
+fn string_literal_length(expr: &ast::Expression) -> Option<usize> {
+    match expr {
+        ast::Expression::StringLiteral { segments, .. } => {
+            let mut total: usize = 0;
+            for seg in segments {
+                total += seg.value.len();
+            }
+            Some(total + 1) // +1 for null terminator
+        }
+        ast::Expression::Parenthesized { inner, .. } => string_literal_length(inner),
+        _ => None,
+    }
+}
+
 /// This function creates allocas on demand for any declarator that is not
 /// already present in `ctx.local_vars`, so that subsequent initializer
 /// lowering and identifier lookups can find every variable.
@@ -424,17 +499,68 @@ fn ensure_allocas_for_declaration(ctx: &mut StmtLoweringContext<'_>, decl: &ast:
             let mangled_name = format!("{}.{}", func_name, var_name);
 
             // Evaluate constant initializer if present.
-            let constant = if let Some(ast::Initializer::Expression(expr)) =
-                init_decl.initializer.as_ref()
-            {
-                match &**expr {
-                    ast::Expression::IntegerLiteral { value, .. } => {
-                        Some(crate::ir::module::Constant::Integer(*value as i128))
+            let constant =
+                if let Some(ast::Initializer::Expression(expr)) = init_decl.initializer.as_ref() {
+                    match &**expr {
+                        ast::Expression::IntegerLiteral { value, .. } => {
+                            Some(crate::ir::module::Constant::Integer(*value as i128))
+                        }
+                        ast::Expression::FloatLiteral { value, .. } => {
+                            Some(crate::ir::module::Constant::Float(*value))
+                        }
+                        ast::Expression::CharLiteral { value, .. } => {
+                            Some(crate::ir::module::Constant::Integer(*value as i128))
+                        }
+                        ast::Expression::StringLiteral { segments, .. } => {
+                            let mut bytes = Vec::new();
+                            for seg in segments {
+                                bytes.extend_from_slice(&seg.value);
+                            }
+                            bytes.push(0); // null terminator
+                            Some(crate::ir::module::Constant::String(bytes))
+                        }
+                        _ => Some(crate::ir::module::Constant::ZeroInit),
                     }
-                    _ => Some(crate::ir::module::Constant::ZeroInit),
+                } else if let Some(ast::Initializer::List { designators_and_initializers, .. }) = init_decl.initializer.as_ref() {
+                    // Brace-init list for static local arrays.
+                    let mut elems = Vec::new();
+                    for di in designators_and_initializers {
+                        if let ast::Initializer::Expression(expr) = &di.initializer {
+                            match expr.as_ref() {
+                                ast::Expression::IntegerLiteral { value, .. } => {
+                                    elems.push(crate::ir::module::Constant::Integer(*value as i128));
+                                }
+                                ast::Expression::CharLiteral { value, .. } => {
+                                    elems.push(crate::ir::module::Constant::Integer(*value as i128));
+                                }
+                                _ => {
+                                    elems.push(crate::ir::module::Constant::ZeroInit);
+                                }
+                            }
+                        } else {
+                            elems.push(crate::ir::module::Constant::ZeroInit);
+                        }
+                    }
+                    if elems.is_empty() {
+                        Some(crate::ir::module::Constant::ZeroInit)
+                    } else {
+                        Some(crate::ir::module::Constant::Array(elems))
+                    }
+                } else {
+                    Some(crate::ir::module::Constant::ZeroInit)
+                };
+
+            // Infer array size from initializer when declaration uses [].
+            let ir_type = match (&c_type, &constant) {
+                (CType::Array(elem, None), Some(crate::ir::module::Constant::String(bytes))) => {
+                    let fixed = CType::Array(elem.clone(), Some(bytes.len()));
+                    IrType::from_ctype(&fixed, ctx.target)
                 }
-            } else {
-                Some(crate::ir::module::Constant::ZeroInit)
+                (CType::Array(elem, None), Some(crate::ir::module::Constant::Array(elems))) => {
+                    let fixed = CType::Array(elem.clone(), Some(elems.len()));
+                    IrType::from_ctype(&fixed, ctx.target)
+                }
+                _ => ir_type,
             };
 
             let mut global =
@@ -467,9 +593,13 @@ fn ensure_allocas_for_declaration(ctx: &mut StmtLoweringContext<'_>, decl: &ast:
             ctx.target,
             ctx.name_table,
         );
+        // For unsized arrays (e.g., `char data[] = "hello"` or `int a[] = {1,2,3}`),
+        // infer the size from the initializer BEFORE creating the alloca so that
+        // the frame layout allocates the correct number of bytes.
+        let c_type = infer_array_size_from_init(&c_type, init_decl.initializer.as_ref(), ctx.name_table);
         let ir_type = IrType::from_ctype(&c_type, ctx.target);
         let (alloca_val, alloca_inst) = ctx.builder.build_alloca(ir_type, decl.span);
-        ctx.function.entry_block_mut().push_instruction(alloca_inst);
+        ctx.function.entry_block_mut().push_alloca(alloca_inst);
         ctx.local_vars.insert(var_name.clone(), alloca_val);
     }
 }
@@ -539,6 +669,7 @@ pub fn lower_declaration_initializers(ctx: &mut StmtLoweringContext<'_>, decl: &
             enum_constants: ctx.enum_constants,
             static_locals: ctx.static_locals,
             struct_defs: ctx.struct_defs,
+            label_blocks: ctx.label_blocks,
         };
         decl_lowering::lower_local_initializer(alloca_val, initializer, &var_type, &mut expr_ctx);
     }
@@ -746,6 +877,22 @@ fn lower_while_loop(
 /// Lowers a `do body while (condition);` loop.
 ///
 /// Block structure:
+/// Returns `true` when `expr` is a compile-time constant that evaluates
+/// to false (zero).  This is used to optimise `do { ... } while(0)` — the
+/// canonical C multi-statement-macro wrapper — by eliding the condition
+/// block entirely so the register allocator never clobbers live variables.
+fn is_constant_false_expr(expr: &ast::Expression) -> bool {
+    match expr {
+        ast::Expression::IntegerLiteral { value, .. } => *value == 0,
+        ast::Expression::FloatLiteral { value, .. } => *value == 0.0,
+        // Cast of zero is still zero: `(int)0`, `(void*)0`, etc.
+        ast::Expression::Cast { operand: inner, .. } => is_constant_false_expr(inner),
+        // Parenthesised expression
+        ast::Expression::Parenthesized { inner, .. } => is_constant_false_expr(inner),
+        _ => false,
+    }
+}
+
 /// ```text
 /// [current] → Branch(body)
 /// [body]    → ... → Branch(cond)
@@ -758,8 +905,22 @@ fn lower_do_while_loop(
     condition: &ast::Expression,
     span: Span,
 ) -> Option<BlockId> {
+    // Optimisation for `do { ... } while(0)` — the most common C idiom
+    // for multi-statement macros.  When the condition is a constant zero
+    // the body executes exactly once and no loop-back edge is needed.
+    // Emitting the condition block would waste a register and, because
+    // the register allocator might assign that register to a variable
+    // that is live across the body, could silently corrupt locals.
+    let condition_is_constant_false = is_constant_false_expr(condition);
+
     let body_block = create_block(ctx, "dowhile.body");
-    let cond_block = create_block(ctx, "dowhile.cond");
+    let cond_block = if condition_is_constant_false {
+        // Dummy — unused, but we still need a BlockId for LoopContext
+        // (a `continue` inside the body jumps to exit when while(0)).
+        body_block // placeholder, will redirect to exit below
+    } else {
+        create_block(ctx, "dowhile.cond")
+    };
     let exit_block = create_block(ctx, "dowhile.end");
 
     // Branch to body block.
@@ -774,35 +935,56 @@ fn lower_do_while_loop(
 
     // --- Body block ---
     ctx.builder.set_insert_point(body_block);
+    // For `do { ... } while(0)`, `continue` should jump directly
+    // to the exit block (there is no next iteration).
+    let continue_target = if condition_is_constant_false {
+        exit_block
+    } else {
+        cond_block
+    };
     ctx.loop_stack.push(LoopContext {
         break_target: exit_block,
-        continue_target: cond_block,
+        continue_target,
     });
 
     let body_result = lower_statement(ctx, body);
     let body_terminated = body_result.is_none() || is_block_terminated(ctx);
     if !body_terminated {
-        let br = ctx.builder.build_branch(cond_block, span);
-        emit_instruction_to_current_block(ctx, br);
-        let body_end_idx = ctx
-            .builder
-            .get_insert_block()
-            .map(|b| b.index())
-            .unwrap_or(body_block.index());
-        add_cfg_edge(ctx, body_end_idx, cond_block.index());
+        if condition_is_constant_false {
+            // `while(0)` — body falls through directly to exit.
+            let br = ctx.builder.build_branch(exit_block, span);
+            emit_instruction_to_current_block(ctx, br);
+            let body_end_idx = ctx
+                .builder
+                .get_insert_block()
+                .map(|b| b.index())
+                .unwrap_or(body_block.index());
+            add_cfg_edge(ctx, body_end_idx, exit_block.index());
+        } else {
+            let br = ctx.builder.build_branch(cond_block, span);
+            emit_instruction_to_current_block(ctx, br);
+            let body_end_idx = ctx
+                .builder
+                .get_insert_block()
+                .map(|b| b.index())
+                .unwrap_or(body_block.index());
+            add_cfg_edge(ctx, body_end_idx, cond_block.index());
+        }
     }
 
     ctx.loop_stack.pop();
 
-    // --- Condition block ---
-    ctx.builder.set_insert_point(cond_block);
-    let cond_val = lower_expr_to_i1(ctx, condition, span);
-    let cond_br = ctx
-        .builder
-        .build_cond_branch(cond_val, body_block, exit_block, span);
-    emit_instruction_to_current_block(ctx, cond_br);
-    add_cfg_edge(ctx, cond_block.index(), body_block.index());
-    add_cfg_edge(ctx, cond_block.index(), exit_block.index());
+    if !condition_is_constant_false {
+        // --- Condition block (only when condition is not constant false) ---
+        ctx.builder.set_insert_point(cond_block);
+        let cond_val = lower_expr_to_i1(ctx, condition, span);
+        let cond_br = ctx
+            .builder
+            .build_cond_branch(cond_val, body_block, exit_block, span);
+        emit_instruction_to_current_block(ctx, cond_br);
+        add_cfg_edge(ctx, cond_block.index(), body_block.index());
+        add_cfg_edge(ctx, cond_block.index(), exit_block.index());
+    }
 
     // Continue at exit block.
     ctx.builder.set_insert_point(exit_block);
@@ -1299,14 +1481,21 @@ fn lower_computed_goto(
 ) -> Option<BlockId> {
     let addr_val = lower_expr_via_context(ctx, target_expr);
 
+    // The address value is a void* that was produced by &&label.
+    // We encoded each label's address as (BlockId.index() + 1) cast to ptr.
+    // Convert back to integer for the Switch dispatch.
+    let int_val = {
+        let (v, inst) = ctx.builder.build_ptr_to_int(addr_val, IrType::I64, span);
+        emit_instruction_to_current_block(ctx, inst);
+        v
+    };
+
     // Collect all known label blocks as possible targets for the indirect
-    // branch. In a real IndirectBr instruction these would be the target
-    // set; here we represent it through a Switch with label indices.
+    // branch. Use 1-based block indices matching lower_address_of_label.
     let possible_targets: Vec<(i64, BlockId)> = ctx
         .label_blocks
         .values()
-        .enumerate()
-        .map(|(i, &block_id)| (i as i64, block_id))
+        .map(|&block_id| (block_id.index() as i64 + 1, block_id))
         .collect();
 
     // Use an unreachable block as the default target.
@@ -1315,7 +1504,7 @@ fn lower_computed_goto(
     // Build a switch instruction to simulate indirect branch.
     let switch_inst =
         ctx.builder
-            .build_switch(addr_val, unreachable_block, possible_targets.clone(), span);
+            .build_switch(int_val, unreachable_block, possible_targets.clone(), span);
     emit_instruction_to_current_block(ctx, switch_inst);
 
     // Add CFG edges.
@@ -1401,10 +1590,12 @@ fn lower_asm_dispatch(
     let span = asm_stmt.span;
 
     // Build output pointer values (from output operand expressions).
+    // Outputs are LVALUES — we need the ADDRESS (alloca pointer) so the
+    // asm result can be stored there, not the loaded value.
     let output_ptrs: Vec<Value> = asm_stmt
         .outputs
         .iter()
-        .map(|op| lower_expr_via_context(ctx, &op.expression))
+        .map(|op| lower_lvalue_via_context(ctx, &op.expression))
         .collect();
 
     // Build input values (from input operand expressions).
@@ -1422,12 +1613,27 @@ fn lower_asm_dispatch(
         .collect();
 
     // Build named operand strings (symbolic names for operands).
+    // Resolve Symbol handles to actual interned strings via name_table.
     let mut named_operand_strs: Vec<Option<String>> = Vec::new();
     for op in &asm_stmt.outputs {
-        named_operand_strs.push(op.symbolic_name.as_ref().map(|s| format!("{}", s.as_u32())));
+        named_operand_strs.push(op.symbolic_name.as_ref().and_then(|s| {
+            let idx = s.as_u32() as usize;
+            if idx < ctx.name_table.len() {
+                Some(ctx.name_table[idx].clone())
+            } else {
+                None
+            }
+        }));
     }
     for op in &asm_stmt.inputs {
-        named_operand_strs.push(op.symbolic_name.as_ref().map(|s| format!("{}", s.as_u32())));
+        named_operand_strs.push(op.symbolic_name.as_ref().and_then(|s| {
+            let idx = s.as_u32() as usize;
+            if idx < ctx.name_table.len() {
+                Some(ctx.name_table[idx].clone())
+            } else {
+                None
+            }
+        }));
     }
 
     // Call asm_lowering module.
@@ -1600,8 +1806,34 @@ fn lower_expr_via_context(ctx: &mut StmtLoweringContext<'_>, expr: &ast::Express
         enum_constants: ctx.enum_constants,
         static_locals: ctx.static_locals,
         struct_defs: ctx.struct_defs,
+        label_blocks: ctx.label_blocks,
     };
     lower_expression(&mut expr_ctx, expr)
+}
+
+/// Lower an expression as an **lvalue** via a `StmtLoweringContext`.
+///
+/// Returns the ADDRESS (alloca pointer) of the expression, not its value.
+/// Used for inline assembly output operands which need a pointer to store
+/// the result into.
+fn lower_lvalue_via_context(ctx: &mut StmtLoweringContext<'_>, expr: &ast::Expression) -> Value {
+    let mut expr_ctx = ExprLoweringContext {
+        builder: ctx.builder,
+        function: ctx.function,
+        module: ctx.module,
+        target: ctx.target,
+        type_builder: ctx.type_builder,
+        diagnostics: ctx.diagnostics,
+        local_vars: ctx.local_vars,
+        param_values: ctx.param_values,
+        name_table: ctx.name_table,
+        local_types: ctx.local_types,
+        enum_constants: ctx.enum_constants,
+        static_locals: ctx.static_locals,
+        struct_defs: ctx.struct_defs,
+        label_blocks: ctx.label_blocks,
+    };
+    lower_lvalue(&mut expr_ctx, expr)
 }
 
 /// Converts an expression result to an I1 (boolean) value for use as a

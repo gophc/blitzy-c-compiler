@@ -989,10 +989,22 @@ pub enum BuiltinKind {
     ChooseExpr,
     /// `__builtin_clz(x)` — count leading zeros.
     Clz,
+    /// `__builtin_clzl(x)` — count leading zeros (long).
+    ClzL,
+    /// `__builtin_clzll(x)` — count leading zeros (long long).
+    ClzLL,
     /// `__builtin_ctz(x)` — count trailing zeros.
     Ctz,
+    /// `__builtin_ctzl(x)` — count trailing zeros (long).
+    CtzL,
+    /// `__builtin_ctzll(x)` — count trailing zeros (long long).
+    CtzLL,
     /// `__builtin_popcount(x)` — population count (number of set bits).
     Popcount,
+    /// `__builtin_popcountl(x)` — population count (long).
+    PopcountL,
+    /// `__builtin_popcountll(x)` — population count (long long).
+    PopcountLL,
     /// `__builtin_bswap16(x)` — 16-bit byte swap.
     Bswap16,
     /// `__builtin_bswap32(x)` — 32-bit byte swap.

@@ -294,6 +294,10 @@ impl AArch64Assembler {
             self.assemble_one(inst)?;
         }
 
+        // Resolve local branch targets (basic block labels) so that
+        // conditional branches don't produce unresolved relocations.
+        let _ = self.resolve_local_branches();
+
         Ok(AssemblyResult {
             code: self.code.clone(),
             relocations: self.relocations.clone(),
@@ -327,6 +331,12 @@ impl AArch64Assembler {
                 self.assemble_one(inst)?;
             }
         }
+
+        // Resolve local branch targets (basic block labels) before
+        // returning the result. Without this step, conditional branches
+        // targeting block labels like "if.then" or "for.body" remain as
+        // unresolved relocations and cause linker errors.
+        let _ = self.resolve_local_branches();
 
         Ok(AssemblyResult {
             code: self.code.clone(),
@@ -367,6 +377,16 @@ impl AArch64Assembler {
                 } else {
                     self.emit_raw_word(NOP_ENCODING);
                 }
+            }
+
+            // NOP with a label-defining comment (e.g. "if.then:") —
+            // this is a basic block label pseudo-instruction. Define the
+            // label in the symbol table WITHOUT emitting an actual NOP so
+            // conditional branch relocations can resolve locally.
+            A64Opcode::NOP if inst.comment.as_ref().is_some_and(|c| c.ends_with(':')) => {
+                let comment = inst.comment.as_ref().unwrap();
+                let label = &comment[..comment.len() - 1]; // strip trailing ':'
+                self.define_label(label);
             }
 
             // Standard single-instruction encoding.
@@ -491,7 +511,7 @@ impl AArch64Assembler {
     // -----------------------------------------------------------------------
 
     /// Emit an ADRP instruction placeholder (encoding with imm21=0).
-    fn emit_adrp(&mut self, rd: u8, _is_got: bool) {
+    fn emit_adrp(&mut self, rd: u32, _is_got: bool) {
         // ADRP encoding: op=1 (bit 31), immlo (bits 30:29), 10000 (bits 28:24),
         // immhi (bits 23:5), Rd (bits 4:0). With imm21=0:
         let hw_rd = registers::hw_encoding(rd) as u32;
@@ -1295,7 +1315,7 @@ impl AArch64Assembler {
 ///
 /// `LDR Xt, [Xn, #imm]` — unsigned offset scaled by 8 for 64-bit loads.
 /// Encoding: `11 111 0 01 01 imm12 Rn Rd`
-fn encode_ldr_unsigned_imm(rd: u8, rn: u8, imm12: u32) -> u32 {
+fn encode_ldr_unsigned_imm(rd: u32, rn: u32, imm12: u32) -> u32 {
     let hw_rd = registers::hw_encoding(rd) as u32;
     let hw_rn = registers::hw_encoding(rn) as u32;
     // size=11 (64-bit), V=0 (GPR), opc=01 (LDR)
@@ -1306,7 +1326,7 @@ fn encode_ldr_unsigned_imm(rd: u8, rn: u8, imm12: u32) -> u32 {
 ///
 /// `ADD Xd, Xn, #imm` (64-bit, no flags).
 /// Encoding: `sf=1 | op=0 | S=0 | 100010 | sh=0 | imm12 | Rn | Rd`
-fn encode_add_imm(rd: u8, rn: u8, imm12: u32) -> u32 {
+fn encode_add_imm(rd: u32, rn: u32, imm12: u32) -> u32 {
     let hw_rd = registers::hw_encoding(rd) as u32;
     let hw_rn = registers::hw_encoding(rn) as u32;
     (1 << 31) | (0b100010 << 23) | ((imm12 & 0xFFF) << 10) | (hw_rn << 5) | hw_rd
@@ -1314,13 +1334,14 @@ fn encode_add_imm(rd: u8, rn: u8, imm12: u32) -> u32 {
 
 /// Format an AArch64 register ID as a human-readable name for asm substitution.
 fn format_aarch64_register(reg: u8) -> String {
-    if reg < 31 {
+    let reg32 = reg as u32;
+    if reg32 < 31 {
         format!("x{}", reg)
-    } else if reg == registers::XZR {
+    } else if reg32 == registers::XZR {
         "xzr".to_string()
-    } else if (32..64).contains(&reg) {
+    } else if (32..64).contains(&reg32) {
         // SIMD/FP register
-        let fp_idx = reg - 32;
+        let fp_idx = reg32 - 32;
         format!("v{}", fp_idx)
     } else {
         format!("r{}", reg)
@@ -1377,7 +1398,7 @@ fn parse_int_literal(s: &str) -> Result<i64, String> {
 
 /// Parse an AArch64 GPR name (x0-x30, xzr, sp, wzr, w0-w30) and return its
 /// internal register ID.  Returns `Err` for unrecognized names.
-fn parse_asm_gpr(name: &str) -> Result<u8, String> {
+fn parse_asm_gpr(name: &str) -> Result<u32, String> {
     let name = name.trim().to_lowercase();
     if name == "sp" {
         return Ok(registers::SP_REG);
@@ -1386,14 +1407,14 @@ fn parse_asm_gpr(name: &str) -> Result<u8, String> {
         return Ok(registers::XZR);
     }
     if let Some(n) = name.strip_prefix('x') {
-        if let Ok(v) = n.parse::<u8>() {
+        if let Ok(v) = n.parse::<u32>() {
             if v <= 30 {
                 return Ok(v);
             }
         }
     }
     if let Some(n) = name.strip_prefix('w') {
-        if let Ok(v) = n.parse::<u8>() {
+        if let Ok(v) = n.parse::<u32>() {
             if v <= 30 {
                 return Ok(v);
             }
@@ -1515,7 +1536,7 @@ fn parse_barrier_option(s: &str) -> u32 {
 
 /// Parse an AArch64 memory operand like `[x0]`, `[x1, #16]`, or `[sp, #-8]`.
 /// Returns (base_register_id, offset).
-fn parse_memory_operand_aarch64(s: &str) -> Option<(u8, i64)> {
+fn parse_memory_operand_aarch64(s: &str) -> Option<(u32, i64)> {
     let s = s.trim();
     let inner = s.strip_prefix('[')?.strip_suffix(']')?;
     let parts: Vec<&str> = inner.split(',').map(|p| p.trim()).collect();

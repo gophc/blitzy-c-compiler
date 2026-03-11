@@ -973,24 +973,12 @@ impl SymbolTable {
             // Struct compatibility: named structs with the same tag are
             // compatible even if their field lists differ (one may be a
             // forward-declared snapshot captured before the full definition).
-            (
-                CType::Struct {
-                    name: Some(na), ..
-                },
-                CType::Struct {
-                    name: Some(nb), ..
-                },
-            ) => na == nb,
+            (CType::Struct { name: Some(na), .. }, CType::Struct { name: Some(nb), .. }) => {
+                na == nb
+            }
 
             // Union compatibility: same as struct — tag-name match suffices.
-            (
-                CType::Union {
-                    name: Some(na), ..
-                },
-                CType::Union {
-                    name: Some(nb), ..
-                },
-            ) => na == nb,
+            (CType::Union { name: Some(na), .. }, CType::Union { name: Some(nb), .. }) => na == nb,
 
             // Enum compatible with its underlying type.
             (

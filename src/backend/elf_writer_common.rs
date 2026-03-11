@@ -706,6 +706,42 @@ impl Elf32Rel {
     }
 }
 
+/// 32-bit ELF relocation entry with addend (`.rela.*` sections).
+///
+/// Each `Elf32Rela` is a 12-byte structure:
+/// - `r_offset`: Virtual address of the relocation target.
+/// - `r_info`: `(sym_index << 8) | rel_type`.
+/// - `r_addend`: Signed addend value.
+pub struct Elf32Rela {
+    /// Offset of the relocation target within the section.
+    pub r_offset: u32,
+    /// Relocation info: `(sym_index << 8) | rel_type`.
+    pub r_info: u32,
+    /// Explicit addend for the relocation computation.
+    pub r_addend: i32,
+}
+
+impl Elf32Rela {
+    /// Create from separate symbol index, relocation type, and addend.
+    pub fn new(offset: u32, sym_index: u32, rel_type: u8, addend: i32) -> Self {
+        Self {
+            r_offset: offset,
+            r_info: (sym_index << 8) | (rel_type as u32),
+            r_addend: addend,
+        }
+    }
+
+    /// Serialize to 12 little-endian bytes.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(12);
+        buf.extend_from_slice(&self.r_offset.to_le_bytes());
+        buf.extend_from_slice(&self.r_info.to_le_bytes());
+        buf.extend_from_slice(&self.r_addend.to_le_bytes());
+        debug_assert_eq!(buf.len(), 12);
+        buf
+    }
+}
+
 // ===========================================================================
 // StringTable — .strtab / .shstrtab Builder
 // ===========================================================================

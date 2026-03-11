@@ -296,17 +296,20 @@ impl ArchCodegen for I686Codegen {
         &self,
         func: &IrFunction,
         diag: &mut DiagnosticEngine,
-        _globals: &[crate::ir::module::GlobalVariable],
-        _func_ref_map: &crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>,
-        _global_var_refs: &crate::common::fx_hash::FxHashMap<
+        globals: &[crate::ir::module::GlobalVariable],
+        func_ref_map: &crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>,
+        global_var_refs: &crate::common::fx_hash::FxHashMap<
             crate::ir::instructions::Value,
             String,
         >,
     ) -> Result<MachineFunction, String> {
-        // Delegate to the inner codegen::I686Codegen which has the full
-        // instruction selection implementation.
-        self.inner
-            .lower_function(func, diag, _globals, _func_ref_map, _global_var_refs)
+        // Create a fresh inner codegen instance with the current
+        // function-reference and global-variable-reference maps, so that
+        // resolve_operand can look up symbol names for callee/global values.
+        let mut inner = codegen::I686Codegen::new(self.pic, self.debug_info);
+        inner.set_func_ref_names(func_ref_map);
+        inner.set_global_var_refs(global_var_refs);
+        inner.lower_function(func, diag, globals, func_ref_map, global_var_refs)
     }
 
     /// Encode i686 machine instructions to raw bytes using the built-in
@@ -575,16 +578,16 @@ mod tests {
         let codegen = I686Codegen::new(false, false);
         let info = codegen.register_info();
 
-        // i686 has only 6 allocatable GPRs (ESP and EBP are reserved).
-        assert_eq!(info.allocatable_gpr.len(), 6);
+        // i686 has 5 allocatable GPRs (ESP, EBP reserved; ECX = spill scratch).
+        assert_eq!(info.allocatable_gpr.len(), 5);
         assert!(info.allocatable_gpr.contains(&EAX));
-        assert!(info.allocatable_gpr.contains(&ECX));
+        assert!(!info.allocatable_gpr.contains(&ECX)); // ECX = spill scratch
         assert!(info.allocatable_gpr.contains(&EDX));
         assert!(info.allocatable_gpr.contains(&EBX));
         assert!(info.allocatable_gpr.contains(&ESI));
         assert!(info.allocatable_gpr.contains(&EDI));
 
-        // ESP and EBP must NOT be allocatable.
+        // ESP, EBP, and ECX must NOT be allocatable.
         assert!(!info.allocatable_gpr.contains(&ESP));
         assert!(!info.allocatable_gpr.contains(&EBP));
     }

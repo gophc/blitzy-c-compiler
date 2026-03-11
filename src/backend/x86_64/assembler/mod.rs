@@ -554,12 +554,17 @@ pub fn assemble(
             }
 
             // Handle inline assembly instructions by assembling the template
-            // directly.  The template has already had operand placeholders
-            // (%0, %1, …) substituted with physical register names by the
-            // register allocation fixup pass, and AT&T-syntax %% escapes
-            // converted to single %.
+            // directly.  Template placeholders (%0, %1, …) are substituted
+            // with physical register names:
+            //   %0..%(num_outputs-1)  → inst.result  (output register)
+            //   %num_outputs..        → inst.operands[i - num_outputs]
             if let Some(ref template) = inst.asm_template {
-                let asm_bytes = assemble_inline_asm_x86_64(template, &inst.operands);
+                let asm_bytes = assemble_inline_asm_x86_64(
+                    template,
+                    inst.result.as_ref(),
+                    inst.asm_num_outputs,
+                    &inst.operands,
+                );
                 ctx.emit_bytes(&asm_bytes);
                 enc.current_offset = ctx.current_offset;
                 continue;
@@ -1067,29 +1072,61 @@ pub fn assemble_retpoline_thunks() -> Vec<(String, Vec<u8>)> {
 ///
 /// # Arguments
 ///
-/// * `template` - The inline assembly template string.
-/// * `operands` - Physical register operands (from register allocation).
-///   Used to substitute `%0`, `%1`, ... placeholders that
-///   haven't been pre-substituted yet.
+/// * `template` - The inline assembly template string with `%0`, `%1`, …
+///   placeholders.
+/// * `result_op` - The physical register assigned to the asm result (outputs).
+/// * `num_outputs` - How many output operands exist. Template `%0`..`%(num_outputs-1)`
+///   map to `result_op`.
+/// * `input_operands` - Physical register operands for inputs (from register
+///   allocation). Template `%num_outputs`.. maps to `input_operands[i - num_outputs]`.
 fn assemble_inline_asm_x86_64(
     template: &str,
-    operands: &[crate::backend::traits::MachineOperand],
+    result_op: Option<&crate::backend::traits::MachineOperand>,
+    num_outputs: usize,
+    input_operands: &[crate::backend::traits::MachineOperand],
 ) -> Vec<u8> {
     let mut result = Vec::new();
 
-    // First, substitute %N operand references with physical register names.
+    // First, protect %% escape sequences from being matched as operand refs.
+    // Replace %% with a placeholder that won't conflict with %N patterns.
+    let template = template.replace("%%", "\x01\x01");
+
+    // Substitute %N operand references with physical register names.
+    // Process HIGHER indices first to avoid %1 matching inside %10.
+    let total_operands = num_outputs + input_operands.len();
     let mut substituted = template.to_string();
-    for (idx, op) in operands.iter().enumerate() {
+    for idx in (0..total_operands).rev() {
         let placeholder = format!("%{}", idx);
-        let reg_name = match op {
-            crate::backend::traits::MachineOperand::Register(r) => x86_64_reg_name_32(*r),
-            _ => format!("%{}", idx),
+        let reg_name = if idx < num_outputs {
+            // Output operand → use result register
+            match result_op {
+                Some(crate::backend::traits::MachineOperand::Register(r)) => {
+                    x86_64_reg_name_32(*r)
+                }
+                _ => format!("%{}", idx),
+            }
+        } else {
+            // Input operand → use input_operands[idx - num_outputs]
+            let input_idx = idx - num_outputs;
+            if input_idx < input_operands.len() {
+                match &input_operands[input_idx] {
+                    crate::backend::traits::MachineOperand::Register(r) => {
+                        x86_64_reg_name_32(*r)
+                    }
+                    crate::backend::traits::MachineOperand::Immediate(imm) => {
+                        format!("${}", imm)
+                    }
+                    _ => format!("%{}", idx),
+                }
+            } else {
+                format!("%{}", idx)
+            }
         };
         substituted = substituted.replace(&placeholder, &reg_name);
     }
 
-    // Convert AT&T %% escapes to single %.
-    substituted = substituted.replace("%%", "%");
+    // Restore %% escapes to single %.
+    substituted = substituted.replace("\x01\x01", "%");
 
     // Split into individual instructions.
     for raw_line in substituted.split('\n') {
@@ -1520,6 +1557,8 @@ mod tests {
             is_leaf: true,
             vreg_to_ir_value: crate::common::fx_hash::FxHashMap::default(),
             sse_vregs: crate::common::fx_hash::FxHashSet::default(),
+            va_save_area_offset: None,
+            named_gpr_count: 0,
         }
     }
 

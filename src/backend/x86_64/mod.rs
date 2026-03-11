@@ -437,6 +437,32 @@ impl ArchCodegen for X86_64Backend {
             prologue.push(push_inst);
         }
 
+        // For variadic functions: save the 6 integer parameter registers
+        // (RDI, RSI, RDX, RCX, R8, R9) to the register save area so that
+        // va_start / va_arg can locate all variadic arguments.
+        if let Some(va_offset) = mf.va_save_area_offset {
+            let save_regs: [u16; 6] = [
+                registers::RDI,
+                registers::RSI,
+                registers::RDX,
+                registers::RCX,
+                registers::R8,
+                registers::R9,
+            ];
+            for (i, &reg) in save_regs.iter().enumerate() {
+                let disp = va_offset as i64 + (i as i64) * 8;
+                let mut save = MachineInstruction::new(X86Opcode::Mov.as_u32());
+                save.operands.push(MachineOperand::Memory {
+                    base: Some(RBP),
+                    index: None,
+                    scale: 1,
+                    displacement: disp,
+                });
+                save.operands.push(MachineOperand::Register(reg));
+                prologue.push(save);
+            }
+        }
+
         prologue
     }
 
@@ -714,6 +740,11 @@ fn x86_opcode_mnemonic(opcode: u32) -> &'static str {
         Some(X86Opcode::Endbr64) => "endbr64",
         Some(X86Opcode::Pause) => "pause",
         Some(X86Opcode::Lfence) => "lfence",
+        Some(X86Opcode::Bsr) => "bsrq",
+        Some(X86Opcode::Bsf) => "bsfq",
+        Some(X86Opcode::Popcnt) => "popcntq",
+        Some(X86Opcode::Bswap) => "bswapq",
+        Some(X86Opcode::Ud2) => "ud2",
         Some(X86Opcode::InlineAsm) => "# inline asm",
         None => "ud2",
     }
@@ -912,7 +943,7 @@ mod tests {
         // 14 allocatable GPRs (16 - RSP - RBP)
         assert_eq!(info.allocatable_gpr.len(), 13); // R11 reserved as spill scratch
                                                     // 16 allocatable SSE registers
-        assert_eq!(info.allocatable_fpr.len(), 16);
+        assert_eq!(info.allocatable_fpr.len(), 15);
         // 5 callee-saved GPRs: RBX, R12, R13, R14, R15
         assert_eq!(info.callee_saved.len(), 5);
         // 8 caller-saved GPRs: RAX, RCX, RDX, RSI, RDI, R8-R10

@@ -624,8 +624,7 @@ impl<'a> MacroExpander<'a> {
                         let va = self.get_va_args_tokens(unexpanded_args, params);
                         let is_va_empty = va.is_empty()
                             || va.iter().all(|t| {
-                                t.is_whitespace()
-                                    || t.kind == PPTokenKind::PlacemarkerToken
+                                t.is_whitespace() || t.kind == PPTokenKind::PlacemarkerToken
                             });
                         if is_va_empty {
                             result.push(PPToken::placemarker(invocation_span));
@@ -666,8 +665,7 @@ impl<'a> MacroExpander<'a> {
                         // has no tokens or contains only whitespace tokens.
                         let is_arg_empty = arg.is_empty()
                             || arg.iter().all(|t| {
-                                t.is_whitespace()
-                                    || t.kind == PPTokenKind::PlacemarkerToken
+                                t.is_whitespace() || t.kind == PPTokenKind::PlacemarkerToken
                             });
                         if is_arg_empty {
                             result.push(PPToken::placemarker(invocation_span));

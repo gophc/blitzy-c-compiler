@@ -743,6 +743,7 @@ mod tests {
             result: Value(1),
             value: Value(0),
             to_type: IrType::I64,
+            from_type: IrType::I8,
             span: dummy_span(),
         };
         assert!(!has_side_effects(&inst));

@@ -131,9 +131,19 @@ impl<'a> BuiltinEvaluator<'a> {
 
             // -- Runtime: bit manipulation --------------------------------
             BuiltinKind::Clz => self.eval_single_arg_int("__builtin_clz", args, CType::Int, span),
+            BuiltinKind::ClzL => self.eval_single_arg_int("__builtin_clzl", args, CType::Int, span),
+            BuiltinKind::ClzLL => self.eval_single_arg_int("__builtin_clzll", args, CType::Int, span),
             BuiltinKind::Ctz => self.eval_single_arg_int("__builtin_ctz", args, CType::Int, span),
+            BuiltinKind::CtzL => self.eval_single_arg_int("__builtin_ctzl", args, CType::Int, span),
+            BuiltinKind::CtzLL => self.eval_single_arg_int("__builtin_ctzll", args, CType::Int, span),
             BuiltinKind::Popcount => {
                 self.eval_single_arg_int("__builtin_popcount", args, CType::Int, span)
+            }
+            BuiltinKind::PopcountL => {
+                self.eval_single_arg_int("__builtin_popcountl", args, CType::Int, span)
+            }
+            BuiltinKind::PopcountLL => {
+                self.eval_single_arg_int("__builtin_popcountll", args, CType::Int, span)
             }
             BuiltinKind::Ffs => self.eval_single_arg_int("__builtin_ffs", args, CType::Int, span),
             BuiltinKind::Ffsll => {
@@ -249,8 +259,14 @@ impl<'a> BuiltinEvaluator<'a> {
 
             // Bit manipulation — int result.
             BuiltinKind::Clz
+            | BuiltinKind::ClzL
+            | BuiltinKind::ClzLL
             | BuiltinKind::Ctz
+            | BuiltinKind::CtzL
+            | BuiltinKind::CtzLL
             | BuiltinKind::Popcount
+            | BuiltinKind::PopcountL
+            | BuiltinKind::PopcountLL
             | BuiltinKind::Ffs
             | BuiltinKind::Ffsll => CType::Int,
 

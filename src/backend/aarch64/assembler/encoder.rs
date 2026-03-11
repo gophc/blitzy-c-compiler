@@ -134,17 +134,17 @@ fn ok_reloc(
     })
 }
 
-/// Get the 5-bit hardware register encoding from an `Option<u8>`, defaulting
+/// Get the 5-bit hardware register encoding from an `Option<u32>`, defaulting
 /// to register 0 if absent.
 #[inline]
-fn hw(reg: Option<u8>) -> u32 {
+fn hw(reg: Option<u32>) -> u32 {
     registers::hw_encoding(reg.unwrap_or(0)) as u32
 }
 
-/// Get the 5-bit hardware register encoding from an `Option<u8>`, defaulting
+/// Get the 5-bit hardware register encoding from an `Option<u32>`, defaulting
 /// to XZR (31) if absent. Used for multiply-accumulate Ra field defaults.
 #[inline]
-fn hw_or_zr(reg: Option<u8>) -> u32 {
+fn hw_or_zr(reg: Option<u32>) -> u32 {
     registers::hw_encoding(reg.unwrap_or(registers::XZR)) as u32
 }
 
@@ -977,9 +977,14 @@ impl AArch64Encoder {
                     let word = enc_add_sub_imm(sf, op, s_flag, 0, 0, rn, rd);
                     ok_reloc(word, AArch64RelocationType::AddAbsLo12Nc, imm)
                 } else {
-                    let uimm = imm as u64;
+                    // Handle negative immediates by flipping ADD↔SUB.
+                    let (actual_op, uimm) = if imm < 0 {
+                        (op ^ 1, (-(imm as i64)) as u64)
+                    } else {
+                        (op, imm as u64)
+                    };
                     let (sh, imm12) = split_add_sub_imm(uimm)?;
-                    ok(enc_add_sub_imm(sf, op, s_flag, sh, imm12, rn, rd))
+                    ok(enc_add_sub_imm(sf, actual_op, s_flag, sh, imm12, rn, rd))
                 }
             }
 
@@ -1161,6 +1166,23 @@ impl AArch64Encoder {
             // =========================================================
             A64Opcode::MADD => ok(enc_mul(sf, rm, 0, ra, rn, rd)),
             A64Opcode::MSUB => ok(enc_mul(sf, rm, 1, ra, rn, rd)),
+            // MUL pseudo: MADD Rd, Rn, Rm, XZR (ra=31)
+            A64Opcode::MUL => ok(enc_mul(sf, rm, 0, 31, rn, rd)),
+            // SMULL: signed multiply long (32×32→64).
+            // Encoding: sf=1, U=0, Ra=11111 (XZR), opcode bits for SMADDL.
+            // SMADDL Xd, Wn, Wm, XZR  → 1 00 11011 001 Rm 0 11111 Rn Rd
+            A64Opcode::SMULL => {
+                let word = (1u32 << 31) // sf=1
+                    | (0b00u32 << 29)   // U=0 (signed)
+                    | (0b11011u32 << 24)
+                    | (0b001u32 << 21)  // op54=00, op31=1 (long)
+                    | ((rm & 0x1F) << 16)
+                    | (0u32 << 15)      // o0=0 (add, not sub)
+                    | (0b11111u32 << 10) // Ra=XZR (makes it SMULL not SMADDL)
+                    | ((rn & 0x1F) << 5)
+                    | (rd & 0x1F);
+                ok(word)
+            }
             A64Opcode::SDIV => ok(enc_dp_2src(sf, rm, 0b000011, rn, rd)),
             A64Opcode::UDIV => ok(enc_dp_2src(sf, rm, 0b000010, rn, rd)),
             A64Opcode::SMULH => ok(enc_smulh(rm, rn, rd)),
@@ -1432,9 +1454,15 @@ impl AArch64Encoder {
             // Comparison Pseudo-instructions
             // =========================================================
             A64Opcode::CMP_imm => {
-                let uimm = imm as u64;
+                // CMP is SUBS with Rd=XZR.  Negative immediates become
+                // CMN (ADDS with Rd=XZR).
+                let (actual_op, uimm) = if imm < 0 {
+                    (0u32, (-(imm as i64)) as u64) // ADDS (CMN)
+                } else {
+                    (1u32, imm as u64)              // SUBS (CMP)
+                };
                 let (sh, imm12) = split_add_sub_imm(uimm)?;
-                ok(enc_add_sub_imm(sf, 1, 1, sh, imm12, rn, zr))
+                ok(enc_add_sub_imm(sf, actual_op, 1, sh, imm12, rn, zr))
             }
             A64Opcode::CMP_reg => {
                 let shift_type = ((inst.shift >> 6) & 0x3) as u32;
@@ -1444,9 +1472,14 @@ impl AArch64Encoder {
                 ))
             }
             A64Opcode::CMN_imm => {
-                let uimm = imm as u64;
+                // CMN is ADDS with Rd=XZR.  Negative → CMP (SUBS).
+                let (actual_op, uimm) = if imm < 0 {
+                    (1u32, (-(imm as i64)) as u64) // SUBS (CMP)
+                } else {
+                    (0u32, imm as u64)              // ADDS (CMN)
+                };
                 let (sh, imm12) = split_add_sub_imm(uimm)?;
-                ok(enc_add_sub_imm(sf, 0, 1, sh, imm12, rn, zr))
+                ok(enc_add_sub_imm(sf, actual_op, 1, sh, imm12, rn, zr))
             }
             A64Opcode::CMN_reg => {
                 let shift_type = ((inst.shift >> 6) & 0x3) as u32;
@@ -1578,6 +1611,38 @@ impl AArch64Encoder {
                     (1, 0b01)
                 };
                 ok(enc_fp_int_cvt(s, ft, 0b00, 0b110, rn, rd))
+            }
+
+            // =========================================================
+            // SIMD / Vector Instructions
+            // =========================================================
+            A64Opcode::CNT => {
+                // CNT Vd.8B, Vn.8B — AdvSIMD two-reg misc, size=00, opcode=00101
+                // Encoding: 0 Q 0 01110 size 10000 00101 10 Rn Rd
+                // Q=0 (8B), size=00 → 0_0_0_01110_00_10000_00101_10_Rn_Rd
+                let q = 0u32;
+                let word = (q << 30)
+                    | (0b00_01110_00u32 << 21)
+                    | (0b10000u32 << 16)
+                    | (0b00101u32 << 12)
+                    | (0b10u32 << 10)
+                    | ((rn & 0x1F) << 5)
+                    | (rd & 0x1F);
+                ok(word)
+            }
+            A64Opcode::ADDV => {
+                // ADDV Bd, Vn.8B — AdvSIMD across lanes, size=00, opcode=11011
+                // Encoding: 0 Q 0 01110 size 11000 11011 10 Rn Rd
+                // Q=0 (8B), size=00 → 0_0_0_01110_00_11000_11011_10_Rn_Rd
+                let q = 0u32;
+                let word = (q << 30)
+                    | (0b00_01110_00u32 << 21)
+                    | (0b11000u32 << 16)
+                    | (0b11011u32 << 12)
+                    | (0b10u32 << 10)
+                    | ((rn & 0x1F) << 5)
+                    | (rd & 0x1F);
+                ok(word)
             }
 
             // =========================================================

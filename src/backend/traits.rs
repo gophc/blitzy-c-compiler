@@ -228,6 +228,20 @@ impl MachineOperand {
         }
     }
 
+    /// Returns the register number regardless of whether this is a
+    /// `Register` or a `VirtualRegister`.  Useful when converting
+    /// back to architecture-specific instructions after register
+    /// allocation, where surviving VirtualRegisters are a valid
+    /// fallback.
+    #[inline]
+    pub fn as_any_register(&self) -> Option<u16> {
+        match self {
+            MachineOperand::Register(r) => Some(*r),
+            MachineOperand::VirtualRegister(v) => Some(*v as u16),
+            _ => None,
+        }
+    }
+
     /// If this is a `VirtualRegister`, return the virtual register number.
     #[inline]
     pub fn as_virtual_register(&self) -> Option<u32> {
@@ -365,6 +379,31 @@ pub struct MachineInstruction {
     /// The register allocator treats these registers as unavailable across
     /// this instruction. Empty for non-inline-asm instructions.
     pub asm_clobbers: Vec<String>,
+
+    /// Number of output operands in the inline assembly statement.
+    ///
+    /// Used during template substitution to determine which `%N` placeholders
+    /// refer to the result register (outputs: `%0`..`%(asm_num_outputs-1)`)
+    /// versus input operands stored in `self.operands`.
+    /// Template `%N` where N >= asm_num_outputs maps to `self.operands[N - asm_num_outputs]`.
+    /// Zero for non-inline-asm instructions.
+    pub asm_num_outputs: usize,
+
+    /// Architecture-specific condition code (used by AArch64 CSET, B.cond, etc.).
+    ///
+    /// This field preserves the condition code through the
+    /// `A64Instruction → MachineInstruction → A64Instruction` round-trip
+    /// that occurs during register allocation.  The value is the raw 4-bit
+    /// AArch64 condition encoding (0=EQ, 1=NE, 2=CS, …, 14=AL).
+    /// `None` for instructions that do not use a condition code.
+    pub cond_code: Option<u8>,
+
+    /// Architecture-specific shift/rotate encoding (used by AArch64).
+    ///
+    /// For MOVZ/MOVK/MOVN this is the `hw * 16` halfword shift.
+    /// For register-shifted instructions this packs shift-type and amount.
+    /// Preserved through the MachineInstruction round-trip.
+    pub arch_shift: u8,
 }
 
 impl MachineInstruction {
@@ -385,6 +424,9 @@ impl MachineInstruction {
             encoded_bytes: Vec::new(),
             asm_template: None,
             asm_clobbers: Vec::new(),
+            asm_num_outputs: 0,
+            cond_code: None,
+            arch_shift: 0,
         }
     }
 
@@ -751,6 +793,15 @@ pub struct MachineFunction {
     /// register (e.g., XMM15) and MOVSD instructions instead of a GPR scratch
     /// (R11) and MOV instructions. Populated during instruction selection.
     pub sse_vregs: crate::common::fx_hash::FxHashSet<u32>,
+
+    /// RBP-relative offset of the variadic register save area (negative).
+    /// Set only for variadic functions on x86-64.  The save area holds
+    /// 6 GPR slots (RDI, RSI, RDX, RCX, R8, R9) at consecutive offsets.
+    pub va_save_area_offset: Option<i32>,
+
+    /// Number of named (non-variadic) GPR parameters.  Used by va_start
+    /// to compute the address of the first variadic argument in the save area.
+    pub named_gpr_count: usize,
 }
 
 impl MachineFunction {
@@ -772,6 +823,8 @@ impl MachineFunction {
             is_leaf: true,
             vreg_to_ir_value: FxHashMap::default(),
             sse_vregs: crate::common::fx_hash::FxHashSet::default(),
+            va_save_area_offset: None,
+            named_gpr_count: 0,
         }
     }
 

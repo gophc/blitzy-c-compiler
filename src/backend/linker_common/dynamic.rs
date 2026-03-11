@@ -400,6 +400,19 @@ impl GnuHashTable {
 // Global Offset Table (.got / .got.plt)
 // ===========================================================================
 
+/// Number of reserved entries at the start of `.got.plt`.
+///
+/// - **x86-64 / i686 / AArch64**: 3 entries — `[0]` = `.dynamic` address,
+///   `[1]` = link\_map, `[2]` = resolver (filled by ld.so).
+/// - **RISC-V 64**: 2 entries — `[0]` = resolver, `[1]` = link\_map
+///   (the RISC-V ABI stores the resolver at `[0]`, not `[2]`).
+pub fn got_plt_reserved_count(target: &Target) -> usize {
+    match target {
+        Target::RiscV64 => 2,
+        _ => 3,
+    }
+}
+
 /// An entry in the `.got` section.
 #[derive(Debug, Clone)]
 pub struct GotEntry {
@@ -450,7 +463,8 @@ impl GlobalOffsetTable {
     pub fn add_got_plt_entry(&mut self, sym: &str) -> (u64, u32) {
         let pw = self.target.pointer_width() as u64;
         let idx = self.got_plt_entries.len() as u32;
-        let offset = (3 + idx as u64) * pw;
+        let reserved = got_plt_reserved_count(&self.target) as u64;
+        let offset = (reserved + idx as u64) * pw;
         self.got_plt_entries.push(GotPltEntry {
             symbol_name: sym.to_owned(),
             offset,
@@ -464,14 +478,15 @@ impl GlobalOffsetTable {
         vec![0u8; self.entries.len() * self.target.pointer_width()]
     }
 
-    /// Encode `.got.plt` with 3 reserved entries + lazy-binding targets.
+    /// Encode `.got.plt` with reserved entries + lazy-binding targets.
     pub fn encode_got_plt(&self, plt_base: u64) -> Vec<u8> {
         let pw = self.target.pointer_width();
         let (plt0_sz, pltn_sz) = plt_sizes(&self.target);
-        let total = 3 + self.got_plt_entries.len();
+        let reserved = got_plt_reserved_count(&self.target);
+        let total = reserved + self.got_plt_entries.len();
         let mut buf = Vec::with_capacity(total * pw);
-        // 3 reserved entries (filled by dynamic linker).
-        for _ in 0..3 {
+        // Reserved entries (filled by dynamic linker at load time).
+        for _ in 0..reserved {
             if pw == 8 {
                 buf.extend_from_slice(&0u64.to_le_bytes());
             } else {
@@ -501,9 +516,10 @@ impl GlobalOffsetTable {
     pub fn got_plt_entries(&self) -> &[GotPltEntry] {
         &self.got_plt_entries
     }
-    /// Total size of `.got.plt` in bytes (3 reserved + N stubs × pointer width).
+    /// Total size of `.got.plt` in bytes (reserved + N stubs × pointer width).
     pub fn got_plt_size(&self) -> usize {
-        (3 + self.got_plt_entries.len()) * self.target.pointer_width()
+        (got_plt_reserved_count(&self.target) + self.got_plt_entries.len())
+            * self.target.pointer_width()
     }
 }
 
@@ -532,6 +548,12 @@ impl ProcedureLinkageTable {
             stubs: Vec::new(),
             target,
         }
+    }
+
+    /// Public constructor for use by the linker common infrastructure
+    /// when re-encoding PLT sections with final virtual addresses.
+    pub fn new_public(target: Target) -> Self {
+        Self::new(target)
     }
 
     /// Generate PLT0 header stub (resolver trampoline).
@@ -641,9 +663,9 @@ impl ProcedureLinkageTable {
         b.extend_from_slice(&encode_aarch64_adrp(16, pd as i32).to_le_bytes());
         // ldr x17, [x16, #PAGEOFF(GOT+16)]
         b.extend_from_slice(&encode_aarch64_ldr64(17, 16, (got2 & 0xFFF) as u32 / 8).to_le_bytes());
-        // add x16, x16, #PAGEOFF(GOT+8)
-        let got1_lo = ((gpa + 8) & 0xFFF) as u32;
-        b.extend_from_slice(&encode_aarch64_add_imm(16, 16, got1_lo).to_le_bytes());
+        // add x16, x16, #PAGEOFF(GOT+16) — must match the LDR target (GOT[2])
+        let got2_lo = (got2 & 0xFFF) as u32;
+        b.extend_from_slice(&encode_aarch64_add_imm(16, 16, got2_lo).to_le_bytes());
         // br x17
         b.extend_from_slice(&0xD61F0220u32.to_le_bytes());
         // 3 × nop
@@ -676,24 +698,32 @@ impl ProcedureLinkageTable {
 
     fn plt0_riscv64(&self, gpa: u64, pa: u64) -> Vec<u8> {
         let mut b = Vec::with_capacity(32);
-        let off = gpa as i64 - pa as i64;
+        // RISC-V GOT.PLT layout (2-entry reserved model):
+        //   [0] = _dl_runtime_resolve (resolver, filled by ld.so)
+        //   [1] = link_map             (filled by ld.so)
+        //   [2+] = JUMP_SLOT entries
+        //
+        // PLT0 loads resolver from GOT[0] into t3, link_map from
+        // GOT[1] into t0, then jumps to resolver.
+        let off = gpa as i64 - pa as i64; // PC-relative to GOT[0]
         let (hi, lo) = riscv_hi20_lo12(off as i32);
-        // auipc t2(x7), hi20
+        // auipc t2(x7), hi20  — t2 = PLT0 + hi_page, base for
+        //                        PC-relative GOT access
         b.extend_from_slice(&encode_rv_auipc(7, hi).to_le_bytes());
-        // sub t1(x6), t1(x6), t3(x28)
+        // sub t1(x6), t1(x6), t3(x28) — PLT index bookkeeping
         b.extend_from_slice(&encode_rv_sub(6, 6, 28).to_le_bytes());
-        // ld t3(x28), lo12(t2/x7)
+        // ld t3(x28), lo12(t2/x7) — load resolver from GOT[0]
         b.extend_from_slice(&encode_rv_ld(28, 7, lo).to_le_bytes());
-        // addi t1(x6), t1(x6), -(32+12)
+        // addi t1(x6), t1(x6), -(32+12) — PLT index bookkeeping
         b.extend_from_slice(&encode_rv_addi(6, 6, -44).to_le_bytes());
-        // addi t0(x5), t2(x7), lo12
+        // addi t0(x5), t2(x7), lo12 — t0 = address of GOT[0]
         b.extend_from_slice(&encode_rv_addi(5, 7, lo).to_le_bytes());
-        // srli t1(x6), t1(x6), 1
+        // srli t1(x6), t1(x6), 1 — PLT index bookkeeping
         b.extend_from_slice(&encode_rv_srli(6, 6, 1).to_le_bytes());
-        // ld t0(x5), 8(t0/x5)
+        // ld t0(x5), 8(t0/x5) — load link_map from GOT[1] = GOT[0]+8
         b.extend_from_slice(&encode_rv_ld(5, 5, 8).to_le_bytes());
-        // jalr x0, t0(x5), 0 (jr t0)
-        b.extend_from_slice(&encode_rv_jalr(0, 5, 0).to_le_bytes());
+        // jr t3(x28) — jump to resolver (_dl_runtime_resolve)
+        b.extend_from_slice(&encode_rv_jalr(0, 28, 0).to_le_bytes());
         debug_assert_eq!(b.len(), 32);
         b
     }
@@ -876,6 +906,8 @@ fn encode_relocations(relocs: &[DynamicRelocation], is_64bit: bool) -> Vec<u8> {
             buf.extend_from_slice(&e.to_bytes());
         }
     } else {
+        // i686 uses Elf32_Rel (8 bytes, no addend) — the glibc i386
+        // dynamic linker asserts DT_PLTREL == DT_REL.
         for r in relocs {
             let e = Elf32Rel::new(r.offset as u32, r.sym_index, r.rel_type as u8);
             buf.extend_from_slice(&e.to_bytes());
@@ -949,6 +981,8 @@ impl DynamicSection {
                 s.add_entry(DT_PLTGOT, 0);
             }
         } else {
+            // 32-bit ELF (i686) uses REL entries (8 bytes, no addend)
+            // because the i386 glibc dynamic linker asserts DT_PLTREL==DT_REL.
             if !rela_dyn_bytes.is_empty() {
                 s.add_entry(DT_REL, 0);
                 s.add_entry(DT_RELSZ, rela_dyn_bytes.len() as u64);
@@ -1104,11 +1138,22 @@ impl DynamicLinkContext {
     /// collected. After this call the various `encode_*()` helpers can be
     /// used to obtain the raw byte vectors.
     pub fn finalize(&mut self) {
+        // Add needed library names to .dynstr BEFORE building .dynamic,
+        // so that patch_needed_libs can find them in the string table.
+        for lib in &self.needed_libs.clone() {
+            self.dynsym.add_dynstr_string(lib);
+        }
+
         // Build .gnu.hash from the symbol table
         self.gnu_hash = GnuHashTable::build(&self.dynsym.symbols);
 
         // Build .dynamic from accumulated metadata
         self.dynamic = DynamicSection::build(self);
+
+        // Patch DT_NEEDED entries with the correct dynstr offsets
+        let dynstr_data = self.dynsym.encode_dynstr();
+        self.dynamic
+            .patch_needed_libs(&self.needed_libs, &dynstr_data);
     }
 
     /// Return the null-terminated `PT_INTERP` content, if one was set.
@@ -1289,7 +1334,7 @@ fn default_glob_dat_reloc(target: Target) -> u32 {
 }
 
 /// Returns the `R_*_JUMP_SLOT` relocation type for the given target.
-fn default_jump_slot_reloc(target: Target) -> u32 {
+pub fn default_jump_slot_reloc(target: Target) -> u32 {
     match target {
         Target::X86_64 => 7,     // R_X86_64_JUMP_SLOT
         Target::I686 => 7,       // R_386_JMP_SLOT
@@ -1299,7 +1344,7 @@ fn default_jump_slot_reloc(target: Target) -> u32 {
 }
 
 /// Return `(plt0_size, pltn_size)` for the given target.
-fn plt_sizes(target: &Target) -> (usize, usize) {
+pub fn plt_sizes(target: &Target) -> (usize, usize) {
     match target {
         Target::X86_64 | Target::I686 => (16, 16),
         Target::AArch64 | Target::RiscV64 => (32, 16),

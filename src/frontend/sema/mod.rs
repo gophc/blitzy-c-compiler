@@ -700,10 +700,8 @@ impl<'a> SemanticAnalyzer<'a> {
                         if is_primitive {
                             Ok(CType::Int)
                         } else {
-                            self.diagnostics.emit_error(
-                                *span,
-                                "subscripted value is not an array or pointer",
-                            );
+                            self.diagnostics
+                                .emit_error(*span, "subscripted value is not an array or pointer");
                             Err(())
                         }
                     }
@@ -755,10 +753,8 @@ impl<'a> SemanticAnalyzer<'a> {
                         if is_primitive {
                             Ok(CType::Int)
                         } else {
-                            self.diagnostics.emit_error(
-                                *span,
-                                "member reference base type is not a pointer",
-                            );
+                            self.diagnostics
+                                .emit_error(*span, "member reference base type is not a pointer");
                             Err(())
                         }
                     }
@@ -1530,12 +1526,8 @@ impl<'a> SemanticAnalyzer<'a> {
                     BinaryOp::BitwiseAnd => Some(l & r),
                     BinaryOp::BitwiseOr => Some(l | r),
                     BinaryOp::BitwiseXor => Some(l ^ r),
-                    BinaryOp::LogicalAnd => {
-                        Some(if l != 0 && r != 0 { 1 } else { 0 })
-                    }
-                    BinaryOp::LogicalOr => {
-                        Some(if l != 0 || r != 0 { 1 } else { 0 })
-                    }
+                    BinaryOp::LogicalAnd => Some(if l != 0 && r != 0 { 1 } else { 0 }),
+                    BinaryOp::LogicalOr => Some(if l != 0 || r != 0 { 1 } else { 0 }),
                     BinaryOp::Equal => Some(if l == r { 1 } else { 0 }),
                     BinaryOp::NotEqual => Some(if l != r { 1 } else { 0 }),
                     BinaryOp::Less => Some(if l < r { 1 } else { 0 }),
@@ -1779,8 +1771,14 @@ impl<'a> SemanticAnalyzer<'a> {
             }
             BuiltinKind::Unreachable | BuiltinKind::Trap => Ok(CType::Void),
             BuiltinKind::Clz
+            | BuiltinKind::ClzL
+            | BuiltinKind::ClzLL
             | BuiltinKind::Ctz
+            | BuiltinKind::CtzL
+            | BuiltinKind::CtzLL
             | BuiltinKind::Popcount
+            | BuiltinKind::PopcountL
+            | BuiltinKind::PopcountLL
             | BuiltinKind::Ffs
             | BuiltinKind::Ffsll => Ok(CType::Int),
             BuiltinKind::Bswap16 => Ok(CType::UShort),
@@ -1826,7 +1824,19 @@ impl<'a> SemanticAnalyzer<'a> {
         associations: &[GenericAssociation],
         span: Span,
     ) -> Result<CType, ()> {
-        let ctrl_stripped = self.strip_qualifiers(controlling_type).clone();
+        // C11 §6.5.1.1p2: The controlling expression undergoes lvalue
+        // conversion, which includes array-to-pointer decay and
+        // function-to-pointer decay, and qualifier stripping.
+        let decayed = match self.strip_qualifiers(controlling_type) {
+            CType::Array(elem, _) => {
+                CType::Pointer(elem.clone(), TypeQualifiers::default())
+            }
+            CType::Function { .. } => {
+                CType::Pointer(Box::new(controlling_type.clone()), TypeQualifiers::default())
+            }
+            _ => controlling_type.clone(),
+        };
+        let ctrl_stripped = self.strip_qualifiers(&decayed).clone();
         let mut default_expr_type: Option<CType> = None;
 
         // First pass: try to match the controlling type against each
@@ -1871,32 +1881,23 @@ impl<'a> SemanticAnalyzer<'a> {
     /// qualifiers.  Named struct/union types match by tag name; other
     /// types use structural compatibility.
     fn types_match_generic(&self, a: &CType, b: &CType) -> bool {
+        let a = self.strip_qualifiers(a);
+        let b = self.strip_qualifiers(b);
         if a == b {
             return true;
         }
         match (a, b) {
-            (
-                CType::Struct {
-                    name: Some(na), ..
-                },
-                CType::Struct {
-                    name: Some(nb), ..
-                },
-            ) => na == nb,
-            (
-                CType::Union {
-                    name: Some(na), ..
-                },
-                CType::Union {
-                    name: Some(nb), ..
-                },
-            ) => na == nb,
-            (CType::Pointer(inner_a, _), CType::Pointer(inner_b, _)) => {
-                self.types_match_generic(
-                    self.strip_qualifiers(inner_a),
-                    self.strip_qualifiers(inner_b),
-                )
+            (CType::Struct { name: Some(na), .. }, CType::Struct { name: Some(nb), .. }) => {
+                na == nb
             }
+            (CType::Union { name: Some(na), .. }, CType::Union { name: Some(nb), .. }) => na == nb,
+            // For _Generic, pointer types match if their pointed-to types
+            // match after stripping qualifiers (ignore const, volatile on
+            // both the pointer and the pointee).
+            (CType::Pointer(inner_a, _), CType::Pointer(inner_b, _)) => self.types_match_generic(
+                self.strip_qualifiers(inner_a),
+                self.strip_qualifiers(inner_b),
+            ),
             (CType::Typedef { underlying: ua, .. }, other)
             | (other, CType::Typedef { underlying: ua, .. }) => {
                 self.types_match_generic(self.strip_qualifiers(ua), self.strip_qualifiers(other))
@@ -2348,8 +2349,7 @@ impl<'a> SemanticAnalyzer<'a> {
         if let Some(ref members) = spec.members {
             let mut fields = Vec::new();
             for member in members {
-                let member_base =
-                    self.resolve_type_from_spec_qualifier_list(&member.specifiers);
+                let member_base = self.resolve_type_from_spec_qualifier_list(&member.specifiers);
 
                 if member.declarators.is_empty() {
                     // Anonymous struct/union member (C11 §6.7.2.1p13).
@@ -3022,9 +3022,7 @@ impl<'a> SemanticAnalyzer<'a> {
         // look up the completed definition from the tag namespace.
         let fields: Vec<StructField> = if stored_fields.is_empty() {
             if let Some(ref tag_name) = tag_name_opt {
-                if let Some(entry) =
-                    self.scopes.lookup_tag_by_str(tag_name, self.interner)
-                {
+                if let Some(entry) = self.scopes.lookup_tag_by_str(tag_name, self.interner) {
                     if entry.is_complete {
                         match (&kind, &entry.ty) {
                             (StructOrUnion::Struct, CType::Struct { ref fields, .. })
@@ -3071,16 +3069,13 @@ impl<'a> SemanticAnalyzer<'a> {
                 let inner_fields: &[StructField] = match &field.ty {
                     CType::Struct { fields: f, .. } | CType::Union { fields: f, .. } => f,
                     CType::Qualified(inner, _) => match inner.as_ref() {
-                        CType::Struct { fields: f, .. }
-                        | CType::Union { fields: f, .. } => f,
+                        CType::Struct { fields: f, .. } | CType::Union { fields: f, .. } => f,
                         _ => continue,
                     },
                     CType::Typedef { underlying, .. } => match underlying.as_ref() {
-                        CType::Struct { fields: f, .. }
-                        | CType::Union { fields: f, .. } => f,
+                        CType::Struct { fields: f, .. } | CType::Union { fields: f, .. } => f,
                         CType::Qualified(inner, _) => match inner.as_ref() {
-                            CType::Struct { fields: f, .. }
-                            | CType::Union { fields: f, .. } => f,
+                            CType::Struct { fields: f, .. } | CType::Union { fields: f, .. } => f,
                             _ => continue,
                         },
                         _ => continue,

@@ -100,19 +100,19 @@ pub const MAX_HFA_MEMBERS: usize = 4;
 pub const MAX_COMPOSITE_REG_SIZE: usize = 16;
 
 /// Integer argument register IDs (X0–X7), indexed by NGRN.
-pub const INT_ARG_REGS: [u8; 8] = [X0, X1, X2, X3, X4, X5, X6, X7];
+pub const INT_ARG_REGS: [u32; 8] = [X0, X1, X2, X3, X4, X5, X6, X7];
 
 /// Float/SIMD argument register IDs (V0–V7), indexed by NSRN.
-pub const FP_ARG_REGS: [u8; 8] = [V0, V1, V2, V3, V4, V5, V6, V7];
+pub const FP_ARG_REGS: [u32; 8] = [V0, V1, V2, V3, V4, V5, V6, V7];
 
 /// Integer return registers (X0, X1 — for register pair returns).
-pub const INT_RET_REGS: [u8; 2] = [X0, X1];
+pub const INT_RET_REGS: [u32; 2] = [X0, X1];
 
 /// Float return registers (V0–V3 — for HFA returns up to 4 members).
-pub const FP_RET_REGS: [u8; 4] = [V0, V1, V2, V3];
+pub const FP_RET_REGS: [u32; 4] = [V0, V1, V2, V3];
 
 /// Indirect result location register — callee writes large return values to `[X8]`.
-pub const INDIRECT_RESULT_REG: u8 = X8;
+pub const INDIRECT_RESULT_REG: u32 = X8;
 
 // ===========================================================================
 // ArgClass — Argument Classification
@@ -880,7 +880,7 @@ impl AArch64Abi {
 /// These 10 registers must be preserved by the callee. Typically saved and
 /// restored in pairs using STP/LDP instructions for efficiency.
 #[inline]
-pub fn callee_saved_gprs() -> &'static [u8] {
+pub fn callee_saved_gprs() -> &'static [u32] {
     CALLEE_SAVED_GPRS
 }
 
@@ -889,7 +889,7 @@ pub fn callee_saved_gprs() -> &'static [u8] {
 /// Only the lower 64 bits (D8–D15) of these registers are preserved by the
 /// callee. The upper 64 bits of V8–V15 may be clobbered.
 #[inline]
-pub fn callee_saved_fprs() -> &'static [u8] {
+pub fn callee_saved_fprs() -> &'static [u32] {
     CALLEE_SAVED_FPRS
 }
 
@@ -898,7 +898,7 @@ pub fn callee_saved_fprs() -> &'static [u8] {
 /// Includes X0–X18 (argument/scratch/platform) and X30 (LR, clobbered by
 /// BL instructions). These 20 registers may be clobbered by any function call.
 #[inline]
-pub fn caller_saved_gprs() -> &'static [u8] {
+pub fn caller_saved_gprs() -> &'static [u32] {
     CALLER_SAVED_GPRS
 }
 
@@ -906,7 +906,7 @@ pub fn caller_saved_gprs() -> &'static [u8] {
 ///
 /// These 24 registers may be clobbered by any function call.
 #[inline]
-pub fn caller_saved_fprs() -> &'static [u8] {
+pub fn caller_saved_fprs() -> &'static [u32] {
     CALLER_SAVED_FPRS
 }
 

@@ -85,6 +85,21 @@ thread_local! {
     // `lower_translation_unit` so that sizeof/alignof evaluation in global
     // constant expressions can resolve forward-referenced struct types.
     static SIZEOF_STRUCT_DEFS: RefCell<Option<FxHashMap<String, CType>>> = const { RefCell::new(None) };
+
+    // typeof resolution context — maps variable names to their resolved CTypes.
+    // Populated incrementally during `collect_locals_from_declaration` so that
+    // `typeof(var)` can look up a previously declared variable's type.  Also
+    // pre-seeded with function parameter types at the start of
+    // `lower_function_definition`.
+    static TYPEOF_CONTEXT: RefCell<Option<FxHashMap<String, CType>>> = const { RefCell::new(None) };
+
+    // Typedef resolution context — maps typedef names to their resolved CTypes.
+    // Populated at the start of `lower_translation_unit` by scanning all
+    // top-level typedef declarations and the builtin typedefs registered by
+    // the semantic analyzer. This allows `resolve_base_type_fast` to correctly
+    // resolve `TypedefName` to the actual underlying C type instead of
+    // defaulting to `CType::Int`.
+    static TYPEDEF_MAP: RefCell<Option<FxHashMap<String, CType>>> = const { RefCell::new(None) };
 }
 
 // ============================================================================
@@ -739,13 +754,63 @@ pub fn lower_translation_unit(
         map
     };
 
-    eprintln!("[BCC-TIMING] ir-pass0-struct-collect: {:.3}s", _t0.elapsed().as_secs_f64());
+    eprintln!(
+        "[BCC-TIMING] ir-pass0-struct-collect: {:.3}s",
+        _t0.elapsed().as_secs_f64()
+    );
     // Populate the thread-local struct definitions registry so that
     // sizeof/alignof evaluation in global constant expressions can
     // resolve forward-referenced struct/union types.
     SIZEOF_STRUCT_DEFS.with(|defs| {
         *defs.borrow_mut() = Some(struct_defs.clone());
     });
+
+    // ====================================================================
+    // Pass 0.5 — Collect typedef definitions for type resolution
+    // ====================================================================
+    // Initialize the typedef map with builtin typedefs BEFORE scanning
+    // user code, so that typedef chains (e.g., typedef __builtin_va_list
+    // va_list) can resolve through the map incrementally.
+    {
+        let mut typedef_map: FxHashMap<String, CType> = FxHashMap::default();
+        // Pre-seed with the compiler builtin typedef.
+        typedef_map.insert(
+            "__builtin_va_list".to_string(),
+            CType::Pointer(Box::new(CType::Void), crate::common::types::TypeQualifiers::default()),
+        );
+        // Install the map into thread-local BEFORE the scan loop so that
+        // resolve_base_type_fast can find __builtin_va_list when resolving
+        // `typedef __builtin_va_list va_list;`.
+        TYPEDEF_MAP.with(|map| {
+            *map.borrow_mut() = Some(typedef_map);
+        });
+    }
+    // Now scan all top-level typedef declarations and incrementally
+    // add resolved types to the map.
+    for ext_decl in &translation_unit.declarations {
+        if let ast::ExternalDeclaration::Declaration(decl) = ext_decl {
+            if matches!(decl.specifiers.storage_class, Some(ast::StorageClass::Typedef)) {
+                for init_decl in &decl.declarators {
+                    let declarator = &init_decl.declarator;
+                    if let Some(td_name) = decl_lowering::extract_declarator_name(declarator, &name_table) {
+                        let full_type = decl_lowering::resolve_declaration_type(
+                            &decl.specifiers,
+                            declarator,
+                            target,
+                            &name_table,
+                        );
+                        // Chase Typedef wrappers to get the real underlying type.
+                        let resolved = crate::common::types::resolve_typedef(&full_type).clone();
+                        TYPEDEF_MAP.with(|map| {
+                            if let Some(ref mut m) = *map.borrow_mut() {
+                                m.insert(td_name, resolved);
+                            }
+                        });
+                    }
+                }
+            }
+        }
+    }
 
     // ====================================================================
     // Pass 1 — Global declarations, function prototypes, file-scope asm
@@ -812,7 +877,10 @@ pub fn lower_translation_unit(
         }
     }
 
-    eprintln!("[BCC-TIMING] ir-pass1-globals: {:.3}s", _t1.elapsed().as_secs_f64());
+    eprintln!(
+        "[BCC-TIMING] ir-pass1-globals: {:.3}s",
+        _t1.elapsed().as_secs_f64()
+    );
     // ====================================================================
     // Pass 1.5 — Collect enum constants from the AST
     // ====================================================================
@@ -845,7 +913,10 @@ pub fn lower_translation_unit(
         map
     };
 
-    eprintln!("[BCC-TIMING] ir-pass1.5-enums: {:.3}s", _t15.elapsed().as_secs_f64());
+    eprintln!(
+        "[BCC-TIMING] ir-pass1.5-enums: {:.3}s",
+        _t15.elapsed().as_secs_f64()
+    );
     // ====================================================================
     // Pass 2 — Function definitions (alloca-first pattern)
     // ====================================================================
@@ -1082,8 +1153,7 @@ fn collect_struct_defs_from_specifiers(
                     let tag_name_idx = tag.as_u32() as usize;
                     if tag_name_idx < name_table.len() {
                         let tag_name = name_table[tag_name_idx].clone();
-                        let fields =
-                            decl_lowering::extract_struct_union_fields_fast(s, name_table);
+                        let fields = decl_lowering::extract_struct_union_fields_fast(s, name_table);
                         let ctype = CType::Struct {
                             name: Some(tag_name.clone()),
                             fields,
@@ -1099,8 +1169,7 @@ fn collect_struct_defs_from_specifiers(
                     let tag_name_idx = tag.as_u32() as usize;
                     if tag_name_idx < name_table.len() {
                         let tag_name = name_table[tag_name_idx].clone();
-                        let fields =
-                            decl_lowering::extract_struct_union_fields_fast(u, name_table);
+                        let fields = decl_lowering::extract_struct_union_fields_fast(u, name_table);
                         let ctype = CType::Union {
                             name: Some(tag_name.clone()),
                             fields,

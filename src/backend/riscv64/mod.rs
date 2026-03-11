@@ -245,6 +245,12 @@ pub struct RiscV64Codegen {
     /// Built once during construction and returned by reference from
     /// [`ArchCodegen::relocation_types()`].
     pub relocation_types: Vec<RelocationTypeInfo>,
+
+    /// Set of function names that accept variadic arguments (`...`).
+    /// On RISC-V LP64D, variadic function calls must pass ALL FP arguments
+    /// in integer registers instead of FP registers.  Populated from
+    /// `IrModule::declarations()` before code generation begins.
+    pub variadic_functions: crate::common::fx_hash::FxHashSet<String>,
 }
 
 impl RiscV64Codegen {
@@ -266,7 +272,15 @@ impl RiscV64Codegen {
             pic_mode,
             debug_info,
             relocation_types: Self::build_relocation_types(),
+            variadic_functions: crate::common::fx_hash::FxHashSet::default(),
         }
+    }
+
+    /// Populate the variadic function set from module declarations.
+    /// Must be called before `lower_function` to ensure correct ABI
+    /// handling for variadic calls (FP args in integer registers).
+    pub fn set_variadic_functions(&mut self, set: crate::common::fx_hash::FxHashSet<String>) {
+        self.variadic_functions = set;
     }
 
     /// Build the complete set of RISC-V 64 relocation type descriptors.
@@ -388,6 +402,22 @@ impl RiscV64Codegen {
     /// representation ([`codegen::RvInstruction`]) to the backend-agnostic
     /// [`MachineInstruction`] format used by the register allocator and
     /// assembly emitter.
+    /// Convert a register ID to the appropriate MachineOperand.
+    ///
+    /// Register IDs 0–63 are physical registers and map to
+    /// `MachineOperand::Register`.  IDs ≥ 100 are virtual registers
+    /// assigned during instruction selection and map to
+    /// `MachineOperand::VirtualRegister`, which the register allocator
+    /// will later resolve to physical registers.
+    #[inline]
+    fn reg_to_operand(reg: u16) -> MachineOperand {
+        if reg >= 100 {
+            MachineOperand::VirtualRegister(reg as u32)
+        } else {
+            MachineOperand::Register(reg as u16)
+        }
+    }
+
     fn rv_to_machine_instruction(rv: &codegen::RvInstruction) -> MachineInstruction {
         let opcode = rv.opcode as u32;
         let mut mi = MachineInstruction::new(opcode);
@@ -404,22 +434,22 @@ impl RiscV64Codegen {
 
         // Destination register (result).
         if let Some(rd) = rv.rd {
-            mi = mi.with_result(MachineOperand::Register(rd as u16));
+            mi = mi.with_result(Self::reg_to_operand(rd));
         }
 
         // Source register 1.
         if let Some(rs1) = rv.rs1 {
-            mi = mi.with_operand(MachineOperand::Register(rs1 as u16));
+            mi = mi.with_operand(Self::reg_to_operand(rs1));
         }
 
         // Source register 2.
         if let Some(rs2) = rv.rs2 {
-            mi = mi.with_operand(MachineOperand::Register(rs2 as u16));
+            mi = mi.with_operand(Self::reg_to_operand(rs2));
         }
 
         // Source register 3 (fused multiply-add).
         if let Some(rs3) = rv.rs3 {
-            mi = mi.with_operand(MachineOperand::Register(rs3 as u16));
+            mi = mi.with_operand(Self::reg_to_operand(rs3));
         }
 
         // Immediate value.
@@ -430,6 +460,23 @@ impl RiscV64Codegen {
         // Symbol reference for relocations.
         if let Some(ref sym) = rv.symbol {
             mi = mi.with_operand(MachineOperand::GlobalSymbol(sym.clone()));
+        }
+
+        // Preserve `.label:` comments through the MachineInstruction
+        // round-trip by stashing them in `asm_template`.  This lets the
+        // two-pass assembler in `emit_assembly` reconstruct label offsets
+        // when converting back via `machine_to_rv_instruction`.
+        if let Some(ref comment) = rv.comment {
+            if comment.starts_with(".label:") {
+                mi.asm_template = Some(comment.clone());
+            }
+        }
+
+        // Propagate the call-argument-setup flag so the post-register-
+        // allocation parallel-move resolver (`resolve_call_arg_conflicts`)
+        // can identify the contiguous arg-setup window before CALL.
+        if rv.is_call_arg_setup {
+            mi.is_call_arg_setup = true;
         }
 
         // Mark branch / call / terminator status based on opcode.
@@ -520,14 +567,12 @@ impl RiscV64Codegen {
             }
 
             // Step 1: Instruction selection (IR → machine instructions).
-            let empty_refs = crate::common::fx_hash::FxHashMap::default();
-            let empty_gvar_refs = crate::common::fx_hash::FxHashMap::default();
             let mf = match self.lower_function(
                 func,
                 diagnostics,
                 module.globals(),
-                &empty_refs,
-                &empty_gvar_refs,
+                &module.func_ref_map,
+                &module.global_var_refs,
             ) {
                 Ok(mf) => mf,
                 Err(msg) => {
@@ -585,12 +630,15 @@ impl RiscV64Codegen {
                         let rv_inst = Self::machine_to_rv_instruction(mi);
                         match encoder.encode(&rv_inst) {
                             Ok(encoded) => {
-                                // Collect relocation if present.  The symbol
-                                // name comes from the RvInstruction, not the
-                                // relocation entry (which only carries type + addend).
+                                // Collect relocation if present.
                                 if let Some(ref reloc) = encoded.relocation {
-                                    // Resolve the symbol to a sym_index; for now
-                                    // store 0 and let the linker resolve it.
+                                    let sym_name = rv_inst
+                                        .symbol
+                                        .as_deref()
+                                        .map(|s| s.trim_end_matches("@plt").to_string())
+                                        .unwrap_or_default();
+                                    let _ = sym_name; // used below for ELF sym_index resolution
+
                                     text_relocations.push(Relocation {
                                         offset: (func_base_offset
                                             + bytes.len()
@@ -602,6 +650,12 @@ impl RiscV64Codegen {
                                     });
                                 }
                                 bytes.extend_from_slice(&encoded.bytes);
+
+                                // Emit continuation bytes (e.g. the JALR half
+                                // of an AUIPC+JALR CALL pair).
+                                if let Some(ref cont) = encoded.continuation {
+                                    bytes.extend_from_slice(&cont.bytes);
+                                }
                             }
                             Err(_e) => {
                                 bytes.extend_from_slice(&0x0000_0013u32.to_le_bytes());
@@ -701,7 +755,9 @@ impl RiscV64Codegen {
         }
 
         // -----------------------------------------------------------------
-        // Phase 4: Add external declarations as undefined symbols
+        // Phase 4: Add external declarations as undefined symbols.
+        // Mark them as STT_FUNC so the dynamic linker creates PLT entries
+        // for lazy binding of external function calls (e.g., printf, exit).
         // -----------------------------------------------------------------
         for decl in module.declarations() {
             symbols.push(ElfSymbol {
@@ -709,7 +765,7 @@ impl RiscV64Codegen {
                 value: 0,
                 size: 0,
                 binding: STB_GLOBAL,
-                sym_type: elf_writer_common::STT_NOTYPE,
+                sym_type: elf_writer_common::STT_FUNC,
                 section_index: 0, // SHN_UNDEF
                 visibility: elf_writer_common::STV_DEFAULT,
             });
@@ -812,8 +868,8 @@ impl ArchCodegen for RiscV64Codegen {
         func: &IrFunction,
         _diag: &mut DiagnosticEngine,
         _globals: &[crate::ir::module::GlobalVariable],
-        _func_ref_map: &crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>,
-        _global_var_refs: &crate::common::fx_hash::FxHashMap<
+        func_ref_map: &crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>,
+        global_var_refs: &crate::common::fx_hash::FxHashMap<
             crate::ir::instructions::Value,
             String,
         >,
@@ -826,12 +882,30 @@ impl ArchCodegen for RiscV64Codegen {
             constant_values.insert(val.index(), imm);
         }
 
+        // Build float constant cache from the IR function's float_constant_values.
+        // Float constants are stored as global variables in .rodata; the cache
+        // maps Value index → (symbol_name, f64_value) so the instruction selector
+        // can generate LA + FLD to load them into FPRs.
+        let mut float_constant_values = crate::common::fx_hash::FxHashMap::default();
+        for (val, (name, fval)) in &func.float_constant_values {
+            float_constant_values.insert(val.index(), (name.clone(), *fval));
+        }
+
         // Create the instruction selector for this function.
         let mut selector = RiscV64InstructionSelector::new(self.target, self.pic_mode);
         selector.set_constant_values(constant_values);
+        selector.set_float_constant_values(float_constant_values);
+        selector.set_func_ref_names(func_ref_map.clone());
+        selector.set_global_var_refs(global_var_refs.clone());
+        selector.set_variadic_functions(self.variadic_functions.clone());
 
         // Run instruction selection over the entire function.
         let rv_instructions = selector.select_function(func, &self.abi);
+
+        // Capture the vreg → IR Value mapping BEFORE building the
+        // MachineFunction.  This lets the register allocator in
+        // `generation.rs` resolve virtual registers to physical ones.
+        let vreg_ir_map = selector.vreg_to_ir_value_map();
 
         // Build the MachineFunction from selected instructions.
         let mut mf = MachineFunction::new(func.name.clone());
@@ -864,10 +938,11 @@ impl ArchCodegen for RiscV64Codegen {
         mf.frame_size = selector.frame_size as usize;
 
         // Record callee-saved registers that the function uses.
-        // Scan the instruction operands for callee-saved register usage.
+        // Only track physical registers (< 100); virtual regs will be
+        // resolved to physical by the register allocator.
         for rv_inst in &rv_instructions {
             if let Some(rd) = rv_inst.rd {
-                if registers::is_callee_saved(rd) {
+                if rd < 100 && registers::is_callee_saved(rd) {
                     let reg_u16 = rd as u16;
                     if !mf.callee_saved_regs.contains(&reg_u16) {
                         mf.callee_saved_regs.push(reg_u16);
@@ -875,6 +950,9 @@ impl ArchCodegen for RiscV64Codegen {
                 }
             }
         }
+
+        // Populate the vreg → IR Value mapping for the register allocator.
+        mf.vreg_to_ir_value = vreg_ir_map;
 
         Ok(mf)
     }
@@ -887,25 +965,148 @@ impl ArchCodegen for RiscV64Codegen {
     /// produce relocation entries.
     fn emit_assembly(&self, mf: &MachineFunction) -> Result<AssembledFunction, String> {
         use crate::backend::riscv64::assembler::encoder::RiscV64Encoder;
+        use crate::backend::traits::FunctionRelocation;
 
-        let mut output: Vec<u8> = Vec::new();
         let encoder = RiscV64Encoder::new();
+
+        // ---------------------------------------------------------------
+        // Pass 1: Collect all instructions, compute sizes, and record
+        //         local label offsets.  NOP instructions carrying a
+        //         `.label:` comment are NOT emitted — they only define
+        //         the label address.
+        // ---------------------------------------------------------------
+        struct InstructionRecord {
+            rv_inst: codegen::RvInstruction,
+            offset: usize,
+            primary_size: usize,
+            cont_size: usize,
+        }
+
+        let mut records: Vec<InstructionRecord> = Vec::new();
+        let mut label_offsets: crate::common::fx_hash::FxHashMap<String, usize> =
+            crate::common::fx_hash::FxHashMap::default();
+        let mut current_offset: usize = 0;
 
         for block in &mf.blocks {
             for mi in &block.instructions {
-                // Reconstruct the RvInstruction and encode via the assembler.
                 let rv_inst = Self::machine_to_rv_instruction(mi);
+
+                // Check for label-definition NOP.
+                if let Some(ref comment) = rv_inst.comment {
+                    if let Some(label) = comment.strip_prefix(".label:") {
+                        label_offsets.insert(label.to_string(), current_offset);
+                        continue; // don't emit this NOP
+                    }
+                }
+
+                // Encode to determine size (the actual bytes will be
+                // regenerated in pass 2 if branches are patched, but we
+                // need a faithful size estimate).
                 match encoder.encode(&rv_inst) {
                     Ok(encoded) => {
-                        // Collect relocations if present — the relocation's
-                        // offset must be adjusted by the current output position.
+                        let primary_size = encoded.bytes.len();
+                        let cont_size = encoded
+                            .continuation
+                            .as_ref()
+                            .map(|c| c.bytes.len())
+                            .unwrap_or(0);
+                        records.push(InstructionRecord {
+                            rv_inst,
+                            offset: current_offset,
+                            primary_size,
+                            cont_size,
+                        });
+                        current_offset += primary_size + cont_size;
+                    }
+                    Err(_) => {
+                        // NOP placeholder for unrecognised opcodes.
+                        records.push(InstructionRecord {
+                            rv_inst,
+                            offset: current_offset,
+                            primary_size: 4,
+                            cont_size: 0,
+                        });
+                        current_offset += 4;
+                    }
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------
+        // Pass 2: Emit binary, resolving local branches against the
+        //         label map.  External references become relocations.
+        // ---------------------------------------------------------------
+        let mut output: Vec<u8> = Vec::with_capacity(current_offset);
+        let mut relocations: Vec<FunctionRelocation> = Vec::new();
+
+        for rec in &records {
+            let rv_inst = &rec.rv_inst;
+
+            // Determine if the branch target is a local label.
+            let is_local_branch = rv_inst.symbol.as_ref().map_or(false, |sym| {
+                label_offsets.contains_key(sym.as_str())
+            });
+
+            if is_local_branch {
+                // Resolve the branch locally: compute PC-relative offset
+                // and re-encode with the concrete immediate.
+                let sym = rv_inst.symbol.as_ref().unwrap();
+                let target_offset = label_offsets[sym.as_str()];
+                let pc_rel = (target_offset as i64) - (rec.offset as i64);
+
+                let mut patched = rv_inst.clone();
+                patched.imm = pc_rel;
+                patched.symbol = None; // no relocation needed
+
+                match encoder.encode(&patched) {
+                    Ok(encoded) => {
+                        output.extend_from_slice(&encoded.bytes);
+                        if let Some(ref cont) = encoded.continuation {
+                            output.extend_from_slice(&cont.bytes);
+                        }
+                    }
+                    Err(_) => {
+                        output.extend_from_slice(&0x0000_0013u32.to_le_bytes());
+                    }
+                }
+            } else {
+                // External or non-branch: encode and emit relocations.
+                let sym_name = rv_inst
+                    .symbol
+                    .as_deref()
+                    .map(|s| s.trim_end_matches("@plt").to_string())
+                    .unwrap_or_default();
+
+                match encoder.encode(rv_inst) {
+                    Ok(encoded) => {
+                        let primary_offset = output.len();
+
                         if let Some(ref reloc) = encoded.relocation {
-                            let _ = reloc; // Relocations are tracked at the object level
+                            relocations.push(FunctionRelocation {
+                                offset: (primary_offset + reloc.offset as usize) as u64,
+                                symbol: sym_name.clone(),
+                                rel_type_id: reloc.reloc_type,
+                                addend: reloc.addend,
+                                section: ".text".to_string(),
+                            });
                         }
                         output.extend_from_slice(&encoded.bytes);
+
+                        if let Some(ref cont) = encoded.continuation {
+                            if let Some(ref cont_reloc) = cont.relocation {
+                                relocations.push(FunctionRelocation {
+                                    offset: (output.len() + cont_reloc.offset as usize)
+                                        as u64,
+                                    symbol: sym_name.clone(),
+                                    rel_type_id: cont_reloc.reloc_type,
+                                    addend: cont_reloc.addend,
+                                    section: ".text".to_string(),
+                                });
+                            }
+                            output.extend_from_slice(&cont.bytes);
+                        }
                     }
-                    Err(_e) => {
-                        // Emit NOP for unrecognized opcodes.
+                    Err(_) => {
                         output.extend_from_slice(&0x0000_0013u32.to_le_bytes());
                     }
                 }
@@ -914,7 +1115,7 @@ impl ArchCodegen for RiscV64Codegen {
 
         Ok(AssembledFunction {
             bytes: output,
-            relocations: Vec::new(),
+            relocations,
         })
     }
 
@@ -978,7 +1179,20 @@ impl ArchCodegen for RiscV64Codegen {
     /// signed immediates.
     fn emit_prologue(&self, mf: &MachineFunction) -> Vec<MachineInstruction> {
         let mut prologue: Vec<MachineInstruction> = Vec::new();
-        let frame_size = mf.frame_size;
+
+        // Count callee-saved registers (excluding RA and FP which are
+        // always saved as part of the 16-byte header).
+        let extra_callee_saved: usize = mf
+            .callee_saved_regs
+            .iter()
+            .filter(|&&r| r != FP as u16 && r != RA as u16)
+            .count();
+
+        // Recompute frame size to include callee-saved register space.
+        // The original frame_size from instruction selection accounts for
+        // RA/FP (16 bytes) + locals, but NOT for callee-saved registers
+        // assigned by the register allocator.  We must add space for them.
+        let frame_size = mf.frame_size + extra_callee_saved * 8;
 
         if frame_size == 0 && mf.callee_saved_regs.is_empty() && mf.is_leaf {
             // Leaf function with no locals and no callee-saved registers:
@@ -1044,15 +1258,18 @@ impl ArchCodegen for RiscV64Codegen {
         prologue.push(set_fp);
 
         // Save callee-saved registers.
-        // S-type store: rs1=base, rs2=value, imm=displacement
-        let mut save_offset = -24i64; // Start below FP save area
+        // Store them at the BOTTOM of the frame (SP-relative) to avoid
+        // colliding with FP-relative local variable allocas.
+        // Layout:  SP → [callee-saved regs] [arg-spill] ...  [locals] [FP] [RA] ← old SP
+        // Save area starts at SP + 0 and grows upward.
+        let mut save_sp_offset = 0i64;
         for &reg in &mf.callee_saved_regs {
             // Skip FP (s0) and RA — already saved above.
             if reg == FP as u16 || reg == RA as u16 {
                 continue;
             }
 
-            let opcode = if registers::is_fpr(reg as u8) {
+            let opcode = if registers::is_fpr(reg) {
                 codegen::RvOpcode::FSD
             } else {
                 codegen::RvOpcode::SD
@@ -1060,11 +1277,11 @@ impl ArchCodegen for RiscV64Codegen {
 
             let mut save = MachineInstruction::new(opcode as u32);
             save = save
-                .with_operand(MachineOperand::Register(FP as u16))
+                .with_operand(MachineOperand::Register(SP as u16))
                 .with_operand(MachineOperand::Register(reg))
-                .with_operand(MachineOperand::Immediate(save_offset));
+                .with_operand(MachineOperand::Immediate(save_sp_offset));
             prologue.push(save);
-            save_offset -= 8;
+            save_sp_offset += 8;
         }
 
         prologue
@@ -1085,7 +1302,14 @@ impl ArchCodegen for RiscV64Codegen {
     /// ```
     fn emit_epilogue(&self, mf: &MachineFunction) -> Vec<MachineInstruction> {
         let mut epilogue: Vec<MachineInstruction> = Vec::new();
-        let frame_size = mf.frame_size;
+
+        // Recompute frame size to match prologue (include callee-saved).
+        let extra_callee_saved: usize = mf
+            .callee_saved_regs
+            .iter()
+            .filter(|&&r| r != FP as u16 && r != RA as u16)
+            .count();
+        let frame_size = mf.frame_size + extra_callee_saved * 8;
 
         if frame_size == 0 && mf.callee_saved_regs.is_empty() && mf.is_leaf {
             // Leaf function with no frame: just return.
@@ -1096,17 +1320,8 @@ impl ArchCodegen for RiscV64Codegen {
 
         let aligned_frame = align_to_16(if frame_size < 16 { 16 } else { frame_size });
 
-        // Restore callee-saved registers (reverse order of prologue).
-        // Calculate the full offset first.
-        let num_callee_saved = mf
-            .callee_saved_regs
-            .iter()
-            .filter(|&&r| r != FP as u16 && r != RA as u16)
-            .count();
-        let final_offset = -24i64 - ((num_callee_saved as i64 - 1) * 8);
-        let mut current_offset = final_offset;
-
-        // Restore in reverse order (bottom to top).
+        // Restore callee-saved registers from SP-relative offsets
+        // (bottom of frame), matching the prologue save order.
         let callee_regs: Vec<u16> = mf
             .callee_saved_regs
             .iter()
@@ -1114,21 +1329,21 @@ impl ArchCodegen for RiscV64Codegen {
             .copied()
             .collect();
 
-        for &reg in callee_regs.iter().rev() {
-            let opcode = if registers::is_fpr(reg as u8) {
+        let mut restore_sp_offset = 0i64;
+        for &reg in &callee_regs {
+            let opcode = if registers::is_fpr(reg) {
                 codegen::RvOpcode::FLD
             } else {
                 codegen::RvOpcode::LD
             };
 
-            // I-type load: rd=dest, rs1=base, imm=displacement
             let mut restore = MachineInstruction::new(opcode as u32);
             restore = restore
                 .with_result(MachineOperand::Register(reg))
-                .with_operand(MachineOperand::Register(FP as u16))
-                .with_operand(MachineOperand::Immediate(current_offset));
+                .with_operand(MachineOperand::Register(SP as u16))
+                .with_operand(MachineOperand::Immediate(restore_sp_offset));
             epilogue.push(restore);
-            current_offset += 8;
+            restore_sp_offset += 8;
         }
 
         // ld s0, frame_size-16(sp) — restore frame pointer.
@@ -1275,14 +1490,15 @@ impl RiscV64Codegen {
 
         // Extract rd from the result operand.
         let rd = mi.result.as_ref().and_then(|op| match op {
-            MachineOperand::Register(r) => Some(*r as u8),
+            MachineOperand::Register(r) => Some(*r as u16),
+            MachineOperand::VirtualRegister(v) => Some(*v as u16),
             _ => None,
         });
 
         // Extract rs1, rs2, rs3 and immediate from operands.
-        let mut rs1: Option<u8> = None;
-        let mut rs2: Option<u8> = None;
-        let mut rs3: Option<u8> = None;
+        let mut rs1: Option<u16> = None;
+        let mut rs2: Option<u16> = None;
+        let mut rs3: Option<u16> = None;
         let mut imm: i64 = 0;
         let mut symbol: Option<String> = None;
 
@@ -1291,9 +1507,20 @@ impl RiscV64Codegen {
             match op {
                 MachineOperand::Register(r) => {
                     match reg_idx {
-                        0 => rs1 = Some(*r as u8),
-                        1 => rs2 = Some(*r as u8),
-                        2 => rs3 = Some(*r as u8),
+                        0 => rs1 = Some(*r as u16),
+                        1 => rs2 = Some(*r as u16),
+                        2 => rs3 = Some(*r as u16),
+                        _ => {}
+                    }
+                    reg_idx += 1;
+                }
+                MachineOperand::VirtualRegister(v) => {
+                    // After register allocation this shouldn't occur,
+                    // but handle defensively.
+                    match reg_idx {
+                        0 => rs1 = Some(*v as u16),
+                        1 => rs2 = Some(*v as u16),
+                        2 => rs3 = Some(*v as u16),
                         _ => {}
                     }
                     reg_idx += 1;
@@ -1309,13 +1536,29 @@ impl RiscV64Codegen {
                 } => {
                     // Extract base register and displacement from Memory
                     // operand — used when MachineInstructions are built
-                    // directly (e.g., prologue/epilogue) with Memory
-                    // operands.  Map base → rs1, displacement → imm.
+                    // directly (e.g., prologue/epilogue, spill code) with
+                    // Memory operands.  Map base → rs1, displacement → imm.
+                    //
+                    // CRITICAL: Advance reg_idx past the slot we just
+                    // filled so that subsequent Register operands land in
+                    // the correct field (rs2, not rs1).  Without this,
+                    // a spill-store pattern like:
+                    //   operands = [Memory{base=s0, disp=-112}, Register(t0)]
+                    // would put s0 into rs1, then the Register(t0) would
+                    // OVERWRITE rs1 (because reg_idx was still 0), producing
+                    //   SD zero, -112(t0)   instead of   SD t0, -112(s0)
                     if let Some(b) = base {
                         if rs1.is_none() {
-                            rs1 = Some(*b as u8);
+                            rs1 = Some(*b as u16);
+                            // Ensure next Register goes to rs2, not rs1.
+                            if reg_idx < 1 {
+                                reg_idx = 1;
+                            }
                         } else if rs2.is_none() {
-                            rs2 = Some(*b as u8);
+                            rs2 = Some(*b as u16);
+                            if reg_idx < 2 {
+                                reg_idx = 2;
+                            }
                         }
                     }
                     imm = *displacement;
@@ -1323,6 +1566,14 @@ impl RiscV64Codegen {
                 _ => {}
             }
         }
+
+        // Restore `.label:` comments that were stashed in asm_template
+        // during rv_to_machine_instruction.
+        let comment = mi
+            .asm_template
+            .as_ref()
+            .filter(|t| t.starts_with(".label:"))
+            .cloned();
 
         codegen::RvInstruction {
             opcode,
@@ -1333,7 +1584,8 @@ impl RiscV64Codegen {
             imm,
             symbol,
             is_fp: false,
-            comment: None,
+            comment,
+            is_call_arg_setup: mi.is_call_arg_setup,
         }
     }
 }

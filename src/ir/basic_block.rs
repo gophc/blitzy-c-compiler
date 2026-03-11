@@ -255,6 +255,29 @@ impl BasicBlock {
         self.instructions.insert(index, inst);
     }
 
+    /// Pushes an alloca instruction into the entry block, ensuring it is
+    /// placed before any terminator instruction.
+    ///
+    /// During IR lowering of GCC statement expressions containing ternary
+    /// operators, the entry block may already have a terminator (e.g., a
+    /// `CondBranch` from the first ternary) by the time a subsequent
+    /// statement expression needs to allocate stack space.  Using the
+    /// normal `push_instruction` would place the alloca *after* the
+    /// terminator, corrupting the block structure.
+    ///
+    /// This method inserts before the terminator (if one exists) or
+    /// appends to the end (if no terminator is present).
+    #[inline]
+    pub fn push_alloca(&mut self, inst: Instruction) {
+        if self.has_terminator() {
+            // Insert just before the terminator (last instruction).
+            let pos = self.instructions.len() - 1;
+            self.instructions.insert(pos, inst);
+        } else {
+            self.instructions.push(inst);
+        }
+    }
+
     /// Returns an immutable slice over all instructions in the block.
     ///
     /// Instructions are returned in execution order — phi nodes first

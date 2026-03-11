@@ -591,6 +591,9 @@ pub enum Instruction {
         value: Value,
         /// Target type (wider integer).
         to_type: IrType,
+        /// Source type (narrower integer) — used by codegen to select
+        /// the correct MOVZX variant (byte vs word source).
+        from_type: IrType,
         /// Source location.
         span: Span,
     },
@@ -606,6 +609,9 @@ pub enum Instruction {
         value: Value,
         /// Target type (wider integer).
         to_type: IrType,
+        /// Source type (narrower integer) — used by codegen to select
+        /// the correct MOVSX variant (byte vs word source).
+        from_type: IrType,
         /// Source location.
         span: Span,
     },

@@ -413,7 +413,10 @@ impl<'a> ConstantEvaluator<'a> {
 
             // GCC builtin calls — some are compile-time constants
             Expression::BuiltinCall {
-                builtin, args, span, ..
+                builtin,
+                args,
+                span,
+                ..
             } => self.evaluate_builtin_call(builtin, args, *span),
 
             // __builtin_constant_p(expr) — returns 1 for ICE, 0 otherwise
@@ -1297,10 +1300,8 @@ impl<'a> ConstantEvaluator<'a> {
                         self.evaluate_constant_expr(&args[2])
                     }
                 } else {
-                    self.diagnostics.emit_error(
-                        span,
-                        "__builtin_choose_expr requires 3 arguments",
-                    );
+                    self.diagnostics
+                        .emit_error(span, "__builtin_choose_expr requires 3 arguments");
                     Err(())
                 }
             }
@@ -1340,15 +1341,12 @@ impl<'a> ConstantEvaluator<'a> {
         // Check if the callee is a known builtin identifier
         if let Expression::Identifier { name, .. } = callee {
             let name_str = self.resolve_symbol_name(*name);
-            match name_str.as_str() {
-                "__builtin_constant_p" => {
-                    if !args.is_empty() {
-                        let is_const = self.is_constant_expression(&args[0]);
-                        return Ok(ConstValue::SignedInt(if is_const { 1 } else { 0 }));
-                    }
-                    return Ok(ConstValue::SignedInt(0));
+            if name_str.as_str() == "__builtin_constant_p" {
+                if !args.is_empty() {
+                    let is_const = self.is_constant_expression(&args[0]);
+                    return Ok(ConstValue::SignedInt(if is_const { 1 } else { 0 }));
                 }
-                _ => {}
+                return Ok(ConstValue::SignedInt(0));
             }
         }
         self.diagnostics

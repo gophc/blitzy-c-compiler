@@ -227,13 +227,14 @@ pub const ST7: u16 = 107;
 // Register Classification Sets
 // ===========================================================================
 
-/// Registers available for the register allocator (excludes ESP and EBP).
+/// Registers available for the register allocator (excludes ESP, EBP, ECX).
 ///
-/// Only 6 of the 8 GPRs are allocatable — ESP is the stack pointer and
-/// EBP is the frame pointer, both reserved.  This is one of the key
-/// constraints of the i686 backend: significantly higher register pressure
-/// compared to x86-64's 14 allocatable GPRs.
-pub const ALLOCATABLE_GPRS: &[u16] = &[EAX, ECX, EDX, EBX, ESI, EDI];
+/// Only 5 of the 8 GPRs are allocatable — ESP is the stack pointer,
+/// EBP is the frame pointer, and ECX is **reserved** as the dedicated
+/// spill scratch register (analogous to R11 on x86-64).  Excluding ECX
+/// from allocation ensures that spill code (which loads/stores via ECX)
+/// never clobbers a live value.
+pub const ALLOCATABLE_GPRS: &[u16] = &[EAX, EDX, EBX, ESI, EDI];
 
 /// Callee-saved registers: the callee must preserve these across calls.
 ///
@@ -252,8 +253,9 @@ pub const CALLER_SAVED: &[u16] = &[EAX, ECX, EDX];
 ///
 /// ESP is the hardware stack pointer; EBP is the frame pointer used for
 /// stack argument access (`[EBP+8]`, `[EBP+12]`, etc.) and local variable
-/// access (`[EBP-4]`, `[EBP-8]`, etc.).
-pub const RESERVED: &[u16] = &[ESP, EBP];
+/// access (`[EBP-4]`, `[EBP-8]`, etc.).  ECX is reserved as the dedicated
+/// spill scratch register (analogous to R11 on x86-64).
+pub const RESERVED: &[u16] = &[ESP, EBP, ECX];
 
 /// Return value registers for 32-bit integer/pointer returns.
 ///
@@ -270,8 +272,8 @@ pub const RETURN_GPRS_64BIT: &[u16] = &[EAX, EDX];
 /// Total number of general-purpose registers in the i686 architecture.
 pub const NUM_GPRS: usize = 8;
 
-/// Number of GPRs available for allocation (excludes ESP, EBP).
-pub const NUM_ALLOCATABLE_GPRS: usize = 6;
+/// Number of GPRs available for allocation (excludes ESP, EBP, ECX).
+pub const NUM_ALLOCATABLE_GPRS: usize = 5;
 
 // ===========================================================================
 // Register Name Lookup Functions
@@ -627,11 +629,12 @@ mod tests {
 
     #[test]
     fn test_allocatable_gprs_excludes_reserved() {
-        // ESP and EBP must NOT be in the allocatable set
+        // ESP, EBP, and ECX (spill scratch) must NOT be in the allocatable set
         assert!(!ALLOCATABLE_GPRS.contains(&ESP));
         assert!(!ALLOCATABLE_GPRS.contains(&EBP));
+        assert!(!ALLOCATABLE_GPRS.contains(&ECX));
         assert_eq!(ALLOCATABLE_GPRS.len(), NUM_ALLOCATABLE_GPRS);
-        assert_eq!(NUM_ALLOCATABLE_GPRS, 6);
+        assert_eq!(NUM_ALLOCATABLE_GPRS, 5);
     }
 
     #[test]
@@ -655,7 +658,8 @@ mod tests {
     fn test_reserved_set() {
         assert!(RESERVED.contains(&ESP));
         assert!(RESERVED.contains(&EBP));
-        assert_eq!(RESERVED.len(), 2);
+        assert!(RESERVED.contains(&ECX)); // ECX reserved as spill scratch
+        assert_eq!(RESERVED.len(), 3);
     }
 
     #[test]
@@ -667,7 +671,8 @@ mod tests {
     #[test]
     fn test_num_gprs() {
         assert_eq!(NUM_GPRS, 8);
-        assert_eq!(NUM_ALLOCATABLE_GPRS, 6);
+        assert_eq!(NUM_ALLOCATABLE_GPRS, 5);
+        // 8 total - 3 reserved (ESP, EBP, ECX) = 5 allocatable
         assert_eq!(NUM_GPRS - RESERVED.len(), NUM_ALLOCATABLE_GPRS);
     }
 
@@ -752,8 +757,8 @@ mod tests {
     fn test_is_reserved() {
         assert!(is_reserved(ESP));
         assert!(is_reserved(EBP));
+        assert!(is_reserved(ECX)); // ECX reserved as spill scratch
         assert!(!is_reserved(EAX));
-        assert!(!is_reserved(ECX));
         assert!(!is_reserved(EDX));
         assert!(!is_reserved(EBX));
         assert!(!is_reserved(ESI));
@@ -824,10 +829,10 @@ mod tests {
     fn test_i686_register_info() {
         let info = i686_register_info();
 
-        // Verify allocatable GPRs (6 registers, no ESP/EBP)
-        assert_eq!(info.allocatable_gpr.len(), 6);
+        // Verify allocatable GPRs (5 registers: ESP, EBP reserved; ECX = spill scratch)
+        assert_eq!(info.allocatable_gpr.len(), 5);
         assert!(info.allocatable_gpr.contains(&EAX));
-        assert!(info.allocatable_gpr.contains(&ECX));
+        assert!(!info.allocatable_gpr.contains(&ECX)); // ECX = spill scratch
         assert!(info.allocatable_gpr.contains(&EDX));
         assert!(info.allocatable_gpr.contains(&EBX));
         assert!(info.allocatable_gpr.contains(&ESI));
@@ -851,10 +856,11 @@ mod tests {
         assert!(info.caller_saved.contains(&ECX));
         assert!(info.caller_saved.contains(&EDX));
 
-        // Reserved: ESP, EBP
-        assert_eq!(info.reserved.len(), 2);
+        // Reserved: ESP, EBP, ECX (spill scratch)
+        assert_eq!(info.reserved.len(), 3);
         assert!(info.reserved.contains(&ESP));
         assert!(info.reserved.contains(&EBP));
+        assert!(info.reserved.contains(&ECX));
 
         // cdecl: NO register arguments — all arguments on the stack
         assert!(info.argument_gpr.is_empty());

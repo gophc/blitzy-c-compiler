@@ -1025,14 +1025,14 @@ fn parse_primary_expression(parser: &mut Parser<'_>) -> Result<Expression, ()> {
         TokenKind::BuiltinUnreachable => parse_builtin_simple(parser, BuiltinKind::Unreachable),
         TokenKind::BuiltinTrap => parse_builtin_simple(parser, BuiltinKind::Trap),
         TokenKind::BuiltinClz => parse_builtin_simple(parser, BuiltinKind::Clz),
-        TokenKind::BuiltinClzl => parse_builtin_simple(parser, BuiltinKind::Clz),
-        TokenKind::BuiltinClzll => parse_builtin_simple(parser, BuiltinKind::Clz),
+        TokenKind::BuiltinClzl => parse_builtin_simple(parser, BuiltinKind::ClzL),
+        TokenKind::BuiltinClzll => parse_builtin_simple(parser, BuiltinKind::ClzLL),
         TokenKind::BuiltinCtz => parse_builtin_simple(parser, BuiltinKind::Ctz),
-        TokenKind::BuiltinCtzl => parse_builtin_simple(parser, BuiltinKind::Ctz),
-        TokenKind::BuiltinCtzll => parse_builtin_simple(parser, BuiltinKind::Ctz),
+        TokenKind::BuiltinCtzl => parse_builtin_simple(parser, BuiltinKind::CtzL),
+        TokenKind::BuiltinCtzll => parse_builtin_simple(parser, BuiltinKind::CtzLL),
         TokenKind::BuiltinPopcount => parse_builtin_simple(parser, BuiltinKind::Popcount),
-        TokenKind::BuiltinPopcountl => parse_builtin_simple(parser, BuiltinKind::Popcount),
-        TokenKind::BuiltinPopcountll => parse_builtin_simple(parser, BuiltinKind::Popcount),
+        TokenKind::BuiltinPopcountl => parse_builtin_simple(parser, BuiltinKind::PopcountL),
+        TokenKind::BuiltinPopcountll => parse_builtin_simple(parser, BuiltinKind::PopcountLL),
         TokenKind::BuiltinBswap16 => parse_builtin_simple(parser, BuiltinKind::Bswap16),
         TokenKind::BuiltinBswap32 => parse_builtin_simple(parser, BuiltinKind::Bswap32),
         TokenKind::BuiltinBswap64 => parse_builtin_simple(parser, BuiltinKind::Bswap64),
@@ -1167,11 +1167,10 @@ fn parse_builtin_offsetof(parser: &mut Parser<'_>) -> Result<Expression, ()> {
 
     // First argument: type-name.
     let type_name = parse_type_name(parser)?;
-    // Encode the type name span as a placeholder integer literal for the
-    // AST — semantic analysis will resolve the type from context.
-    let type_placeholder = Expression::IntegerLiteral {
-        value: 0,
-        suffix: IntegerSuffix::None,
+    // Carry the full TypeName through the AST via a SizeofType wrapper
+    // so IR lowering can extract struct layout information.
+    let type_carrier = Expression::SizeofType {
+        type_name: Box::new(type_name.clone()),
         span: type_name.span,
     };
 
@@ -1186,7 +1185,7 @@ fn parse_builtin_offsetof(parser: &mut Parser<'_>) -> Result<Expression, ()> {
     let span = parser.make_span(start);
     Ok(Expression::BuiltinCall {
         builtin: BuiltinKind::Offsetof,
-        args: vec![type_placeholder, member_expr],
+        args: vec![type_carrier, member_expr],
         span,
     })
 }
@@ -1200,18 +1199,17 @@ fn parse_builtin_types_compatible(parser: &mut Parser<'_>) -> Result<Expression,
     parser.expect(TokenKind::LeftParen)?;
 
     let type1 = parse_type_name(parser)?;
-    let placeholder1 = Expression::IntegerLiteral {
-        value: 0,
-        suffix: IntegerSuffix::None,
+    // Carry full TypeName through AST via SizeofType wrapper.
+    let carrier1 = Expression::SizeofType {
+        type_name: Box::new(type1.clone()),
         span: type1.span,
     };
 
     parser.expect(TokenKind::Comma)?;
 
     let type2 = parse_type_name(parser)?;
-    let placeholder2 = Expression::IntegerLiteral {
-        value: 0,
-        suffix: IntegerSuffix::None,
+    let carrier2 = Expression::SizeofType {
+        type_name: Box::new(type2.clone()),
         span: type2.span,
     };
 
@@ -1220,7 +1218,7 @@ fn parse_builtin_types_compatible(parser: &mut Parser<'_>) -> Result<Expression,
     let span = parser.make_span(start);
     Ok(Expression::BuiltinCall {
         builtin: BuiltinKind::TypesCompatibleP,
-        args: vec![placeholder1, placeholder2],
+        args: vec![carrier1, carrier2],
         span,
     })
 }

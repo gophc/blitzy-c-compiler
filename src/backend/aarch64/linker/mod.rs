@@ -240,7 +240,8 @@ impl AArch64Linker {
         // Ensure the config is set up for executable linking.
         let mut exec_config = self.config.clone();
         exec_config.output_type = OutputType::Executable;
-        exec_config.allow_undefined = false;
+        // Preserve allow_undefined from the caller — generation.rs sets it
+        // to true for dynamically linked executables that reference libc.
 
         // Delegate to the shared linker infrastructure which handles:
         // - Symbol resolution with strong/weak binding

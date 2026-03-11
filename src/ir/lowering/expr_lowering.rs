@@ -96,6 +96,10 @@ pub struct ExprLoweringContext<'a> {
     /// Used by `resolve_type_name` and `lower_sizeof_type` to resolve
     /// forward-referenced struct/union types to their complete layouts.
     pub struct_defs: &'a FxHashMap<String, CType>,
+    /// Label name → BlockId mapping for computed goto (`&&label`).
+    /// When non-empty, `lower_address_of_label` can resolve label names to
+    /// block IDs and produce meaningful pointer-sized integer values.
+    pub label_blocks: &'a FxHashMap<String, crate::ir::instructions::BlockId>,
 }
 
 // ---------------------------------------------------------------------------
@@ -171,6 +175,61 @@ fn add_cfg_edge(ctx: &mut ExprLoweringContext<'_>, from_idx: usize, to_idx: usiz
 /// so that the backend can resolve the `Value` to an immediate.  The
 /// in-function instruction is a `BinOp::Add` with `Value::UNDEF` operand
 /// that serves as a placeholder defining the SSA value.
+/// Check whether an AST expression is a compile-time constant for
+/// `__builtin_constant_p`.  This recursively evaluates arithmetic on
+/// literals, casts of constants, sizeof, and parenthesized sub-expressions.
+fn is_compile_time_constant(expr: &ast::Expression) -> bool {
+    match expr {
+        ast::Expression::IntegerLiteral { .. }
+        | ast::Expression::FloatLiteral { .. }
+        | ast::Expression::CharLiteral { .. }
+        | ast::Expression::SizeofType { .. }
+        | ast::Expression::SizeofExpr { .. }
+        | ast::Expression::AlignofType { .. } => true,
+
+        // Parenthesized: transparent.
+        ast::Expression::Parenthesized { inner, .. } => is_compile_time_constant(inner),
+
+        // Binary arithmetic on two constants is constant.
+        ast::Expression::Binary { left, right, .. } => {
+            is_compile_time_constant(left) && is_compile_time_constant(right)
+        }
+
+        // Unary arithmetic on a constant is constant.
+        ast::Expression::UnaryOp { operand, op, .. } => {
+            match op {
+                // AddressOf a variable is NOT a compile-time constant
+                // for __builtin_constant_p purposes.
+                ast::UnaryOp::AddressOf => false,
+                _ => is_compile_time_constant(operand),
+            }
+        }
+
+        // Cast of a constant is constant.
+        ast::Expression::Cast { operand, .. } => is_compile_time_constant(operand),
+
+        // Conditional with constant condition and constant branches.
+        ast::Expression::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+            ..
+        } => {
+            is_compile_time_constant(condition)
+                && then_expr.as_ref().map_or(true, |e| is_compile_time_constant(e))
+                && is_compile_time_constant(else_expr)
+        }
+
+        // Comma: the last expression determines constness.
+        ast::Expression::Comma { exprs, .. } => {
+            exprs.last().map_or(false, |e| is_compile_time_constant(e))
+        }
+
+        // Everything else (variables, function calls, etc.) is NOT constant.
+        _ => false,
+    }
+}
+
 fn emit_int_const(
     ctx: &mut ExprLoweringContext<'_>,
     value: i128,
@@ -200,6 +259,58 @@ fn emit_int_const(
     // resolve constants without fragile positional matching.
     ctx.function.constant_values.insert(result, value as i64);
     result
+}
+
+/// Emit an integer constant for use as a GEP byte-offset index.
+///
+/// This is a public wrapper around `emit_int_const` for use by
+/// `decl_lowering::make_index_value` which computes element byte
+/// offsets for aggregate initialiser stores.
+pub fn emit_int_const_for_index(
+    ctx: &mut ExprLoweringContext<'_>,
+    byte_offset: i64,
+) -> Value {
+    let ir_ty = size_ir_type(ctx.target);
+    emit_int_const(ctx, byte_offset as i128, ir_ty, Span::dummy())
+}
+
+/// Emit a zero constant with the given IR type.  Used by `zero_init_field`
+/// in `decl_lowering` to produce correctly-sized stores for aggregate
+/// member zero-initialization (C99 §6.7.9/19).
+pub fn emit_int_const_for_zero(
+    ctx: &mut ExprLoweringContext<'_>,
+    ir_ty: IrType,
+) -> Value {
+    emit_int_const(ctx, 0, ir_ty, Span::dummy())
+}
+
+/// Convert a value for storage into an element of the given C type.
+///
+/// When the target element type is narrower than `int` (e.g., `char` = I8,
+/// `short` = I16), inserts a truncation so that the backend emits the
+/// correctly-sized store operation.  Without this, integer literals (which
+/// default to I32) would be stored with 32-bit width, overwriting adjacent
+/// memory in arrays.
+pub fn convert_for_store(
+    ctx: &mut ExprLoweringContext<'_>,
+    value: Value,
+    target_ctype: &CType,
+) -> Value {
+    let target_ir = ctype_to_ir(target_ctype, ctx.target);
+    // Only truncate for narrow integer types (I8, I16).
+    // Guard: non-integer IR types (Struct, Ptr, Float, etc.) skip truncation.
+    let tw = match target_ir {
+        IrType::I1 | IrType::I8 | IrType::I16 | IrType::I32 | IrType::I64 | IrType::I128 => {
+            target_ir.int_width()
+        }
+        _ => return value,
+    };
+    if tw > 0 && tw < 32 {
+        let (v, i) = ctx.builder.build_trunc(value, target_ir, Span::dummy());
+        emit_inst(ctx, i);
+        return v;
+    }
+    value
 }
 
 /// Emit a compile-time floating-point constant.
@@ -271,7 +382,7 @@ fn emit_one(ctx: &mut ExprLoweringContext<'_>, ir_ty: IrType, span: Span) -> Val
 ///
 /// For the most common leaf types we resolve directly to avoid a round-trip
 /// through `IrType::from_ctype`; aggregate and function types still delegate.
-fn ctype_to_ir(ctype: &CType, target: &Target) -> IrType {
+pub fn ctype_to_ir(ctype: &CType, target: &Target) -> IrType {
     let resolved = types::resolve_typedef(ctype);
     match resolved {
         CType::Void => IrType::Void,
@@ -339,6 +450,48 @@ fn size_ir_type(target: &Target) -> IrType {
 }
 
 /// Return the C type corresponding to `size_t` for the current target.
+/// Map an IR element type back to an approximate CType.
+///
+/// This is used when a global array's element type needs to be recovered
+/// for array-to-pointer decay but the original C type is unavailable
+/// (e.g. lookup_var_type fell back to CType::Int).
+fn ir_elem_to_approx_ctype(ir_ty: &IrType) -> CType {
+    match ir_ty {
+        IrType::I8 => CType::Char,
+        IrType::I16 => CType::Short,
+        IrType::I32 => CType::Int,
+        IrType::I64 => CType::LongLong,
+        IrType::F32 => CType::Float,
+        IrType::F64 => CType::Double,
+        IrType::Ptr => CType::Pointer(Box::new(CType::Void), TypeQualifiers::default()),
+        _ => CType::Int,
+    }
+}
+
+/// Map an IR type to an approximate CType (including compound types).
+///
+/// Used to reconstruct C types from global variable IR types for sizeof
+/// and array decay type computations.
+fn ir_type_to_approx_ctype(ir_ty: &IrType) -> CType {
+    match ir_ty {
+        IrType::I1 => CType::Bool,
+        IrType::I8 => CType::Char,
+        IrType::I16 => CType::Short,
+        IrType::I32 => CType::Int,
+        IrType::I64 => CType::LongLong,
+        IrType::I128 => CType::LongLong, // approximate
+        IrType::F32 => CType::Float,
+        IrType::F64 => CType::Double,
+        IrType::Ptr => CType::Pointer(Box::new(CType::Void), TypeQualifiers::default()),
+        IrType::Array(elem, count) => {
+            let elem_cty = ir_type_to_approx_ctype(elem);
+            CType::Array(Box::new(elem_cty), Some(*count))
+        }
+        IrType::Void => CType::Void,
+        _ => CType::Int,
+    }
+}
+
 fn size_ctype(target: &Target) -> CType {
     if target.is_64bit() {
         CType::ULong
@@ -493,7 +646,23 @@ fn lookup_var(ctx: &ExprLoweringContext<'_>, name: &str) -> Option<(Value, bool)
 
 /// Look up the declared C type of a variable.
 fn lookup_var_type(ctx: &ExprLoweringContext<'_>, name: &str) -> CType {
-    ctx.local_types.get(name).cloned().unwrap_or(CType::Int)
+    // For static local variables, prefer the module global (which has the
+    // correct inferred array size from the initializer) over the local_types
+    // entry (which may have None size from the declaration syntax).
+    if let Some(mangled) = ctx.static_locals.get(name) {
+        if let Some(gv) = ctx.module.get_global(mangled.as_str()) {
+            return ir_type_to_approx_ctype(&gv.ty);
+        }
+    }
+    // Check local types (parameters, local variables).
+    if let Some(ct) = ctx.local_types.get(name) {
+        return ct.clone();
+    }
+    // Fall back to global variable types from the module.
+    if let Some(gv) = ctx.module.get_global(name) {
+        return ir_type_to_approx_ctype(&gv.ty);
+    }
+    CType::Int
 }
 
 // =========================================================================
@@ -949,6 +1118,34 @@ fn lower_identifier(ctx: &mut ExprLoweringContext<'_>, sym_idx: u32, span: Span)
                 let current_func = &mut *ctx.function;
                 current_func.global_var_refs.insert(ptr_val, global_name);
             }
+
+            // Check if the global variable itself is an array type.
+            // lookup_var_type only checks local_types and may miss globals,
+            // so we also detect array decay by inspecting the IR type.
+            let global_is_array = matches!(&gt, crate::ir::types::IrType::Array(_, _));
+
+            // Arrays decay to pointers: the address of the global IS the
+            // pointer to the first element, so return it directly (no load).
+            if is_array_decay || global_is_array {
+                // Compute proper decayed type.
+                let ret_ty = if is_array_decay {
+                    decayed_ty
+                } else {
+                    // Build pointer-to-element from the IR array element type.
+                    // We construct a generic pointer CType since we don't have
+                    // the original C element type here.
+                    match &gt {
+                        crate::ir::types::IrType::Array(elem_ir, _) => {
+                            // Map IR element type back to an approximate CType.
+                            let elem_cty = ir_elem_to_approx_ctype(elem_ir);
+                            CType::Pointer(Box::new(elem_cty), TypeQualifiers::default())
+                        }
+                        _ => CType::Pointer(Box::new(CType::Int), TypeQualifiers::default()),
+                    }
+                };
+                return TypedValue::new(ptr_val, ret_ty);
+            }
+
             let (loaded, li) = ctx.builder.build_load(ptr_val, gt, span);
             emit_inst(ctx, li);
             return TypedValue::new(loaded, var_cty);
@@ -995,6 +1192,19 @@ fn lower_identifier(ctx: &mut ExprLoweringContext<'_>, sym_idx: u32, span: Span)
             {
                 let current_func = &mut *ctx.function;
                 current_func.global_var_refs.insert(ptr_val, mangled_name);
+            }
+            // Check for array-to-pointer decay: arrays and string-initialized
+            // arrays should return the pointer directly (no load).
+            let global_is_array = matches!(&gt, IrType::Array(_, _));
+            if is_array_decay || global_is_array {
+                // Build the decayed pointer type for the return.
+                let ret_ty = if let IrType::Array(elem, _) = &gt {
+                    let elem_cty = ir_elem_to_approx_ctype(elem);
+                    CType::Pointer(Box::new(elem_cty), TypeQualifiers::default())
+                } else {
+                    var_cty
+                };
+                return TypedValue::new(ptr_val, ret_ty);
             }
             let (loaded, li) = ctx.builder.build_load(ptr_val, gt, span);
             emit_inst(ctx, li);
@@ -1816,11 +2026,11 @@ fn lower_cast(
             emit_inst(ctx, i);
             return v;
         } else if is_unsigned(from) {
-            let (v, i) = ctx.builder.build_zext(value, to_ir, span);
+            let (v, i) = ctx.builder.build_zext_from(value, from_ir.clone(), to_ir, span);
             emit_inst(ctx, i);
             return v;
         } else {
-            let (v, i) = ctx.builder.build_sext(value, to_ir, span);
+            let (v, i) = ctx.builder.build_sext_from(value, from_ir.clone(), to_ir, span);
             emit_inst(ctx, i);
             return v;
         }
@@ -2002,9 +2212,36 @@ fn lower_sizeof_expr(
     operand: &ast::Expression,
     span: Span,
 ) -> TypedValue {
-    // sizeof(expr) — evaluate the expression type (not the expression itself).
-    let inner = lower_expr_inner(ctx, operand);
-    let size = ctx.type_builder.sizeof_type(&inner.ty);
+    // sizeof(expr) — evaluate the expression's type WITHOUT triggering
+    // array-to-pointer decay. In C, sizeof is one of the few contexts
+    // that preserves array types: sizeof(arr) returns the total array
+    // size, not the pointer size.
+    //
+    // Try to determine the original (non-decayed) type for identifiers.
+    // Unwrap parenthesized expressions to find the actual operand.
+    // sizeof(arr) parses as sizeof(Parenthesized(Identifier("arr"))).
+    let unwrapped = {
+        let mut e = operand;
+        while let ast::Expression::Parenthesized { inner, .. } = e {
+            e = inner.as_ref();
+        }
+        e
+    };
+    let expr_ty = if let ast::Expression::Identifier { name, .. } = unwrapped {
+        let sym_name = resolve_sym(ctx, name.as_u32());
+        let vty = lookup_var_type(ctx, sym_name);
+        if types::is_array(&vty) {
+            // Use the original array type (not decayed pointer).
+            vty
+        } else {
+            // For non-arrays, fall back to normal lowering.
+            lower_expr_inner(ctx, operand).ty
+        }
+    } else {
+        // For complex expressions, evaluate normally.
+        lower_expr_inner(ctx, operand).ty
+    };
+    let size = ctx.type_builder.sizeof_type(&expr_ty);
     let ir_ty = size_ir_type(ctx.target);
     let val = emit_int_const(ctx, size as i128, ir_ty, span);
     TypedValue::new(val, size_ctype(ctx.target))
@@ -2065,6 +2302,21 @@ fn lower_member_access(
     span: Span,
 ) -> TypedValue {
     let lv = lower_member_access_lvalue(ctx, object, member_sym, is_arrow, span);
+
+    // Array-typed members decay to a pointer to the first element.
+    // The GEP address IS the pointer value — do not load from it.
+    if matches!(types::resolve_typedef(&lv.ty), CType::Array(_, _)) {
+        let elem_ty = match types::resolve_typedef(&lv.ty) {
+            CType::Array(elem, _) => (**elem).clone(),
+            _ => unreachable!(),
+        };
+        let ptr_ty = CType::Pointer(
+            Box::new(elem_ty),
+            crate::common::types::TypeQualifiers::default(),
+        );
+        return TypedValue::new(lv.value, ptr_ty);
+    }
+
     let ir_ty = ctype_to_ir(&lv.ty, ctx.target);
     let (loaded, li) = ctx.builder.build_load(lv.value, ir_ty, span);
     emit_inst(ctx, li);
@@ -2412,7 +2664,7 @@ fn lower_statement_expression(
                 );
                 let ir_type = IrType::from_ctype(&c_type, ctx.target);
                 let (alloca_val, alloca_inst) = ctx.builder.build_alloca(ir_type, span);
-                ctx.function.entry_block_mut().push_instruction(alloca_inst);
+                ctx.function.entry_block_mut().push_alloca(alloca_inst);
                 stmt_local_vars.insert(var_name.clone(), alloca_val);
                 stmt_local_types.insert(var_name, c_type);
             }
@@ -2470,6 +2722,7 @@ fn lower_statement_expression(
                         enum_constants: stmt_ctx.enum_constants,
                         static_locals: stmt_ctx.static_locals,
                         struct_defs: stmt_ctx.struct_defs,
+                        label_blocks: stmt_ctx.label_blocks,
                     };
                     let tv = lower_expr_inner(&mut inner_expr_ctx, expr);
                     last_val = tv.value;
@@ -2501,14 +2754,9 @@ fn lower_builtin(
         // ----- Compile-time builtins (produce constants) -----
         ast::BuiltinKind::ConstantP => {
             // __builtin_constant_p(expr) → 1 if constant, 0 otherwise.
-            // Heuristic: integer/float literals are constant.
+            // Evaluate whether the expression is a compile-time constant.
             if let Some(arg) = args.first() {
-                let is_const = matches!(
-                    arg,
-                    ast::Expression::IntegerLiteral { .. }
-                        | ast::Expression::FloatLiteral { .. }
-                        | ast::Expression::CharLiteral { .. }
-                );
+                let is_const = is_compile_time_constant(arg);
                 let v = emit_int_const(ctx, if is_const { 1 } else { 0 }, IrType::I32, span);
                 TypedValue::new(v, CType::Int)
             } else {
@@ -2519,20 +2767,35 @@ fn lower_builtin(
 
         ast::BuiltinKind::TypesCompatibleP => {
             // __builtin_types_compatible_p(type1, type2)
-            // Without full type resolution from sema, default to 0 (incompatible).
-            let v = emit_int_const(ctx, 0, IrType::I32, span);
+            // args[0] and args[1] are SizeofType carriers with TypeNames.
+            let ty1 = if let Some(ast::Expression::SizeofType { type_name, .. }) = args.first() {
+                resolve_type_name(ctx, type_name)
+            } else {
+                CType::Int
+            };
+            let ty2 = if let Some(ast::Expression::SizeofType { type_name, .. }) = args.get(1) {
+                resolve_type_name(ctx, type_name)
+            } else {
+                CType::Int
+            };
+            // Compare types ignoring top-level qualifiers (GCC semantics).
+            let compat = types_are_compatible_ignoring_qualifiers(&ty1, &ty2);
+            let v = emit_int_const(ctx, if compat { 1 } else { 0 }, IrType::I32, span);
             TypedValue::new(v, CType::Int)
         }
 
         ast::BuiltinKind::ChooseExpr => {
             // __builtin_choose_expr(const_expr, expr1, expr2)
             // const_expr must be an integer constant expression.
+            // Per GCC semantics, if const_expr is nonzero, use expr1; else expr2.
             if args.len() >= 3 {
-                let cond_tv = lower_expr_inner(ctx, &args[0]);
-                // In the full pipeline the condition is a compile-time constant;
-                // for safety, lower both and use a conditional.
-                let _ = cond_tv;
-                lower_expr_inner(ctx, &args[1])
+                // Try to evaluate the condition as a compile-time constant.
+                let cond_val = try_eval_integer_constant(&args[0], ctx.name_table, ctx.enum_constants);
+                if cond_val.unwrap_or(1) != 0 {
+                    lower_expr_inner(ctx, &args[1])
+                } else {
+                    lower_expr_inner(ctx, &args[2])
+                }
             } else {
                 TypedValue::void()
             }
@@ -2540,8 +2803,10 @@ fn lower_builtin(
 
         ast::BuiltinKind::Offsetof => {
             // __builtin_offsetof(type, member) — compile-time constant.
-            // Requires type resolution; emit a 0 placeholder constant.
-            let v = emit_int_const(ctx, 0, size_ir_type(ctx.target), span);
+            // args[0] = SizeofType carrying the TypeName
+            // args[1] = member designator expression (Identifier or MemberAccess chain)
+            let offset = compute_builtin_offsetof(ctx, args, span);
+            let v = emit_int_const(ctx, offset as i128, size_ir_type(ctx.target), span);
             TypedValue::new(v, size_ctype(ctx.target))
         }
 
@@ -2578,8 +2843,14 @@ fn lower_builtin(
 
         // ----- Bit-manipulation builtins (produce runtime IR) -----
         ast::BuiltinKind::Clz => lower_bit_builtin(ctx, args, "clz", span),
+        ast::BuiltinKind::ClzL => lower_bit_builtin(ctx, args, "clzl", span),
+        ast::BuiltinKind::ClzLL => lower_bit_builtin(ctx, args, "clzll", span),
         ast::BuiltinKind::Ctz => lower_bit_builtin(ctx, args, "ctz", span),
+        ast::BuiltinKind::CtzL => lower_bit_builtin(ctx, args, "ctzl", span),
+        ast::BuiltinKind::CtzLL => lower_bit_builtin(ctx, args, "ctzll", span),
         ast::BuiltinKind::Popcount => lower_bit_builtin(ctx, args, "popcount", span),
+        ast::BuiltinKind::PopcountL => lower_bit_builtin(ctx, args, "popcountl", span),
+        ast::BuiltinKind::PopcountLL => lower_bit_builtin(ctx, args, "popcountll", span),
         ast::BuiltinKind::Ffs => lower_bit_builtin(ctx, args, "ffs", span),
         ast::BuiltinKind::Ffsll => lower_bit_builtin(ctx, args, "ffsll", span),
 
@@ -2595,24 +2866,48 @@ fn lower_builtin(
         ast::BuiltinKind::VaCopy => lower_va_builtin(ctx, args, "va_copy", span),
 
         // ----- Frame / return address -----
+        // These builtins are lowered as Call instructions so the backend's
+        // try_inline_builtin can intercept them and emit MOV RBP / MOV [RBP+8].
         ast::BuiltinKind::FrameAddress => {
+            let mut call_args = Vec::new();
             if let Some(arg) = args.first() {
-                let _ = lower_expr_inner(ctx, arg);
+                let v = lower_expr_inner(ctx, arg);
+                call_args.push(v.value);
             }
-            let v = emit_int_const(ctx, 0, IrType::Ptr, span);
+            let callee = emit_global_ref(ctx, "__builtin_frame_address", span);
+            let result = ctx.builder.fresh_value();
+            let inst = crate::ir::instructions::Instruction::Call {
+                result,
+                callee,
+                args: call_args,
+                return_type: IrType::Ptr,
+                span,
+            };
+            emit_inst(ctx, inst);
             TypedValue::new(
-                v,
+                result,
                 CType::Pointer(Box::new(CType::Void), TypeQualifiers::default()),
             )
         }
 
         ast::BuiltinKind::ReturnAddress => {
+            let mut call_args = Vec::new();
             if let Some(arg) = args.first() {
-                let _ = lower_expr_inner(ctx, arg);
+                let v = lower_expr_inner(ctx, arg);
+                call_args.push(v.value);
             }
-            let v = emit_int_const(ctx, 0, IrType::Ptr, span);
+            let callee = emit_global_ref(ctx, "__builtin_return_address", span);
+            let result = ctx.builder.fresh_value();
+            let inst = crate::ir::instructions::Instruction::Call {
+                result,
+                callee,
+                args: call_args,
+                return_type: IrType::Ptr,
+                span,
+            };
+            emit_inst(ctx, inst);
             TypedValue::new(
-                v,
+                result,
                 CType::Pointer(Box::new(CType::Void), TypeQualifiers::default()),
             )
         }
@@ -2716,6 +3011,10 @@ fn lower_bswap(
 }
 
 /// Lower a variadic argument builtin (va_start, va_end, va_arg, va_copy).
+///
+/// For va_start, va_end, va_arg: the first argument (the va_list) must be
+/// passed by ADDRESS (not by value) so the backend can read/write the slot.
+/// For va_copy: both arguments are va_list addresses.
 fn lower_va_builtin(
     ctx: &mut ExprLoweringContext<'_>,
     args: &[ast::Expression],
@@ -2723,9 +3022,22 @@ fn lower_va_builtin(
     span: Span,
 ) -> TypedValue {
     let mut arg_vals = Vec::new();
-    for a in args {
-        let tv = lower_expr_inner(ctx, a);
-        arg_vals.push(tv.value);
+    for (i, a) in args.iter().enumerate() {
+        // For va_start/va_end/va_arg: pass the ADDRESS of the first
+        // argument (the va_list variable) so the backend can modify it.
+        // For va_copy: pass the ADDRESS of both arguments.
+        let need_address = match name {
+            "va_start" | "va_end" | "va_arg" => i == 0,
+            "va_copy" => i <= 1,
+            _ => false,
+        };
+        if need_address {
+            let addr = lower_lvalue(ctx, a);
+            arg_vals.push(addr);
+        } else {
+            let tv = lower_expr_inner(ctx, a);
+            arg_vals.push(tv.value);
+        }
     }
     let intrinsic_name = format!("__builtin_{}", name);
     let callee = emit_global_ref(ctx, &intrinsic_name, span);
@@ -2742,7 +3054,9 @@ fn lower_va_builtin(
 }
 
 /// Lower overflow-checking arithmetic builtin.
-/// __builtin_add_overflow(a, b, result_ptr) → bool (1 if overflow).
+/// Lower `__builtin_{add,sub,mul}_overflow(a, b, result_ptr)` as a Call
+/// instruction so the backend's `try_inline_builtin` can intercept it and
+/// emit architecture-specific overflow-checking code (ADD/SUB/IMUL + SETO).
 fn lower_overflow_arith(
     ctx: &mut ExprLoweringContext<'_>,
     args: &[ast::Expression],
@@ -2758,28 +3072,90 @@ fn lower_overflow_arith(
     let b = lower_expr_inner(ctx, &args[1]);
     let result_ptr = lower_expr_inner(ctx, &args[2]);
 
-    let ir_ty = ctype_to_ir(&a.ty, ctx.target);
+    // Emit pure IR: sign-extend both operands to i64, perform the
+    // 64-bit operation, truncate to i32, store, then compare the
+    // 64-bit result against the sign-extension of the truncated
+    // value to detect 32-bit overflow.  This avoids Call-based
+    // inline expansion and its register allocator clobber issues.
 
-    // Perform the operation.
-    let (res, inst) = match op {
-        IrBinOp::Add => ctx.builder.build_add(a.value, b.value, ir_ty.clone(), span),
-        IrBinOp::Sub => ctx.builder.build_sub(a.value, b.value, ir_ty.clone(), span),
-        IrBinOp::Mul => ctx.builder.build_mul(a.value, b.value, ir_ty.clone(), span),
-        _ => {
-            let (v, i) = ctx.builder.build_add(a.value, b.value, ir_ty.clone(), span);
-            (v, i)
-        }
-    };
-    emit_inst(ctx, inst);
+    // Step 1: sign-extend a and b from i32 to i64.
+    let a64 = ctx.builder.fresh_value();
+    emit_inst(ctx, Instruction::SExt {
+        result: a64,
+        value: a.value,
+        to_type: IrType::I64,
+        from_type: IrType::I32,
+        span,
+    });
+    let b64 = ctx.builder.fresh_value();
+    emit_inst(ctx, Instruction::SExt {
+        result: b64,
+        value: b.value,
+        to_type: IrType::I64,
+        from_type: IrType::I32,
+        span,
+    });
 
-    // Store result to the pointer.
-    let si = ctx.builder.build_store(res, result_ptr.value, span);
-    emit_inst(ctx, si);
+    // Step 2: 64-bit operation (a64 op b64).
+    let result64 = ctx.builder.fresh_value();
+    emit_inst(ctx, Instruction::BinOp {
+        result: result64,
+        op,
+        lhs: a64,
+        rhs: b64,
+        ty: IrType::I64,
+        span,
+    });
 
-    // For overflow detection, a full implementation would compare sign bits.
-    // For now, return 0 (no overflow) — the backend can refine this.
-    let overflow = emit_int_const(ctx, 0, IrType::I1, span);
-    TypedValue::new(overflow, CType::Bool)
+    // Step 3: truncate to i32 for the stored result.
+    let result32 = ctx.builder.fresh_value();
+    emit_inst(ctx, Instruction::Trunc {
+        result: result32,
+        value: result64,
+        to_type: IrType::I32,
+        span,
+    });
+
+    // Step 4: store the i32 result through the pointer.
+    emit_inst(ctx, Instruction::Store {
+        value: result32,
+        ptr: result_ptr.value,
+        volatile: false,
+        span,
+    });
+
+    // Step 5: sign-extend the truncated i32 back to i64.
+    let extended64 = ctx.builder.fresh_value();
+    emit_inst(ctx, Instruction::SExt {
+        result: extended64,
+        value: result32,
+        to_type: IrType::I64,
+        from_type: IrType::I32,
+        span,
+    });
+
+    // Step 6: compare original 64-bit result with sign-extended value.
+    // If they differ, the 32-bit result overflowed.
+    let overflow_i1 = ctx.builder.fresh_value();
+    emit_inst(ctx, Instruction::ICmp {
+        result: overflow_i1,
+        op: ICmpOp::Ne,
+        lhs: result64,
+        rhs: extended64,
+        span,
+    });
+
+    // Step 7: zero-extend i1 to i32 for the C int return value.
+    let overflow_int = ctx.builder.fresh_value();
+    emit_inst(ctx, Instruction::ZExt {
+        result: overflow_int,
+        value: overflow_i1,
+        to_type: IrType::I32,
+        from_type: IrType::I1,
+        span,
+    });
+
+    TypedValue::new(overflow_int, CType::Int)
 }
 
 /// Emit a reference to a global function/symbol by name.
@@ -2787,7 +3163,6 @@ fn emit_global_ref(ctx: &mut ExprLoweringContext<'_>, name: &str, span: Span) ->
     // Look up in module globals / functions.
     if let Some(func) = ctx.module.get_function(name) {
         // Function declarations provide a callable Value.
-        // Access params and entry_block for validation.
         let _param_count = func.param_count();
         let _entry = func.entry_block();
         // Emit a global reference constant pointing to the function.
@@ -2804,14 +3179,48 @@ fn emit_global_ref(ctx: &mut ExprLoweringContext<'_>, name: &str, span: Span) ->
         emit_inst(ctx, gi);
         ptr_val
     } else {
-        // Create a placeholder global reference value.
-        ctx.builder.fresh_value()
+        // Register a func-ref so the backend can intercept __builtin_*
+        // intrinsics and emit inline code instead of an external call.
+        let fptr = ctx.builder.fresh_value();
+        ctx.module.func_ref_map.insert(fptr, name.to_string());
+        {
+            let current_func = &mut *ctx.function;
+            current_func.func_ref_map.insert(fptr, name.to_string());
+        }
+        fptr
     }
 }
 
 // =========================================================================
 // GENERIC SELECTION  (C11 _Generic)
 // =========================================================================
+
+/// Apply C11 lvalue conversion for `_Generic`: strip qualifiers, decay
+/// arrays to pointers, and decay functions to function pointers.
+/// This is applied to both the controlling expression type and each
+/// association type before comparison.
+fn generic_lvalue_convert(ty: &CType) -> CType {
+    let stripped = types::unqualified(ty);
+    match stripped {
+        CType::Array(elem, _) => {
+            CType::Pointer(
+                Box::new(generic_lvalue_convert(elem)),
+                TypeQualifiers::default(),
+            )
+        }
+        CType::Function { .. } => {
+            CType::Pointer(Box::new(stripped.clone()), TypeQualifiers::default())
+        }
+        CType::Pointer(inner, _) => {
+            // Strip qualifiers from pointee too, for _Generic matching
+            CType::Pointer(
+                Box::new(generic_lvalue_convert(inner)),
+                TypeQualifiers::default(),
+            )
+        }
+        other => other.clone(),
+    }
+}
 
 fn lower_generic(
     ctx: &mut ExprLoweringContext<'_>,
@@ -2821,7 +3230,10 @@ fn lower_generic(
 ) -> TypedValue {
     // Evaluate the controlling expression's type (not its value).
     let ctrl_tv = lower_expr_inner(ctx, controlling);
-    let ctrl_ty = ctrl_tv.ty.clone();
+    // C11 §6.5.1.1p2: Apply lvalue conversion to the controlling type.
+    // This means: array → pointer decay, function → pointer decay,
+    // and strip all qualifiers (including on pointee for _Generic).
+    let ctrl_ty = generic_lvalue_convert(&ctrl_tv.ty);
 
     // Find the matching association.
     // GenericAssociation is a struct with type_name: Option<TypeName> and expression: Box<Expression>.
@@ -2830,7 +3242,8 @@ fn lower_generic(
     for assoc in associations {
         if let Some(ref tn) = assoc.type_name {
             let assoc_ty = resolve_type_name(ctx, tn);
-            if types::is_compatible(&ctrl_ty, &assoc_ty) {
+            let assoc_converted = generic_lvalue_convert(&assoc_ty);
+            if types::is_compatible(&ctrl_ty, &assoc_converted) {
                 return lower_expr_inner(ctx, &assoc.expression);
             }
         } else {
@@ -2862,17 +3275,35 @@ fn lower_generic(
 
 fn lower_address_of_label(
     ctx: &mut ExprLoweringContext<'_>,
-    _label_sym: u32,
+    label_sym: u32,
     span: Span,
 ) -> TypedValue {
     // &&label produces a void* to the label address.
-    // In the full pipeline, the statement lowering pass maintains a
-    // label→BlockId mapping, and this function looks up the block ID,
-    // converts it to a pointer Value using BlockAddress.
-    // For now, emit a null pointer as a placeholder.
-    let null = emit_int_const(ctx, 0, IrType::Ptr, span);
+    // We encode this as the label's BlockId index (1-based to avoid null).
+    // The computed goto dispatch uses a Switch instruction that maps these
+    // indices back to the corresponding basic blocks.
+    //
+    // CRITICAL: label_blocks uses the naming convention "label_{symbol_id}"
+    // (matching collect_label_names in decl_lowering.rs), NOT the human-
+    // readable name from name_table.
+    let label_name = format!("label_{}", label_sym);
+
+    // Look up the block ID for this label.
+    let block_index: i128 = ctx
+        .label_blocks
+        .get(&label_name)
+        .map(|bid| bid.index() as i128 + 1) // 1-based to avoid null pointer confusion
+        .unwrap_or(0);
+
+    let val = emit_int_const(ctx, block_index, IrType::I64, span);
+    // IntToPtr to produce a void*
+    let ptr_val = {
+        let (v, inst) = ctx.builder.build_int_to_ptr(val, span);
+        emit_inst(ctx, inst);
+        v
+    };
     TypedValue::new(
-        null,
+        ptr_val,
         CType::Pointer(Box::new(CType::Void), TypeQualifiers::default()),
     )
 }
@@ -2942,11 +3373,11 @@ fn insert_implicit_conversion(
             return v;
         }
         if is_unsigned(from) {
-            let (v, i) = ctx.builder.build_zext(value, to_ir, span);
+            let (v, i) = ctx.builder.build_zext_from(value, from_ir.clone(), to_ir, span);
             emit_inst(ctx, i);
             return v;
         } else {
-            let (v, i) = ctx.builder.build_sext(value, to_ir, span);
+            let (v, i) = ctx.builder.build_sext_from(value, from_ir.clone(), to_ir, span);
             emit_inst(ctx, i);
             return v;
         }
@@ -2955,7 +3386,7 @@ fn insert_implicit_conversion(
     // Bool (I1) to integer.
     if matches!(from, CType::Bool) && types::is_integer(to) {
         let to_ir = ctype_to_ir(to, ctx.target);
-        let (v, i) = ctx.builder.build_zext(value, to_ir, span);
+        let (v, i) = ctx.builder.build_zext_from(value, IrType::I1, to_ir, span);
         emit_inst(ctx, i);
         return v;
     }
@@ -3025,7 +3456,7 @@ fn insert_implicit_conversion(
             emit_inst(ctx, i);
             return v;
         }
-        let (v, i) = ctx.builder.build_sext(value, to_ir, span);
+        let (v, i) = ctx.builder.build_sext_from(value, from_ir.clone(), to_ir, span);
         emit_inst(ctx, i);
         return v;
     }
@@ -3102,4 +3533,271 @@ fn lower_to_bool(
     let (v, i) = ctx.builder.build_icmp(ICmpOp::Ne, value, zero, span);
     emit_inst(ctx, i);
     v
+}
+
+// ===========================================================================
+// Compile-time integer constant evaluation (for choose_expr, etc.)
+// ===========================================================================
+
+/// Try to evaluate an AST expression as a compile-time integer constant.
+/// Returns `None` if the expression cannot be evaluated at compile time.
+fn try_eval_integer_constant(
+    expr: &ast::Expression,
+    name_table: &[String],
+    enum_constants: &FxHashMap<String, i128>,
+) -> Option<i128> {
+    match expr {
+        ast::Expression::IntegerLiteral { value, .. } => Some(*value as i128),
+        ast::Expression::Parenthesized { inner, .. } => {
+            try_eval_integer_constant(inner, name_table, enum_constants)
+        }
+        ast::Expression::UnaryOp { op, operand, .. } => {
+            let val = try_eval_integer_constant(operand, name_table, enum_constants)?;
+            match op {
+                ast::UnaryOp::Negate => Some(-val),
+                ast::UnaryOp::BitwiseNot => Some(!val),
+                ast::UnaryOp::LogicalNot => Some(if val == 0 { 1 } else { 0 }),
+                ast::UnaryOp::Plus => Some(val),
+                _ => None,
+            }
+        }
+        ast::Expression::Binary {
+            op, left, right, ..
+        } => {
+            let l = try_eval_integer_constant(left, name_table, enum_constants)?;
+            let r = try_eval_integer_constant(right, name_table, enum_constants)?;
+            match op {
+                ast::BinaryOp::Add => Some(l.wrapping_add(r)),
+                ast::BinaryOp::Sub => Some(l.wrapping_sub(r)),
+                ast::BinaryOp::Mul => Some(l.wrapping_mul(r)),
+                ast::BinaryOp::Div if r != 0 => Some(l / r),
+                ast::BinaryOp::Mod if r != 0 => Some(l % r),
+                ast::BinaryOp::Equal => Some(if l == r { 1 } else { 0 }),
+                ast::BinaryOp::NotEqual => Some(if l != r { 1 } else { 0 }),
+                ast::BinaryOp::Less => Some(if l < r { 1 } else { 0 }),
+                ast::BinaryOp::Greater => Some(if l > r { 1 } else { 0 }),
+                ast::BinaryOp::LessEqual => Some(if l <= r { 1 } else { 0 }),
+                ast::BinaryOp::GreaterEqual => Some(if l >= r { 1 } else { 0 }),
+                ast::BinaryOp::BitwiseAnd => Some(l & r),
+                ast::BinaryOp::BitwiseOr => Some(l | r),
+                ast::BinaryOp::BitwiseXor => Some(l ^ r),
+                ast::BinaryOp::LogicalAnd => Some(if l != 0 && r != 0 { 1 } else { 0 }),
+                ast::BinaryOp::LogicalOr => Some(if l != 0 || r != 0 { 1 } else { 0 }),
+                ast::BinaryOp::ShiftLeft => Some(l.wrapping_shl(r as u32)),
+                ast::BinaryOp::ShiftRight => Some(l.wrapping_shr(r as u32)),
+                _ => None,
+            }
+        }
+        ast::Expression::Identifier { name, .. } => {
+            let idx = name.as_u32() as usize;
+            if idx < name_table.len() {
+                enum_constants.get(&name_table[idx]).copied()
+            } else {
+                None
+            }
+        }
+        ast::Expression::BuiltinCall {
+            builtin: ast::BuiltinKind::TypesCompatibleP,
+            args,
+            ..
+        } => {
+            // Recursively evaluate types_compatible_p as a constant.
+            // For choose_expr where the condition IS types_compatible_p.
+            // We can't fully resolve types here without ctx, so return None
+            // to let the caller use the default behavior.
+            let _ = args;
+            None
+        }
+        _ => None,
+    }
+}
+
+// ===========================================================================
+// __builtin_types_compatible_p
+// ===========================================================================
+
+/// Compare two CTypes for compatibility, ignoring top-level qualifiers.
+///
+/// GCC semantics: two types are compatible if they are the same type after
+/// stripping top-level `const`/`volatile`/`restrict` qualifiers.
+fn types_are_compatible_ignoring_qualifiers(a: &CType, b: &CType) -> bool {
+    let a = strip_qualifiers(a);
+    let b = strip_qualifiers(b);
+    ctypes_structurally_equal(a, b)
+}
+
+/// Strip top-level qualifiers and typedefs from a CType.
+fn strip_qualifiers(ty: &CType) -> &CType {
+    match ty {
+        CType::Qualified(inner, _) => strip_qualifiers(inner),
+        CType::Typedef { underlying, .. } => strip_qualifiers(underlying),
+        _ => ty,
+    }
+}
+
+/// Check structural equality of two CTypes (after qualifier stripping).
+fn ctypes_structurally_equal(a: &CType, b: &CType) -> bool {
+    // Discriminant check for simple unit-variant types.
+    match (a, b) {
+        (CType::Void, CType::Void)
+        | (CType::Bool, CType::Bool)
+        | (CType::Char, CType::Char)
+        | (CType::SChar, CType::SChar)
+        | (CType::UChar, CType::UChar)
+        | (CType::Short, CType::Short)
+        | (CType::UShort, CType::UShort)
+        | (CType::Int, CType::Int)
+        | (CType::UInt, CType::UInt)
+        | (CType::Long, CType::Long)
+        | (CType::ULong, CType::ULong)
+        | (CType::LongLong, CType::LongLong)
+        | (CType::ULongLong, CType::ULongLong)
+        | (CType::Float, CType::Float)
+        | (CType::Double, CType::Double)
+        | (CType::LongDouble, CType::LongDouble) => true,
+        (CType::Pointer(a_inner, _), CType::Pointer(b_inner, _)) => {
+            ctypes_structurally_equal(strip_qualifiers(a_inner), strip_qualifiers(b_inner))
+        }
+        (CType::Array(a_elem, a_sz), CType::Array(b_elem, b_sz)) => {
+            a_sz == b_sz && ctypes_structurally_equal(strip_qualifiers(a_elem), strip_qualifiers(b_elem))
+        }
+        (CType::Struct { name: an, .. }, CType::Struct { name: bn, .. }) => {
+            match (an, bn) {
+                (Some(a_name), Some(b_name)) => a_name == b_name,
+                _ => false,
+            }
+        }
+        (CType::Union { name: an, .. }, CType::Union { name: bn, .. }) => {
+            match (an, bn) {
+                (Some(a_name), Some(b_name)) => a_name == b_name,
+                _ => false,
+            }
+        }
+        (CType::Enum { name: an, .. }, CType::Enum { name: bn, .. }) => {
+            match (an, bn) {
+                (Some(a_name), Some(b_name)) => a_name == b_name,
+                _ => false,
+            }
+        }
+        (CType::Function { return_type: ar, params: ap, .. }, CType::Function { return_type: br, params: bp, .. }) => {
+            ctypes_structurally_equal(strip_qualifiers(ar), strip_qualifiers(br))
+                && ap.len() == bp.len()
+                && ap.iter().zip(bp.iter()).all(|(pa, pb)| ctypes_structurally_equal(strip_qualifiers(pa), strip_qualifiers(pb)))
+        }
+        _ => false,
+    }
+}
+
+// ===========================================================================
+// __builtin_offsetof computation
+// ===========================================================================
+
+/// Compute the byte offset of a struct/union member for `__builtin_offsetof`.
+///
+/// Extracts the type from args[0] (a `SizeofType` carrier) and the member
+/// designator chain from args[1] (an `Identifier` or `MemberAccess` chain).
+/// Returns the byte offset as a `usize`.
+fn compute_builtin_offsetof(
+    ctx: &ExprLoweringContext<'_>,
+    args: &[ast::Expression],
+    _span: Span,
+) -> usize {
+    // Extract the type from args[0].
+    let ctype = if let Some(ast::Expression::SizeofType { type_name, .. }) = args.first() {
+        resolve_type_name(ctx, type_name)
+    } else {
+        return 0;
+    };
+
+    // Extract the member designator chain from args[1].
+    // For `b` → ["b"]
+    // For `inner.b` → ["inner", "b"]
+    let member_chain = if let Some(member_expr) = args.get(1) {
+        extract_member_chain(member_expr, ctx.name_table)
+    } else {
+        return 0;
+    };
+
+    // Walk the struct type, computing cumulative byte offset.
+    compute_offset_in_type(&ctype, &member_chain, ctx.type_builder)
+}
+
+/// Extract a chain of member names from a member-designator expression.
+///
+/// Handles:
+///   - `Identifier { name }` → `["name"]`
+///   - `MemberAccess { object, member }` → recursively: object chain + ["member"]
+fn extract_member_chain(expr: &ast::Expression, name_table: &[String]) -> Vec<String> {
+    match expr {
+        ast::Expression::Identifier { name, .. } => {
+            let idx = name.as_u32() as usize;
+            let s = if idx < name_table.len() {
+                name_table[idx].clone()
+            } else {
+                format!("sym_{}", idx)
+            };
+            vec![s]
+        }
+        ast::Expression::MemberAccess {
+            object, member, ..
+        } => {
+            let mut chain = extract_member_chain(object, name_table);
+            let idx = member.as_u32() as usize;
+            let s = if idx < name_table.len() {
+                name_table[idx].clone()
+            } else {
+                format!("sym_{}", idx)
+            };
+            chain.push(s);
+            chain
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Compute byte offset of a member chain within a CType.
+fn compute_offset_in_type(
+    ctype: &CType,
+    member_chain: &[String],
+    type_builder: &TypeBuilder,
+) -> usize {
+    if member_chain.is_empty() {
+        return 0;
+    }
+
+    let fields = match ctype {
+        CType::Struct { fields, .. } => fields,
+        CType::Union { fields, .. } => fields,
+        _ => return 0,
+    };
+
+    let target_name = &member_chain[0];
+
+    // Compute field offsets using the same logic as decl_lowering.
+    let mut current_offset: usize = 0;
+    for field in fields {
+        let field_align = type_builder.alignof_type(&field.ty);
+        let align = if field_align == 0 { 1 } else { field_align };
+        current_offset = (current_offset + align - 1) & !(align - 1);
+
+        let field_name = field.name.as_deref().unwrap_or("");
+        if field_name == target_name {
+            // Found the field.
+            if member_chain.len() == 1 {
+                // Final field — return the offset.
+                return current_offset;
+            }
+            // Recurse into nested struct/union for remaining chain.
+            return current_offset
+                + compute_offset_in_type(&field.ty, &member_chain[1..], type_builder);
+        }
+
+        // For unions, all fields start at offset 0.
+        if !matches!(ctype, CType::Union { .. }) {
+            current_offset += type_builder.sizeof_type(&field.ty);
+        }
+    }
+
+    // Field not found — return 0.
+    0
 }

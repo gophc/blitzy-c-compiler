@@ -1226,7 +1226,7 @@ mod tests {
     fn test_register_info() {
         let info = x86_64_register_info();
         assert_eq!(info.allocatable_gpr.len(), 13);
-        assert_eq!(info.allocatable_fpr.len(), 16);
+        assert_eq!(info.allocatable_fpr.len(), 15);
         assert_eq!(info.argument_gpr.len(), 6);
         assert_eq!(info.argument_fpr.len(), 8);
         assert_eq!(info.return_gpr.len(), 2);

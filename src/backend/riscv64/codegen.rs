@@ -434,13 +434,13 @@ pub struct RvInstruction {
     /// The instruction opcode identifying the operation.
     pub opcode: RvOpcode,
     /// Destination register, or `None` for instructions without a result.
-    pub rd: Option<u8>,
+    pub rd: Option<u16>,
     /// First source register.
-    pub rs1: Option<u8>,
+    pub rs1: Option<u16>,
     /// Second source register.
-    pub rs2: Option<u8>,
+    pub rs2: Option<u16>,
     /// Third source register (fused multiply-add only).
-    pub rs3: Option<u8>,
+    pub rs3: Option<u16>,
     /// Immediate value (12-bit signed for I-type, 20-bit for U-type, etc.).
     pub imm: i64,
     /// Symbol reference for linker relocations (function/global names).
@@ -449,11 +449,16 @@ pub struct RvInstruction {
     pub is_fp: bool,
     /// Optional debug annotation for assembly listing.
     pub comment: Option<String>,
+    /// Whether this instruction is part of a call-argument setup sequence.
+    /// Used by the post-register-allocation parallel-move resolver
+    /// (`resolve_call_arg_conflicts`) to identify the contiguous window of
+    /// argument-loading instructions that precede a CALL.
+    pub is_call_arg_setup: bool,
 }
 
 impl RvInstruction {
     /// Create a new R-type instruction (register-register).
-    fn r_type(opcode: RvOpcode, rd: u8, rs1: u8, rs2: u8) -> Self {
+    fn r_type(opcode: RvOpcode, rd: u16, rs1: u16, rs2: u16) -> Self {
         RvInstruction {
             opcode,
             rd: Some(rd),
@@ -464,11 +469,12 @@ impl RvInstruction {
             symbol: None,
             is_fp: false,
             comment: None,
+            is_call_arg_setup: false,
         }
     }
 
     /// Create a new I-type instruction (register-immediate).
-    fn i_type(opcode: RvOpcode, rd: u8, rs1: u8, imm: i64) -> Self {
+    fn i_type(opcode: RvOpcode, rd: u16, rs1: u16, imm: i64) -> Self {
         RvInstruction {
             opcode,
             rd: Some(rd),
@@ -479,11 +485,12 @@ impl RvInstruction {
             symbol: None,
             is_fp: false,
             comment: None,
+            is_call_arg_setup: false,
         }
     }
 
     /// Create a new S-type instruction (store).
-    fn s_type(opcode: RvOpcode, rs1: u8, rs2: u8, imm: i64) -> Self {
+    fn s_type(opcode: RvOpcode, rs1: u16, rs2: u16, imm: i64) -> Self {
         RvInstruction {
             opcode,
             rd: None,
@@ -494,11 +501,12 @@ impl RvInstruction {
             symbol: None,
             is_fp: false,
             comment: None,
+            is_call_arg_setup: false,
         }
     }
 
     /// Create a new B-type instruction (conditional branch).
-    fn b_type(opcode: RvOpcode, rs1: u8, rs2: u8, imm: i64) -> Self {
+    fn b_type(opcode: RvOpcode, rs1: u16, rs2: u16, imm: i64) -> Self {
         RvInstruction {
             opcode,
             rd: None,
@@ -509,11 +517,12 @@ impl RvInstruction {
             symbol: None,
             is_fp: false,
             comment: None,
+            is_call_arg_setup: false,
         }
     }
 
     /// Create a new U-type instruction (upper immediate).
-    fn u_type(opcode: RvOpcode, rd: u8, imm: i64) -> Self {
+    fn u_type(opcode: RvOpcode, rd: u16, imm: i64) -> Self {
         RvInstruction {
             opcode,
             rd: Some(rd),
@@ -524,6 +533,7 @@ impl RvInstruction {
             symbol: None,
             is_fp: false,
             comment: None,
+            is_call_arg_setup: false,
         }
     }
 
@@ -539,12 +549,22 @@ impl RvInstruction {
             symbol: None,
             is_fp: false,
             comment: None,
+            is_call_arg_setup: false,
         }
     }
 
     /// Set the floating-point flag on this instruction.
     fn with_fp(mut self) -> Self {
         self.is_fp = true;
+        self
+    }
+
+    /// Mark this instruction as part of a call-argument setup sequence.
+    /// The post-register-allocation parallel-move resolver uses this flag
+    /// to identify the contiguous window of argument-loading instructions
+    /// that precede a CALL instruction.
+    fn as_call_arg_setup(mut self) -> Self {
+        self.is_call_arg_setup = true;
         self
     }
 
@@ -600,7 +620,7 @@ fn split_i32_lui_addi(val: i64) -> (i64, i64) {
 /// that are later resolved by the register allocator.
 struct ValueMap {
     /// Maps IR Value index → register ID (physical or virtual).
-    regs: crate::common::fx_hash::FxHashMap<u32, u8>,
+    regs: crate::common::fx_hash::FxHashMap<u32, u16>,
     /// Maps IR Value index → stack frame offset for spilled/alloca'd values.
     stack_offsets: crate::common::fx_hash::FxHashMap<u32, i64>,
     /// Next virtual register number for allocation.
@@ -612,39 +632,48 @@ impl ValueMap {
         ValueMap {
             regs: crate::common::fx_hash::FxHashMap::default(),
             stack_offsets: crate::common::fx_hash::FxHashMap::default(),
-            next_vreg: 64, // above physical register space (0-63)
+            next_vreg: 100, // virtual register IDs start above physical (0-63)
         }
     }
 
-    /// Allocate a GPR for an IR value from the allocatable pool.
-    fn alloc_gpr(&mut self, val: Value) -> u8 {
+    /// Allocate a virtual GPR for an IR value.
+    ///
+    /// Returns a virtual register ID (≥ 100) that will be resolved to
+    /// a physical register by the register allocator in `generation.rs`.
+    fn alloc_gpr(&mut self, val: Value) -> u16 {
         let idx = val.index();
         if let Some(&reg) = self.regs.get(&idx) {
             return reg;
         }
-        let pool = &ALLOCATABLE_GPRS;
-        let reg = pool[(self.next_vreg as usize) % pool.len()];
+        let vreg = self.next_vreg as u16;
         self.next_vreg += 1;
-        self.regs.insert(idx, reg);
-        reg
+        self.regs.insert(idx, vreg);
+        vreg
     }
 
-    /// Allocate an FPR for an IR value from the allocatable pool.
-    fn alloc_fpr(&mut self, val: Value) -> u8 {
+    /// Allocate a virtual FPR for an IR value.
+    ///
+    /// Returns a virtual register ID that will be resolved to a physical
+    /// FPR by the register allocator.
+    fn alloc_fpr(&mut self, val: Value) -> u16 {
         let idx = val.index();
         if let Some(&reg) = self.regs.get(&idx) {
             return reg;
         }
-        let pool = &ALLOCATABLE_FPRS;
-        let reg = pool[(self.next_vreg as usize) % pool.len()];
+        let vreg = self.next_vreg as u16;
         self.next_vreg += 1;
-        self.regs.insert(idx, reg);
-        reg
+        self.regs.insert(idx, vreg);
+        vreg
     }
 
     /// Get the register for an IR value, defaulting to T0.
-    fn get_reg(&self, val: Value) -> u8 {
+    fn get_reg(&self, val: Value) -> u16 {
         *self.regs.get(&val.index()).unwrap_or(&T0)
+    }
+
+    /// Check if a register has been allocated for the given Value.
+    fn has_reg(&self, val: Value) -> bool {
+        self.regs.contains_key(&val.index())
     }
 
     /// Get the stack offset for an IR value (alloca'd value).
@@ -659,8 +688,20 @@ impl ValueMap {
     }
 
     /// Record a register mapping for an IR value.
-    fn set_reg(&mut self, val: Value, reg: u8) {
+    fn set_reg(&mut self, val: Value, reg: u16) {
         self.regs.insert(val.index(), reg);
+    }
+
+    /// Build a mapping from virtual register ID → IR Value for the
+    /// register allocator.  Only includes virtual registers (≥ 100).
+    fn vreg_to_ir_value_map(&self) -> crate::common::fx_hash::FxHashMap<u32, Value> {
+        let mut map = crate::common::fx_hash::FxHashMap::default();
+        for (&val_idx, &reg) in &self.regs {
+            if reg >= 100 {
+                map.insert(reg as u32, Value(val_idx));
+            }
+        }
+        map
     }
 }
 
@@ -699,15 +740,32 @@ pub struct RiscV64InstructionSelector {
     /// Current stack allocation offset (grows downward from FP).
     alloca_offset: i64,
     /// Callee-saved GPRs actually used in this function.
-    used_callee_saved_gprs: Vec<u8>,
+    used_callee_saved_gprs: Vec<u16>,
     /// Callee-saved FPRs actually used in this function.
-    used_callee_saved_fprs: Vec<u8>,
+    used_callee_saved_fprs: Vec<u16>,
     /// Block label map: IR BlockId index → string label.
     block_labels: crate::common::fx_hash::FxHashMap<usize, String>,
     /// Whether the current function makes any calls.
     has_calls: bool,
     /// Constant value cache: maps IR Value index to integer constant value.
     constant_values: crate::common::fx_hash::FxHashMap<u32, i64>,
+    /// Float constant cache: maps IR Value index to .rodata global symbol name.
+    /// Populated from `IrFunction::float_constant_values` so the instruction
+    /// selector can load FP constants via `la + fld` instead of integer LI.
+    float_constant_cache: crate::common::fx_hash::FxHashMap<u32, (String, f64)>,
+    /// Maps IR Value indices to function names for direct calls.
+    /// Populated from `IrModule::func_ref_map` during lowering.
+    func_ref_names: crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>,
+    /// Set of function names that are declared as variadic (`...`).
+    /// On RISC-V LP64D, variadic function calls pass ALL FP arguments
+    /// in integer registers (not FP registers), so the codegen must
+    /// convert FPR values to GPR before the call.
+    variadic_functions: crate::common::fx_hash::FxHashSet<String>,
+    /// Maps IR Value indices to global variable names.
+    global_var_refs: crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>,
+    /// Maps IR Value indices to their IR types, populated during instruction
+    /// selection so that Store can choose the correct width (SB/SH/SW/SD).
+    value_types: crate::common::fx_hash::FxHashMap<u32, crate::ir::types::IrType>,
 }
 
 impl RiscV64InstructionSelector {
@@ -731,12 +789,56 @@ impl RiscV64InstructionSelector {
             block_labels: crate::common::fx_hash::FxHashMap::default(),
             has_calls: false,
             constant_values: crate::common::fx_hash::FxHashMap::default(),
+            float_constant_cache: crate::common::fx_hash::FxHashMap::default(),
+            func_ref_names: crate::common::fx_hash::FxHashMap::default(),
+            variadic_functions: crate::common::fx_hash::FxHashSet::default(),
+            global_var_refs: crate::common::fx_hash::FxHashMap::default(),
+            value_types: crate::common::fx_hash::FxHashMap::default(),
         }
+    }
+
+    /// Set the function reference name map for resolving direct call targets.
+    pub fn set_func_ref_names(
+        &mut self,
+        map: crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>,
+    ) {
+        self.func_ref_names = map;
+    }
+
+    /// Set the global variable reference map.
+    pub fn set_global_var_refs(
+        &mut self,
+        map: crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>,
+    ) {
+        self.global_var_refs = map;
+    }
+
+    /// Set the variadic function names so the call emitter knows to pass
+    /// FP arguments in integer registers (RISC-V LP64D ABI requirement).
+    pub fn set_variadic_functions(
+        &mut self,
+        set: crate::common::fx_hash::FxHashSet<String>,
+    ) {
+        self.variadic_functions = set;
     }
 
     /// Set the constant value cache (called before `select_function`).
     pub fn set_constant_values(&mut self, cv: crate::common::fx_hash::FxHashMap<u32, i64>) {
         self.constant_values = cv;
+    }
+
+    /// Set the float constant cache for FP constant loading from .rodata.
+    pub fn set_float_constant_values(
+        &mut self,
+        fv: crate::common::fx_hash::FxHashMap<u32, (String, f64)>,
+    ) {
+        self.float_constant_cache = fv;
+    }
+
+    /// Return the virtual register → IR Value mapping for the register
+    /// allocator.  Must be called after `select_function`.
+    pub fn vreg_to_ir_value_map(&self) -> crate::common::fx_hash::FxHashMap<u32, Value> {
+        self.vmap.vreg_to_ir_value_map()
     }
 
     /// Reset selector state for a new function.
@@ -746,7 +848,10 @@ impl RiscV64InstructionSelector {
         self.frame_size = 0;
         self.spill_slots.clear();
         self.vmap = ValueMap::new();
-        self.alloca_offset = 0;
+        // Reserve 16 bytes at the top of the frame for RA and FP saves.
+        // Local allocas will start below FP - 16, avoiding overlap with
+        // the saved return address at FP - 8 and saved frame pointer at FP - 16.
+        self.alloca_offset = 16;
         self.used_callee_saved_gprs.clear();
         self.used_callee_saved_fprs.clear();
         self.block_labels.clear();
@@ -771,8 +876,15 @@ impl RiscV64InstructionSelector {
     }
 
     /// Emit a label pseudo-instruction for a basic block.
+    ///
+    /// Emits a NOP carrying a `.label:` comment so that the assembler
+    /// can record the label's offset during code emission.
     fn emit_block_label(&mut self, label: &str) {
         self.current_block = Some(label.to_string());
+        // Emit a NOP that carries the label definition.
+        let mut inst = RvInstruction::no_op(RvOpcode::NOP);
+        inst.comment = Some(format!(".label:{}", label));
+        self.instructions.push(inst);
     }
 
     // -----------------------------------------------------------------------
@@ -785,7 +897,7 @@ impl RiscV64InstructionSelector {
     }
 
     /// Get a destination register for an IR value given its type.
-    fn dest_reg(&mut self, val: Value, ty: &IrType) -> u8 {
+    fn dest_reg(&mut self, val: Value, ty: &IrType) -> u16 {
         if Self::uses_fpr(ty) {
             self.vmap.alloc_fpr(val)
         } else {
@@ -794,12 +906,56 @@ impl RiscV64InstructionSelector {
     }
 
     /// Get the source register for an IR value.
-    fn src_reg(&self, val: Value) -> u8 {
+    fn src_reg(&mut self, val: Value) -> u16 {
+        // If the Value already has a register allocated, just return it.
+        if self.vmap.has_reg(val) {
+            return self.vmap.get_reg(val);
+        }
+
+        // Check if the Value refers to a global variable whose address
+        // should be loaded via an LA pseudo-instruction.
+        if let Some(name) = self.global_var_refs.get(&val).cloned() {
+            let rd = self.vmap.alloc_gpr(val);
+            self.emit(RvInstruction {
+                opcode: RvOpcode::LA,
+                rd: Some(rd),
+                rs1: None,
+                rs2: None,
+                rs3: None,
+                imm: 0,
+                symbol: Some(name),
+                is_fp: false,
+                comment: Some("load global address".to_string()),
+                is_call_arg_setup: false,
+            });
+            return rd;
+        }
+
+        // Check if the Value refers to a function whose address is
+        // needed (function pointer decay).
+        if let Some(name) = self.func_ref_names.get(&val).cloned() {
+            let rd = self.vmap.alloc_gpr(val);
+            self.emit(RvInstruction {
+                opcode: RvOpcode::LA,
+                rd: Some(rd),
+                rs1: None,
+                rs2: None,
+                rs3: None,
+                imm: 0,
+                symbol: Some(name),
+                is_fp: false,
+                comment: Some("load function address".to_string()),
+                is_call_arg_setup: false,
+            });
+            return rd;
+        }
+
+        // Fall back to normal register lookup (allocates on first use).
         self.vmap.get_reg(val)
     }
 
     /// Track usage of a callee-saved register.
-    fn mark_callee_saved(&mut self, reg: u8) {
+    fn mark_callee_saved(&mut self, reg: u16) {
         if is_callee_saved(reg) {
             if is_gpr(reg) && !self.used_callee_saved_gprs.contains(&reg) {
                 self.used_callee_saved_gprs.push(reg);
@@ -820,34 +976,34 @@ impl RiscV64InstructionSelector {
         self.instructions.push(inst);
     }
 
-    fn emit_r(&mut self, op: RvOpcode, rd: u8, rs1: u8, rs2: u8) {
+    fn emit_r(&mut self, op: RvOpcode, rd: u16, rs1: u16, rs2: u16) {
         self.emit(RvInstruction::r_type(op, rd, rs1, rs2));
     }
 
-    fn emit_i(&mut self, op: RvOpcode, rd: u8, rs1: u8, imm: i64) {
+    fn emit_i(&mut self, op: RvOpcode, rd: u16, rs1: u16, imm: i64) {
         self.emit(RvInstruction::i_type(op, rd, rs1, imm));
     }
 
-    fn emit_s(&mut self, op: RvOpcode, base: u8, src: u8, offset: i64) {
+    fn emit_s(&mut self, op: RvOpcode, base: u16, src: u16, offset: i64) {
         self.emit(RvInstruction::s_type(op, base, src, offset));
     }
 
-    fn emit_b(&mut self, op: RvOpcode, rs1: u8, rs2: u8, target_label: &str) {
+    fn emit_b(&mut self, op: RvOpcode, rs1: u16, rs2: u16, target_label: &str) {
         let mut inst = RvInstruction::b_type(op, rs1, rs2, 0);
         inst.symbol = Some(target_label.to_string());
         self.emit(inst);
     }
 
     #[allow(dead_code)]
-    fn emit_u(&mut self, op: RvOpcode, rd: u8, imm: i64) {
+    fn emit_u(&mut self, op: RvOpcode, rd: u16, imm: i64) {
         self.emit(RvInstruction::u_type(op, rd, imm));
     }
 
-    fn emit_fp_r(&mut self, op: RvOpcode, rd: u8, rs1: u8, rs2: u8) {
+    fn emit_fp_r(&mut self, op: RvOpcode, rd: u16, rs1: u16, rs2: u16) {
         self.emit(RvInstruction::r_type(op, rd, rs1, rs2).with_fp());
     }
 
-    fn emit_fp_unary(&mut self, op: RvOpcode, rd: u8, rs1: u8) {
+    fn emit_fp_unary(&mut self, op: RvOpcode, rd: u16, rs1: u16) {
         let mut inst = RvInstruction::i_type(op, rd, rs1, 0);
         inst.is_fp = true;
         inst.rs2 = None;
@@ -864,7 +1020,7 @@ impl RiscV64InstructionSelector {
     /// - 12-bit signed: single ADDI
     /// - 32-bit: LUI + ADDI (with sign-extension correction)
     /// - 64-bit: multi-instruction sequence (LUI+ADDI+SLLI+ADDI chains)
-    pub fn materialize_immediate(&mut self, rd: u8, value: i64) -> Vec<RvInstruction> {
+    pub fn materialize_immediate(&mut self, rd: u16, value: i64) -> Vec<RvInstruction> {
         let mut result = Vec::new();
 
         if value == 0 {
@@ -895,7 +1051,7 @@ impl RiscV64InstructionSelector {
     }
 
     /// Internal helper for materializing 64-bit immediates.
-    fn materialize_i64_into(result: &mut Vec<RvInstruction>, rd: u8, value: i64) {
+    fn materialize_i64_into(result: &mut Vec<RvInstruction>, rd: u16, value: i64) {
         let upper32 = (value >> 32) as i32 as i64;
         let lower32_u = (value as u64) & 0xFFFF_FFFF;
 
@@ -939,7 +1095,7 @@ impl RiscV64InstructionSelector {
     }
 
     /// Emit immediate materialization inline (adds to self.instructions).
-    fn emit_immediate(&mut self, rd: u8, value: i64) {
+    fn emit_immediate(&mut self, rd: u16, value: i64) {
         let insts = self.materialize_immediate(rd, value);
         for inst in insts {
             self.instructions.push(inst);
@@ -954,7 +1110,7 @@ impl RiscV64InstructionSelector {
     ///
     /// - **Non-PIC**: `LUI rd, %hi(sym)` + `ADDI rd, rd, %lo(sym)`
     /// - **PIC (GOT)**: `AUIPC rd, %got_pcrel_hi(sym)` + `LD rd, rd, %pcrel_lo(.)`
-    pub fn materialize_address(&mut self, rd: u8, symbol: &str) -> Vec<RvInstruction> {
+    pub fn materialize_address(&mut self, rd: u16, symbol: &str) -> Vec<RvInstruction> {
         let mut result = Vec::new();
 
         if self.pic_mode {
@@ -968,6 +1124,7 @@ impl RiscV64InstructionSelector {
                 symbol: Some(format!("%got_pcrel_hi({})", symbol)),
                 is_fp: false,
                 comment: Some(format!("GOT hi: {}", symbol)),
+                is_call_arg_setup: false,
             });
             result.push(RvInstruction {
                 opcode: RvOpcode::LD,
@@ -979,6 +1136,7 @@ impl RiscV64InstructionSelector {
                 symbol: Some(format!("%pcrel_lo(.L_got_{})", symbol)),
                 is_fp: false,
                 comment: Some(format!("GOT ld: {}", symbol)),
+                is_call_arg_setup: false,
             });
         } else {
             result.push(RvInstruction {
@@ -991,6 +1149,7 @@ impl RiscV64InstructionSelector {
                 symbol: Some(format!("%hi({})", symbol)),
                 is_fp: false,
                 comment: Some(format!("addr hi: {}", symbol)),
+                is_call_arg_setup: false,
             });
             result.push(RvInstruction {
                 opcode: RvOpcode::ADDI,
@@ -1002,6 +1161,7 @@ impl RiscV64InstructionSelector {
                 symbol: Some(format!("%lo({})", symbol)),
                 is_fp: false,
                 comment: Some(format!("addr lo: {}", symbol)),
+                is_call_arg_setup: false,
             });
         }
 
@@ -1009,7 +1169,7 @@ impl RiscV64InstructionSelector {
     }
 
     /// Emit address materialization inline.
-    fn emit_address(&mut self, rd: u8, symbol: &str) {
+    fn emit_address(&mut self, rd: u16, symbol: &str) {
         let insts = self.materialize_address(rd, symbol);
         for inst in insts {
             self.instructions.push(inst);
@@ -1017,7 +1177,7 @@ impl RiscV64InstructionSelector {
     }
 
     /// Materialize a PC-relative address (for local PIC symbols).
-    fn emit_pcrel_address(&mut self, rd: u8, symbol: &str) {
+    fn emit_pcrel_address(&mut self, rd: u16, symbol: &str) {
         self.emit(RvInstruction {
             opcode: RvOpcode::AUIPC,
             rd: Some(rd),
@@ -1028,6 +1188,7 @@ impl RiscV64InstructionSelector {
             symbol: Some(format!("%pcrel_hi({})", symbol)),
             is_fp: false,
             comment: None,
+            is_call_arg_setup: false,
         });
         self.emit(RvInstruction {
             opcode: RvOpcode::ADDI,
@@ -1039,6 +1200,7 @@ impl RiscV64InstructionSelector {
             symbol: Some(format!("%pcrel_lo(.L_pcrel_{})", symbol)),
             is_fp: false,
             comment: None,
+            is_call_arg_setup: false,
         });
     }
 
@@ -1056,7 +1218,7 @@ impl RiscV64InstructionSelector {
     /// - I64/Ptr → LD
     /// - F32 → FLW
     /// - F64 → FLD
-    pub fn emit_load(&mut self, rd: u8, base: u8, offset: i64, ty: &IrType) {
+    pub fn emit_load(&mut self, rd: u16, base: u16, offset: i64, ty: &IrType) {
         if !fits_i12(offset) {
             // Large offset: materialize into T0, then ADD to base
             self.emit_immediate(T0, offset);
@@ -1098,7 +1260,7 @@ impl RiscV64InstructionSelector {
     /// - I64/Ptr → SD
     /// - F32 → FSW
     /// - F64 → FSD
-    pub fn emit_store(&mut self, src: u8, base: u8, offset: i64, ty: &IrType) {
+    pub fn emit_store(&mut self, src: u16, base: u16, offset: i64, ty: &IrType) {
         if !fits_i12(offset) {
             self.emit_immediate(T0, offset);
             self.emit_r(RvOpcode::ADD, T0, base, T0);
@@ -1132,7 +1294,7 @@ impl RiscV64InstructionSelector {
     /// For conditional branches, callers should use `emit_branch` instead,
     /// which generates direct branch instructions. This method produces a
     /// 0/1 integer result for use as a value.
-    pub fn emit_comparison(&mut self, rd: u8, rs1: u8, rs2: u8, op: &ICmpOp) {
+    pub fn emit_comparison(&mut self, rd: u16, rs1: u16, rs2: u16, op: &ICmpOp) {
         match op {
             ICmpOp::Eq => {
                 // rd = (rs1 == rs2) → SUB tmp, rs1, rs2; SEQZ rd, tmp
@@ -1179,7 +1341,7 @@ impl RiscV64InstructionSelector {
     }
 
     /// Emit a floating-point comparison, putting 0/1 into integer `rd`.
-    fn emit_fcmp(&mut self, rd: u8, rs1: u8, rs2: u8, op: &FCmpOp, is_double: bool) {
+    fn emit_fcmp(&mut self, rd: u16, rs1: u16, rs2: u16, op: &FCmpOp, is_double: bool) {
         match (op, is_double) {
             (FCmpOp::Oeq, false) => self.emit_fp_r(RvOpcode::FEQ_S, rd, rs1, rs2),
             (FCmpOp::Oeq, true) => self.emit_fp_r(RvOpcode::FEQ_D, rd, rs1, rs2),
@@ -1235,7 +1397,7 @@ impl RiscV64InstructionSelector {
     ///
     /// Conditional branches use B-type instructions with ±4 KiB range.
     /// For far branches (detected post-layout), trampolines may be needed.
-    pub fn emit_branch(&mut self, cond: Option<(u8, u8, &ICmpOp)>, target_label: &str) {
+    pub fn emit_branch(&mut self, cond: Option<(u16, u16, &ICmpOp)>, target_label: &str) {
         match cond {
             None => {
                 // Unconditional jump: J target (pseudo for JAL x0, offset)
@@ -1282,7 +1444,7 @@ impl RiscV64InstructionSelector {
     ///
     /// Handles integer width conversions, integer↔float conversions,
     /// and pointer↔integer conversions.
-    pub fn emit_conversion(&mut self, rd: u8, rs: u8, from_ty: &IrType, to_ty: &IrType) {
+    pub fn emit_conversion(&mut self, rd: u16, rs: u16, from_ty: &IrType, to_ty: &IrType) {
         match (from_ty, to_ty) {
             // Integer truncation: just use the lower bits via ANDI/shift
             (_, IrType::I1) => {
@@ -1387,52 +1549,423 @@ impl RiscV64InstructionSelector {
     /// Emit a function call instruction sequence.
     ///
     /// Follows the LP64D ABI:
-    /// - Integer args in a0–a7, FP args in fa0–fa7
+    /// Attempt to emit specialised code for compiler builtins (RISC-V 64).
+    /// Returns `true` if the builtin was handled, `false` otherwise.
+    fn try_emit_rv_builtin(
+        &mut self,
+        fname: &str,
+        result: &Value,
+        args: &[Value],
+        return_type: &IrType,
+    ) -> bool {
+        match fname {
+            // ── byte-swap builtins ────────────────────────────────────
+            // RISC-V Zbb extension has REV8, but we cannot assume Zbb.
+            // Implement bswap with shift-and-mask sequences.
+            "__builtin_bswap64" => {
+                let rd = self.dest_reg(*result, return_type);
+                let src = self.src_reg(args[0]);
+                self.emit_bswap64(rd, src);
+                true
+            }
+            "__builtin_bswap32" => {
+                let rd = self.dest_reg(*result, return_type);
+                let src = self.src_reg(args[0]);
+                self.emit_bswap32(rd, src);
+                true
+            }
+            "__builtin_bswap16" => {
+                let rd = self.dest_reg(*result, return_type);
+                let src = self.src_reg(args[0]);
+                self.emit_bswap16(rd, src);
+                true
+            }
+            // ── branch hint builtins (passthrough) ───────────────────
+            "__builtin_expect" | "__builtin_expect_with_probability" => {
+                let rd = self.dest_reg(*result, return_type);
+                let src = self.src_reg(args[0]);
+                if rd != src {
+                    self.emit_i(RvOpcode::ADDI, rd, src, 0); // MV
+                }
+                true
+            }
+            "__builtin_assume_aligned" => {
+                let rd = self.dest_reg(*result, return_type);
+                let src = self.src_reg(args[0]);
+                if rd != src {
+                    self.emit_i(RvOpcode::ADDI, rd, src, 0); // MV
+                }
+                true
+            }
+            // CLZ / CTZ / popcount / ffs — these require loop labels which
+            // are complex in the RISC-V instruction selection phase.
+            // Fall through to a real function call for now.
+            "__builtin_clz" | "__builtin_clzl" | "__builtin_clzll"
+            | "__builtin_ctz" | "__builtin_ctzl" | "__builtin_ctzll"
+            | "__builtin_popcount" | "__builtin_popcountl" | "__builtin_popcountll"
+            | "__builtin_ffs" | "__builtin_ffsl" | "__builtin_ffsll" => {
+                false // Let these fall through to emit_call
+            }
+            // ── trap ─────────────────────────────────────────────────
+            "__builtin_trap" | "__builtin_unreachable" => {
+                self.emit(RvInstruction::no_op(RvOpcode::EBREAK));
+                true
+            }
+            _ => false, // Not a recognised builtin.
+        }
+    }
+
+    /// Emit byte-swap for 64-bit value: reverse all 8 bytes.
+    /// Uses t0 (register 5) as temporary.
+    fn emit_bswap64(&mut self, rd: u16, src: u16) {
+        // Strategy: extract each byte, shift to its swapped position, OR together.
+        // We use rd as accumulator and T0 (5) as scratch.
+        let t0: u16 = 5; // t0 = x5
+        // Byte 0 (bits 0-7) → bits 56-63
+        self.emit_i(RvOpcode::ANDI, rd, src, 0xFF);
+        self.emit_i(RvOpcode::SLLI, rd, rd, 56);
+        // Byte 1 (bits 8-15) → bits 48-55
+        self.emit_i(RvOpcode::SRLI, t0, src, 8);
+        self.emit_i(RvOpcode::ANDI, t0, t0, 0xFF);
+        self.emit_i(RvOpcode::SLLI, t0, t0, 48);
+        self.emit_r(RvOpcode::OR, rd, rd, t0);
+        // Byte 2 (bits 16-23) → bits 40-47
+        self.emit_i(RvOpcode::SRLI, t0, src, 16);
+        self.emit_i(RvOpcode::ANDI, t0, t0, 0xFF);
+        self.emit_i(RvOpcode::SLLI, t0, t0, 40);
+        self.emit_r(RvOpcode::OR, rd, rd, t0);
+        // Byte 3 (bits 24-31) → bits 32-39
+        self.emit_i(RvOpcode::SRLI, t0, src, 24);
+        self.emit_i(RvOpcode::ANDI, t0, t0, 0xFF);
+        self.emit_i(RvOpcode::SLLI, t0, t0, 32);
+        self.emit_r(RvOpcode::OR, rd, rd, t0);
+        // Byte 4 (bits 32-39) → bits 24-31
+        self.emit_i(RvOpcode::SRLI, t0, src, 32);
+        self.emit_i(RvOpcode::ANDI, t0, t0, 0xFF);
+        self.emit_i(RvOpcode::SLLI, t0, t0, 24);
+        self.emit_r(RvOpcode::OR, rd, rd, t0);
+        // Byte 5 (bits 40-47) → bits 16-23
+        self.emit_i(RvOpcode::SRLI, t0, src, 40);
+        self.emit_i(RvOpcode::ANDI, t0, t0, 0xFF);
+        self.emit_i(RvOpcode::SLLI, t0, t0, 16);
+        self.emit_r(RvOpcode::OR, rd, rd, t0);
+        // Byte 6 (bits 48-55) → bits 8-15
+        self.emit_i(RvOpcode::SRLI, t0, src, 48);
+        self.emit_i(RvOpcode::ANDI, t0, t0, 0xFF);
+        self.emit_i(RvOpcode::SLLI, t0, t0, 8);
+        self.emit_r(RvOpcode::OR, rd, rd, t0);
+        // Byte 7 (bits 56-63) → bits 0-7
+        self.emit_i(RvOpcode::SRLI, t0, src, 56);
+        self.emit_r(RvOpcode::OR, rd, rd, t0);
+    }
+
+    /// Emit byte-swap for 32-bit value: reverse bottom 4 bytes.
+    fn emit_bswap32(&mut self, rd: u16, src: u16) {
+        let t0: u16 = 5; // t0 = x5
+        self.emit_i(RvOpcode::ANDI, rd, src, 0xFF);
+        self.emit_i(RvOpcode::SLLI, rd, rd, 24);
+        self.emit_i(RvOpcode::SRLI, t0, src, 8);
+        self.emit_i(RvOpcode::ANDI, t0, t0, 0xFF);
+        self.emit_i(RvOpcode::SLLI, t0, t0, 16);
+        self.emit_r(RvOpcode::OR, rd, rd, t0);
+        self.emit_i(RvOpcode::SRLI, t0, src, 16);
+        self.emit_i(RvOpcode::ANDI, t0, t0, 0xFF);
+        self.emit_i(RvOpcode::SLLI, t0, t0, 8);
+        self.emit_r(RvOpcode::OR, rd, rd, t0);
+        self.emit_i(RvOpcode::SRLI, t0, src, 24);
+        self.emit_i(RvOpcode::ANDI, t0, t0, 0xFF);
+        self.emit_r(RvOpcode::OR, rd, rd, t0);
+    }
+
+    /// Emit byte-swap for 16-bit value: swap the two bottom bytes.
+    fn emit_bswap16(&mut self, rd: u16, src: u16) {
+        let t0: u16 = 5; // t0 = x5
+        // low byte → bits 8-15
+        self.emit_i(RvOpcode::ANDI, rd, src, 0xFF);
+        self.emit_i(RvOpcode::SLLI, rd, rd, 8);
+        // high byte → bits 0-7
+        self.emit_i(RvOpcode::SRLI, t0, src, 8);
+        self.emit_i(RvOpcode::ANDI, t0, t0, 0xFF);
+        self.emit_r(RvOpcode::OR, rd, rd, t0);
+    }
+
+
+/// - Integer args in a0–a7, FP args in fa0–fa7
     /// - Stack-passed args aligned to 8 bytes
     /// - Return value in a0 (integer) or fa0 (FP)
     /// - Caller saves: t0–t6, a0–a7, ft0–ft11, fa0–fa7
+    /// Emit a sequence of GPR register-to-register moves that correctly
+    /// handles the parallel-copy problem (no source clobbered before read).
+    ///
+    /// Uses topological ordering with T0 (x5) as the scratch register
+    /// to break cycles.
+    fn emit_parallel_gpr_moves(
+        instructions: &mut Vec<RvInstruction>,
+        moves: &[(u16, u16)],
+    ) {
+        if moves.is_empty() {
+            return;
+        }
+        // Check if there are any conflicts: a dst that is also a src
+        // of a different pending move.
+        let dsts: std::collections::HashSet<u16> = moves.iter().map(|m| m.0).collect();
+        let has_conflict = moves.iter().any(|m| dsts.contains(&m.1) && m.0 != m.1);
+        if !has_conflict {
+            // No conflicts — emit in order.
+            for &(dst, src) in moves {
+                instructions.push(
+                    RvInstruction::i_type(RvOpcode::ADDI, dst, src, 0)
+                        .as_call_arg_setup(),
+                );
+            }
+            return;
+        }
+        // Parallel-copy resolution with topological ordering.
+        let mut pending: Vec<(u16, u16)> = moves.to_vec();
+        let mut emitted = true;
+        while emitted && !pending.is_empty() {
+            emitted = false;
+            let srcs: std::collections::HashSet<u16> =
+                pending.iter().map(|m| m.1).collect();
+            let mut next_pending = Vec::new();
+            for &(dst, src) in &pending {
+                if !srcs.contains(&dst) || dst == src {
+                    // Safe to emit: no other pending move reads from dst.
+                    if dst != src {
+                        instructions.push(
+                            RvInstruction::i_type(RvOpcode::ADDI, dst, src, 0)
+                                .as_call_arg_setup(),
+                        );
+                    }
+                    emitted = true;
+                } else {
+                    next_pending.push((dst, src));
+                }
+            }
+            pending = next_pending;
+        }
+        // If there's a cycle remaining, break it using T0 as scratch.
+        while !pending.is_empty() {
+            let (_first_dst, first_src) = pending[0];
+            // Save first_src to T0
+            instructions.push(
+                RvInstruction::i_type(RvOpcode::ADDI, T0, first_src, 0)
+                    .as_call_arg_setup(),
+            );
+            // Replace first_src in all pending moves with T0
+            for m in pending.iter_mut() {
+                if m.1 == first_src {
+                    m.1 = T0;
+                }
+            }
+            // Now first move can be emitted: dst ← T0
+            pending[0].1 = T0;
+            // Re-run topological resolution
+            let mut still_pending = Vec::new();
+            let mut progress = true;
+            while progress && !pending.is_empty() {
+                progress = false;
+                let srcs: std::collections::HashSet<u16> =
+                    pending.iter().map(|m| m.1).collect();
+                let mut next = Vec::new();
+                for &(dst, src) in &pending {
+                    if !srcs.contains(&dst) || dst == src {
+                        if dst != src {
+                            instructions.push(
+                                RvInstruction::i_type(RvOpcode::ADDI, dst, src, 0)
+                                    .as_call_arg_setup(),
+                            );
+                        }
+                        progress = true;
+                    } else {
+                        next.push((dst, src));
+                    }
+                }
+                pending = next;
+            }
+            if !pending.is_empty() {
+                still_pending = pending.clone();
+                pending = still_pending;
+            }
+        }
+    }
+
+    /// Emit a sequence of FPR register-to-register moves with parallel-copy
+    /// resolution. Uses FT0 as the scratch register.
+    fn emit_parallel_fpr_moves(
+        instructions: &mut Vec<RvInstruction>,
+        moves: &[(u16, u16)],
+    ) {
+        if moves.is_empty() {
+            return;
+        }
+        let dsts: std::collections::HashSet<u16> = moves.iter().map(|m| m.0).collect();
+        let has_conflict = moves.iter().any(|m| dsts.contains(&m.1) && m.0 != m.1);
+        if !has_conflict {
+            for &(dst, src) in moves {
+                let mut inst = RvInstruction::r_type(RvOpcode::FSGNJ_D, dst, src, src)
+                    .as_call_arg_setup();
+                inst.is_fp = true;
+                instructions.push(inst);
+            }
+            return;
+        }
+        // For FP cycles, use FT0 as scratch
+        let ft0: u16 = FT0;
+        let mut pending: Vec<(u16, u16)> = moves.to_vec();
+        let mut emitted = true;
+        while emitted && !pending.is_empty() {
+            emitted = false;
+            let srcs: std::collections::HashSet<u16> =
+                pending.iter().map(|m| m.1).collect();
+            let mut next_pending = Vec::new();
+            for &(dst, src) in &pending {
+                if !srcs.contains(&dst) || dst == src {
+                    if dst != src {
+                        let mut inst = RvInstruction::r_type(
+                            RvOpcode::FSGNJ_D, dst, src, src,
+                        ).as_call_arg_setup();
+                        inst.is_fp = true;
+                        instructions.push(inst);
+                    }
+                    emitted = true;
+                } else {
+                    next_pending.push((dst, src));
+                }
+            }
+            pending = next_pending;
+        }
+        while !pending.is_empty() {
+            let (_, first_src) = pending[0];
+            let mut inst = RvInstruction::r_type(RvOpcode::FSGNJ_D, ft0, first_src, first_src)
+                .as_call_arg_setup();
+            inst.is_fp = true;
+            instructions.push(inst);
+            for m in pending.iter_mut() {
+                if m.1 == first_src {
+                    m.1 = ft0;
+                }
+            }
+            let mut progress = true;
+            while progress && !pending.is_empty() {
+                progress = false;
+                let srcs: std::collections::HashSet<u16> =
+                    pending.iter().map(|m| m.1).collect();
+                let mut next = Vec::new();
+                for &(dst, src) in &pending {
+                    if !srcs.contains(&dst) || dst == src {
+                        if dst != src {
+                            let mut inst2 = RvInstruction::r_type(
+                                RvOpcode::FSGNJ_D, dst, src, src,
+                            ).as_call_arg_setup();
+                            inst2.is_fp = true;
+                            instructions.push(inst2);
+                        }
+                        progress = true;
+                    } else {
+                        next.push((dst, src));
+                    }
+                }
+                pending = next;
+            }
+        }
+    }
+
     pub fn emit_call(
         &mut self,
         callee: &str,
-        args: &[(u8, bool)], // (register, is_fp)
-        result_reg: Option<u8>,
+        args: &[(u16, bool)], // (register, is_fp)
+        result_reg: Option<u16>,
         result_is_fp: bool,
+        is_variadic: bool,
     ) {
         self.has_calls = true;
 
-        // Move arguments into ABI registers using separate counters for
-        // integer and floating-point register banks per LP64D calling convention.
-        // Integer args go to a0–a7, FP args go to fa0–fa7; each bank maintains
-        // its own allocation counter.
+        // ── Parallel-copy resolution for argument register moves ─────
+        //
+        // Build the list of (dst_abi_reg, src_reg) moves for both integer
+        // and FP banks, then resolve the parallel-copy problem to avoid
+        // clobbering source registers that are read by later moves.
+        //
+        // Example conflict:
+        //   printf("%d %d", a, b)  where a is in A2, b is in A0
+        //   Naive order:  MV A0, A2 (format); MV A1, A2 (a); MV A2, A0 (b)
+        //   A0 clobbered before A2 reads it → wrong value for b.
+        //
+        // The resolution algorithm:
+        //   1. Collect (dst, src) register-to-register moves.
+        //   2. Emit moves with no dependency first (topological order).
+        //   3. Break cycles using T0 as scratch for GPR, FT0 for FPR.
+
         let mut int_idx: usize = 0;
         let mut fp_idx: usize = 0;
         let mut stack_offset: i64 = 0;
 
+        // GPR moves: (dst_abi_reg, src_reg)
+        let mut gpr_moves: Vec<(u16, u16)> = Vec::new();
+        // FPR moves: (dst_abi_reg, src_reg)
+        let mut fpr_moves: Vec<(u16, u16)> = Vec::new();
+        // FP→GPR cross-class moves for variadic calls.
+        // These are emitted as FMV.X.D / FMV.X.W instructions AFTER
+        // the normal parallel-copy resolution (since they cannot use
+        // the standard MV pseudo which only works within a register class).
+        // Entries: (dst_gpr_abi_reg, src_fpr_vreg)
+        let mut fp_to_gpr_moves: Vec<(u16, u16)> = Vec::new();
+
         for &(reg, is_fp) in args.iter() {
-            if is_fp {
+            if is_fp && is_variadic {
+                // ── RISC-V LP64D ABI: variadic FP → integer register ──
+                //
+                // Variadic arguments after the `...` must ALL be passed
+                // in integer registers (a0–a7) as raw bit patterns.
+                // We use the integer arg slot and record a cross-class
+                // move that will be emitted as FMV.X.D / FMV.X.W below.
+                if int_idx < 8 {
+                    let ai = A0 + int_idx as u16;
+                    int_idx += 1;
+                    fp_to_gpr_moves.push((ai, reg));
+                } else {
+                    // Spill to stack as raw bits (still FP-sized).
+                    self.emit_store(reg, SP, stack_offset, &IrType::F64);
+                    stack_offset += 8;
+                }
+            } else if is_fp {
                 if fp_idx < 8 {
-                    let fa = FA0 + fp_idx as u8;
+                    let fa = FA0 + fp_idx as u16;
                     fp_idx += 1;
                     if reg != fa {
-                        // FSGNJ.D fa_i, reg, reg  (FP MV)
-                        self.emit_fp_r(RvOpcode::FSGNJ_D, fa, reg, reg);
+                        fpr_moves.push((fa, reg));
                     }
                 } else {
-                    // FP spill to stack
                     self.emit_store(reg, SP, stack_offset, &IrType::F64);
                     stack_offset += 8;
                 }
             } else if int_idx < 8 {
-                let ai = A0 + int_idx as u8;
+                let ai = A0 + int_idx as u16;
                 int_idx += 1;
                 if reg != ai {
-                    self.emit_i(RvOpcode::ADDI, ai, reg, 0); // MV
+                    gpr_moves.push((ai, reg));
                 }
             } else {
-                // Integer spill to stack
                 self.emit_s(RvOpcode::SD, SP, reg, stack_offset);
                 stack_offset += 8;
             }
+        }
+
+        // Resolve GPR parallel copies
+        Self::emit_parallel_gpr_moves(&mut self.instructions, &gpr_moves);
+
+        // Resolve FPR parallel copies
+        Self::emit_parallel_fpr_moves(&mut self.instructions, &fpr_moves);
+
+        // Emit cross-class FP→GPR moves for variadic arguments.
+        // These use FMV.X.D (double) with physical destination registers
+        // and virtual/physical source FPR registers.
+        for &(dst_gpr, src_fpr) in &fp_to_gpr_moves {
+            let mut inst = RvInstruction::i_type(RvOpcode::FMV_X_D, dst_gpr, src_fpr, 0);
+            inst.is_fp = true;
+            inst.is_call_arg_setup = true;
+            self.instructions.push(inst);
         }
 
         // Generate the call instruction
@@ -1448,6 +1981,7 @@ impl RiscV64InstructionSelector {
                 symbol: Some(format!("{}@plt", callee)),
                 is_fp: false,
                 comment: Some(format!("call {}", callee)),
+                is_call_arg_setup: false,
             });
         } else {
             // Direct call
@@ -1461,6 +1995,7 @@ impl RiscV64InstructionSelector {
                 symbol: Some(callee.to_string()),
                 is_fp: false,
                 comment: Some(format!("call {}", callee)),
+                is_call_arg_setup: false,
             });
         }
 
@@ -1506,12 +2041,13 @@ impl RiscV64InstructionSelector {
                 constraints,
                 clobbers.join(","),
             )),
+            is_call_arg_setup: false,
         };
         self.emit(inst);
     }
 
     /// Get RISC-V ABI register name for a physical register index.
-    fn rv_reg_name(&self, reg: u8) -> String {
+    fn rv_reg_name(&self, reg: u16) -> String {
         match reg {
             0 => "zero".to_string(),
             1 => "ra".to_string(),
@@ -1612,7 +2148,7 @@ impl RiscV64InstructionSelector {
     /// For small case counts (≤8): cascaded BEQ comparisons.
     /// For dense ranges: jump table with bounds check.
     /// For sparse cases: binary search tree.
-    pub fn emit_switch(&mut self, val_reg: u8, default_label: &str, cases: &[(i64, String)]) {
+    pub fn emit_switch(&mut self, val_reg: u16, default_label: &str, cases: &[(i64, String)]) {
         if cases.is_empty() {
             // Just jump to default
             self.emit_branch(None, default_label);
@@ -1639,7 +2175,7 @@ impl RiscV64InstructionSelector {
     }
 
     /// Emit cascaded BEQ comparisons for a switch statement.
-    fn emit_switch_cascade(&mut self, val_reg: u8, default_label: &str, cases: &[(i64, String)]) {
+    fn emit_switch_cascade(&mut self, val_reg: u16, default_label: &str, cases: &[(i64, String)]) {
         for (case_val, case_label) in cases {
             if fits_i12(*case_val) {
                 // Compare: ADDI T0, x0, case_val; BEQ val_reg, T0, label
@@ -1656,7 +2192,7 @@ impl RiscV64InstructionSelector {
     /// Emit a jump table for a dense switch statement.
     fn emit_switch_jump_table(
         &mut self,
-        val_reg: u8,
+        val_reg: u16,
         default_label: &str,
         cases: &[(i64, String)],
         min_val: i64,
@@ -1718,6 +2254,7 @@ impl RiscV64InstructionSelector {
                 symbol: Some(entry.clone()),
                 is_fp: false,
                 comment: Some(format!("switch table entry: {}", entry)),
+                is_call_arg_setup: false,
             });
         }
     }
@@ -1821,13 +2358,13 @@ impl RiscV64InstructionSelector {
 
         // Restore callee-saved FPRs (reverse order of prologue)
         // Count includes FP which we skip
-        let gprs_to_restore: Vec<u8> = self
+        let gprs_to_restore: Vec<u16> = self
             .used_callee_saved_gprs
             .iter()
             .copied()
             .filter(|&r| r != FP)
             .collect();
-        let fprs_to_restore: Vec<u8> = self.used_callee_saved_fprs.clone();
+        let fprs_to_restore: Vec<u16> = self.used_callee_saved_fprs.clone();
 
         // Restore FPRs
         let mut offset = frame - 24 - (gprs_to_restore.len() as i64 * 8);
@@ -1884,7 +2421,7 @@ impl RiscV64InstructionSelector {
     // ===================================================================
 
     /// Select arithmetic instructions for an IR BinOp.
-    fn select_binop(&mut self, rd: u8, lhs_reg: u8, rhs_reg: u8, op: &BinOp, ty: &IrType) {
+    fn select_binop(&mut self, rd: u16, lhs_reg: u16, rhs_reg: u16, op: &BinOp, ty: &IrType) {
         // Decide whether to use W-variants for 32-bit int ops
         let use_word = matches!(ty, IrType::I32);
 
@@ -2018,6 +2555,7 @@ impl RiscV64InstructionSelector {
                         symbol: Some("fmodf".to_string()),
                         is_fp: false,
                         comment: Some("FRem via fmodf".to_string()),
+                        is_call_arg_setup: false,
                     });
                     if rd != FA0 {
                         self.emit_fp_r(RvOpcode::FSGNJ_S, rd, FA0, FA0);
@@ -2039,6 +2577,7 @@ impl RiscV64InstructionSelector {
                         symbol: Some("fmod".to_string()),
                         is_fp: false,
                         comment: Some("FRem via fmod".to_string()),
+                        is_call_arg_setup: false,
                     });
                     if rd != FA0 {
                         self.emit_fp_r(RvOpcode::FSGNJ_D, rd, FA0, FA0);
@@ -2054,7 +2593,11 @@ impl RiscV64InstructionSelector {
     // ===================================================================
 
     /// Lower a GetElementPtr instruction.
-    fn select_gep(&mut self, result: Value, base: Value, indices: &[Value], result_type: &IrType) {
+    ///
+    /// The IR lowering phase pre-computes byte offsets for all GEP indices
+    /// (`index * sizeof(element)`), so the backend treats indices as raw
+    /// byte displacements without additional scaling (elem_size = 1).
+    fn select_gep(&mut self, result: Value, base: Value, indices: &[Value], _result_type: &IrType) {
         let rd = self.vmap.alloc_gpr(result);
         let base_reg = self.src_reg(base);
 
@@ -2063,22 +2606,10 @@ impl RiscV64InstructionSelector {
             self.emit_i(RvOpcode::ADDI, rd, base_reg, 0); // MV
         }
 
-        // Apply each index: address += index * element_size
-        let elem_size = result_type.size_bytes(&self.target) as i64;
+        // Indices are already byte offsets — just ADD them to the base.
         for idx in indices {
             let idx_reg = self.src_reg(*idx);
-            if elem_size == 1 {
-                self.emit_r(RvOpcode::ADD, rd, rd, idx_reg);
-            } else if elem_size > 0 && (elem_size as u64).is_power_of_two() {
-                let shift = (elem_size as u64).trailing_zeros() as i64;
-                self.emit_i(RvOpcode::SLLI, T0, idx_reg, shift);
-                self.emit_r(RvOpcode::ADD, rd, rd, T0);
-            } else {
-                // General case: multiply by element size
-                self.emit_immediate(T0, elem_size);
-                self.emit_r(RvOpcode::MUL, T0, idx_reg, T0);
-                self.emit_r(RvOpcode::ADD, rd, rd, T0);
-            }
+            self.emit_r(RvOpcode::ADD, rd, rd, idx_reg);
         }
     }
 
@@ -2123,6 +2654,8 @@ impl RiscV64InstructionSelector {
                     self.emit_immediate(T0, offset);
                     self.emit_r(RvOpcode::ADD, rd, FP, T0);
                 }
+                // Alloca produces a pointer.
+                self.value_types.insert(result.index(), IrType::Ptr);
             }
 
             Instruction::Load {
@@ -2135,6 +2668,7 @@ impl RiscV64InstructionSelector {
                 let ptr_reg = self.src_reg(*ptr);
                 let rd = self.dest_reg(*result, ty);
                 self.emit_load(rd, ptr_reg, 0, ty);
+                self.value_types.insert(result.index(), ty.clone());
             }
 
             Instruction::Store {
@@ -2145,9 +2679,13 @@ impl RiscV64InstructionSelector {
             } => {
                 let val_reg = self.src_reg(*value);
                 let ptr_reg = self.src_reg(*ptr);
-                // Determine store type from the value (default to I64)
-                // The IR Store doesn't carry a type directly; infer from value mapping
-                let ty = IrType::I64; // Default; real type tracking done by IR
+                // Look up the type of the stored value.  Fall back to I64
+                // (8-byte store) when the producing instruction wasn't tracked.
+                let ty = self
+                    .value_types
+                    .get(&value.index())
+                    .cloned()
+                    .unwrap_or(IrType::I64);
                 self.emit_store(val_reg, ptr_reg, 0, &ty);
             }
 
@@ -2159,18 +2697,54 @@ impl RiscV64InstructionSelector {
                 ty,
                 span: _,
             } => {
-                // Handle constant sentinel: BinOp(Add, result, result, UNDEF)
+                // Handle constant sentinel: BinOp(Add/FAdd, result, result, UNDEF)
                 if *lhs == *result && *rhs == Value::UNDEF {
-                    let rd = self.dest_reg(*result, ty);
-                    if let Some(&imm) = self.constant_values.get(&result.index()) {
-                        // Use LI (LUI+ADDI) to materialize the constant.
-                        let insts = self.materialize_immediate(rd, imm);
-                        for inst in insts {
+                    // --- Float constant sentinel (FAdd or float type) ---
+                    // Check the float constant cache first: float constants
+                    // are stored as global variables in .rodata and must be
+                    // loaded via LA + FLD (not integer LI).
+                    if let Some((sym_name, _fval)) =
+                        self.float_constant_cache.get(&result.index()).cloned()
+                    {
+                        let fd = self.vmap.alloc_fpr(*result);
+                        // Load the address of the .rodata float constant
+                        // into T0 via LA (AUIPC+ADDI with PC-relative relocs).
+                        self.emit(RvInstruction {
+                            opcode: RvOpcode::LA,
+                            rd: Some(T0),
+                            rs1: None,
+                            rs2: None,
+                            rs3: None,
+                            imm: 0,
+                            symbol: Some(sym_name),
+                            is_fp: false,
+                            comment: Some("load float const addr".to_string()),
+                            is_call_arg_setup: false,
+                        });
+                        // Load the double/float from memory into the FPR.
+                        self.emit_load(fd, T0, 0, ty);
+                        self.value_types.insert(result.index(), ty.clone());
+                    } else if let Some(gname) =
+                        self.global_var_refs.get(result).cloned()
+                    {
+                        // Global variable reference: load address of global.
+                        let rd = self.dest_reg(*result, ty);
+                        let addr_insts = self.materialize_address(rd, &gname);
+                        for inst in addr_insts {
                             self.emit(inst);
                         }
                     } else {
-                        // Fallback: load 0.
-                        self.emit(RvInstruction::i_type(RvOpcode::ADDI, rd, ZERO, 0));
+                        let rd = self.dest_reg(*result, ty);
+                        if let Some(&imm) = self.constant_values.get(&result.index()) {
+                            // Use LI (LUI+ADDI) to materialize the integer constant.
+                            let insts = self.materialize_immediate(rd, imm);
+                            for inst in insts {
+                                self.emit(inst);
+                            }
+                        } else {
+                            // Fallback: load 0.
+                            self.emit(RvInstruction::i_type(RvOpcode::ADDI, rd, ZERO, 0));
+                        }
                     }
                 } else {
                     let lhs_reg = self.src_reg(*lhs);
@@ -2178,6 +2752,7 @@ impl RiscV64InstructionSelector {
                     let rd = self.dest_reg(*result, ty);
                     self.select_binop(rd, lhs_reg, rhs_reg, op, ty);
                 }
+                self.value_types.insert(result.index(), ty.clone());
             }
 
             Instruction::ICmp {
@@ -2191,6 +2766,8 @@ impl RiscV64InstructionSelector {
                 let rhs_reg = self.src_reg(*rhs);
                 let rd = self.vmap.alloc_gpr(*result);
                 self.emit_comparison(rd, lhs_reg, rhs_reg, op);
+                // Comparison results are I32 (boolean in a GPR).
+                self.value_types.insert(result.index(), IrType::I32);
             }
 
             Instruction::FCmp {
@@ -2208,6 +2785,8 @@ impl RiscV64InstructionSelector {
                 // the IR FCmp does not carry the operand type directly.
                 let is_double_op = true; // conservative default
                 self.emit_fcmp(rd, lhs_reg, rhs_reg, op, is_double_op);
+                // FCmp result is an integer boolean.
+                self.value_types.insert(result.index(), IrType::I32);
             }
 
             Instruction::Branch { target, span: _ } => {
@@ -2255,30 +2834,65 @@ impl RiscV64InstructionSelector {
             } => {
                 self.has_calls = true;
 
-                // Prepare argument registers
-                let mut arg_regs: Vec<(u8, bool)> = Vec::new();
+                // Resolve callee — check func_ref_names for direct call target.
+                let callee_name = if let Some(fname) = self.func_ref_names.get(callee) {
+                    fname.clone()
+                } else {
+                    format!("__ir_callee_{}", callee.index())
+                };
+
+                // Prepare argument registers.
+                // For variadic functions on RISC-V LP64D, ALL FP arguments
+                // must be passed in integer registers (the ABI mandates that
+                // variadic FP values are conveyed as raw bits in GPRs).
+                let is_variadic_call = self.variadic_functions.contains(&callee_name);
+                let mut arg_regs: Vec<(u16, bool)> = Vec::new();
                 for arg in args.iter() {
                     let reg = self.src_reg(*arg);
-                    let is_fp_arg = is_fpr(reg);
+                    // Determine if the argument is floating-point by its IR
+                    // type, NOT by the virtual register number.  Virtual
+                    // register IDs (≥100) do not encode GPR-vs-FPR — that
+                    // information is only in the type map.
+                    let is_fp_arg = self
+                        .value_types
+                        .get(&arg.index())
+                        .map(|ty| Self::uses_fpr(ty))
+                        .unwrap_or(false);
+                    // NOTE: For variadic calls, the FP→GPR conversion
+                    // (FMV.X.D) is deferred to emit_call where physical
+                    // ABI registers are available.  Virtual register IDs
+                    // do not distinguish GPR/FPR, so emitting FMV.X.D
+                    // here with virtual registers would produce garbage
+                    // after register allocation.
                     arg_regs.push((reg, is_fp_arg));
                 }
 
-                // Determine callee symbol name from the Value index
-                let callee_name = format!("__ir_callee_{}", callee.index());
+                // ── Builtin interception ──────────────────────────────
+                // Check if this is a compiler builtin that can be emitted
+                // inline without a real function call.
+                let handled_as_builtin = self.try_emit_rv_builtin(
+                    &callee_name, result, args, return_type,
+                );
 
-                // result is a Value; allocate a register for it
-                let result_reg = if *result != Value::UNDEF {
-                    Some(if Self::uses_fpr(return_type) {
-                        self.vmap.alloc_fpr(*result)
+                if !handled_as_builtin {
+                    // result is a Value; allocate a register for it
+                    let result_reg = if *result != Value::UNDEF {
+                        Some(if Self::uses_fpr(return_type) {
+                            self.vmap.alloc_fpr(*result)
+                        } else {
+                            self.vmap.alloc_gpr(*result)
+                        })
                     } else {
-                        self.vmap.alloc_gpr(*result)
-                    })
-                } else {
-                    None
-                };
-                let result_is_fp = Self::uses_fpr(return_type);
+                        None
+                    };
+                    let result_is_fp = Self::uses_fpr(return_type);
 
-                self.emit_call(&callee_name, &arg_regs, result_reg, result_is_fp);
+                    self.emit_call(&callee_name, &arg_regs, result_reg, result_is_fp, is_variadic_call);
+                }
+                // Record the return type so Store picks the right width.
+                if *result != Value::UNDEF {
+                    self.value_types.insert(result.index(), return_type.clone());
+                }
             }
 
             Instruction::Return { value, span: _ } => {
@@ -2307,6 +2921,7 @@ impl RiscV64InstructionSelector {
                 // Phi nodes should be eliminated before instruction selection.
                 // If encountered, just allocate a register for the result.
                 let _rd = self.dest_reg(*result, ty);
+                self.value_types.insert(result.index(), ty.clone());
             }
 
             Instruction::GetElementPtr {
@@ -2318,6 +2933,8 @@ impl RiscV64InstructionSelector {
                 span: _,
             } => {
                 self.select_gep(*result, *base, indices, result_type);
+                // GEP always produces a pointer.
+                self.value_types.insert(result.index(), IrType::Ptr);
             }
 
             Instruction::BitCast {
@@ -2338,6 +2955,7 @@ impl RiscV64InstructionSelector {
                         self.emit_i(RvOpcode::ADDI, rd, src, 0); // MV
                     }
                 }
+                self.value_types.insert(result.index(), to_type.clone());
             }
 
             Instruction::Trunc {
@@ -2365,23 +2983,27 @@ impl RiscV64InstructionSelector {
                         }
                     }
                 }
+                self.value_types.insert(result.index(), to_type.clone());
             }
 
             Instruction::ZExt {
                 result,
                 value,
                 to_type,
+                from_type: _,
                 span: _,
             } => {
                 let src = self.src_reg(*value);
                 let rd = self.vmap.alloc_gpr(*result);
                 self.emit_conversion(rd, src, &IrType::I32, to_type);
+                self.value_types.insert(result.index(), to_type.clone());
             }
 
             Instruction::SExt {
                 result,
                 value,
                 to_type,
+                from_type: _,
                 span: _,
             } => {
                 let src = self.src_reg(*value);
@@ -2405,6 +3027,7 @@ impl RiscV64InstructionSelector {
                         }
                     }
                 }
+                self.value_types.insert(result.index(), to_type.clone());
             }
 
             Instruction::IntToPtr {
@@ -2418,6 +3041,7 @@ impl RiscV64InstructionSelector {
                 if rd != src {
                     self.emit_i(RvOpcode::ADDI, rd, src, 0);
                 }
+                self.value_types.insert(result.index(), IrType::Ptr);
             }
 
             Instruction::PtrToInt {
@@ -2446,6 +3070,7 @@ impl RiscV64InstructionSelector {
                     }
                     _ => {}
                 }
+                self.value_types.insert(result.index(), to_type.clone());
             }
 
             Instruction::InlineAsm {
@@ -2486,7 +3111,8 @@ impl RiscV64InstructionSelector {
                     .map(|blk| self.block_label(blk.index()))
                     .collect();
                 // Substitute %0, %1, ... in template with operand representations.
-                let substituted = Self::substitute_template(template, &operand_reprs, &target_labels);
+                let substituted =
+                    Self::substitute_template(template, &operand_reprs, &target_labels);
                 self.emit_inline_asm_substituted(&substituted, constraints, clobbers);
             }
         }
@@ -2510,13 +3136,17 @@ impl RiscV64InstructionSelector {
     pub fn select_function(&mut self, func: &IrFunction, _abi: &RiscV64Abi) -> Vec<RvInstruction> {
         self.reset();
 
-        // Phase 1: Build block label map
+        // Phase 1: Build block label map.
+        // Labels must be unique across the entire compilation unit.
+        // IR block labels like "if.then" are NOT unique across functions
+        // (or even within a function with nested ifs), so we always
+        // prefix with the function name and block index.
         for (i, block) in func.blocks().iter().enumerate() {
-            let label = if let Some(ref lbl) = block.label {
-                lbl.clone()
-            } else {
-                format!(".LBB_{}_{}", func.name, i)
-            };
+            let base = block
+                .label
+                .as_deref()
+                .unwrap_or("bb");
+            let label = format!(".L_{}_{}_{}", func.name, base, i);
             self.block_labels.insert(block.index, label);
         }
 
@@ -2526,10 +3156,10 @@ impl RiscV64InstructionSelector {
             let loc = abi_state.classify_arg(&param_ir_to_ctype(&param.ty));
             match loc {
                 ArgLocation::Register(reg) => {
-                    self.vmap.set_reg(param.value, reg as u8);
+                    self.vmap.set_reg(param.value, reg);
                 }
                 ArgLocation::RegisterPair(r1, _r2) => {
-                    self.vmap.set_reg(param.value, r1 as u8);
+                    self.vmap.set_reg(param.value, r1);
                 }
                 ArgLocation::Stack(offset) => {
                     self.vmap.set_stack_offset(param.value, offset as i64);
@@ -2560,7 +3190,14 @@ impl RiscV64InstructionSelector {
             self.used_callee_saved_gprs.len() + self.used_callee_saved_fprs.len();
 
         // Frame size = locals + callee_saved_regs * 8 + RA + FP + alignment
-        let locals_size = self.alloca_offset.unsigned_abs() as usize;
+        // alloca_offset starts at 16 (reserving space for RA and FP saves).
+        // compute_frame_layout already accounts for RA/FP (16 bytes), so
+        // pass only the actual local variable space.
+        let locals_size = if self.alloca_offset > 16 {
+            (self.alloca_offset - 16) as usize
+        } else {
+            0
+        };
         let frame_layout = RiscV64Abi::compute_frame_layout(
             &func
                 .params

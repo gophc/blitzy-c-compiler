@@ -497,8 +497,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
 
         // -Wp,<flags> — pass flags to preprocessor (GCC compat).
         // Must be checked before generic -W handler below.
-        if arg.starts_with("-Wp,") {
-            let sub_flags = &arg[4..];
+        if let Some(sub_flags) = arg.strip_prefix("-Wp,") {
             let parts: Vec<&str> = sub_flags.split(',').collect();
             let mut j = 0;
             while j < parts.len() {
@@ -510,11 +509,9 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
                     }
                 } else if parts[j] == "-MP" {
                     cli.depfile_phony = true;
-                } else if parts[j] == "-MT" {
-                    if j + 1 < parts.len() {
-                        cli.depfile_target = Some(parts[j + 1].to_string());
-                        j += 1;
-                    }
+                } else if parts[j] == "-MT" && j + 1 < parts.len() {
+                    cli.depfile_target = Some(parts[j + 1].to_string());
+                    j += 1;
                 }
                 j += 1;
             }
@@ -564,10 +561,10 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
                     if cli.target == Target::X86_64 {
                         cli.target = Target::RiscV64; // best effort
                     }
-                } else if march_val.starts_with("armv8") || march_val.starts_with("aarch64") {
-                    if cli.target == Target::X86_64 {
-                        cli.target = Target::AArch64;
-                    }
+                } else if (march_val.starts_with("armv8") || march_val.starts_with("aarch64"))
+                    && cli.target == Target::X86_64
+                {
+                    cli.target = Target::AArch64;
                 }
             }
             // Infer from -mabi=lp64 (RISC-V LP64D ABI) or -mabi=ilp32
@@ -1363,7 +1360,10 @@ fn compile_single_file(
         format!("IR lowering failed for '{}': {}", input, e)
     })?;
     let t_ir_elapsed = t_ir_start.elapsed();
-    eprintln!("[BCC-TIMING] ir-lowering: {:.3}s", t_ir_elapsed.as_secs_f64());
+    eprintln!(
+        "[BCC-TIMING] ir-lowering: {:.3}s",
+        t_ir_elapsed.as_secs_f64()
+    );
 
     if diagnostics.has_errors() {
         diagnostics.print_all(&source_map);
@@ -1412,7 +1412,10 @@ fn compile_single_file(
             format!("code generation failed for '{}': {}", input, e)
         })?;
     let t_codegen_elapsed = t_codegen_start.elapsed();
-    eprintln!("[BCC-TIMING] codegen: {:.3}s", t_codegen_elapsed.as_secs_f64());
+    eprintln!(
+        "[BCC-TIMING] codegen: {:.3}s",
+        t_codegen_elapsed.as_secs_f64()
+    );
 
     if diagnostics.has_errors() {
         diagnostics.print_all(&source_map);
@@ -1450,10 +1453,7 @@ fn compile_single_file(
                 .to_string_lossy()
                 .to_string()
         };
-        let dep_target = args
-            .depfile_target
-            .as_deref()
-            .unwrap_or(output);
+        let dep_target = args.depfile_target.as_deref().unwrap_or(output);
         // Write a minimal dependency file listing the source file.
         // The kernel build system processes this with fixdep.
         let dep_content = format!("{}: {}\n", dep_target, input);
@@ -1591,7 +1591,10 @@ fn main() {
     // `-print-file-name=<file>`: GCC prints the full path to a file in
     // its installation. BCC outputs an empty string for unsupported files,
     // which the kernel build system interprets as "not found."
-    if let Some(arg) = args_slice.iter().find(|a| a.starts_with("-print-file-name=")) {
+    if let Some(arg) = args_slice
+        .iter()
+        .find(|a| a.starts_with("-print-file-name="))
+    {
         let _name = arg.strip_prefix("-print-file-name=").unwrap_or("");
         // Return the queried name as-is (like "plugin"), indicating not found
         println!("{}", _name);

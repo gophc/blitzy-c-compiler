@@ -579,15 +579,13 @@ pub fn link(
     }
 
     // -----------------------------------------------------------------------
-    // Phase 5: Relocation Processing
+    // Phase 5: Collect Relocations & Build Section Data
     // -----------------------------------------------------------------------
-    // Collect all relocations from all input objects.
     let mut all_relocations: Vec<relocation::Relocation> = Vec::new();
     for input in &inputs {
         all_relocations.extend(input.relocations.iter().cloned());
     }
 
-    // Build section data buffers for relocation patching.
     let mut section_data_map: FxHashMap<String, Vec<u8>> = FxHashMap::default();
     let ordered_sections = merger.get_ordered_sections();
     for output_section in &ordered_sections {
@@ -595,7 +593,331 @@ pub fn link(
         section_data_map.insert(output_section.name.clone(), data);
     }
 
-    // Process relocations (collect, resolve, apply).
+    // -----------------------------------------------------------------------
+    // Phase 5.5: Pre-generate Dynamic Sections (PLT/GOT) BEFORE relocations
+    // -----------------------------------------------------------------------
+    // For dynamically-linked executables and shared libraries, we must
+    // generate PLT stubs and assign them virtual addresses BEFORE relocation
+    // processing, so that CALL/BL relocations to external symbols can be
+    // resolved to PLT stub addresses.
+    //
+    // We also pre-compute virtual addresses for each dynamic section using
+    // the same algorithm as write_elf_output, starting from the end of the
+    // existing layout. This ensures the PLT addresses used during relocation
+    // processing match the final ELF output.
+    let mut dyn_section_addresses: FxHashMap<String, (u64, u64)> = FxHashMap::default();
+
+    if config.is_shared() || !config.needed_libs.is_empty() {
+        // Collect referenced symbols from relocations for .dynsym filtering.
+        let mut referenced_symbols: FxHashSet<String> = FxHashSet::default();
+        for input in &inputs {
+            for reloc in &input.relocations {
+                if !reloc.symbol_name.is_empty() {
+                    referenced_symbols.insert(reloc.symbol_name.clone());
+                }
+            }
+        }
+
+        // Generate all dynamic linking sections (PLT, GOT, .dynamic, etc.).
+        generate_dynamic_sections(
+            config,
+            &sym_table,
+            &mut section_data_map,
+            &address_map,
+            &referenced_symbols,
+            diagnostics,
+        );
+
+        // Pre-compute virtual addresses for dynamic sections using the same
+        // algorithm as write_elf_output. This ensures consistency between
+        // the addresses used for relocation patching and the final ELF layout.
+        let dynamic_section_names = [
+            ".interp",
+            ".dynamic",
+            ".dynsym",
+            ".dynstr",
+            ".gnu.hash",
+            ".got",
+            ".got.plt",
+            ".plt",
+            ".rela.dyn",
+            ".rela.plt",
+        ];
+
+        let mut dyn_vaddr_cursor: u64 = 0;
+        let mut dyn_foff_cursor: u64 = 0;
+        for info in address_map.section_addresses.values() {
+            let sec_end_va = info.virtual_address + info.mem_size;
+            let sec_end_fo = info.file_offset + info.size;
+            if sec_end_va > dyn_vaddr_cursor {
+                dyn_vaddr_cursor = sec_end_va;
+            }
+            if sec_end_fo > dyn_foff_cursor {
+                dyn_foff_cursor = sec_end_fo;
+            }
+        }
+        let page_align = 0x1000u64;
+        dyn_vaddr_cursor = (dyn_vaddr_cursor + page_align - 1) & !(page_align - 1);
+        dyn_foff_cursor = (dyn_foff_cursor + page_align - 1) & !(page_align - 1);
+
+        let align = if config.target.is_64bit() { 8u64 } else { 4u64 };
+
+        for &sec_name in &dynamic_section_names {
+            let already_in_main_layout = ordered_sections.iter().any(|s| s.name == sec_name);
+            if already_in_main_layout {
+                continue;
+            }
+            if let Some(data) = section_data_map.get(sec_name) {
+                if !data.is_empty() {
+                    dyn_vaddr_cursor = (dyn_vaddr_cursor + align - 1) & !(align - 1);
+                    dyn_foff_cursor = (dyn_foff_cursor + align - 1) & !(align - 1);
+                    let va = dyn_vaddr_cursor;
+                    let fo = dyn_foff_cursor;
+                    dyn_section_addresses.insert(sec_name.to_string(), (va, fo));
+                    dyn_vaddr_cursor += data.len() as u64;
+                    dyn_foff_cursor += data.len() as u64;
+                }
+            }
+        }
+
+        // Add PLT symbol entries to the symbol address map so that
+        // resolve_relocations can resolve CALL/BL to PLT stubs.
+        if let Some(&(plt_vaddr, _plt_foff)) = dyn_section_addresses.get(".plt") {
+            // Determine PLT entry sizes for this architecture.
+            let (plt0_size, pltn_size): (u64, u64) = match config.target {
+                Target::AArch64 => (32, 16),
+                Target::RiscV64 => (32, 16),
+                Target::X86_64 => (16, 16),
+                Target::I686 => (16, 16),
+            };
+
+            // Scan relocations for PLT-needed undefined function symbols.
+            let mut plt_index: u64 = 0;
+            let mut plt_sym_addrs: Vec<(String, u64)> = Vec::new();
+            let mut seen: FxHashSet<String> = FxHashSet::default();
+            for reloc in all_relocations.iter() {
+                if handler.needs_plt(reloc.rel_type) && !reloc.symbol_name.is_empty() {
+                    if let Some(sym) = symbol_address_map.get(&reloc.symbol_name) {
+                        if !sym.is_defined && !seen.contains(&reloc.symbol_name) {
+                            seen.insert(reloc.symbol_name.clone());
+                            let entry_addr = plt_vaddr + plt0_size + plt_index * pltn_size;
+                            plt_sym_addrs.push((reloc.symbol_name.clone(), entry_addr));
+                            plt_index += 1;
+                        }
+                    }
+                }
+            }
+
+            // Update the symbol address map so resolve_relocations sees
+            // these PLT-bound symbols as "defined" with PLT stub addresses.
+            for (name, addr) in &plt_sym_addrs {
+                if let Some(sym) = symbol_address_map.get_mut(name) {
+                    sym.final_address = *addr;
+                    sym.is_defined = true;
+                }
+            }
+        }
+
+        // Re-encode PLT and GOT.PLT sections with correct virtual addresses.
+        // The initial encoding in generate_dynamic_sections used base=0
+        // because addresses weren't known yet. For architectures with
+        // PC-relative PLT stubs (AArch64 ADRP, RISC-V AUIPC), we must
+        // re-encode with the final addresses.
+        if let (Some(&(plt_va, _)), Some(&(got_plt_va, _))) = (
+            dyn_section_addresses.get(".plt"),
+            dyn_section_addresses.get(".got.plt"),
+        ) {
+            // Re-build the PLT section bytes with correct addresses.
+            // We need the PltTable and stubs — reconstruct from the .rela.plt
+            // section data and the imported symbol list.
+            let plt_table = dynamic::ProcedureLinkageTable::new_public(config.target);
+            let mut plt_buf = plt_table.generate_plt0(got_plt_va, plt_va);
+
+            // Determine PLT entry sizes for re-encoding.
+            let (plt0_sz, pltn_sz): (u64, u64) = match config.target {
+                Target::AArch64 | Target::RiscV64 => (32, 16),
+                Target::X86_64 | Target::I686 => (16, 16),
+            };
+
+            // Reconstruct stubs from the symbols that were assigned PLT addresses.
+            // We need (symbol_name, got_plt_offset, index) for each PLT entry.
+            // CRITICAL: We also regenerate .rela.plt in this same loop to
+            // guarantee JUMP_SLOT entries are in the same order as PLT stubs.
+            // The original .rela.plt from build_dynamic_sections may have a
+            // different symbol ordering which would cause PLT stubs to load
+            // from the wrong GOT.PLT slots.
+            let pw = if config.target.is_64bit() { 8u64 } else { 4u64 };
+            let is64 = config.target.is_64bit();
+            let js_reltype = dynamic::default_jump_slot_reloc(config.target);
+            let reserved = dynamic::got_plt_reserved_count(&config.target) as u64;
+            let mut stub_idx: u32 = 0;
+            let mut seen_stubs: FxHashSet<String> = FxHashSet::default();
+            // Collect ordered stub info for .rela.plt regeneration.
+            let mut ordered_plt_syms: Vec<(String, u64)> = Vec::new();
+            for reloc in all_relocations.iter() {
+                if handler.needs_plt(reloc.rel_type) && !reloc.symbol_name.is_empty() {
+                    if let Some(sym) = symbol_address_map.get(&reloc.symbol_name) {
+                        if !seen_stubs.contains(&reloc.symbol_name) {
+                            let expected_addr = plt_va + plt0_sz + stub_idx as u64 * pltn_sz;
+                            if sym.final_address == expected_addr {
+                                seen_stubs.insert(reloc.symbol_name.clone());
+                                let gp_off = (reserved + stub_idx as u64) * pw;
+                                let stub = dynamic::PltStub {
+                                    symbol_name: reloc.symbol_name.clone(),
+                                    got_plt_offset: gp_off,
+                                    index: stub_idx,
+                                };
+                                let off = plt0_sz + stub_idx as u64 * pltn_sz;
+                                plt_buf.extend_from_slice(
+                                    &plt_table.generate_plt_entry(
+                                        &stub,
+                                        got_plt_va,
+                                        plt_va,
+                                        off,
+                                    ),
+                                );
+                                ordered_plt_syms
+                                    .push((reloc.symbol_name.clone(), gp_off));
+                                stub_idx += 1;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !plt_buf.is_empty() {
+                section_data_map.insert(".plt".to_string(), plt_buf);
+            }
+
+            // Re-encode .got.plt with correct lazy-binding targets.
+            let num_stubs = stub_idx as usize;
+            let total_entries = reserved as usize + num_stubs;
+            let mut gotplt_buf = Vec::with_capacity(total_entries * pw as usize);
+            // Reserved entries (filled by dynamic linker at load time).
+            for _ in 0..reserved {
+                if pw == 8 {
+                    gotplt_buf.extend_from_slice(&0u64.to_le_bytes());
+                } else {
+                    gotplt_buf.extend_from_slice(&0u32.to_le_bytes());
+                }
+            }
+            // Per-stub entries: initially point to the push instruction
+            // inside each PLT entry for lazy resolution, so the dynamic
+            // linker can identify which symbol to resolve.
+            let (plt0_sz, pltn_sz) = dynamic::plt_sizes(&config.target);
+            for i in 0..num_stubs {
+                let plt_entry_va = plt_va + plt0_sz as u64 + i as u64 * pltn_sz as u64;
+                let lazy_target = match config.target {
+                    Target::AArch64 | Target::RiscV64 => plt_va,
+                    Target::X86_64 | Target::I686 => plt_entry_va + 6,
+                };
+                if pw == 8 {
+                    gotplt_buf.extend_from_slice(&lazy_target.to_le_bytes());
+                } else {
+                    gotplt_buf.extend_from_slice(&(lazy_target as u32).to_le_bytes());
+                }
+            }
+            section_data_map.insert(".got.plt".to_string(), gotplt_buf);
+
+            // Regenerate .rela.plt so JUMP_SLOT entries match PLT stub order.
+            // Look up each symbol's dynsym index from the existing .dynsym.
+            // If we can't look up indices, fall back to sequential 1-based.
+            let mut rela_plt_data: Vec<u8> = Vec::new();
+            for (i, (sym_name, gp_off)) in ordered_plt_syms.iter().enumerate() {
+                // GOT.PLT slot VA = got_plt_va + gp_off (absolute, pre-patching
+                // happens below so store section-relative here — the offset
+                // patching pass below will add got_plt_va).
+                let r_offset = *gp_off;
+                // dynsym index: use 1-based sequential order matching the
+                // order symbols appear in the .dynsym we generated.
+                // The .dynsym from build_dynamic_sections may have a different
+                // order, so we look it up from the section data.
+                let sym_idx = dynsym_index_for_name(
+                    section_data_map.get(".dynsym"),
+                    section_data_map.get(".dynstr"),
+                    sym_name,
+                    is64,
+                )
+                .unwrap_or((i + 1) as u32);
+                if is64 {
+                    let r_info = ((sym_idx as u64) << 32) | (js_reltype as u64);
+                    rela_plt_data.extend_from_slice(&r_offset.to_le_bytes());
+                    rela_plt_data.extend_from_slice(&r_info.to_le_bytes());
+                    rela_plt_data.extend_from_slice(&0i64.to_le_bytes()); // addend
+                } else {
+                    // i686: Elf32_Rel format (8 bytes, no addend)
+                    let r_info = (sym_idx << 8) | (js_reltype & 0xFF);
+                    rela_plt_data
+                        .extend_from_slice(&(r_offset as u32).to_le_bytes());
+                    rela_plt_data.extend_from_slice(&r_info.to_le_bytes());
+                }
+            }
+            if !rela_plt_data.is_empty() {
+                section_data_map
+                    .insert(".rela.plt".to_string(), rela_plt_data);
+            }
+        }
+
+        // Patch .rela.dyn and .rela.plt r_offset fields from section-relative
+        // to absolute virtual addresses. The dynamic linker expects r_offset
+        // to be the VA of the GOT/GOT.PLT slot, not a byte offset within the
+        // section.
+        let entry_size: usize = if config.target.is_64bit() { 24 } else { 8 };
+
+        if let Some(&(got_va, _)) = dyn_section_addresses.get(".got") {
+            if let Some(rela_dyn_data) = section_data_map.get_mut(".rela.dyn") {
+                let num_entries = rela_dyn_data.len() / entry_size;
+                for i in 0..num_entries {
+                    let base = i * entry_size;
+                    if config.target.is_64bit() {
+                        let old_off = u64::from_le_bytes(
+                            rela_dyn_data[base..base + 8].try_into().unwrap(),
+                        );
+                        let new_off = old_off + got_va;
+                        rela_dyn_data[base..base + 8]
+                            .copy_from_slice(&new_off.to_le_bytes());
+                    } else {
+                        let old_off = u32::from_le_bytes(
+                            rela_dyn_data[base..base + 4].try_into().unwrap(),
+                        );
+                        let new_off = old_off + got_va as u32;
+                        rela_dyn_data[base..base + 4]
+                            .copy_from_slice(&new_off.to_le_bytes());
+                    }
+                }
+            }
+        }
+
+        if let Some(&(got_plt_va, _)) = dyn_section_addresses.get(".got.plt") {
+            if let Some(rela_plt_data) = section_data_map.get_mut(".rela.plt") {
+                let num_entries = rela_plt_data.len() / entry_size;
+                for i in 0..num_entries {
+                    let base = i * entry_size;
+                    if config.target.is_64bit() {
+                        let old_off = u64::from_le_bytes(
+                            rela_plt_data[base..base + 8].try_into().unwrap(),
+                        );
+                        let new_off = old_off + got_plt_va;
+                        rela_plt_data[base..base + 8]
+                            .copy_from_slice(&new_off.to_le_bytes());
+                    } else {
+                        let old_off = u32::from_le_bytes(
+                            rela_plt_data[base..base + 4].try_into().unwrap(),
+                        );
+                        let new_off = old_off + got_plt_va as u32;
+                        rela_plt_data[base..base + 4]
+                            .copy_from_slice(&new_off.to_le_bytes());
+                    }
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 6: Relocation Processing
+    // -----------------------------------------------------------------------
+    // Now that PLT addresses are available in symbol_address_map, CALL/BL
+    // relocations to external symbols can be resolved.
     if !all_relocations.is_empty() {
         let _reloc_result = relocation::process_relocations(
             &config.target,
@@ -608,43 +930,8 @@ pub fn link(
         );
     }
 
-    // Check for relocation errors.
     if diagnostics.has_errors() && !config.allow_undefined {
         return Err("linking aborted due to relocation errors".to_string());
-    }
-
-    // -----------------------------------------------------------------------
-    // Phase 6: Dynamic Section Generation
-    // -----------------------------------------------------------------------
-    // Generate dynamic linking sections when:
-    // - Producing a shared library (ET_DYN), OR
-    // - The executable has DT_NEEDED entries (e.g. implicit -lc for libc)
-    // The latter case produces a dynamically-linked ET_EXEC with PT_INTERP
-    // and PT_DYNAMIC program headers so the runtime dynamic linker resolves
-    // undefined symbols at load time.
-    if config.is_shared() || !config.needed_libs.is_empty() {
-        // Collect the set of symbol names actually referenced by relocations.
-        // For executables, only these symbols should appear as imports in the
-        // dynamic symbol table (.dynsym). Without this filter, every
-        // declared-but-unused libc symbol from headers would end up in
-        // .dynsym, causing "undefined symbol" errors at runtime when the
-        // dynamic linker tries to resolve them.
-        let mut referenced_symbols: FxHashSet<String> = FxHashSet::default();
-        for input in &inputs {
-            for reloc in &input.relocations {
-                if !reloc.symbol_name.is_empty() {
-                    referenced_symbols.insert(reloc.symbol_name.clone());
-                }
-            }
-        }
-        generate_dynamic_sections(
-            config,
-            &sym_table,
-            &mut section_data_map,
-            &address_map,
-            &referenced_symbols,
-            diagnostics,
-        );
     }
 
     // -----------------------------------------------------------------------
@@ -690,6 +977,45 @@ pub fn link(
 // ============================================================================
 // Internal Helper Functions
 // ============================================================================
+
+/// Look up a symbol's index in an encoded `.dynsym` section by searching the
+/// companion `.dynstr` for the symbol's name.
+///
+/// Returns `None` if the symbol is not found or the section data is missing.
+fn dynsym_index_for_name(
+    dynsym_data: Option<&Vec<u8>>,
+    dynstr_data: Option<&Vec<u8>>,
+    name: &str,
+    is_64bit: bool,
+) -> Option<u32> {
+    let dynsym = dynsym_data?;
+    let dynstr = dynstr_data?;
+    let entry_size: usize = if is_64bit { 24 } else { 16 };
+    if dynsym.is_empty() || entry_size == 0 {
+        return None;
+    }
+    let num_entries = dynsym.len() / entry_size;
+    for i in 0..num_entries {
+        let base = i * entry_size;
+        let st_name = if is_64bit {
+            u32::from_le_bytes(dynsym[base..base + 4].try_into().ok()?) as usize
+        } else {
+            u32::from_le_bytes(dynsym[base..base + 4].try_into().ok()?) as usize
+        };
+        if st_name < dynstr.len() {
+            // Read null-terminated string from dynstr.
+            let end = dynstr[st_name..]
+                .iter()
+                .position(|&b| b == 0)
+                .map(|p| st_name + p)
+                .unwrap_or(dynstr.len());
+            if &dynstr[st_name..end] == name.as_bytes() {
+                return Some(i as u32);
+            }
+        }
+    }
+    None
+}
 
 /// Handle relocatable output (passthrough — no actual linking).
 ///
@@ -1243,7 +1569,7 @@ fn write_elf_output(
 
             let pt_load_dyn = crate::backend::elf_writer_common::Elf64ProgramHeader {
                 p_type: 1,  // PT_LOAD
-                p_flags: 6, // PF_R | PF_W (dynamic sections are readable + writable)
+                p_flags: 7, // PF_R | PF_W | PF_X (includes .plt which needs execute)
                 p_offset: min_foff,
                 p_vaddr: min_vaddr,
                 p_paddr: min_vaddr,
@@ -1331,11 +1657,15 @@ fn dynamic_section_attributes(name: &str, config: &LinkerConfig) -> (u32, u64, u
             section_merger::SHF_ALLOC | section_merger::SHF_EXECINSTR,
             0,
         ),
-        ".rela.dyn" | ".rela.plt" => (
-            section_merger::SHT_RELA,
-            section_merger::SHF_ALLOC,
-            if config.target.is_64bit() { 24 } else { 8 },
-        ),
+        ".rela.dyn" | ".rela.plt" => {
+            if config.target.is_64bit() {
+                (section_merger::SHT_RELA, section_merger::SHF_ALLOC, 24)
+            } else {
+                // i686 uses SHT_REL (no addend) — glibc i386 dynamic linker
+                // asserts DT_PLTREL == DT_REL.
+                (section_merger::SHT_REL, section_merger::SHF_ALLOC, 8)
+            }
+        }
         _ => (section_merger::SHT_PROGBITS, section_merger::SHF_ALLOC, 0),
     }
 }

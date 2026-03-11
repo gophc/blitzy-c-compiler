@@ -95,7 +95,7 @@ pub struct InlineAsmOperand {
     /// Constraint string (e.g., "r", "m", "i", "=r", "+r").
     pub constraint: String,
     /// Register ID assigned by the register allocator, if any.
-    pub register: Option<u8>,
+    pub register: Option<u16>,
     /// Whether this is an output operand.
     pub is_output: bool,
     /// Whether this is a read-write operand ("+r").
@@ -1129,6 +1129,7 @@ impl RiscV64Assembler {
                 symbol: None,
                 is_fp: false,
                 comment: Some(format!(".label:{}", label)),
+                is_call_arg_setup: false,
             });
         }
 
@@ -1156,6 +1157,7 @@ impl RiscV64Assembler {
                 symbol: None,
                 is_fp: false,
                 comment: None,
+                is_call_arg_setup: false,
             }),
 
             "ret" => Ok(RvInstruction {
@@ -1168,6 +1170,7 @@ impl RiscV64Assembler {
                 symbol: None,
                 is_fp: false,
                 comment: None,
+                is_call_arg_setup: false,
             }),
 
             // For other mnemonics, create a generic instruction
@@ -1183,6 +1186,7 @@ impl RiscV64Assembler {
                     symbol: None,
                     is_fp: false,
                     comment: Some(format!("asm: {}", line)),
+                    is_call_arg_setup: false,
                 };
 
                 // Try to map common mnemonics
@@ -1268,6 +1272,7 @@ impl RiscV64Assembler {
                                 symbol: None,
                                 is_fp: false,
                                 comment: None,
+                                is_call_arg_setup: false,
                             });
                         }
                         RvOpcode::CSRRS
@@ -1286,6 +1291,7 @@ impl RiscV64Assembler {
                                 symbol: None,
                                 is_fp: false,
                                 comment: None,
+                                is_call_arg_setup: false,
                             });
                         }
                         RvOpcode::CSRRW
@@ -1304,6 +1310,7 @@ impl RiscV64Assembler {
                                 symbol: None,
                                 is_fp: false,
                                 comment: None,
+                                is_call_arg_setup: false,
                             });
                         }
                         RvOpcode::CSRRS
@@ -1322,6 +1329,7 @@ impl RiscV64Assembler {
                                 symbol: None,
                                 is_fp: false,
                                 comment: None,
+                                is_call_arg_setup: false,
                             });
                         }
                         RvOpcode::CSRRC
@@ -1353,7 +1361,7 @@ impl RiscV64Assembler {
                             inst.imm = parse_csr_name(operands[1]) as i64;
                             // zimm is a 5-bit unsigned immediate stored in the rs1
                             // field; encode as a register number directly.
-                            let zimm = parse_asm_immediate(operands[2]).unwrap_or(0) as u8;
+                            let zimm = parse_asm_immediate(operands[2]).unwrap_or(0) as u16;
                             inst.rs1 = Some(zimm & 0x1F);
                         } else if operands.len() == 2 {
                             inst.rd = parse_register_name(operands[0]);
@@ -1642,7 +1650,7 @@ fn patch_pcrel_lo12_s_code(code: &mut [u8], offset: usize, value: i64) -> Result
 /// Parse a RISC-V register name (ABI or numeric) to a register ID.
 ///
 /// Returns `None` if the string is not a valid register name.
-fn parse_register_name(name: &str) -> Option<u8> {
+fn parse_register_name(name: &str) -> Option<u16> {
     let name = name.trim();
     match name {
         // ABI integer register names
@@ -1681,7 +1689,7 @@ fn parse_register_name(name: &str) -> Option<u8> {
         _ => {
             // Try numeric format: x0–x31
             if let Some(stripped) = name.strip_prefix('x') {
-                if let Ok(n) = stripped.parse::<u8>() {
+                if let Ok(n) = stripped.parse::<u16>() {
                     if n < 32 {
                         return Some(n);
                     }
@@ -1689,7 +1697,7 @@ fn parse_register_name(name: &str) -> Option<u8> {
             }
             // Try FP format: f0–f31 or ft0–ft11, fs0–fs11, fa0–fa7
             if let Some(stripped) = name.strip_prefix('f') {
-                if let Ok(n) = stripped.parse::<u8>() {
+                if let Ok(n) = stripped.parse::<u16>() {
                     if n < 32 {
                         return Some(n + 32); // FP register IDs are 32-63
                     }
@@ -1738,7 +1746,7 @@ fn parse_register_name(name: &str) -> Option<u8> {
 /// Parse a memory operand of the form `offset(register)`.
 ///
 /// Returns `(offset, register_id)` or `None` if not a memory operand.
-fn parse_memory_operand(s: &str) -> Option<(i64, u8)> {
+fn parse_memory_operand(s: &str) -> Option<(i64, u16)> {
     let s = s.trim();
     if let Some(paren_start) = s.find('(') {
         if s.ends_with(')') {
@@ -1990,6 +1998,7 @@ mod tests {
             symbol: None,
             is_fp: false,
             comment: None,
+            is_call_arg_setup: false,
         };
         let result = asm.assemble_single(&nop);
         assert!(result.is_ok());

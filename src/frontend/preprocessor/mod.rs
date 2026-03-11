@@ -1396,7 +1396,7 @@ impl<'a> Preprocessor<'a> {
                         variadic = true;
                         gcc_va_name = Some(param_name);
                         idx += 1; // skip `...`
-                        // Expect `)` next.
+                                  // Expect `)` next.
                         while idx < tokens.len() && tokens[idx].kind == PPTokenKind::Whitespace {
                             idx += 1;
                         }
@@ -1562,8 +1562,7 @@ impl<'a> Preprocessor<'a> {
                 let combined: String = expanded
                     .iter()
                     .filter(|t| {
-                        t.kind != PPTokenKind::Whitespace
-                            && t.kind != PPTokenKind::PlacemarkerToken
+                        t.kind != PPTokenKind::Whitespace && t.kind != PPTokenKind::PlacemarkerToken
                     })
                     .map(|t| t.text.as_str())
                     .collect::<Vec<_>>()
@@ -1571,8 +1570,7 @@ impl<'a> Preprocessor<'a> {
                 let trimmed = combined.trim();
                 if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
                     (trimmed[1..trimmed.len() - 1].to_string(), false)
-                } else if trimmed.starts_with('<') && trimmed.ends_with('>') && trimmed.len() >= 2
-                {
+                } else if trimmed.starts_with('<') && trimmed.ends_with('>') && trimmed.len() >= 2 {
                     (trimmed[1..trimmed.len() - 1].to_string(), true)
                 } else {
                     // Try joining with spaces between tokens for stringified result.

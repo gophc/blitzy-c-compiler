@@ -123,10 +123,11 @@ pub const ALLOCATABLE_GPRS: [u16; 13] = [
     RBX, R12, R13, R14, R15, // callee-saved
 ];
 
-/// All allocatable SSE registers (all 16 are allocatable, all are caller-saved).
-pub const ALLOCATABLE_SSE: [u16; 16] = [
+/// All allocatable SSE registers (XMM0–XMM14 are allocatable, all are
+/// caller-saved).  XMM15 is reserved as the float spill scratch register
+/// (analogous to R11 for integer spills).
+pub const ALLOCATABLE_SSE: [u16; 15] = [
     XMM0, XMM1, XMM2, XMM3, XMM4, XMM5, XMM6, XMM7, XMM8, XMM9, XMM10, XMM11, XMM12, XMM13, XMM14,
-    XMM15,
 ];
 
 /// Callee-saved GPRs — the function prologue must save these if used, and the
@@ -642,7 +643,7 @@ mod tests {
 
     #[test]
     fn test_allocatable_sse_count() {
-        assert_eq!(ALLOCATABLE_SSE.len(), 16);
+        assert_eq!(ALLOCATABLE_SSE.len(), 15); // XMM15 reserved as float spill scratch
         for &r in &ALLOCATABLE_SSE {
             assert!(is_sse(r), "Allocatable SSE {} is not an SSE register", r);
         }

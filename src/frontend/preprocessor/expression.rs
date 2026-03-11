@@ -713,13 +713,9 @@ impl<'a> ExprParser<'a> {
                     self.parse_has_attribute_operator(span)
                 } else if text == "__has_builtin" {
                     self.parse_has_builtin_operator(span)
-                } else if text == "__has_include"
-                    || text == "__has_include_next"
-                {
+                } else if text == "__has_include" || text == "__has_include_next" {
                     self.parse_has_include_operator(span)
-                } else if text == "__has_feature"
-                    || text == "__has_extension"
-                {
+                } else if text == "__has_feature" || text == "__has_extension" {
                     // GCC/Clang feature/extension checks — return 0 for
                     // unrecognized features, which is the safe default.
                     self.parse_has_feature_operator(span)

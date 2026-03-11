@@ -840,11 +840,20 @@ impl IrBuilder {
     /// - `to_ty`: The target type (wider integer).
     /// - `span`: Source location for diagnostic reporting.
     pub fn build_zext(&mut self, val: Value, to_ty: IrType, span: Span) -> (Value, Instruction) {
+        self.build_zext_from(val, IrType::I8, to_ty, span)
+    }
+
+    /// Builds a zero-extension instruction with an explicit source type.
+    ///
+    /// This variant is used when the source type width matters for
+    /// correct code generation (e.g., MOVZX byte vs word on x86-64).
+    pub fn build_zext_from(&mut self, val: Value, from_ty: IrType, to_ty: IrType, span: Span) -> (Value, Instruction) {
         let result = self.fresh_value();
         let inst = Instruction::ZExt {
             result,
             value: val,
             to_type: to_ty,
+            from_type: from_ty,
             span,
         };
         (result, inst)
@@ -861,11 +870,17 @@ impl IrBuilder {
     /// - `to_ty`: The target type (wider integer).
     /// - `span`: Source location for diagnostic reporting.
     pub fn build_sext(&mut self, val: Value, to_ty: IrType, span: Span) -> (Value, Instruction) {
+        self.build_sext_from(val, IrType::I8, to_ty, span)
+    }
+
+    /// Builds a sign-extension instruction with an explicit source type.
+    pub fn build_sext_from(&mut self, val: Value, from_ty: IrType, to_ty: IrType, span: Span) -> (Value, Instruction) {
         let result = self.fresh_value();
         let inst = Instruction::SExt {
             result,
             value: val,
             to_type: to_ty,
+            from_type: from_ty,
             span,
         };
         (result, inst)
