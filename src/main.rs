@@ -971,8 +971,16 @@ fn run_compilation(args: CliArgs) -> Result<(), String> {
 
     // Single-file fast path
     if args.input_files.len() == 1 {
+        let input = &args.input_files[0];
+        // If the single input is an object file (.o) and we're linking (not -c/-S),
+        // pass it directly to the linker (e.g., `bcc -shared -o lib.so foo.o`).
+        if is_object_or_archive(input) && !args.compile_only && !args.emit_assembly {
+            let final_output = output_path.as_deref().unwrap_or("a.out");
+            let obj_path = PathBuf::from(input);
+            return link_object_files(&[obj_path], final_output, &ctx);
+        }
         return compile_single_file(
-            &args.input_files[0],
+            input,
             output_path.as_deref().unwrap_or("a.out"),
             &args,
             &ctx,
@@ -1015,13 +1023,21 @@ fn run_compilation(args: CliArgs) -> Result<(), String> {
         return Ok(());
     }
 
-    // Multi-file link mode: compile each to temp .o, then link all
+    // Multi-file link mode: compile each .c to temp .o, pass .o files
+    // through directly, then link all objects together.
     let _temp_dir =
         TempDir::new().map_err(|e| format!("failed to create temporary directory: {}", e))?;
 
     let mut object_files: Vec<PathBuf> = Vec::new();
 
     for input in &args.input_files {
+        // If the input is already an object file or archive, pass it
+        // directly to the linker without recompiling.
+        if is_object_or_archive(input) {
+            object_files.push(PathBuf::from(input));
+            continue;
+        }
+
         let temp_obj: TempFile = create_temp_object_file()
             .map_err(|e| format!("failed to create temporary object file: {}", e))?;
         let obj_path = temp_obj.path().to_path_buf();
@@ -1182,6 +1198,28 @@ fn run_preprocess_only(
 ///
 /// Runs all applicable phases (preprocessing through code generation/linking)
 /// based on the compilation flags.
+/// Check if a path refers to a pre-compiled object file (`.o`) or static
+/// archive (`.a`) that should be passed directly to the linker rather
+/// than through the compilation pipeline.
+fn is_object_or_archive(path: &str) -> bool {
+    let p = Path::new(path);
+    // Check by file extension first
+    match p.extension().and_then(|e| e.to_str()) {
+        Some("o") | Some("a") | Some("so") => return true,
+        _ => {}
+    }
+    // Fall back to checking ELF magic bytes for files without recognized extensions
+    if let Ok(mut f) = std::fs::File::open(p) {
+        use std::io::Read;
+        let mut magic = [0u8; 4];
+        if f.read_exact(&mut magic).is_ok() {
+            // ELF magic: 0x7f 'E' 'L' 'F'
+            return magic == [0x7f, b'E', b'L', b'F'];
+        }
+    }
+    false
+}
+
 fn compile_single_file(
     input: &str,
     output: &str,

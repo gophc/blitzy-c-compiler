@@ -1712,9 +1712,23 @@ impl AArch64InstructionSelector {
     /// Select load instructions based on the loaded type's size.
     fn select_load(&mut self, result: &Value, ptr: &Value, ty: &IrType) -> Vec<A64Instruction> {
         let rd = result.index() as u32 + VREG_BASE;
-        let rn = ptr.index() as u32 + VREG_BASE;
+        let mut rn = ptr.index() as u32 + VREG_BASE;
         let size = self.type_size_for_mem(ty);
         let is_32 = Self::is_32bit_type(ty);
+
+        let mut insts = Vec::new();
+
+        // If the pointer is a global variable reference, materialize its
+        // address into IP0 first, then load from IP0.
+        if let Some(sym_name) = self.global_var_refs.get(ptr).cloned() {
+            insts.push(
+                A64Instruction::new(A64Opcode::LA)
+                    .with_rd(rd)
+                    .with_symbol(sym_name.clone())
+                    .with_comment(format!("materialize global {} for load", sym_name)),
+            );
+            rn = rd; // Load from the register where we just put the address.
+        }
 
         let opcode = match ty {
             IrType::I1 | IrType::I8 => A64Opcode::LDRB_imm,
@@ -1740,7 +1754,8 @@ impl AArch64InstructionSelector {
             inst = inst.set_fp();
         }
 
-        vec![inst]
+        insts.push(inst);
+        insts
     }
 
     /// Select store instructions. Since the IR Store does not carry the stored
@@ -1750,11 +1765,28 @@ impl AArch64InstructionSelector {
         let rd = value.index() as u32 + VREG_BASE;
         let rn = ptr.index() as u32 + VREG_BASE;
 
-        vec![A64Instruction::new(A64Opcode::STR_imm)
+        let mut insts = Vec::new();
+
+        // If the pointer is a global variable reference, materialize its
+        // address into IP0 (X16) first, then store to IP0.
+        let actual_rn = if let Some(sym_name) = self.global_var_refs.get(ptr).cloned() {
+            insts.push(
+                A64Instruction::new(A64Opcode::LA)
+                    .with_rd(IP0)
+                    .with_symbol(sym_name.clone())
+                    .with_comment(format!("materialize global {} for store", sym_name)),
+            );
+            IP0
+        } else {
+            rn
+        };
+
+        insts.push(A64Instruction::new(A64Opcode::STR_imm)
             .with_rd(rd)
-            .with_rn(rn)
+            .with_rn(actual_rn)
             .with_imm(0)
-            .with_comment("store (64-bit default)")]
+            .with_comment("store (64-bit default)"));
+        insts
     }
 
     /// Select instructions for a binary operation (integer or FP).
@@ -1772,7 +1804,7 @@ impl AArch64InstructionSelector {
             let rd = result.index() as u32 + VREG_BASE;
             let is_32 = Self::is_32bit_type(ty);
             // Look up constant from our cached constants.
-            if let Some(&imm) = self.constant_values.get(&result.index()) {
+            if let Some(&imm) = self.constant_values.get(&(result.index() as u32 + VREG_BASE)) {
                 let mut inst = A64Instruction::new(A64Opcode::MOVZ)
                     .with_rd(rd)
                     .with_imm(imm);
@@ -2752,22 +2784,56 @@ impl AArch64InstructionSelector {
                 }
             } else if int_reg_idx < NUM_INT_ARG_REGS {
                 let dest = INT_ARG_REGS[int_reg_idx];
-                insts.push(
-                    A64Instruction::new(A64Opcode::MOV_reg)
-                        .with_rd(dest)
-                        .with_rn(src)
-                        .with_comment(format!("int arg {} -> {}", i, gpr_name(dest))),
-                );
+                // Check if this argument is a global variable reference.
+                // Global variable addresses must be materialized with an LA
+                // pseudo-instruction (ADRP+ADD) rather than a simple MOV,
+                // because the Value has no defining instruction — it refers
+                // directly to a linker symbol whose address is only known
+                // at link time.
+                if let Some(sym_name) = self.global_var_refs.get(arg).cloned() {
+                    insts.push(
+                        A64Instruction::new(A64Opcode::LA)
+                            .with_rd(dest)
+                            .with_symbol(sym_name.clone())
+                            .with_comment(format!("load addr of global {} for arg {}", sym_name, i)),
+                    );
+                } else {
+                    insts.push(
+                        A64Instruction::new(A64Opcode::MOV_reg)
+                            .with_rd(dest)
+                            .with_rn(src)
+                            .with_comment(format!("int arg {} -> {}", i, gpr_name(dest))),
+                    );
+                }
                 int_reg_idx += 1;
             } else {
                 // Spill integer arg to stack.
-                insts.push(
-                    A64Instruction::new(A64Opcode::STR_imm)
-                        .with_rd(src)
-                        .with_rn(SP_REG)
-                        .with_imm(stack_offset)
-                        .with_comment(format!("stack arg {} at sp+{}", i, stack_offset)),
-                );
+                // If this is a global variable reference, materialize its
+                // address into the IP0 scratch register first, then store
+                // that register onto the stack.
+                if let Some(sym_name) = self.global_var_refs.get(arg).cloned() {
+                    insts.push(
+                        A64Instruction::new(A64Opcode::LA)
+                            .with_rd(IP0)
+                            .with_symbol(sym_name.clone())
+                            .with_comment(format!("load addr of global {} for stack arg {}", sym_name, i)),
+                    );
+                    insts.push(
+                        A64Instruction::new(A64Opcode::STR_imm)
+                            .with_rd(IP0)
+                            .with_rn(SP_REG)
+                            .with_imm(stack_offset)
+                            .with_comment(format!("stack arg {} (global) at sp+{}", i, stack_offset)),
+                    );
+                } else {
+                    insts.push(
+                        A64Instruction::new(A64Opcode::STR_imm)
+                            .with_rd(src)
+                            .with_rn(SP_REG)
+                            .with_imm(stack_offset)
+                            .with_comment(format!("stack arg {} at sp+{}", i, stack_offset)),
+                    );
+                }
                 stack_offset += 8;
             }
         }

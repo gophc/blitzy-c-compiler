@@ -951,31 +951,36 @@ fn apply_allocation_result(mf: &mut MachineFunction, alloc: &AllocationResult, t
     // MOV/load opcodes are architecture-dependent:
     // x86-64: X86Opcode::Mov = 0, X86Opcode::Movsd = 86
     // i686:   I686_MOV = 0x100
-    // AArch64: LDR (opcode for 64-bit load from codegen) = 57 (A64Opcode::LDR_imm)
+    // AArch64: LDR_imm = 59 (A64Opcode::LDR_imm enum discriminant)
     // RISC-V 64: LD = 13 (RvOpcode::LD)
+    //
+    // IMPORTANT: AArch64 opcode values MUST match A64Opcode enum
+    // discriminants exactly.  If variants are added to the enum
+    // (e.g. MUL, SMULL), all subsequent discriminants shift.
+    // Current mapping: LDR_imm=59, STR_imm=72.
     let mov_opcode: u32 = match target {
         Target::I686 => 0x100,    // I686_MOV
-        Target::AArch64 => 57,    // A64Opcode::LDR_imm (64-bit load)
+        Target::AArch64 => 59,    // A64Opcode::LDR_imm (64-bit load)
         Target::RiscV64 => 13,    // RvOpcode::LD
         _ => 0,                   // X86Opcode::Mov
     };
     let movsd_opcode: u32 = match target {
         Target::I686 => 0x100,    // i686 uses MOV for all spills (no SSE)
-        Target::AArch64 => 57,    // AArch64: same LDR_imm for FP spills
+        Target::AArch64 => 59,    // AArch64: same LDR_imm for FP spills
         Target::RiscV64 => 13,    // RISC-V: LD for FP spills (stored as 64-bit)
         _ => 86,                  // X86Opcode::Movsd
     };
     // Store opcodes for spill stores:
     // x86-64 / i686: same opcode as load (MOV is bidirectional via operand layout)
-    // AArch64: STR (opcode 70 = A64Opcode::STR_imm)
+    // AArch64: STR_imm = 72 (A64Opcode::STR_imm enum discriminant)
     // RISC-V 64: SD = 20 (RvOpcode::SD)
     let store_opcode: u32 = match target {
-        Target::AArch64 => 70,    // A64Opcode::STR_imm
+        Target::AArch64 => 72,    // A64Opcode::STR_imm
         Target::RiscV64 => 20,    // RvOpcode::SD
         _ => mov_opcode,          // x86: same opcode for load/store
     };
     let store_fp_opcode: u32 = match target {
-        Target::AArch64 => 70,    // AArch64 STR_imm
+        Target::AArch64 => 72,    // AArch64 STR_imm
         Target::RiscV64 => 20,    // RISC-V SD
         _ => movsd_opcode,        // x86: MOVSD for float stores
     };

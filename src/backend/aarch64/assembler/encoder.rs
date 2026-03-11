@@ -1412,41 +1412,50 @@ impl AArch64Encoder {
                 ok(enc_br_reg(0b10, link))
             }
             A64Opcode::CBZ => {
+                // The register to test (Rt) is in rn, not rd —
+                // CBNZ/CBZ have no destination register.
+                let rt = rn;
                 if inst.symbol.is_some() {
-                    let word = enc_cbz(sf, 0, 0, rd);
+                    let word = enc_cbz(sf, 0, 0, rt);
                     ok_reloc(word, AArch64RelocationType::Condbr19, imm)
                 } else {
                     let offset = (imm >> 2) as i32;
-                    ok(enc_cbz(sf, 0, offset, rd))
+                    ok(enc_cbz(sf, 0, offset, rt))
                 }
             }
             A64Opcode::CBNZ => {
+                // The register to test (Rt) is in rn, not rd.
+                let rt = rn;
                 if inst.symbol.is_some() {
-                    let word = enc_cbz(sf, 1, 0, rd);
+                    let word = enc_cbz(sf, 1, 0, rt);
                     ok_reloc(word, AArch64RelocationType::Condbr19, imm)
                 } else {
                     let offset = (imm >> 2) as i32;
-                    ok(enc_cbz(sf, 1, offset, rd))
+                    ok(enc_cbz(sf, 1, offset, rt))
                 }
             }
             A64Opcode::TBZ => {
+                // Rt (register to test) is in rn — TBZ has no dest.
+                let rt = rn;
                 let bit = inst.shift as u32;
                 if inst.symbol.is_some() {
-                    let word = enc_tbz(bit, 0, 0, rd);
+                    let word = enc_tbz(bit, 0, 0, rt);
                     ok_reloc(word, AArch64RelocationType::Tstbr14, imm)
                 } else {
                     let offset = (imm >> 2) as i32;
-                    ok(enc_tbz(bit, 0, offset, rd))
+                    ok(enc_tbz(bit, 0, offset, rt))
                 }
             }
             A64Opcode::TBNZ => {
+                // Rt (register to test) is in rn — TBNZ has no dest.
+                let rt = rn;
                 let bit = inst.shift as u32;
                 if inst.symbol.is_some() {
-                    let word = enc_tbz(bit, 1, 0, rd);
+                    let word = enc_tbz(bit, 1, 0, rt);
                     ok_reloc(word, AArch64RelocationType::Tstbr14, imm)
                 } else {
                     let offset = (imm >> 2) as i32;
-                    ok(enc_tbz(bit, 1, offset, rd))
+                    ok(enc_tbz(bit, 1, offset, rt))
                 }
             }
 

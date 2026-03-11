@@ -389,6 +389,63 @@ impl AArch64Codegen {
         mi
     }
 
+    /// Emit an STP to `[base, #offset]`, falling back to an ADD+STP
+    /// sequence when the offset exceeds the STP 7-bit signed range.
+    ///
+    /// The `scratch` register (typically IP0 / X16) is used as the
+    /// intermediate base when the offset is too large.
+    fn emit_stp_large_offset(
+        out: &mut Vec<MachineInstruction>,
+        rt1: u16,
+        rt2: u16,
+        base: u16,
+        offset: i64,
+        is_fp: bool,
+        scratch: u16,
+        stp_max: i64,
+    ) {
+        if offset >= -512 && offset <= stp_max {
+            out.push(Self::make_stp(rt1, rt2, base, offset, is_fp));
+        } else {
+            // ADD scratch, base, #offset   (offset fits in 12-bit unsigned for ≤4095)
+            let mut add_mi = MachineInstruction::new(OPCODE_ADD_IMM);
+            add_mi.result = Some(MachineOperand::Register(scratch));
+            add_mi.operands.push(MachineOperand::Register(base));
+            add_mi.operands.push(MachineOperand::Immediate(offset));
+            add_mi.operand_size = 8;
+            out.push(add_mi);
+            // STP rt1, rt2, [scratch, #0]
+            out.push(Self::make_stp(rt1, rt2, scratch, 0, is_fp));
+        }
+    }
+
+    /// Emit an LDP from `[base, #offset]`, falling back to an ADD+LDP
+    /// sequence when the offset exceeds the LDP 7-bit signed range.
+    fn emit_ldp_large_offset(
+        out: &mut Vec<MachineInstruction>,
+        rt1: u16,
+        rt2: u16,
+        base: u16,
+        offset: i64,
+        is_fp: bool,
+        scratch: u16,
+        ldp_max: i64,
+    ) {
+        if offset >= -512 && offset <= ldp_max {
+            out.push(Self::make_ldp(rt1, rt2, base, offset, is_fp));
+        } else {
+            // ADD scratch, base, #offset
+            let mut add_mi = MachineInstruction::new(OPCODE_ADD_IMM);
+            add_mi.result = Some(MachineOperand::Register(scratch));
+            add_mi.operands.push(MachineOperand::Register(base));
+            add_mi.operands.push(MachineOperand::Immediate(offset));
+            add_mi.operand_size = 8;
+            out.push(add_mi);
+            // LDP rt1, rt2, [scratch, #0]
+            out.push(Self::make_ldp(rt1, rt2, scratch, 0, is_fp));
+        }
+    }
+
     /// Create a `MachineInstruction` for a MOV register operation.
     fn make_mov_reg(rd: u16, rn: u16) -> MachineInstruction {
         let mut mi = MachineInstruction::new(OPCODE_MOV_REG);
@@ -753,12 +810,14 @@ impl ArchCodegen for AArch64Codegen {
             }
         }
 
-        // Also merge constants from func.constant_values (authoritative IR
+        // Merge constants from func.constant_values (authoritative IR
         // constant map produced during lowering / SSA construction).  This
-        // ensures GEP indices and other small constants are visible to the
-        // instruction selector for constant-folding and dead-ADD elimination.
+        // is the definitive per-function constant table and MUST override
+        // the heuristic values derived from global `.Lconst.i.*` variables
+        // above, because the heuristic can assign wrong constants when the
+        // global constant list spans multiple functions.
         for (&val, &imm) in &func.constant_values {
-            constant_values.entry(val.index() + 64).or_insert(imm as i64);
+            constant_values.insert(val.index() + 64, imm as i64);
         }
 
         // Build float constant cache from func.float_constant_values.
@@ -940,6 +999,16 @@ impl ArchCodegen for AArch64Codegen {
             }
         }
 
+        // ── Parallel-move resolution for call argument setup ──────────
+        // After register allocation, sequential MOV instructions that set
+        // up call arguments (X0-X7) can clobber source registers.
+        // Example: if v7 was allocated to X1, the sequence
+        //   MOV X1, X25   (arg 1)
+        //   MOV X2, X1    (arg 2 — reads WRONG X1)
+        // corrupts arg 2.  We detect such conflicts and reorder the moves,
+        // using X16 (IP0 scratch) as a temporary for cycle resolution.
+        Self::fixup_call_arg_moves(&mut all_instructions);
+
         let result = asm.assemble_function(&all_instructions)?;
 
         // Convert assembly relocations to FunctionRelocations for the
@@ -1081,45 +1150,71 @@ impl ArchCodegen for AArch64Codegen {
         // Save GPRs in pairs.
         // Callee-saved regs are placed AFTER the locals area:
         //   [FP + 16 + mf.frame_size]  = first callee-saved pair
+        //
+        // The STP signed-offset form uses a 7-bit signed immediate
+        // scaled by 8, giving a range of [-512, +504].  When the
+        // callee-saved offset exceeds this range we use IP0 (X16) —
+        // which is reserved and never allocated — to hold the target
+        // address.
         let mut offset = 16i64 + mf.frame_size as i64;
+        let stp_max: i64 = 504;
+        let scratch = registers::IP0 as u16;
         let mut i = 0;
         while i + 1 < gpr_saved.len() {
-            prologue.push(Self::make_stp(
+            Self::emit_stp_large_offset(
+                &mut prologue,
                 gpr_saved[i],
                 gpr_saved[i + 1],
                 sp,
                 offset,
                 false,
-            ));
+                scratch,
+                stp_max,
+            );
             offset += 16;
             i += 2;
         }
         if i < gpr_saved.len() {
-            prologue.push(Self::make_stp(
+            Self::emit_stp_large_offset(
+                &mut prologue,
                 gpr_saved[i],
                 gpr_saved[i],
                 sp,
                 offset,
                 false,
-            ));
+                scratch,
+                stp_max,
+            );
             offset += 16;
         }
 
         // Save FPRs in pairs.
         let mut j = 0;
         while j + 1 < fpr_saved.len() {
-            prologue.push(Self::make_stp(
+            Self::emit_stp_large_offset(
+                &mut prologue,
                 fpr_saved[j],
                 fpr_saved[j + 1],
                 sp,
                 offset,
                 true,
-            ));
+                scratch,
+                stp_max,
+            );
             offset += 16;
             j += 2;
         }
         if j < fpr_saved.len() {
-            prologue.push(Self::make_stp(fpr_saved[j], fpr_saved[j], sp, offset, true));
+            Self::emit_stp_large_offset(
+                &mut prologue,
+                fpr_saved[j],
+                fpr_saved[j],
+                sp,
+                offset,
+                true,
+                scratch,
+                stp_max,
+            );
         }
 
         prologue
@@ -1181,45 +1276,63 @@ impl ArchCodegen for AArch64Codegen {
             fpr_offsets.push((j, offset));
         }
 
+        // Restore callee-saved registers in reverse order.
+        // Use the large-offset helper so that offsets exceeding the
+        // LDP 7-bit signed range fall back to ADD+LDP via IP0.
+        let ldp_max: i64 = 504;
+        let scratch = registers::IP0 as u16;
+
         // Restore FPRs in reverse order.
         for &(idx, off) in fpr_offsets.iter().rev() {
             if idx + 1 < fpr_saved.len() {
-                epilogue.push(Self::make_ldp(
+                Self::emit_ldp_large_offset(
+                    &mut epilogue,
                     fpr_saved[idx],
                     fpr_saved[idx + 1],
                     sp,
                     off,
                     true,
-                ));
+                    scratch,
+                    ldp_max,
+                );
             } else {
-                epilogue.push(Self::make_ldp(
+                Self::emit_ldp_large_offset(
+                    &mut epilogue,
                     fpr_saved[idx],
                     fpr_saved[idx],
                     sp,
                     off,
                     true,
-                ));
+                    scratch,
+                    ldp_max,
+                );
             }
         }
 
         // Restore GPRs in reverse order.
         for &(idx, off) in gpr_offsets.iter().rev() {
             if idx + 1 < gpr_saved.len() {
-                epilogue.push(Self::make_ldp(
+                Self::emit_ldp_large_offset(
+                    &mut epilogue,
                     gpr_saved[idx],
                     gpr_saved[idx + 1],
                     sp,
                     off,
                     false,
-                ));
+                    scratch,
+                    ldp_max,
+                );
             } else {
-                epilogue.push(Self::make_ldp(
+                Self::emit_ldp_large_offset(
+                    &mut epilogue,
                     gpr_saved[idx],
                     gpr_saved[idx],
                     sp,
                     off,
                     false,
-                ));
+                    scratch,
+                    ldp_max,
+                );
             }
         }
 
@@ -1533,6 +1646,171 @@ impl AArch64Codegen {
     }
 
     /// Map a `u32` opcode back to an `A64Opcode`.
+    // ================================================================
+    // Parallel-move resolution for call argument setup
+    // ================================================================
+
+    /// Resolve register conflicts in the argument-setup MOV sequence
+    /// that precedes every CALL instruction.  After register allocation
+    /// a later MOV may read a register that an earlier MOV already
+    /// clobbered.  We detect this pattern and reorder (or insert a
+    /// temporary via X16/IP0) to eliminate the conflict.
+    fn fixup_call_arg_moves(insts: &mut Vec<A64Instruction>) {
+        // AArch64 IP0 — intra-procedure-call scratch, never used by
+        // the register allocator and safe to clobber between calls.
+        const TEMP_REG: u32 = 16; // X16
+
+        // Phase 1 — collect every CALL site that has a conflicting
+        // argument-register move sequence.
+        struct CallFixup {
+            call_idx: usize,
+            mov_indices: Vec<usize>,       // indices into `insts` (execution order)
+            resolved: Vec<(u32, u32, bool)>, // (dst, src, is_32bit)
+        }
+        let mut fixups: Vec<CallFixup> = Vec::new();
+
+        for i in 0..insts.len() {
+            if insts[i].opcode != A64Opcode::CALL {
+                continue;
+            }
+            // Walk backward to collect MOV_reg with arg-register destinations.
+            let mut mov_indices: Vec<usize> = Vec::new();
+            let mut j = i;
+            while j > 0 {
+                j -= 1;
+                if insts[j].opcode == A64Opcode::MOV_reg {
+                    if let Some(dst) = insts[j].rd {
+                        if dst <= 7 {
+                            mov_indices.push(j);
+                            continue;
+                        }
+                    }
+                }
+                // Allow non-MOV instructions that are commonly interleaved
+                // with the argument setup (address materialisation, immediates,
+                // labels, FP moves, stack stores).
+                match insts[j].opcode {
+                    A64Opcode::ADRP
+                    | A64Opcode::ADD_imm
+                    | A64Opcode::MOVZ
+                    | A64Opcode::MOVK
+                    | A64Opcode::NOP
+                    | A64Opcode::FMOV_d
+                    | A64Opcode::STR_imm => continue,
+                    _ => break,
+                }
+            }
+            if mov_indices.len() < 2 {
+                continue;
+            }
+            mov_indices.reverse(); // execution order (first emitted → first)
+
+            // Build (dst, src, is_32bit) triples.
+            let moves: Vec<(u32, u32, bool)> = mov_indices
+                .iter()
+                .map(|&idx| {
+                    let dst = insts[idx].rd.unwrap();
+                    let src = insts[idx].rm.unwrap_or(0);
+                    let w = insts[idx].is_32bit;
+                    (dst, src, w)
+                })
+                .collect();
+
+            // Conflict detection: does any move[k].src equal an earlier
+            // move[l].dst (l < k)?
+            let has_conflict = (1..moves.len()).any(|k| {
+                let src_k = moves[k].1;
+                (0..k).any(|l| moves[l].0 == src_k)
+            });
+            if !has_conflict {
+                continue;
+            }
+
+            let resolved = Self::resolve_parallel_moves(&moves, TEMP_REG);
+            fixups.push(CallFixup {
+                call_idx: i,
+                mov_indices,
+                resolved,
+            });
+        }
+
+        if fixups.is_empty() {
+            return;
+        }
+
+        // Phase 2 — build a new instruction vector with the original
+        // conflicting MOVs replaced by the resolved sequence.
+        let skip: std::collections::HashSet<usize> = fixups
+            .iter()
+            .flat_map(|f| f.mov_indices.iter().copied())
+            .collect();
+
+        let mut new_insts = Vec::with_capacity(insts.len() + fixups.len() * 2);
+        let mut fix_idx = 0;
+
+        for (i, inst) in insts.iter().enumerate() {
+            if skip.contains(&i) {
+                continue; // replaced by resolved sequence
+            }
+            // Insert the resolved moves immediately before the CALL.
+            if fix_idx < fixups.len() && i == fixups[fix_idx].call_idx {
+                for &(dst, src, w) in &fixups[fix_idx].resolved {
+                    let mut mov = A64Instruction::new(A64Opcode::MOV_reg);
+                    mov.rd = Some(dst);
+                    mov.rm = Some(src);
+                    mov.is_32bit = w;
+                    new_insts.push(mov);
+                }
+                fix_idx += 1;
+            }
+            new_insts.push(inst.clone());
+        }
+
+        *insts = new_insts;
+    }
+
+    /// Topological parallel-move resolution.
+    ///
+    /// Given a set of simultaneous register moves `(dst, src)`, produce
+    /// a sequential ordering that preserves all source values.  If a
+    /// cycle exists (e.g. swap X0↔X1), break it with `temp` (X16/IP0).
+    fn resolve_parallel_moves(
+        moves: &[(u32, u32, bool)],
+        temp: u32,
+    ) -> Vec<(u32, u32, bool)> {
+        // Remove self-moves (dst == src) — they are no-ops.
+        let mut pending: Vec<(u32, u32, bool)> = moves
+            .iter()
+            .copied()
+            .filter(|&(d, s, _)| d != s)
+            .collect();
+        let mut result: Vec<(u32, u32, bool)> = Vec::with_capacity(pending.len() + 1);
+
+        while !pending.is_empty() {
+            // Find a move whose destination is NOT a source of any other
+            // pending move — it is safe to emit because nothing else
+            // still needs to read from `dst`.
+            let ready = (0..pending.len()).find(|&i| {
+                let d = pending[i].0;
+                !pending
+                    .iter()
+                    .enumerate()
+                    .any(|(j, &(_, s, _))| j != i && s == d)
+            });
+
+            if let Some(idx) = ready {
+                result.push(pending.remove(idx));
+            } else {
+                // Every remaining move's destination is someone else's
+                // source → cycle.  Break it by saving one source to temp.
+                let (_d, s, w) = pending[0];
+                result.push((temp, s, w)); // MOV temp, src
+                pending[0].1 = temp; // rewrite: MOV dst, temp
+            }
+        }
+        result
+    }
+
     fn u32_to_a64_opcode(opcode: u32) -> A64Opcode {
         match opcode {
             x if x == OPCODE_STP => A64Opcode::STP,
