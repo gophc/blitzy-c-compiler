@@ -449,6 +449,9 @@ impl IrType {
             // ----- Long long (always 64-bit) -----
             CType::LongLong | CType::ULongLong => IrType::I64,
 
+            // ----- __int128 (always 128-bit) -----
+            CType::Int128 | CType::UInt128 => IrType::I128,
+
             // ----- Floating-point -----
             CType::Float => IrType::F32,
             CType::Double => IrType::F64,

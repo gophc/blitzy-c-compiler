@@ -153,6 +153,11 @@ pub struct SemanticAnalyzer<'a> {
     /// by `handle_static_assert()` to provide enum values to the
     /// `ConstantEvaluator`.
     enum_constant_values: FxHashMap<String, i128>,
+    /// String-keyed tag type map for sizeof_ctype_resolved.  Maintained
+    /// incrementally by analyze_struct_definition / analyze_enum_definition
+    /// so that handle_static_assert can pass it to the ConstantEvaluator
+    /// without rebuilding per _Static_assert.
+    tag_types_by_name: std::collections::HashMap<String, CType>,
 }
 
 impl<'a> SemanticAnalyzer<'a> {
@@ -199,6 +204,7 @@ impl<'a> SemanticAnalyzer<'a> {
             switch_case_values: FxHashMap::default(),
             switch_has_default: false,
             enum_constant_values: FxHashMap::default(),
+            tag_types_by_name: std::collections::HashMap::new(),
         };
 
         // Pre-register GCC builtin type names as typedefs at global scope.
@@ -565,6 +571,8 @@ impl<'a> SemanticAnalyzer<'a> {
                         | CType::UChar
                         | CType::LongLong
                         | CType::ULongLong
+                        | CType::Int128
+                        | CType::UInt128
                         | CType::Float
                         | CType::Double
                         | CType::LongDouble
@@ -782,6 +790,12 @@ impl<'a> SemanticAnalyzer<'a> {
             }
             Expression::SizeofType { .. } => Ok(self.size_t_type()),
             Expression::AlignofType { .. } => Ok(self.size_t_type()),
+            Expression::AlignofExpr { expr: inner, .. } => {
+                // GCC __alignof__(expr) — analyze the inner expression for
+                // side-effect checking, then return size_t.
+                let _ = self.analyze_expression(inner);
+                Ok(self.size_t_type())
+            }
 
             // --- Cast expression ---
             Expression::Cast {
@@ -1263,6 +1277,28 @@ impl<'a> SemanticAnalyzer<'a> {
         // Process member declarations to build field list.
         let mut fields = Vec::new();
         for member in members {
+            // Process embedded struct/union/enum definitions within member
+            // specifiers so that tags defined inline (e.g.
+            //   struct outer { struct inner_tag { int x; } named; };
+            // ) are registered in the tag namespace and their fields are
+            // available for later use (e.g. `struct inner_tag t; t.x`).
+            for spec in &member.specifiers.type_specifiers {
+                match spec {
+                    TypeSpecifier::Struct(s) | TypeSpecifier::Union(s) => {
+                        if s.members.is_some() {
+                            let mut s_clone = s.clone();
+                            let _ = self.analyze_struct_definition(&mut s_clone);
+                        }
+                    }
+                    TypeSpecifier::Enum(e) => {
+                        if e.enumerators.is_some() {
+                            let mut e_clone = e.clone();
+                            let _ = self.analyze_enum_definition(&mut e_clone);
+                        }
+                    }
+                    _ => {}
+                }
+            }
             let member_base_type = self.resolve_type_from_spec_qualifier_list(&member.specifiers);
 
             if member.declarators.is_empty() {
@@ -1292,10 +1328,11 @@ impl<'a> SemanticAnalyzer<'a> {
                     .and_then(|d| self.extract_declarator_name(d))
                     .map(|sym| self.interner.resolve(sym).to_string());
 
-                let bit_width = decl.bit_width.as_ref().map(|_bw| {
-                    // In a full implementation, evaluate as integer constant.
-                    // For now, use a placeholder that represents "some bitfield".
-                    0u32
+                let bit_width = decl.bit_width.as_ref().map(|bw| {
+                    // Evaluate the bitfield width as an integer constant
+                    // expression. This is required for correct struct layout
+                    // computation (sizeof, _Static_assert).
+                    eval_bitfield_width(bw)
                 });
 
                 fields.push(crate::common::types::StructField {
@@ -1333,6 +1370,10 @@ impl<'a> SemanticAnalyzer<'a> {
             };
             self.scopes.declare_tag(tag_name, entry);
             self.scopes.complete_tag(tag_name, complete_type.clone());
+            // Update the string-keyed name map for sizeof resolution.
+            let tag_str = self.interner.resolve(tag_name).to_string();
+            self.tag_types_by_name
+                .insert(tag_str, complete_type.clone());
         }
 
         Ok(complete_type)
@@ -1786,8 +1827,18 @@ impl<'a> SemanticAnalyzer<'a> {
             BuiltinKind::Bswap64 => Ok(CType::ULongLong),
             BuiltinKind::VaStart | BuiltinKind::VaEnd | BuiltinKind::VaCopy => Ok(CType::Void),
             BuiltinKind::VaArg => {
-                // Type depends on the type argument; placeholder.
-                Ok(CType::Int)
+                // Extract the real type from the second argument which
+                // is wrapped as SizeofType by the parser.
+                if args.len() >= 2 {
+                    if let Expression::SizeofType { ref type_name, .. } = args[1] {
+                        let resolved = self.resolve_type_name(type_name);
+                        Ok(resolved)
+                    } else {
+                        Ok(CType::Int)
+                    }
+                } else {
+                    Ok(CType::Int)
+                }
             }
             BuiltinKind::FrameAddress | BuiltinKind::ReturnAddress => Ok(CType::Pointer(
                 Box::new(CType::Void),
@@ -1807,6 +1858,13 @@ impl<'a> SemanticAnalyzer<'a> {
             BuiltinKind::ObjectSize => {
                 let _ = (args, span);
                 Ok(CType::ULong)
+            }
+            BuiltinKind::ExtractReturnAddr => {
+                let _ = (args, span);
+                Ok(CType::Pointer(
+                    Box::new(CType::Void),
+                    crate::common::types::TypeQualifiers::default(),
+                ))
             }
         }
     }
@@ -1948,7 +2006,11 @@ impl<'a> SemanticAnalyzer<'a> {
                 }
                 ty
             }
-            DirectAbstractDeclarator::Array { size, .. } => {
+            DirectAbstractDeclarator::Array {
+                base: base_dad,
+                size,
+                ..
+            } => {
                 let arr_size = size.as_ref().and_then(|s| {
                     if let Expression::IntegerLiteral { value, .. } = s.as_ref() {
                         Some(*value as usize)
@@ -1956,9 +2018,15 @@ impl<'a> SemanticAnalyzer<'a> {
                         None
                     }
                 });
-                CType::Array(Box::new(base), arr_size)
+                let arr_ty = CType::Array(Box::new(base), arr_size);
+                if let Some(ref inner) = base_dad {
+                    self.apply_direct_abstract_declarator_to_type(arr_ty, inner)
+                } else {
+                    arr_ty
+                }
             }
             DirectAbstractDeclarator::Function {
+                base: base_dad,
                 params,
                 is_variadic,
             } => {
@@ -1973,16 +2041,27 @@ impl<'a> SemanticAnalyzer<'a> {
                             if let Some(ref ptr) = ad.pointer {
                                 pt = self.apply_pointer_to_type(pt, ptr);
                             }
+                            if let Some(ref d) = ad.direct {
+                                pt = self.apply_direct_abstract_declarator_to_type(pt, d);
+                            }
                             pt
                         } else {
                             bt
                         }
                     })
                     .collect();
-                CType::Function {
+                let func_ty = CType::Function {
                     return_type: Box::new(base),
                     params: param_types,
                     variadic: *is_variadic,
+                };
+                // If there's a base direct-abstract-declarator (e.g., the `(*)`
+                // in `(*)(int)`), apply it to the function type to create a
+                // pointer-to-function (or other derived type).
+                if let Some(ref inner) = base_dad {
+                    self.apply_direct_abstract_declarator_to_type(func_ty, inner)
+                } else {
+                    func_ty
                 }
             }
         }
@@ -2066,8 +2145,10 @@ impl<'a> SemanticAnalyzer<'a> {
             // Pointer member access: ptr->member.
             Expression::PointerMemberAccess { object, member, .. } => {
                 let obj_ty = self.infer_typeof_expr_type(object);
-                match obj_ty {
-                    CType::Pointer(inner, _) => self.lookup_member_type(&inner, *member),
+                // Strip qualifiers and typedefs before checking for pointer
+                let stripped = crate::common::types::resolve_and_strip(&obj_ty);
+                match stripped {
+                    CType::Pointer(inner, _) => self.lookup_member_type(inner, *member),
                     _ => CType::Int,
                 }
             }
@@ -2099,8 +2180,6 @@ impl<'a> SemanticAnalyzer<'a> {
             Expression::Cast { type_name, .. } => self.resolve_type_name(type_name),
             // Parenthesized.
             Expression::Parenthesized { inner, .. } => self.infer_typeof_expr_type(inner),
-            // Statement expression.
-            Expression::StatementExpression { .. } => CType::Int,
             // Post/pre increment/decrement — same type as operand.
             Expression::PostIncrement { operand, .. }
             | Expression::PostDecrement { operand, .. }
@@ -2129,22 +2208,96 @@ impl<'a> SemanticAnalyzer<'a> {
                     CType::Int
                 }
             }
+            // C11 _Generic selection — infer the type of the matching branch.
+            Expression::Generic {
+                controlling,
+                associations,
+                ..
+            } => {
+                let ctrl_ty = self.infer_typeof_expr_type(controlling);
+                let ctrl_stripped = crate::common::types::resolve_and_strip(&ctrl_ty);
+                let mut default_type: Option<CType> = None;
+
+                // Match controlling type against each association.
+                for assoc in associations.iter() {
+                    if let Some(ref tn) = assoc.type_name {
+                        let assoc_type = self.resolve_type_name(tn);
+                        let assoc_stripped = crate::common::types::resolve_and_strip(&assoc_type);
+                        if self.types_match_generic(ctrl_stripped, assoc_stripped) {
+                            return self.infer_typeof_expr_type(&assoc.expression);
+                        }
+                    } else {
+                        // Default association.
+                        default_type = Some(self.infer_typeof_expr_type(&assoc.expression));
+                    }
+                }
+
+                // Fallback to default or Int.
+                default_type.unwrap_or(CType::Int)
+            }
+            // Statement expression — infer from last expression in compound.
+            Expression::StatementExpression { compound, .. } => {
+                // The type is the type of the last expression statement.
+                if let Some(last) = compound.items.last() {
+                    if let crate::frontend::parser::ast::BlockItem::Statement(
+                        Statement::Expression(Some(ref expr)),
+                    ) = last
+                    {
+                        return self.infer_typeof_expr_type(expr);
+                    }
+                }
+                CType::Int
+            }
             // Default fallback.
             _ => CType::Int,
         }
     }
 
     /// Look up the type of a struct/union member by name.
+    ///
+    /// Handles forward-referenced structs whose `fields` list may be empty
+    /// at the time of type recording (e.g. function parameters, typeof).
+    /// When fields are empty and the struct has a tag name, resolves the
+    /// current definition from the tag namespace.
     fn lookup_member_type(&self, ty: &CType, member: Symbol) -> CType {
         let member_str = self.interner.resolve(member);
-        match ty {
-            CType::Struct { fields, .. } | CType::Union { fields, .. } => {
-                if let Some(found) = Self::find_member_in_fields(fields, member_str) {
+        let stripped = crate::common::types::resolve_and_strip(ty);
+        match stripped {
+            CType::Struct {
+                name, fields, ..
+            }
+            | CType::Union {
+                name, fields, ..
+            } => {
+                // If fields is empty, try resolving from tag namespace
+                let resolved_fields = if fields.is_empty() {
+                    if let Some(ref tag_name) = name {
+                        if let Some(entry) =
+                            self.scopes.lookup_tag_by_str(tag_name, self.interner)
+                        {
+                            if entry.is_complete {
+                                match &entry.ty {
+                                    CType::Struct { fields: f, .. }
+                                    | CType::Union { fields: f, .. } => f.as_slice(),
+                                    _ => fields.as_slice(),
+                                }
+                            } else {
+                                fields.as_slice()
+                            }
+                        } else {
+                            fields.as_slice()
+                        }
+                    } else {
+                        fields.as_slice()
+                    }
+                } else {
+                    fields.as_slice()
+                };
+                if let Some(found) = Self::find_member_in_fields(resolved_fields, member_str) {
                     return found;
                 }
                 CType::Int
             }
-            CType::Typedef { underlying, .. } => self.lookup_member_type(underlying, member),
             _ => CType::Int,
         }
     }
@@ -2169,6 +2322,7 @@ impl<'a> SemanticAnalyzer<'a> {
         let mut has_unsigned = false;
         let mut has_bool = false;
         let mut has_complex = false;
+        let mut has_int128 = false;
         let mut typedef_type: Option<CType> = None;
         let mut struct_type: Option<CType> = None;
         let mut enum_type: Option<CType> = None;
@@ -2186,6 +2340,7 @@ impl<'a> SemanticAnalyzer<'a> {
                 TypeSpecifier::Unsigned => has_unsigned = true,
                 TypeSpecifier::Bool => has_bool = true,
                 TypeSpecifier::Complex => has_complex = true,
+                TypeSpecifier::Int128 => has_int128 = true,
                 TypeSpecifier::TypedefName(sym) => {
                     // Look up the typedef in the scope.
                     if let Some(id) = self.scopes.lookup_ordinary(*sym) {
@@ -2243,6 +2398,12 @@ impl<'a> SemanticAnalyzer<'a> {
                 CType::SChar
             } else {
                 CType::Char
+            }
+        } else if has_int128 {
+            if has_unsigned {
+                CType::UInt128
+            } else {
+                CType::Int128
             }
         } else if has_short {
             if has_unsigned {
@@ -2715,8 +2876,15 @@ impl<'a> SemanticAnalyzer<'a> {
             }
             // Populate with known variable types so that sizeof(var)
             // works for local arrays in block-scope _Static_assert.
+            // Also populate typedef types so sizeof(__u8) etc. resolve
+            // correctly (typedef names in struct member types must be
+            // resolvable for accurate struct layout computation).
             for (var_sym, sym_id) in self.scopes.all_ordinary_symbols() {
                 let entry = self.symbols.get(sym_id);
+                if entry.storage_class == crate::frontend::sema::symbol_table::StorageClass::Typedef
+                {
+                    evaluator.register_typedef_type(var_sym, entry.ty.clone());
+                }
                 evaluator.register_variable_type(var_sym, entry.ty.clone());
             }
             // Populate with known enum constant values so that expressions
@@ -2736,7 +2904,15 @@ impl<'a> SemanticAnalyzer<'a> {
                 .collect();
             evaluator.set_name_table(name_table);
 
-            evaluator.evaluate_static_assert_node(sa)
+            // Inject the pre-built string-keyed tag type map for sizeof
+            // resolution of lightweight "tag reference" CTypes.  We move
+            // the map into the evaluator (zero-copy) and retrieve it back
+            // after evaluation to avoid per-_Static_assert cloning.
+            let name_map = std::mem::take(&mut self.tag_types_by_name);
+            evaluator.set_tag_name_index(name_map);
+            let result = evaluator.evaluate_static_assert_node(sa);
+            self.tag_types_by_name = evaluator.take_tag_name_index();
+            result
         } else {
             Ok(())
         }
@@ -2843,6 +3019,116 @@ impl<'a> SemanticAnalyzer<'a> {
                     crate::common::types::TypeQualifiers::default(),
                 ));
             }
+
+            // GCC implicit builtin functions: __builtin_memcpy, __builtin_memset,
+            // __builtin_memmove, __builtin_strlen, __builtin_strcmp, etc.
+            // These are regular function calls that GCC treats as built-in.
+            // Return the appropriate function type so the call type-checks.
+            let void_ptr =
+                CType::Pointer(Box::new(CType::Void), TypeQualifiers::default());
+            let const_void_ptr = CType::Pointer(
+                Box::new(CType::Void),
+                TypeQualifiers {
+                    is_const: true,
+                    ..TypeQualifiers::default()
+                },
+            );
+            let const_char_ptr = CType::Pointer(
+                Box::new(CType::Char),
+                TypeQualifiers {
+                    is_const: true,
+                    ..TypeQualifiers::default()
+                },
+            );
+            let size_t = self.size_t_type();
+
+            if let Some(builtin_ty) = match name_str {
+                // void *__builtin_memcpy(void *dest, const void *src, size_t n)
+                "__builtin_memcpy" => Some(CType::Function {
+                    return_type: Box::new(void_ptr.clone()),
+                    params: vec![void_ptr.clone(), const_void_ptr.clone(), size_t.clone()],
+                    variadic: false,
+                }),
+                // void *__builtin_memmove(void *dest, const void *src, size_t n)
+                "__builtin_memmove" => Some(CType::Function {
+                    return_type: Box::new(void_ptr.clone()),
+                    params: vec![void_ptr.clone(), const_void_ptr.clone(), size_t.clone()],
+                    variadic: false,
+                }),
+                // void *__builtin_memset(void *s, int c, size_t n)
+                "__builtin_memset" => Some(CType::Function {
+                    return_type: Box::new(void_ptr.clone()),
+                    params: vec![void_ptr.clone(), CType::Int, size_t.clone()],
+                    variadic: false,
+                }),
+                // int __builtin_memcmp(const void *s1, const void *s2, size_t n)
+                "__builtin_memcmp" => Some(CType::Function {
+                    return_type: Box::new(CType::Int),
+                    params: vec![
+                        const_void_ptr.clone(),
+                        const_void_ptr.clone(),
+                        size_t.clone(),
+                    ],
+                    variadic: false,
+                }),
+                // size_t __builtin_strlen(const char *s)
+                "__builtin_strlen" => Some(CType::Function {
+                    return_type: Box::new(size_t.clone()),
+                    params: vec![const_char_ptr.clone()],
+                    variadic: false,
+                }),
+                // int __builtin_strcmp(const char *s1, const char *s2)
+                "__builtin_strcmp" | "__builtin_strncmp" => Some(CType::Function {
+                    return_type: Box::new(CType::Int),
+                    params: vec![const_char_ptr.clone(), const_char_ptr.clone()],
+                    variadic: false,
+                }),
+                // char *__builtin_strcpy(char *dest, const char *src)
+                "__builtin_strcpy" | "__builtin_strncpy" | "__builtin_strcat"
+                | "__builtin_strncat" => Some(CType::Function {
+                    return_type: Box::new(CType::Pointer(
+                        Box::new(CType::Char),
+                        TypeQualifiers::default(),
+                    )),
+                    params: vec![
+                        CType::Pointer(Box::new(CType::Char), TypeQualifiers::default()),
+                        const_char_ptr.clone(),
+                    ],
+                    variadic: false,
+                }),
+                // char *__builtin_strchr(const char *s, int c)
+                "__builtin_strchr" | "__builtin_strrchr" => Some(CType::Function {
+                    return_type: Box::new(CType::Pointer(
+                        Box::new(CType::Char),
+                        TypeQualifiers::default(),
+                    )),
+                    params: vec![const_char_ptr.clone(), CType::Int],
+                    variadic: false,
+                }),
+                // int __builtin_abs(int)
+                "__builtin_abs" => Some(CType::Function {
+                    return_type: Box::new(CType::Int),
+                    params: vec![CType::Int],
+                    variadic: false,
+                }),
+                // long __builtin_labs(long)
+                "__builtin_labs" => Some(CType::Function {
+                    return_type: Box::new(CType::Long),
+                    params: vec![CType::Long],
+                    variadic: false,
+                }),
+                // int __builtin_printf(const char *fmt, ...)
+                "__builtin_printf" | "__builtin_snprintf" | "__builtin_sprintf"
+                | "__builtin_fprintf" => Some(CType::Function {
+                    return_type: Box::new(CType::Int),
+                    params: vec![const_char_ptr.clone()],
+                    variadic: true,
+                }),
+                _ => None,
+            } {
+                return Ok(builtin_ty);
+            }
+
             self.diagnostics
                 .emit_error(span, format!("use of undeclared identifier '{}'", name_str));
             Err(())
@@ -2940,15 +3226,24 @@ impl<'a> SemanticAnalyzer<'a> {
     }
 
     /// Resolve the return type of a function call expression.
+    ///
+    /// Properly strips qualifiers, typedefs, and atomic wrappers before
+    /// checking for function or pointer-to-function types. This is required
+    /// for patterns like `READ_ONCE(fn_ptr)(args)` where the kernel's macro
+    /// wraps the result in `const volatile typeof(...)`.
     fn resolve_function_call_type(&mut self, callee_type: &CType, span: Span) -> Result<CType, ()> {
-        // Strip pointers (function pointers are common).
-        let resolved = match callee_type {
-            CType::Pointer(inner, _) => inner.as_ref(),
-            CType::Function { .. } => callee_type,
-            _ => callee_type,
+        use crate::common::types::resolve_and_strip;
+
+        // Fully strip qualifiers and typedefs first
+        let stripped = resolve_and_strip(callee_type);
+
+        // Check for pointer-to-function, then function directly
+        let func_type = match stripped {
+            CType::Pointer(inner, _) => resolve_and_strip(inner),
+            other => other,
         };
 
-        match resolved {
+        match func_type {
             CType::Function { return_type, .. } => Ok(*return_type.clone()),
             _ => {
                 // Called object is not a function.
@@ -3017,6 +3312,8 @@ impl<'a> SemanticAnalyzer<'a> {
                     | CType::ULong
                     | CType::LongLong
                     | CType::ULongLong
+                    | CType::Int128
+                    | CType::UInt128
                     | CType::Char
                     | CType::UChar
                     | CType::SChar
@@ -3223,6 +3520,7 @@ impl<'a> SemanticAnalyzer<'a> {
             CType::Int | CType::UInt => 3,
             CType::Long | CType::ULong => 4,
             CType::LongLong | CType::ULongLong => 5,
+            CType::Int128 | CType::UInt128 => 6,
             _ => 3, // Default to int rank.
         }
     }
@@ -3238,7 +3536,23 @@ impl<'a> SemanticAnalyzer<'a> {
 
     /// Check if a type is a scalar type (arithmetic or pointer).
     fn is_scalar_type(&self, ty: &CType) -> bool {
-        self.is_arithmetic_type(ty) || self.is_pointer_type(ty)
+        self.is_arithmetic_type(ty)
+            || self.is_pointer_type(ty)
+            || self.is_function_type(ty)
+            || self.is_array_type(ty)
+    }
+
+    /// Check if a type is an array type (decays to a pointer, which is scalar).
+    fn is_array_type(&self, ty: &CType) -> bool {
+        let stripped = self.strip_qualifiers(ty);
+        matches!(stripped, CType::Array { .. })
+    }
+
+    /// Check if a type is a function type (decays to a function pointer,
+    /// which is scalar).
+    fn is_function_type(&self, ty: &CType) -> bool {
+        let stripped = self.strip_qualifiers(ty);
+        matches!(stripped, CType::Function { .. })
     }
 
     /// Check if a type is an arithmetic type (integer or floating-point).
@@ -3263,6 +3577,8 @@ impl<'a> SemanticAnalyzer<'a> {
                 | CType::ULong
                 | CType::LongLong
                 | CType::ULongLong
+                | CType::Int128
+                | CType::UInt128
                 | CType::Enum { .. }
         )
     }
@@ -3303,6 +3619,7 @@ impl<'a> SemanticAnalyzer<'a> {
             | Expression::SizeofExpr { span, .. }
             | Expression::SizeofType { span, .. }
             | Expression::AlignofType { span, .. }
+            | Expression::AlignofExpr { span, .. }
             | Expression::Cast { span, .. }
             | Expression::Binary { span, .. }
             | Expression::Conditional { span, .. }
@@ -3333,6 +3650,42 @@ impl ScopeStack {
     #[inline]
     pub fn depth(&self) -> u32 {
         self.current_depth()
+    }
+}
+
+/// Evaluate a bitfield width expression to a u32 value.
+///
+/// Handles common patterns:
+/// - Integer literals: `int x : 6;`
+/// - Parenthesized literals: `int x : (6);`
+/// - Simple binary/unary expressions involving integer literals
+///
+/// Falls back to 0 for complex expressions that cannot be evaluated
+/// statically in this simplified context.
+fn eval_bitfield_width(expr: &crate::frontend::parser::ast::Expression) -> u32 {
+    use crate::frontend::parser::ast::Expression;
+    match expr {
+        Expression::IntegerLiteral { value, .. } => *value as u32,
+        Expression::Parenthesized { inner, .. } => eval_bitfield_width(inner),
+        Expression::UnaryOp {
+            op: crate::frontend::parser::ast::UnaryOp::Plus,
+            operand,
+            ..
+        } => eval_bitfield_width(operand),
+        Expression::Binary {
+            op, left, right, ..
+        } => {
+            let l = eval_bitfield_width(left);
+            let r = eval_bitfield_width(right);
+            match op {
+                crate::frontend::parser::ast::BinaryOp::Add => l.wrapping_add(r),
+                crate::frontend::parser::ast::BinaryOp::Sub => l.wrapping_sub(r),
+                crate::frontend::parser::ast::BinaryOp::Mul => l.wrapping_mul(r),
+                _ => 0,
+            }
+        }
+        Expression::Cast { operand, .. } => eval_bitfield_width(operand),
+        _ => 0,
     }
 }
 

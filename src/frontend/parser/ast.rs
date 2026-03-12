@@ -100,6 +100,9 @@ pub struct InitDeclarator {
     pub declarator: Declarator,
     /// Optional initializer expression or initializer list.
     pub initializer: Option<Initializer>,
+    /// GCC explicit register variable binding: `register int x asm("eax")`.
+    /// Contains the register name string (e.g., "a0", "eax").
+    pub asm_register: Option<String>,
     /// Source span.
     pub span: Span,
 }
@@ -203,6 +206,8 @@ pub enum TypeSpecifier {
     Bool,
     /// `_Complex`
     Complex,
+    /// `__int128` — GCC 128-bit integer extension.
+    Int128,
     /// `struct { ... }` or `struct tag`
     Struct(StructOrUnionSpecifier),
     /// `union { ... }` or `union tag`
@@ -367,6 +372,9 @@ pub enum DirectAbstractDeclarator {
     Parenthesized(Box<AbstractDeclarator>),
     /// Array abstract declarator: `[size]`, `[*]`, `[static size]`.
     Array {
+        /// The base direct-abstract-declarator being arrayed, if this is a
+        /// suffix chain (e.g., the `(*)` in `(*)[10]`).
+        base: Option<Box<DirectAbstractDeclarator>>,
         /// Optional array size expression.
         size: Option<Box<Expression>>,
         /// Type qualifiers on the array (e.g., `[const 10]`).
@@ -376,6 +384,10 @@ pub enum DirectAbstractDeclarator {
     },
     /// Function abstract declarator: `(parameter-list)`.
     Function {
+        /// The base direct-abstract-declarator this function suffix is
+        /// applied to (e.g., the `(*)` in `(*)(int)`). `None` for
+        /// standalone function type names like `void(int)`.
+        base: Option<Box<DirectAbstractDeclarator>>,
         /// Parameter declarations.
         params: Vec<ParameterDeclaration>,
         /// Whether the parameter list ends with `...` (variadic).
@@ -715,6 +727,11 @@ pub enum Expression {
         type_name: Box<TypeName>,
         span: Span,
     },
+    /// `__alignof__(expr)` — GCC extension: alignment of an expression's type.
+    AlignofExpr {
+        expr: Box<Expression>,
+        span: Span,
+    },
 
     // -- Cast expression ---------------------------------------------------
     /// `(type-name) expr` — explicit type cast.
@@ -1041,6 +1058,9 @@ pub enum BuiltinKind {
     PrefetchData,
     /// `__builtin_object_size(ptr, type)` — object size at compile time.
     ObjectSize,
+    /// `__builtin_extract_return_addr(addr)` — extract return address
+    /// (no-op identity on most architectures).
+    ExtractReturnAddr,
 }
 
 // ===========================================================================
@@ -1220,6 +1240,7 @@ impl Expression {
             | Expression::SizeofExpr { span, .. }
             | Expression::SizeofType { span, .. }
             | Expression::AlignofType { span, .. }
+            | Expression::AlignofExpr { span, .. }
             | Expression::Cast { span, .. }
             | Expression::Binary { span, .. }
             | Expression::Conditional { span, .. }

@@ -148,6 +148,7 @@ pub fn parse_declaration(parser: &mut Parser<'_>) -> Result<Declaration, ()> {
     init_declarators.push(InitDeclarator {
         declarator: first_declarator,
         initializer: first_init,
+        asm_register: None,
         span: first_span,
     });
 
@@ -177,6 +178,7 @@ pub fn parse_declaration(parser: &mut Parser<'_>) -> Result<Declaration, ()> {
         init_declarators.push(InitDeclarator {
             declarator: decl,
             initializer: init,
+            asm_register: None,
             span: decl_span,
         });
     }
@@ -348,6 +350,10 @@ pub fn parse_declaration_specifiers(parser: &mut Parser<'_>) -> Result<Declarati
             TokenKind::Complex => {
                 parser.advance();
                 type_specifiers.push(TypeSpecifier::Complex);
+            }
+            TokenKind::Int128Keyword => {
+                parser.advance();
+                type_specifiers.push(TypeSpecifier::Int128);
             }
 
             // =================================================================
@@ -1700,6 +1706,7 @@ fn parse_direct_abstract_declarator_opt(
             parser.advance(); // consume `(`
             parser.advance(); // consume `)`
             let result = DirectAbstractDeclarator::Function {
+                base: None,
                 params: Vec::new(),
                 is_variadic: false,
             };
@@ -1721,6 +1728,7 @@ fn parse_direct_abstract_declarator_opt(
             let (params, is_variadic) = parse_parameter_type_list(parser)?;
             parser.expect(TokenKind::RightParen)?;
             let result = DirectAbstractDeclarator::Function {
+                base: None,
                 params,
                 is_variadic,
             };
@@ -1732,6 +1740,7 @@ fn parse_direct_abstract_declarator_opt(
             if parser.check(&TokenKind::RightParen) {
                 parser.advance(); // consume `)`
                 let result = DirectAbstractDeclarator::Function {
+                    base: None,
                     params: Vec::new(),
                     is_variadic: false,
                 };
@@ -1740,6 +1749,7 @@ fn parse_direct_abstract_declarator_opt(
             let (params, is_variadic) = parse_parameter_type_list(parser)?;
             parser.expect(TokenKind::RightParen)?;
             let result = DirectAbstractDeclarator::Function {
+                base: None,
                 params,
                 is_variadic,
             };
@@ -1748,8 +1758,14 @@ fn parse_direct_abstract_declarator_opt(
     }
 
     // Check for array abstract declarator: `[...]`.
+    // After parsing the first dimension, check for additional suffix
+    // chains (e.g., `[2][1]` for multi-dimensional array type names
+    // used in `sizeof(int[2][1])` expressions).
     if parser.check(&TokenKind::LeftBracket) {
-        let result = parse_abstract_array_declarator(parser)?;
+        let mut result = parse_abstract_array_declarator(parser)?;
+        if parser.check(&TokenKind::LeftBracket) || parser.check(&TokenKind::LeftParen) {
+            result = parse_abstract_suffix_chain(parser, result)?;
+        }
         return Ok(Some(result));
     }
 
@@ -1816,6 +1832,7 @@ fn parse_abstract_array_declarator(
     parser.expect(TokenKind::RightBracket)?;
 
     Ok(DirectAbstractDeclarator::Array {
+        base: None,
         size,
         qualifiers,
         is_static,
@@ -1833,14 +1850,19 @@ fn parse_abstract_suffix_chain(
     loop {
         if parser.check(&TokenKind::LeftBracket) {
             // Array suffix.
-            let _inner = current;
-            current = parse_abstract_array_declarator(parser)?;
+            let mut arr = parse_abstract_array_declarator(parser)?;
+            // Thread the base through so the chain preserves the inner part.
+            if let DirectAbstractDeclarator::Array { ref mut base, .. } = arr {
+                *base = Some(Box::new(current));
+            }
+            current = arr;
         } else if parser.check(&TokenKind::LeftParen) {
             // Function suffix.
             parser.advance(); // consume `(`
             let (params, is_variadic) = parse_parameter_type_list(parser)?;
             parser.expect(TokenKind::RightParen)?;
             current = DirectAbstractDeclarator::Function {
+                base: Some(Box::new(current)),
                 params,
                 is_variadic,
             };
@@ -1920,6 +1942,10 @@ fn parse_specifier_qualifier_list_for_type_name(
             TokenKind::Complex => {
                 parser.advance();
                 type_specifiers.push(TypeSpecifier::Complex);
+            }
+            TokenKind::Int128Keyword => {
+                parser.advance();
+                type_specifiers.push(TypeSpecifier::Int128);
             }
 
             // Type qualifiers.
@@ -2078,7 +2104,7 @@ fn parse_string_literal_value(parser: &mut Parser<'_>) -> Option<Vec<u8>> {
 /// initializer or trailing `__attribute__`.
 ///
 /// Grammar: `asm-label: '__asm__' '(' string-literal ')'`
-fn skip_asm_label(parser: &mut Parser<'_>) {
+pub(crate) fn skip_asm_label(parser: &mut Parser<'_>) {
     if parser.check(&TokenKind::Asm) {
         parser.advance(); // consume `__asm__` / `asm`
         if parser.match_token(&TokenKind::LeftParen) {
@@ -2107,7 +2133,7 @@ fn skip_asm_label(parser: &mut Parser<'_>) {
 /// constructs to extern declarations.  The parser's normal attribute
 /// handling runs during declarator parsing; this function handles the
 /// after-declarator position where additional attributes may appear.
-fn skip_trailing_attributes(parser: &mut Parser<'_>) {
+pub(crate) fn skip_trailing_attributes(parser: &mut Parser<'_>) {
     while parser.check(&TokenKind::Attribute) {
         parser.advance(); // consume `__attribute__`
         if parser.match_token(&TokenKind::LeftParen) {

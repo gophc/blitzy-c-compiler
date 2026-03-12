@@ -815,6 +815,9 @@ pub struct Preprocessor<'a> {
     pub max_recursion_depth: usize,
     /// Stack of conditional compilation states for nested `#if`/`#endif` blocks.
     conditional_stack: Vec<ConditionalState>,
+    /// Auto-incrementing counter for `__COUNTER__` macro (GCC extension).
+    /// Each expansion of `__COUNTER__` returns the current value and increments it.
+    pub counter_value: u64,
 }
 
 impl<'a> Preprocessor<'a> {
@@ -849,6 +852,7 @@ impl<'a> Preprocessor<'a> {
             include_stack: Vec::new(),
             max_recursion_depth: 512,
             conditional_stack: Vec::new(),
+            counter_value: 0,
         }
     }
 
@@ -1302,13 +1306,15 @@ impl<'a> Preprocessor<'a> {
             }
 
             // Expand all macros (including multi-level rescanning) using
-            // the full MacroExpander.
+            // the full MacroExpander with source map for __LINE__/__FILE__.
             if !line_tokens.is_empty() {
                 let expanded = {
-                    let mut expander = macro_expander::MacroExpander::new(
+                    let mut expander = macro_expander::MacroExpander::new_with_source_map(
                         &self.macro_defs,
                         &mut *self.diagnostics,
                         self.max_recursion_depth,
+                        &mut self.counter_value,
+                        &self.source_map,
                     );
                     expander.expand_tokens(&line_tokens)
                 };
@@ -1699,10 +1705,12 @@ impl<'a> Preprocessor<'a> {
                         .filter(|t| t.kind != PPTokenKind::Whitespace)
                         .cloned()
                         .collect();
-                    let mut expander = macro_expander::MacroExpander::new(
+                    let mut expander = macro_expander::MacroExpander::new_with_source_map(
                         &self.macro_defs,
                         &mut *self.diagnostics,
                         self.max_recursion_depth,
+                        &mut self.counter_value,
+                        &self.source_map,
                     );
                     expander.expand_tokens(&non_ws)
                 };
@@ -2046,10 +2054,12 @@ impl<'a> Preprocessor<'a> {
         let with_defined = directives::resolve_defined_operators(tokens, &self.macro_defs);
         // Step 2: Macro-expand remaining tokens.
         let expanded = {
-            let mut expander = macro_expander::MacroExpander::new(
+            let mut expander = macro_expander::MacroExpander::new_with_source_map(
                 &self.macro_defs,
                 &mut *self.diagnostics,
                 self.max_recursion_depth,
+                &mut self.counter_value,
+                &self.source_map,
             );
             expander.expand_tokens(&with_defined)
         };

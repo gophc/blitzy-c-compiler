@@ -201,6 +201,18 @@ impl<'a> BuiltinEvaluator<'a> {
                     result_type: CType::ULong,
                 })
             }
+            BuiltinKind::ExtractReturnAddr => {
+                // __builtin_extract_return_addr(addr) — on most
+                // architectures this is a no-op identity returning void*.
+                // Treat as a runtime call returning void*.
+                Ok(BuiltinResult::RuntimeCall {
+                    builtin: BuiltinKind::ExtractReturnAddr,
+                    result_type: CType::Pointer(
+                        Box::new(CType::Void),
+                        crate::common::types::TypeQualifiers::default(),
+                    ),
+                })
+            }
         }
     }
 
@@ -312,6 +324,11 @@ impl<'a> BuiltinEvaluator<'a> {
 
             // __builtin_object_size returns size_t.
             BuiltinKind::ObjectSize => self.size_t_type(),
+
+            // __builtin_extract_return_addr returns void*.
+            BuiltinKind::ExtractReturnAddr => {
+                CType::Pointer(Box::new(CType::Void), crate::common::types::TypeQualifiers::default())
+            }
         }
     }
 
@@ -1028,7 +1045,37 @@ impl<'a> BuiltinEvaluator<'a> {
     /// This is a best-effort conversion used only for builtin evaluation.
     /// Full type resolution is performed by the main semantic analyzer.
     fn typename_to_ctype(tn: &TypeName) -> CType {
-        let specs = &tn.specifier_qualifiers.type_specifiers;
+        let base = Self::typename_specifiers_to_ctype(&tn.specifier_qualifiers.type_specifiers);
+        // Apply pointer wrapping from the abstract declarator.
+        Self::apply_abstract_declarator(base, &tn.abstract_declarator)
+    }
+
+    /// Apply pointer wrapping from an abstract declarator to a base type.
+    fn apply_abstract_declarator(base: CType, ad: &Option<AbstractDeclarator>) -> CType {
+        let ad = match ad {
+            Some(ad) => ad,
+            None => return base,
+        };
+        // Count pointer levels.
+        let mut result = base;
+        if let Some(ref ptr) = ad.pointer {
+            result = Self::apply_pointer_chain(result, ptr);
+        }
+        result
+    }
+
+    /// Recursively apply pointer chain: each `Pointer` node adds one `*`.
+    fn apply_pointer_chain(base: CType, ptr: &crate::frontend::parser::ast::Pointer) -> CType {
+        // Inner pointer first (if `**`, inner is the leftmost `*`).
+        let inner = if let Some(ref inner_ptr) = ptr.inner {
+            Self::apply_pointer_chain(base, inner_ptr)
+        } else {
+            base
+        };
+        CType::Pointer(Box::new(inner), TypeQualifiers::default())
+    }
+
+    fn typename_specifiers_to_ctype(specs: &[TypeSpecifier]) -> CType {
 
         // Count occurrences of various specifiers to build the type.
         let mut has_void = false;
@@ -1057,6 +1104,12 @@ impl<'a> BuiltinEvaluator<'a> {
                 TypeSpecifier::Unsigned => has_unsigned = true,
                 TypeSpecifier::Bool => has_bool = true,
                 TypeSpecifier::Complex => has_complex = true,
+                TypeSpecifier::Int128 => {
+                    if has_unsigned {
+                        return CType::UInt128;
+                    }
+                    return CType::Int128;
+                }
                 TypeSpecifier::Struct(s) => {
                     let name = s.tag.map(|sym| format!("struct_{}", sym.as_u32()));
                     struct_type = Some(CType::Struct {
@@ -1451,6 +1504,8 @@ impl<'a> BuiltinEvaluator<'a> {
             "__builtin_sub_overflow" => Some(BuiltinKind::SubOverflow),
             "__builtin_mul_overflow" => Some(BuiltinKind::MulOverflow),
             "__builtin_prefetch" => Some(BuiltinKind::PrefetchData),
+            "__builtin_extract_return_addr" => Some(BuiltinKind::ExtractReturnAddr),
+            "__builtin_object_size" => Some(BuiltinKind::ObjectSize),
             _ => None,
         }
     }

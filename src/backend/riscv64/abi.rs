@@ -348,6 +348,23 @@ impl RiscV64Abi {
             | CType::LongLong
             | CType::ULongLong => self.classify_integer_arg(),
 
+            // __int128: passed as two integer registers on RISC-V 64.
+            CType::Int128 | CType::UInt128 => {
+                if self.int_regs_used % 2 != 0 {
+                    self.int_regs_used += 1; // align to even register pair
+                }
+                if self.int_regs_used + 1 < 8 {
+                    let r1 = INT_ARG_REGS[self.int_regs_used];
+                    let r2 = INT_ARG_REGS[self.int_regs_used + 1];
+                    self.int_regs_used += 2;
+                    ArgLocation::RegisterPair(r1, r2)
+                } else {
+                    let loc = ArgLocation::Stack(self.stack_offset as i32);
+                    self.stack_offset += 16;
+                    loc
+                }
+            }
+
             CType::Pointer(_, _) => self.classify_integer_arg(),
 
             CType::Enum { .. } => self.classify_integer_arg(),
@@ -430,6 +447,9 @@ impl RiscV64Abi {
             | CType::ULong
             | CType::LongLong
             | CType::ULongLong => ArgLocation::Register(X10),
+
+            // __int128: returned in a0+a1 register pair on RISC-V 64.
+            CType::Int128 | CType::UInt128 => ArgLocation::RegisterPair(X10, X11),
 
             CType::Pointer(_, _) => ArgLocation::Register(X10),
             CType::Enum { .. } => ArgLocation::Register(X10),
@@ -519,6 +539,23 @@ impl RiscV64Abi {
             | CType::ULong
             | CType::LongLong
             | CType::ULongLong => self.classify_integer_arg(),
+
+            // __int128: passed as two registers on RISC-V 64
+            CType::Int128 | CType::UInt128 => {
+                if self.int_regs_used % 2 != 0 {
+                    self.int_regs_used += 1; // align to even register pair
+                }
+                if self.int_regs_used + 1 < 8 {
+                    let r1 = INT_ARG_REGS[self.int_regs_used];
+                    let r2 = INT_ARG_REGS[self.int_regs_used + 1];
+                    self.int_regs_used += 2;
+                    ArgLocation::RegisterPair(r1, r2)
+                } else {
+                    let loc = ArgLocation::Stack(self.stack_offset as i32);
+                    self.stack_offset += 16;
+                    loc
+                }
+            }
 
             CType::Pointer(_, _) => self.classify_integer_arg(),
             CType::Enum { .. } => self.classify_integer_arg(),

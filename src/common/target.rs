@@ -354,6 +354,10 @@ impl Target {
                     ("__riscv_div", "1"),
                     ("__riscv_atomic", "1"),
                     ("__riscv_compressed", "1"),
+                    // Code model — default to medany (position-independent,
+                    // ±2 GiB PC-relative addressing) which is the standard
+                    // model for kernel code.
+                    ("__riscv_cmodel_medany", "1"),
                     ("__LP64__", "1"),
                     ("_LP64", "1"),
                 ]);

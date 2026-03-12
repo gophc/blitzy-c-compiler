@@ -294,8 +294,13 @@ pub fn parse_compound_statement(parser: &mut Parser<'_>) -> Result<CompoundState
     // Enforce recursion depth limit.
     parser.enter_recursion()?;
 
+    // Push a typedef shadow scope so that any typedef names shadowed by
+    // variable declarations inside this block are restored on exit.
+    parser.push_typedef_scope();
+
     // Expect opening brace.
     if parser.expect(TokenKind::LeftBrace).is_err() {
+        parser.pop_typedef_scope();
         parser.leave_recursion();
         return Err(());
     }
@@ -394,6 +399,8 @@ pub fn parse_compound_statement(parser: &mut Parser<'_>) -> Result<CompoundState
     // Expect closing brace.
     let has_closing_brace = parser.expect(TokenKind::RightBrace).is_ok();
 
+    // Restore any typedef names that were shadowed in this scope.
+    parser.pop_typedef_scope();
     parser.leave_recursion();
 
     if !has_closing_brace {
@@ -1256,6 +1263,7 @@ fn parse_block_declaration(parser: &mut Parser<'_>) -> Result<Declaration, ()> {
         init_declarators.push(InitDeclarator {
             declarator,
             initializer,
+            asm_register: None,
             span: decl_span,
         });
 
@@ -1272,10 +1280,23 @@ fn parse_block_declaration(parser: &mut Parser<'_>) -> Result<Declaration, ()> {
 
     // Track typedef names: if the storage class is `typedef`, register
     // each declarator name as a typedef name in the parser's symbol table.
+    // Otherwise, if the declaration shadows a typedef name with a variable,
+    // remove that name from the typedef set for the current scope.
     if matches!(specifiers.storage_class, Some(StorageClass::Typedef)) {
         for init_decl in &init_declarators {
             if let Some(sym) = get_declarator_name(&init_decl.declarator) {
                 parser.register_typedef(sym);
+            }
+        }
+    } else {
+        // Non-typedef declaration: if any declarator name matches a
+        // known typedef name, the C standard says it shadows the typedef
+        // for the remainder of this block scope.
+        for init_decl in &init_declarators {
+            if let Some(sym) = get_declarator_name(&init_decl.declarator) {
+                if parser.is_typedef_name(sym) {
+                    parser.shadow_typedef(sym);
+                }
             }
         }
     }

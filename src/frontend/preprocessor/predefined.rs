@@ -348,6 +348,11 @@ pub fn register_predefined_macros(macro_defs: &mut FxHashMap<String, MacroDef>, 
     let ld_sz_str = target.long_double_size().to_string();
     register_object_macro(macro_defs, "__SIZEOF_LONG_DOUBLE__", &ld_sz_str);
 
+    // __int128 support — define __SIZEOF_INT128__ for 64-bit targets
+    if target.is_64bit() {
+        register_object_macro(macro_defs, "__SIZEOF_INT128__", "16");
+    }
+
     // -------------------------------------------------------------------
     // 7. Numeric limit macros
     // -------------------------------------------------------------------

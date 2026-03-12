@@ -218,6 +218,12 @@ pub fn lower_function_definition(
     resolve_struct_forward_ref(&mut return_c_type, struct_defs);
     let return_ir_type = IrType::from_ctype(&return_c_type, target);
 
+    // Store the C-level return type so `lower_function_call` can recover
+    // it even when the callee IR value is typed as opaque `Pointer(Void)`.
+    module
+        .func_c_return_types
+        .insert(func_name.clone(), return_c_type.clone());
+
     let (param_declarations, is_variadic) = extract_function_params(declarator);
 
     let mut builder = IrBuilder::new();
@@ -387,6 +393,25 @@ pub fn lower_function_definition(
         }
     }
 
+    // --- Register a forward declaration for the current function ---
+    // This allows self-referential patterns (recursion, taking own address,
+    // passing self as function pointer) within the function body.  The
+    // final `module.add_function()` will add the full definition, but
+    // identifier lookup needs to find *something* during body lowering.
+    {
+        let fwd_param_types: Vec<IrType> = ir_function
+            .params
+            .iter()
+            .map(|p| p.ty.clone())
+            .collect();
+        let fwd_decl = crate::ir::module::FunctionDeclaration::new(
+            func_name.clone(),
+            return_ir_type.clone(),
+            fwd_param_types,
+        );
+        module.add_declaration(fwd_decl);
+    }
+
     // --- Lower the function body statements ---
     {
         let body_stmt = ast::Statement::Compound(func_def.body.clone());
@@ -444,8 +469,18 @@ pub fn lower_function_declaration(
             None => continue,
         };
 
-        let return_c_type = resolve_base_type_fast(specifiers, name_table);
+        let mut return_c_type = resolve_base_type_fast(specifiers, name_table);
+        // Apply pointer indirection from the declarator (e.g., `void *foo()`)
+        if let Some(ref ptr) = declarator.pointer {
+            return_c_type = apply_pointer_layers(return_c_type, ptr);
+        }
         let return_ir_type = IrType::from_ctype(&return_c_type, target);
+
+        // Store the C-level return type for `lower_function_call`.
+        module
+            .func_c_return_types
+            .entry(func_name.clone())
+            .or_insert_with(|| return_c_type.clone());
 
         let (param_decls, is_variadic) = extract_function_params(declarator);
         let param_types: Vec<IrType> = param_decls
@@ -2113,6 +2148,7 @@ fn map_single_type_specifier_with_names(spec: &ast::TypeSpecifier, name_table: &
         ast::TypeSpecifier::Bool => CType::Bool,
         ast::TypeSpecifier::Signed => CType::Int,
         ast::TypeSpecifier::Unsigned => CType::UInt,
+        ast::TypeSpecifier::Int128 => CType::Int128,
         ast::TypeSpecifier::Struct(s) => {
             let fields = extract_struct_union_fields(s);
             CType::Struct {

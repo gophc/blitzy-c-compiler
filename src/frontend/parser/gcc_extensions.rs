@@ -788,6 +788,7 @@ fn get_expression_span(expr: &Expression) -> Span {
         | Expression::SizeofExpr { span, .. }
         | Expression::SizeofType { span, .. }
         | Expression::AlignofType { span, .. }
+        | Expression::AlignofExpr { span, .. }
         | Expression::Cast { span, .. }
         | Expression::Binary { span, .. }
         | Expression::Conditional { span, .. }

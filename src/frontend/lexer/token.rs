@@ -273,6 +273,8 @@ pub enum TokenKind {
     AsmVolatile,
     /// `__label__` (local label declaration in GCC)
     Label,
+    /// `__int128` — GCC 128-bit integer type extension.
+    Int128Keyword,
     /// `__auto_type` (GCC auto type inference)
     AutoType,
 
@@ -343,6 +345,8 @@ pub enum TokenKind {
     BuiltinMulOverflow,
     /// `__builtin_object_size`
     BuiltinObjectSize,
+    /// `__builtin_extract_return_addr`
+    BuiltinExtractReturnAddr,
     /// `__builtin_prefetch`
     BuiltinPrefetch,
 
@@ -611,6 +615,7 @@ impl TokenKind {
             | TokenKind::Asm
             | TokenKind::AsmVolatile
             | TokenKind::Label
+            | TokenKind::Int128Keyword
             | TokenKind::AutoType
             // GCC builtins
             | TokenKind::BuiltinVaStart
@@ -645,6 +650,7 @@ impl TokenKind {
             | TokenKind::BuiltinSubOverflow
             | TokenKind::BuiltinMulOverflow
             | TokenKind::BuiltinObjectSize
+            | TokenKind::BuiltinExtractReturnAddr
             | TokenKind::BuiltinPrefetch
         )
     }
@@ -824,6 +830,7 @@ impl TokenKind {
             TokenKind::Asm => Some("asm"),
             TokenKind::AsmVolatile => Some("__volatile__"),
             TokenKind::Label => Some("__label__"),
+            TokenKind::Int128Keyword => Some("__int128"),
             TokenKind::AutoType => Some("__auto_type"),
             // GCC builtins
             TokenKind::BuiltinVaStart => Some("__builtin_va_start"),
@@ -858,6 +865,7 @@ impl TokenKind {
             TokenKind::BuiltinSubOverflow => Some("__builtin_sub_overflow"),
             TokenKind::BuiltinMulOverflow => Some("__builtin_mul_overflow"),
             TokenKind::BuiltinObjectSize => Some("__builtin_object_size"),
+            TokenKind::BuiltinExtractReturnAddr => Some("__builtin_extract_return_addr"),
             TokenKind::BuiltinPrefetch => Some("__builtin_prefetch"),
             _ => None,
         }
@@ -1168,6 +1176,8 @@ pub fn lookup_keyword(s: &str) -> Option<TokenKind> {
         // `__inline__` maps to the same `Inline` variant as C `inline`.
         "__inline__" => Some(TokenKind::Inline),
         "__label__" => Some(TokenKind::Label),
+        "__int128" => Some(TokenKind::Int128Keyword),
+        "__int128_t" => Some(TokenKind::Int128Keyword),
         "__auto_type" => Some(TokenKind::AutoType),
         // GCC alternate spellings for C keywords used in system headers
         "__const" => Some(TokenKind::Const),
@@ -1213,6 +1223,7 @@ pub fn lookup_keyword(s: &str) -> Option<TokenKind> {
         "__builtin_sub_overflow" => Some(TokenKind::BuiltinSubOverflow),
         "__builtin_mul_overflow" => Some(TokenKind::BuiltinMulOverflow),
         "__builtin_object_size" => Some(TokenKind::BuiltinObjectSize),
+        "__builtin_extract_return_addr" => Some(TokenKind::BuiltinExtractReturnAddr),
         "__builtin_prefetch" => Some(TokenKind::BuiltinPrefetch),
 
         // Not a keyword — the lexer should treat it as a plain identifier.

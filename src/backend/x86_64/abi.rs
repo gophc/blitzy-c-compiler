@@ -368,7 +368,9 @@ pub fn classify_type(ty: &CType, target: &Target) -> AbiClass {
         | CType::Long
         | CType::ULong
         | CType::LongLong
-        | CType::ULongLong => AbiClass::Integer,
+        | CType::ULongLong
+        | CType::Int128
+        | CType::UInt128 => AbiClass::Integer,
 
         // Pointer → INTEGER class
         CType::Pointer(_, _) => AbiClass::Integer,

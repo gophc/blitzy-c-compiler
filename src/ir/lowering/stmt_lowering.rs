@@ -64,6 +64,7 @@ const MAX_RECURSION_DEPTH: u32 = 512;
 /// `LoopContext` is pushed onto `StmtLoweringContext::loop_stack`. When the
 /// loop body ends the context is popped. `break` and `continue` statements
 /// use the topmost context to determine their branch target.
+#[derive(Clone)]
 pub struct LoopContext {
     /// Block to branch to on `break`.
     pub break_target: BlockId,
@@ -682,6 +683,7 @@ pub fn lower_declaration_initializers(ctx: &mut StmtLoweringContext<'_>, decl: &
             struct_defs: ctx.struct_defs,
             label_blocks: ctx.label_blocks,
             current_function_name: ctx.current_function_name,
+            enclosing_loop_stack: ctx.loop_stack.clone(),
         };
         decl_lowering::lower_local_initializer(alloca_val, initializer, &var_type, &mut expr_ctx);
     }
@@ -1819,7 +1821,8 @@ fn lower_expr_via_context(ctx: &mut StmtLoweringContext<'_>, expr: &ast::Express
         static_locals: ctx.static_locals,
         struct_defs: ctx.struct_defs,
         label_blocks: ctx.label_blocks,
-            current_function_name: ctx.current_function_name,
+        current_function_name: ctx.current_function_name,
+        enclosing_loop_stack: ctx.loop_stack.clone(),
     };
     lower_expression(&mut expr_ctx, expr)
 }
@@ -1845,7 +1848,8 @@ fn lower_lvalue_via_context(ctx: &mut StmtLoweringContext<'_>, expr: &ast::Expre
         static_locals: ctx.static_locals,
         struct_defs: ctx.struct_defs,
         label_blocks: ctx.label_blocks,
-            current_function_name: ctx.current_function_name,
+        current_function_name: ctx.current_function_name,
+        enclosing_loop_stack: ctx.loop_stack.clone(),
     };
     lower_lvalue(&mut expr_ctx, expr)
 }

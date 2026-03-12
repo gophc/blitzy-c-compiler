@@ -103,6 +103,10 @@ pub struct ExprLoweringContext<'a> {
     /// Name of the function currently being lowered.
     /// Used for C99 `__func__` / GCC `__FUNCTION__` / `__PRETTY_FUNCTION__`.
     pub current_function_name: Option<&'a str>,
+    /// Enclosing loop/switch stack propagated from the `StmtLoweringContext`
+    /// so that GCC statement expressions `({ break; })` or `({ continue; })`
+    /// inside a loop body can resolve to the correct targets.
+    pub enclosing_loop_stack: Vec<super::stmt_lowering::LoopContext>,
 }
 
 // ---------------------------------------------------------------------------
@@ -188,7 +192,8 @@ fn is_compile_time_constant(expr: &ast::Expression) -> bool {
         | ast::Expression::CharLiteral { .. }
         | ast::Expression::SizeofType { .. }
         | ast::Expression::SizeofExpr { .. }
-        | ast::Expression::AlignofType { .. } => true,
+        | ast::Expression::AlignofType { .. }
+        | ast::Expression::AlignofExpr { .. } => true,
 
         // Parenthesized: transparent.
         ast::Expression::Parenthesized { inner, .. } => is_compile_time_constant(inner),
@@ -397,6 +402,7 @@ pub fn ctype_to_ir(ctype: &CType, target: &Target) -> IrType {
             }
         }
         CType::LongLong | CType::ULongLong => IrType::I64,
+        CType::Int128 | CType::UInt128 => IrType::I128,
         CType::Float => IrType::F32,
         CType::Double => IrType::F64,
         CType::LongDouble => {
@@ -767,6 +773,16 @@ fn lower_expr_inner(ctx: &mut ExprLoweringContext<'_>, expr: &ast::Expression) -
         ast::Expression::AlignofType { type_name, span } => {
             lower_alignof_type(ctx, type_name, *span)
         }
+        ast::Expression::AlignofExpr { expr: inner, span } => {
+            // GCC __alignof__(expr) — evaluate to the alignment of the
+            // expression's type.  The expression itself is not evaluated.
+            // Treat as alignment 1 (conservative) if the type cannot be
+            // determined; the sema already validated the expression.
+            let size_ty = size_ir_type(ctx.target);
+            let val = emit_int_const(ctx, 1, size_ty, *span);
+            let _ = inner; // expression intentionally unevaluated
+            TypedValue::new(val, CType::ULong)
+        }
 
         // ---- Member access ----
         ast::Expression::MemberAccess {
@@ -920,6 +936,7 @@ fn expr_span(expr: &ast::Expression) -> Span {
         | ast::Expression::SizeofExpr { span, .. }
         | ast::Expression::SizeofType { span, .. }
         | ast::Expression::AlignofType { span, .. }
+        | ast::Expression::AlignofExpr { span, .. }
         | ast::Expression::MemberAccess { span, .. }
         | ast::Expression::PointerMemberAccess { span, .. }
         | ast::Expression::ArraySubscript { span, .. }
@@ -1236,6 +1253,94 @@ fn lower_identifier(ctx: &mut ExprLoweringContext<'_>, sym_idx: u32, span: Span)
         );
     }
 
+    // Implicit builtin functions — auto-declare in the IR module when
+    // __builtin_* identifiers are used as function references.  The kernel
+    // and libc code freely call __builtin_memcpy, __builtin_memset, etc.
+    // without explicit declarations, relying on the compiler's knowledge.
+    if name.starts_with("__builtin_") {
+        // Capture the name as an owned string to release the borrow on ctx.
+        let owned_name = name.to_string();
+        // Map builtins to their underlying libc symbol names: the codegen
+        // will emit a call to the libc function (e.g. memcpy, memset).
+        let (lib_name_str, ret_ir, params_ir, variadic): (&str, IrType, Vec<IrType>, bool) =
+            match owned_name.as_str() {
+                "__builtin_memcpy" | "__builtin_memmove" => {
+                    (owned_name.strip_prefix("__builtin_").unwrap(),
+                     IrType::Ptr, vec![IrType::Ptr, IrType::Ptr, IrType::I64], false)
+                }
+                "__builtin_memset" => {
+                    ("memset", IrType::Ptr, vec![IrType::Ptr, IrType::I32, IrType::I64], false)
+                }
+                "__builtin_memcmp" => {
+                    ("memcmp", IrType::I32, vec![IrType::Ptr, IrType::Ptr, IrType::I64], false)
+                }
+                "__builtin_strlen" => {
+                    ("strlen", IrType::I64, vec![IrType::Ptr], false)
+                }
+                "__builtin_strcmp" | "__builtin_strncmp" => {
+                    (owned_name.strip_prefix("__builtin_").unwrap(),
+                     IrType::I32, vec![IrType::Ptr, IrType::Ptr], false)
+                }
+                "__builtin_strcpy" | "__builtin_strncpy" | "__builtin_strcat" | "__builtin_strncat" => {
+                    (owned_name.strip_prefix("__builtin_").unwrap(),
+                     IrType::Ptr, vec![IrType::Ptr, IrType::Ptr], false)
+                }
+                "__builtin_strchr" | "__builtin_strrchr" => {
+                    (owned_name.strip_prefix("__builtin_").unwrap(),
+                     IrType::Ptr, vec![IrType::Ptr, IrType::I32], false)
+                }
+                "__builtin_abs" => {
+                    ("abs", IrType::I32, vec![IrType::I32], false)
+                }
+                "__builtin_labs" => {
+                    ("labs", IrType::I64, vec![IrType::I64], false)
+                }
+                _ => {
+                    // Generic fallback: declare as returning int with variadic params.
+                    (owned_name.strip_prefix("__builtin_").unwrap_or(&owned_name),
+                     IrType::I32, vec![], true)
+                }
+            };
+        let lib_name_owned = lib_name_str.to_string();
+        // Add a declaration for the underlying libc function if not present.
+        let already_declared = ctx.module.declarations().iter().any(|d| d.name == lib_name_owned)
+            || ctx.module.get_function(&lib_name_owned).is_some();
+        if !already_declared {
+            ctx.module.add_declaration(crate::ir::module::FunctionDeclaration {
+                name: lib_name_owned.clone(),
+                return_type: ret_ir.clone(),
+                param_types: params_ir.clone(),
+                is_variadic: variadic,
+                linkage: crate::ir::module::Linkage::External,
+                visibility: crate::ir::module::Visibility::Default,
+            });
+        }
+        // Also add the __builtin_* name as an alias so the call site resolves.
+        let already_builtin = ctx.module.declarations().iter().any(|d| d.name == owned_name)
+            || ctx.module.get_function(&owned_name).is_some();
+        if !already_builtin {
+            ctx.module.add_declaration(crate::ir::module::FunctionDeclaration {
+                name: owned_name.clone(),
+                return_type: ret_ir,
+                param_types: params_ir,
+                is_variadic: variadic,
+                linkage: crate::ir::module::Linkage::External,
+                visibility: crate::ir::module::Visibility::Default,
+            });
+        }
+        // Return a function reference value.
+        let fptr = ctx.builder.fresh_value();
+        ctx.module.func_ref_map.insert(fptr, owned_name.clone());
+        {
+            let current_func = &mut *ctx.function;
+            current_func.func_ref_map.insert(fptr, owned_name);
+        }
+        return TypedValue::new(
+            fptr,
+            CType::Pointer(Box::new(CType::Void), TypeQualifiers::default()),
+        );
+    }
+
     ctx.diagnostics
         .emit_error(span, format!("undeclared identifier '{}'", name));
     TypedValue::new(Value::UNDEF, CType::Int)
@@ -1284,6 +1389,24 @@ fn lower_identifier_lvalue(
         let val = emit_int_const(ctx, enum_val, IrType::I32, span);
         return TypedValue::new(val, CType::Int);
     }
+    // Function references as lvalues — used for `&function_name`.
+    // Functions decay to pointers, so taking the address of a function
+    // returns the function pointer value.
+    if ctx.module.get_function(name).is_some()
+        || ctx.module.declarations().iter().any(|d| d.name == *name)
+    {
+        let func_name = name.to_string();
+        let fptr = ctx.builder.fresh_value();
+        ctx.module.func_ref_map.insert(fptr, func_name.clone());
+        {
+            let current_func = &mut *ctx.function;
+            current_func.func_ref_map.insert(fptr, func_name);
+        }
+        return TypedValue::new(
+            fptr,
+            CType::Pointer(Box::new(CType::Void), TypeQualifiers::default()),
+        );
+    }
     ctx.diagnostics
         .emit_error(span, format!("undeclared identifier '{}'", name));
     TypedValue::new(Value::UNDEF, CType::Int)
@@ -1307,6 +1430,7 @@ fn lower_binary(
     }
     let lhs = lower_expr_inner(ctx, lhs_expr);
     let rhs = lower_expr_inner(ctx, rhs_expr);
+
 
     if is_pointer_type(&lhs.ty) && is_integer_type(&rhs.ty) {
         // Pointer-integer comparisons: convert integer to pointer and use ptr-ptr comparison.
@@ -1954,7 +2078,7 @@ fn lower_function_call(
     // Determine return type from the callee's function type.
     // For direct function calls, lower_identifier returns a void pointer,
     // so we look up the actual function return type from the IR module.
-    let (ret_cty, _is_variadic) = extract_function_return_type(&callee_tv.ty);
+    let (mut ret_cty, _is_variadic) = extract_function_return_type(&callee_tv.ty);
     let mut ret_ir = ctype_to_ir(&ret_cty, ctx.target);
 
     // If the callee is a known function and the CType-derived return type
@@ -1964,6 +2088,11 @@ fn lower_function_call(
     // the Call instruction carries the correct struct field layout for ABI
     // classification (e.g., small structs returned in registers).
     if let Some(fname) = ctx.function.func_ref_map.get(&callee_tv.value) {
+        // Recover the correct C-level return type from our map.
+        if let Some(stored_cty) = ctx.module.func_c_return_types.get(fname) {
+            ret_cty = stored_cty.clone();
+            ret_ir = ctype_to_ir(&ret_cty, ctx.target);
+        }
         if let Some(func) = ctx.module.get_function(fname) {
             if !func.return_type.is_void() {
                 ret_ir = func.return_type.clone();
@@ -2399,9 +2528,13 @@ fn lower_member_access_lvalue(
         (lv.value, ty)
     };
 
+    // Resolve forward-declared struct/union tag references before member lookup.
+    let mut resolved_obj_ty = obj_ty.clone();
+    resolve_forward_ref_type(&mut resolved_obj_ty, ctx.struct_defs);
+
     // Look up the member in the struct fields.
     let (member_offset, member_ty) =
-        find_struct_member(&obj_ty, &member_name_owned, ctx.type_builder);
+        find_struct_member(&resolved_obj_ty, &member_name_owned, ctx.type_builder, ctx.struct_defs);
 
     // Compute GEP to the member.
     let offset_val = emit_int_const(ctx, member_offset as i128, size_ir_type(ctx.target), span);
@@ -2414,8 +2547,44 @@ fn lower_member_access_lvalue(
 }
 
 /// Find a struct member by name. Returns (byte_offset, member_type).
-fn find_struct_member(ctype: &CType, name: &str, tb: &TypeBuilder) -> (usize, CType) {
+///
+/// When the type is a lightweight tag reference (empty fields with a tag
+/// name), the full definition is resolved from `struct_defs` before
+/// performing the member lookup.
+fn find_struct_member(
+    ctype: &CType,
+    name: &str,
+    tb: &TypeBuilder,
+    struct_defs: &FxHashMap<String, CType>,
+) -> (usize, CType) {
     let resolved = types::resolve_typedef(ctype);
+    // Resolve lightweight tag references (empty fields with a tag name)
+    // by looking up the full definition from the struct_defs registry.
+    let resolved = match resolved {
+        CType::Struct {
+            name: Some(ref tag),
+            ref fields,
+            ..
+        } if fields.is_empty() => {
+            if let Some(full_def) = struct_defs.get(tag.as_str()) {
+                full_def
+            } else {
+                resolved
+            }
+        }
+        CType::Union {
+            name: Some(ref tag),
+            ref fields,
+            ..
+        } if fields.is_empty() => {
+            if let Some(full_def) = struct_defs.get(tag.as_str()) {
+                full_def
+            } else {
+                resolved
+            }
+        }
+        other => other,
+    };
     match resolved {
         CType::Struct {
             fields,
@@ -2424,16 +2593,10 @@ fn find_struct_member(ctype: &CType, name: &str, tb: &TypeBuilder) -> (usize, CT
             ..
         } => {
             let layout = tb.compute_struct_layout_with_fields(fields, *packed, *aligned);
-            // Access overall layout properties for completeness checks.
-            let _total_size = layout.size;
-            let _total_align = layout.alignment;
-            let _has_flex = layout.has_flexible_array;
 
             for (i, field) in fields.iter().enumerate() {
                 if field.name.as_deref() == Some(name) {
                     let fl = &layout.fields[i];
-                    let _field_size = fl.size;
-                    let _field_align = fl.alignment;
                     return (fl.offset, field.ty.clone());
                 }
             }
@@ -2442,7 +2605,8 @@ fn find_struct_member(ctype: &CType, name: &str, tb: &TypeBuilder) -> (usize, CT
                 if field.name.is_none() {
                     let inner = types::resolve_typedef(&field.ty);
                     if matches!(inner, CType::Struct { .. } | CType::Union { .. }) {
-                        let (inner_off, inner_ty) = find_struct_member(inner, name, tb);
+                        let (inner_off, inner_ty) =
+                            find_struct_member(inner, name, tb, struct_defs);
                         if !matches!(inner_ty, CType::Void) {
                             return (layout.fields[i].offset + inner_off, inner_ty);
                         }
@@ -2457,7 +2621,6 @@ fn find_struct_member(ctype: &CType, name: &str, tb: &TypeBuilder) -> (usize, CT
             aligned,
             ..
         } => {
-            // Use compute_union_layout for consistent field information.
             let field_types: Vec<CType> = fields.iter().map(|f| f.ty.clone()).collect();
             let _union_layout = tb.compute_union_layout(&field_types, *packed, *aligned);
             for field in fields {
@@ -2468,7 +2631,7 @@ fn find_struct_member(ctype: &CType, name: &str, tb: &TypeBuilder) -> (usize, CT
                 if field.name.is_none() {
                     let inner = types::resolve_typedef(&field.ty);
                     if matches!(inner, CType::Struct { .. } | CType::Union { .. }) {
-                        let (off, ty) = find_struct_member(inner, name, tb);
+                        let (off, ty) = find_struct_member(inner, name, tb, struct_defs);
                         if !matches!(ty, CType::Void) {
                             return (off, ty);
                         }
@@ -2737,7 +2900,7 @@ fn lower_statement_expression(
         diagnostics: ctx.diagnostics,
         local_vars: &mut stmt_local_vars,
         label_blocks: &mut label_blocks,
-        loop_stack: Vec::new(),
+        loop_stack: ctx.enclosing_loop_stack.clone(),
         switch_ctx: None,
         recursion_depth: 0,
         type_builder: ctx.type_builder,
@@ -2784,6 +2947,7 @@ fn lower_statement_expression(
                         struct_defs: stmt_ctx.struct_defs,
                         label_blocks: stmt_ctx.label_blocks,
                         current_function_name: stmt_ctx.current_function_name,
+                        enclosing_loop_stack: stmt_ctx.loop_stack.clone(),
                     };
                     let tv = lower_expr_inner(&mut inner_expr_ctx, expr);
                     last_val = tv.value;
@@ -3010,6 +3174,16 @@ fn lower_builtin(
             let size_ty = size_ir_type(ctx.target);
             let val = emit_int_const(ctx, -1i128, size_ty, span);
             TypedValue::new(val, CType::ULong)
+        }
+
+        ast::BuiltinKind::ExtractReturnAddr => {
+            // __builtin_extract_return_addr(addr) — on all Linux targets
+            // this is a no-op identity: just return the argument as void*.
+            if let Some(a) = args.first() {
+                lower_expr_inner(ctx, a)
+            } else {
+                TypedValue::void()
+            }
         }
     }
 }

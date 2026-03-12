@@ -961,6 +961,22 @@ impl SymbolTable {
                 self.types_are_compatible(elem_a, elem_b)
             }
 
+            // Function type vs pointer-to-function type: C99 §6.7.6.3/8
+            // states that a parameter declared as "function returning type"
+            // is adjusted to "pointer to function returning type".  This
+            // makes `filler_t filler` and `filler_t *filler` compatible in
+            // parameter contexts, which the Linux kernel relies upon.
+            (CType::Function { .. }, CType::Pointer(inner, _))
+                if matches!(inner.as_ref(), CType::Function { .. }) =>
+            {
+                self.types_are_compatible(a, inner)
+            }
+            (CType::Pointer(inner, _), CType::Function { .. })
+                if matches!(inner.as_ref(), CType::Function { .. }) =>
+            {
+                self.types_are_compatible(inner, b)
+            }
+
             // Typedef: peel and compare.
             (CType::Typedef { underlying: u, .. }, other)
             | (other, CType::Typedef { underlying: u, .. }) => self.types_are_compatible(u, other),

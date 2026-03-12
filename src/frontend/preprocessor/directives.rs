@@ -734,6 +734,7 @@ fn parse_include_header(
                     &pp.macro_defs,
                     &mut *pp.diagnostics,
                     pp.max_recursion_depth,
+                    &mut pp.counter_value,
                 );
                 expander.expand_tokens(tokens)
             };
@@ -904,7 +905,7 @@ fn process_if(pp: &mut Preprocessor, tokens: &[PPToken], directive_span: Span) -
     // Step 2: Macro-expand the remaining expression tokens.
     let expanded = {
         let mut expander =
-            MacroExpander::new(&pp.macro_defs, &mut *pp.diagnostics, pp.max_recursion_depth);
+            MacroExpander::new(&pp.macro_defs, &mut *pp.diagnostics, pp.max_recursion_depth, &mut pp.counter_value);
         expander.expand_tokens(&with_defined)
     };
 
@@ -1036,7 +1037,7 @@ fn process_elif(
     // Step 2: Macro-expand remaining tokens.
     let expanded = {
         let mut expander =
-            MacroExpander::new(&pp.macro_defs, &mut *pp.diagnostics, pp.max_recursion_depth);
+            MacroExpander::new(&pp.macro_defs, &mut *pp.diagnostics, pp.max_recursion_depth, &mut pp.counter_value);
         expander.expand_tokens(&with_defined)
     };
 

@@ -1325,11 +1325,6 @@ fn compile_single_file(
 
     // Register the preprocessed text as a virtual file in the source map
     // so the lexer can produce spans that the diagnostic engine can resolve.
-    // DEBUG: dump pp_text for comparison with -E output
-    if std::env::var("BCC_DUMP_PP").is_ok() {
-        let _ = fs::write("/tmp/bcc_pp_text.txt", &pp_text);
-        eprintln!("[BCC-DEBUG] pp_text dumped to /tmp/bcc_pp_text.txt ({} bytes)", pp_text.len());
-    }
     let pp_file_id = source_map.add_file(format!("<preprocessed:{}>", input), pp_text.clone());
 
     let lexer = Lexer::new(&pp_text, pp_file_id, &mut interner, &mut diagnostics);

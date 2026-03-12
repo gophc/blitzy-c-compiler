@@ -39,6 +39,7 @@ use super::token_paster::{paste_tokens, stringify_tokens, PasteError};
 use super::{MacroDef, MacroKind, PPToken, PPTokenKind};
 use crate::common::diagnostics::{Diagnostic, DiagnosticEngine, Span};
 use crate::common::fx_hash::FxHashMap;
+use crate::common::source_map::SourceMap;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -88,6 +89,15 @@ pub struct MacroExpander<'a> {
 
     /// Mutable reference to the diagnostic engine for error/warning emission.
     diagnostics: &'a mut DiagnosticEngine,
+
+    /// Mutable reference to the `__COUNTER__` value.  Each expansion of
+    /// `__COUNTER__` returns the current value and increments it.
+    counter: &'a mut u64,
+
+    /// Optional reference to the source map for resolving `__LINE__` and
+    /// `__FILE__` magic macros during nested macro expansion.  When `None`,
+    /// these macros fall back to their predefined static values.
+    source_map: Option<&'a SourceMap>,
 }
 
 // ===========================================================================
@@ -110,12 +120,14 @@ impl<'a> MacroExpander<'a> {
     /// ```ignore
     /// let mut diag = DiagnosticEngine::new();
     /// let defs: FxHashMap<String, MacroDef> = FxHashMap::default();
-    /// let mut expander = MacroExpander::new(&defs, &mut diag, 512);
+    /// let mut counter_val: u64 = 0;
+    /// let mut expander = MacroExpander::new(&defs, &mut diag, 512, &mut counter_val);
     /// ```
     pub fn new(
         macro_defs: &'a FxHashMap<String, MacroDef>,
         diagnostics: &'a mut DiagnosticEngine,
         max_depth: usize,
+        counter: &'a mut u64,
     ) -> Self {
         MacroExpander {
             macro_defs,
@@ -123,6 +135,28 @@ impl<'a> MacroExpander<'a> {
             depth: 0,
             max_depth,
             diagnostics,
+            counter,
+            source_map: None,
+        }
+    }
+
+    /// Create a new macro expander with source map access for `__LINE__`
+    /// and `__FILE__` magic macro resolution during nested expansion.
+    pub fn new_with_source_map(
+        macro_defs: &'a FxHashMap<String, MacroDef>,
+        diagnostics: &'a mut DiagnosticEngine,
+        max_depth: usize,
+        counter: &'a mut u64,
+        source_map: &'a SourceMap,
+    ) -> Self {
+        MacroExpander {
+            macro_defs,
+            paint_marker: PaintMarker::new(),
+            depth: 0,
+            max_depth,
+            diagnostics,
+            counter,
+            source_map: Some(source_map),
         }
     }
 
@@ -363,6 +397,48 @@ impl<'a> MacroExpander<'a> {
         macro_def: &MacroDef,
         invocation_span: Span,
     ) -> Vec<PPToken> {
+        // Handle __COUNTER__ — auto-incrementing integer per expansion.
+        if macro_def.is_predefined && macro_def.name == "__COUNTER__" {
+            let val = *self.counter;
+            *self.counter += 1;
+            return vec![PPToken::from_expansion(
+                PPTokenKind::Number,
+                val.to_string(),
+                invocation_span,
+            )];
+        }
+
+        // Handle __LINE__ — expands to current source line number.
+        // This must be handled here (not just in the top-level preprocessor)
+        // because __LINE__ can appear inside nested macro expansions where
+        // the MacroExpander drives the expansion, not expand_object_macro().
+        if macro_def.is_predefined && macro_def.name == "__LINE__" {
+            if let Some(source_map) = self.source_map {
+                if let Some(file) = source_map.get_file(invocation_span.file_id) {
+                    let (line, _) = file.lookup_line_col(invocation_span.start);
+                    return vec![PPToken::from_expansion(
+                        PPTokenKind::Number,
+                        line.to_string(),
+                        invocation_span,
+                    )];
+                }
+            }
+        }
+
+        // Handle __FILE__ — expands to current source filename as string.
+        if macro_def.is_predefined && macro_def.name == "__FILE__" {
+            if let Some(source_map) = self.source_map {
+                let filename = source_map
+                    .get_filename(invocation_span.file_id)
+                    .unwrap_or("<unknown>");
+                return vec![PPToken::from_expansion(
+                    PPTokenKind::StringLiteral,
+                    format!("\"{}\"", filename),
+                    invocation_span,
+                )];
+            }
+        }
+
         if macro_def.replacement.is_empty() {
             return Vec::new();
         }
@@ -696,8 +772,13 @@ impl<'a> MacroExpander<'a> {
             }
 
             // === Default: pass through unchanged ===
+            // Set span to invocation_span so that magic macros like
+            // __LINE__ and __FILE__ that appear in the replacement list
+            // (but are not parameters) resolve to the invocation site,
+            // not the macro definition site.
             let mut t = tok.clone();
             t.from_macro = true;
+            t.span = invocation_span;
             result.push(t);
             i += 1;
         }
@@ -1166,7 +1247,8 @@ mod tests {
         defs.insert("FOO".to_string(), object_macro("FOO", vec![num("42")]));
 
         let mut diag = DiagnosticEngine::new();
-        let mut expander = MacroExpander::new(&defs, &mut diag, 512);
+        let mut counter_val: u64 = 0;
+        let mut expander = MacroExpander::new(&defs, &mut diag, 512, &mut counter_val);
 
         let tokens = vec![ident("FOO")];
         let result = expander.expand_tokens(&tokens);
@@ -1184,7 +1266,8 @@ mod tests {
         defs.insert("A".to_string(), object_macro("A", vec![ident("A")]));
 
         let mut diag = DiagnosticEngine::new();
-        let mut expander = MacroExpander::new(&defs, &mut diag, 512);
+        let mut counter_val: u64 = 0;
+        let mut expander = MacroExpander::new(&defs, &mut diag, 512, &mut counter_val);
 
         let tokens = vec![ident("A")];
         let result = expander.expand_tokens(&tokens);
@@ -1205,7 +1288,8 @@ mod tests {
         defs.insert("B".to_string(), object_macro("B", vec![ident("A")]));
 
         let mut diag = DiagnosticEngine::new();
-        let mut expander = MacroExpander::new(&defs, &mut diag, 512);
+        let mut counter_val: u64 = 0;
+        let mut expander = MacroExpander::new(&defs, &mut diag, 512, &mut counter_val);
 
         let tokens = vec![ident("A")];
         let result = expander.expand_tokens(&tokens);
@@ -1227,7 +1311,8 @@ mod tests {
         defs.insert("Y".to_string(), object_macro("Y", vec![num("42")]));
 
         let mut diag = DiagnosticEngine::new();
-        let mut expander = MacroExpander::new(&defs, &mut diag, 512);
+        let mut counter_val: u64 = 0;
+        let mut expander = MacroExpander::new(&defs, &mut diag, 512, &mut counter_val);
 
         let tokens = vec![ident("X")];
         let result = expander.expand_tokens(&tokens);
@@ -1243,7 +1328,8 @@ mod tests {
         defs.insert("EMPTY".to_string(), object_macro("EMPTY", vec![]));
 
         let mut diag = DiagnosticEngine::new();
-        let mut expander = MacroExpander::new(&defs, &mut diag, 512);
+        let mut counter_val: u64 = 0;
+        let mut expander = MacroExpander::new(&defs, &mut diag, 512, &mut counter_val);
 
         let tokens = vec![ident("EMPTY"), ws(), ident("x")];
         let result = expander.expand_tokens(&tokens);
@@ -1270,7 +1356,8 @@ mod tests {
         defs.insert("C".to_string(), object_macro("C", vec![ident("D")]));
 
         let mut diag = DiagnosticEngine::new();
-        let mut expander = MacroExpander::new(&defs, &mut diag, 2);
+        let mut counter_val: u64 = 0;
+        let mut expander = MacroExpander::new(&defs, &mut diag, 2, &mut counter_val);
 
         let tokens = vec![ident("A")];
         let result = expander.expand_tokens(&tokens);
@@ -1300,7 +1387,8 @@ mod tests {
         );
 
         let mut diag = DiagnosticEngine::new();
-        let mut expander = MacroExpander::new(&defs, &mut diag, 512);
+        let mut counter_val: u64 = 0;
+        let mut expander = MacroExpander::new(&defs, &mut diag, 512, &mut counter_val);
 
         // ADD(1,2) — no whitespace around args to avoid extra ws in output
         let tokens = vec![
@@ -1329,7 +1417,8 @@ mod tests {
         );
 
         let mut diag = DiagnosticEngine::new();
-        let mut expander = MacroExpander::new(&defs, &mut diag, 512);
+        let mut counter_val: u64 = 0;
+        let mut expander = MacroExpander::new(&defs, &mut diag, 512, &mut counter_val);
 
         let tokens = vec![ident("FOO"), ws(), ident("bar")];
         let result = expander.expand_tokens(&tokens);
@@ -1353,7 +1442,8 @@ mod tests {
         );
 
         let mut diag = DiagnosticEngine::new();
-        let mut expander = MacroExpander::new(&defs, &mut diag, 512);
+        let mut counter_val: u64 = 0;
+        let mut expander = MacroExpander::new(&defs, &mut diag, 512, &mut counter_val);
 
         // TWO(1) — too few arguments
         let tokens = vec![ident("TWO"), punct("("), num("1"), punct(")")];
@@ -1372,7 +1462,8 @@ mod tests {
         );
 
         let mut diag = DiagnosticEngine::new();
-        let mut expander = MacroExpander::new(&defs, &mut diag, 512);
+        let mut counter_val: u64 = 0;
+        let mut expander = MacroExpander::new(&defs, &mut diag, 512, &mut counter_val);
 
         // NOP()
         let tokens = vec![ident("NOP"), punct("("), punct(")")];
@@ -1397,7 +1488,8 @@ mod tests {
         );
 
         let mut diag = DiagnosticEngine::new();
-        let mut expander = MacroExpander::new(&defs, &mut diag, 512);
+        let mut counter_val: u64 = 0;
+        let mut expander = MacroExpander::new(&defs, &mut diag, 512, &mut counter_val);
 
         // LOG(1,2,3) — no whitespace around args
         let tokens = vec![
@@ -1428,7 +1520,8 @@ mod tests {
         );
 
         let mut diag = DiagnosticEngine::new();
-        let mut expander = MacroExpander::new(&defs, &mut diag, 512);
+        let mut counter_val: u64 = 0;
+        let mut expander = MacroExpander::new(&defs, &mut diag, 512, &mut counter_val);
 
         let tokens = vec![ident("LOG"), punct("("), punct(")")];
         let result = expander.expand_tokens(&tokens);
@@ -1450,7 +1543,8 @@ mod tests {
         );
 
         let mut diag = DiagnosticEngine::new();
-        let mut expander = MacroExpander::new(&defs, &mut diag, 512);
+        let mut counter_val: u64 = 0;
+        let mut expander = MacroExpander::new(&defs, &mut diag, 512, &mut counter_val);
 
         // STR(hello)
         let tokens = vec![ident("STR"), punct("("), ident("hello"), punct(")")];
@@ -1480,7 +1574,8 @@ mod tests {
         );
 
         let mut diag = DiagnosticEngine::new();
-        let mut expander = MacroExpander::new(&defs, &mut diag, 512);
+        let mut counter_val: u64 = 0;
+        let mut expander = MacroExpander::new(&defs, &mut diag, 512, &mut counter_val);
 
         // PASTE(foo, bar) → foobar
         let tokens = vec![
@@ -1524,7 +1619,8 @@ mod tests {
         );
 
         let mut diag = DiagnosticEngine::new();
-        let mut expander = MacroExpander::new(&defs, &mut diag, 512);
+        let mut counter_val: u64 = 0;
+        let mut expander = MacroExpander::new(&defs, &mut diag, 512, &mut counter_val);
 
         let tokens = vec![ident("CALL"), punct("("), num("42"), punct(")")];
         let result = expander.expand_tokens(&tokens);

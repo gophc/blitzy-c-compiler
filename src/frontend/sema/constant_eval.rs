@@ -33,7 +33,9 @@ use crate::common::fx_hash::FxHashMap;
 use crate::common::diagnostics::{Diagnostic, DiagnosticEngine, Severity, Span};
 use crate::common::string_interner::Symbol;
 use crate::common::target::Target;
-use crate::common::types::{alignof_ctype, is_integer, is_unsigned, sizeof_ctype, CType};
+use crate::common::types::{
+    alignof_ctype_resolved, is_integer, is_unsigned, sizeof_ctype, sizeof_ctype_resolved, CType,
+};
 use crate::frontend::parser::ast::*;
 
 // ===========================================================================
@@ -226,9 +228,17 @@ pub struct ConstantEvaluator<'a> {
     /// Maps variable name Symbol to its CType, enabling correct sizeof
     /// computation for `sizeof(arr)` where `arr` is a local array.
     variable_types: FxHashMap<Symbol, CType>,
+    /// Registry of known typedef names → resolved underlying CType.
+    /// Populated by the semantic analyser so that `sizeof(__u8)` and
+    /// struct members using typedef names are resolved correctly in
+    /// constant expression evaluation.
+    typedef_types: FxHashMap<Symbol, CType>,
     /// Name table for resolving Symbol handles to strings.
     /// Set by the semantic analyser; defaults to empty.
     name_table: Vec<String>,
+    /// Tag types indexed by string name for the resolved sizeof/alignof
+    /// functions.  Built from `tag_types` during `register_tag_type`.
+    tag_types_by_name: std::collections::HashMap<String, CType>,
 }
 
 impl<'a> ConstantEvaluator<'a> {
@@ -247,7 +257,9 @@ impl<'a> ConstantEvaluator<'a> {
             enum_values: FxHashMap::default(),
             tag_types: FxHashMap::default(),
             variable_types: FxHashMap::default(),
+            typedef_types: FxHashMap::default(),
             name_table: Vec::new(),
+            tag_types_by_name: std::collections::HashMap::new(),
         }
     }
 
@@ -267,6 +279,18 @@ impl<'a> ConstantEvaluator<'a> {
         self.tag_types.insert(tag, ty);
     }
 
+    /// Move a string-keyed tag type index into the evaluator.
+    /// The caller can later retrieve it back via `take_tag_name_index`.
+    pub fn set_tag_name_index(&mut self, map: std::collections::HashMap<String, CType>) {
+        self.tag_types_by_name = map;
+    }
+
+    /// Move the string-keyed tag type index out of the evaluator, returning
+    /// ownership to the caller.
+    pub fn take_tag_name_index(&mut self) -> std::collections::HashMap<String, CType> {
+        std::mem::take(&mut self.tag_types_by_name)
+    }
+
     /// Register a known variable type for sizeof/typeof lookups.
     ///
     /// This allows the constant evaluator to correctly compute
@@ -274,6 +298,15 @@ impl<'a> ConstantEvaluator<'a> {
     /// `_Static_assert` expressions.
     pub fn register_variable_type(&mut self, name: Symbol, ty: CType) {
         self.variable_types.insert(name, ty);
+    }
+
+    /// Register a known typedef name → resolved CType for sizeof lookups.
+    ///
+    /// This allows the constant evaluator to correctly compute
+    /// `sizeof(__u8)` and resolve typedef names in struct member types
+    /// during constant expression evaluation.
+    pub fn register_typedef_type(&mut self, name: Symbol, ty: CType) {
+        self.typedef_types.insert(name, ty);
     }
 
     /// Set the name table for resolving Symbol handles to string names.
@@ -1083,7 +1116,7 @@ impl<'a> ConstantEvaluator<'a> {
     /// The result type is `size_t` (unsigned, pointer-width).
     fn evaluate_sizeof_type(&mut self, type_name: &TypeName, span: Span) -> Result<ConstValue, ()> {
         let ctype = self.resolve_type_name(type_name, span)?;
-        let size = sizeof_ctype(&ctype, &self.target);
+        let size = sizeof_ctype_resolved(&ctype, &self.target, &self.tag_types_by_name);
         Ok(ConstValue::UnsignedInt(size as u128))
     }
 
@@ -1096,7 +1129,7 @@ impl<'a> ConstantEvaluator<'a> {
     fn evaluate_sizeof_expr(&mut self, operand: &Expression, span: Span) -> Result<ConstValue, ()> {
         // Try to infer the type of the expression for sizeof
         let ctype = self.infer_expr_type(operand, span)?;
-        let size = sizeof_ctype(&ctype, &self.target);
+        let size = sizeof_ctype_resolved(&ctype, &self.target, &self.tag_types_by_name);
         Ok(ConstValue::UnsignedInt(size as u128))
     }
 
@@ -1106,7 +1139,7 @@ impl<'a> ConstantEvaluator<'a> {
     /// using the target-dependent [`alignof_ctype`] function.
     fn evaluate_alignof(&mut self, type_name: &TypeName, span: Span) -> Result<ConstValue, ()> {
         let ctype = self.resolve_type_name(type_name, span)?;
-        let align = alignof_ctype(&ctype, &self.target);
+        let align = alignof_ctype_resolved(&ctype, &self.target, &self.tag_types_by_name);
         Ok(ConstValue::UnsignedInt(align as u128))
     }
 
@@ -1458,6 +1491,13 @@ impl<'a> ConstantEvaluator<'a> {
                 TypeSpecifier::Unsigned => has_unsigned = true,
                 TypeSpecifier::Bool => has_bool = true,
                 TypeSpecifier::Complex => has_complex = true,
+                TypeSpecifier::Int128 => {
+                    // __int128 type — resolve immediately based on signedness
+                    if has_unsigned {
+                        return Ok(CType::UInt128);
+                    }
+                    return Ok(CType::Int128);
+                }
 
                 // Struct/Union/Enum — look up the tag type from the
                 // registered tag map if available, otherwise fall back to
@@ -1503,10 +1543,12 @@ impl<'a> ConstantEvaluator<'a> {
                     });
                 }
 
-                // Typedef name — cannot resolve without full symbol table
-                TypeSpecifier::TypedefName(_sym) => {
-                    // Best effort: treat as int for sizeof purposes
-                    // The full sema will resolve this properly
+                // Typedef name — resolve from the registered typedef map.
+                TypeSpecifier::TypedefName(sym) => {
+                    if let Some(resolved) = self.typedef_types.get(sym) {
+                        return Ok(resolved.clone());
+                    }
+                    // Fallback: treat as int if the typedef wasn't registered.
                     return Ok(CType::Int);
                 }
 

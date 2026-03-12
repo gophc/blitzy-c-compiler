@@ -135,6 +135,10 @@ pub enum CType {
     LongLong,
     /// `unsigned long long`.
     ULongLong,
+    /// `__int128` / `signed __int128` — 128-bit integer.
+    Int128,
+    /// `unsigned __int128` — unsigned 128-bit integer.
+    UInt128,
 
     // ----- Floating-point types -----
     /// `float` — IEEE 754 single-precision (32-bit).
@@ -302,6 +306,9 @@ pub fn sizeof_ctype(ty: &CType, target: &Target) -> usize {
         // -- Long long — always 8 bytes
         CType::LongLong | CType::ULongLong => 8,
 
+        // -- __int128 — always 16 bytes
+        CType::Int128 | CType::UInt128 => 16,
+
         // -- Float — 4 bytes (IEEE 754 single)
         CType::Float => 4,
 
@@ -376,49 +383,79 @@ fn compute_struct_size(
         return if let Some(a) = aligned { a.max(1) } else { 0 };
     }
 
-    let mut offset: usize = 0;
+    // Bit-level offset tracking for proper bitfield packing.
+    // `bit_offset` tracks position in bits; for non-bitfield members we
+    // round up to a byte boundary first.
+    let mut bit_offset: usize = 0;
     let mut max_field_align: usize = 1;
 
     for field in fields {
-        // For bitfields, approximate: treat as the underlying type's size
-        // when bit_width is present. A full bitfield layout engine would
-        // track bit offsets, but for sizeof purposes this is sufficient.
-        let field_size = if let Some(bits) = field.bit_width {
-            // A zero-width bitfield forces alignment without consuming space.
+        if let Some(bits) = field.bit_width {
+            let bits = bits as usize;
+            let unit_size_bytes = sizeof_ctype(&field.ty, target);
+            let unit_size_bits = unit_size_bytes * 8;
+            let field_align = if packed { 1 } else { alignof_ctype(&field.ty, target) };
+
             if bits == 0 {
-                let fa = if packed {
-                    1
-                } else {
-                    alignof_ctype(&field.ty, target)
-                };
-                offset = align_up(offset, fa);
-                if fa > max_field_align {
-                    max_field_align = fa;
+                // Zero-width bitfield: pad to next alignment boundary of the
+                // underlying type, then close the current storage unit.
+                let align_bits = field_align * 8;
+                if align_bits > 0 {
+                    bit_offset = align_up(bit_offset, align_bits);
+                }
+                if field_align > max_field_align {
+                    max_field_align = field_align;
                 }
                 continue;
             }
-            // Non-zero bitfield: round up to whole bytes.
-            ((bits as usize) + 7) / 8
+
+            // Check if this bitfield fits in the current storage unit.
+            // The storage unit is aligned to field_align and is
+            // unit_size_bits wide. If the bitfield would cross the next
+            // unit boundary, start a new unit.
+            let unit_align_bits = if packed { 8 } else { field_align * 8 };
+            let unit_start = if unit_align_bits > 0 {
+                (bit_offset / unit_align_bits) * unit_align_bits
+            } else {
+                bit_offset
+            };
+            let bits_used_in_unit = bit_offset - unit_start;
+
+            if bits_used_in_unit + bits > unit_size_bits {
+                // Doesn't fit — advance to next storage unit boundary.
+                bit_offset = unit_start + unit_size_bits;
+                // Re-align for the new unit.
+                let byte_offset = (bit_offset + 7) / 8;
+                let aligned_byte = align_up(byte_offset, field_align);
+                bit_offset = aligned_byte * 8;
+            }
+
+            bit_offset += bits;
+
+            if field_align > max_field_align {
+                max_field_align = field_align;
+            }
         } else {
-            sizeof_ctype(&field.ty, target)
-        };
+            // Non-bitfield member: round up to byte boundary first.
+            let byte_offset = (bit_offset + 7) / 8;
 
-        let field_align = if packed {
-            1
-        } else {
-            alignof_ctype(&field.ty, target)
-        };
+            let field_size = sizeof_ctype(&field.ty, target);
+            let field_align = if packed { 1 } else { alignof_ctype(&field.ty, target) };
 
-        // Align the current offset to the field's alignment requirement.
-        offset = align_up(offset, field_align);
+            // Align the byte offset.
+            let aligned_byte = align_up(byte_offset, field_align);
 
-        // Advance past this field.
-        offset += field_size;
+            // Advance past this field.
+            bit_offset = (aligned_byte + field_size) * 8;
 
-        if field_align > max_field_align {
-            max_field_align = field_align;
+            if field_align > max_field_align {
+                max_field_align = field_align;
+            }
         }
     }
+
+    // Convert final bit offset to bytes (round up).
+    let byte_size = (bit_offset + 7) / 8;
 
     // Apply explicit alignment override.
     let struct_align = match aligned {
@@ -433,7 +470,7 @@ fn compute_struct_size(
     };
 
     // Pad the struct to a multiple of its alignment.
-    align_up(offset, struct_align)
+    align_up(byte_size, struct_align)
 }
 
 /// Compute the total size of a union (max field size, padded to alignment).
@@ -539,6 +576,9 @@ pub fn alignof_ctype(ty: &CType, target: &Target) -> usize {
             }
         }
 
+        // -- __int128 — always 16-byte aligned
+        CType::Int128 | CType::UInt128 => 16,
+
         // -- Float
         CType::Float => 4,
 
@@ -627,6 +667,281 @@ fn compute_struct_or_union_align(
 }
 
 // ===========================================================================
+// Tag-Aware sizeof / alignof (for ConstantEvaluator)
+// ===========================================================================
+
+/// Compute `sizeof` for a type, resolving named struct/union tag references
+/// with empty fields from the supplied `tag_types` map (keyed by tag name
+/// string).  This is necessary because the sema uses lightweight "tag
+/// references" (name + empty fields) to avoid deep-cloning large structs.
+/// When a `_Static_assert` or other constant expression needs the real
+/// size, the tag map supplies the complete definition.
+pub fn sizeof_ctype_resolved(
+    ty: &CType,
+    target: &Target,
+    tag_types: &std::collections::HashMap<String, CType>,
+) -> usize {
+    match ty {
+        CType::Struct {
+            name: Some(ref n),
+            fields,
+            ..
+        } if fields.is_empty() => {
+            // Lightweight tag reference — resolve from the tag map.
+            if let Some(resolved) = tag_types.get(n) {
+                return sizeof_ctype_resolved(resolved, target, tag_types);
+            }
+            0 // incomplete / unknown
+        }
+        CType::Union {
+            name: Some(ref n),
+            fields,
+            ..
+        } if fields.is_empty() => {
+            if let Some(resolved) = tag_types.get(n) {
+                return sizeof_ctype_resolved(resolved, target, tag_types);
+            }
+            0
+        }
+        CType::Struct {
+            fields,
+            packed,
+            aligned,
+            ..
+        } => compute_struct_size_resolved(fields, *packed, *aligned, target, tag_types),
+        CType::Union {
+            fields,
+            packed,
+            aligned,
+            ..
+        } => compute_union_size_resolved(fields, *packed, *aligned, target, tag_types),
+        CType::Array(elem, count) => match count {
+            Some(n) => sizeof_ctype_resolved(elem, target, tag_types) * n,
+            None => 0,
+        },
+        CType::Complex(base) => 2 * sizeof_ctype_resolved(base, target, tag_types),
+        CType::Atomic(inner) => sizeof_ctype_resolved(inner, target, tag_types),
+        CType::Typedef { underlying, .. } => {
+            sizeof_ctype_resolved(underlying, target, tag_types)
+        }
+        CType::Qualified(inner, _) => sizeof_ctype_resolved(inner, target, tag_types),
+        CType::Enum {
+            underlying_type, ..
+        } => sizeof_ctype_resolved(underlying_type, target, tag_types),
+        other => sizeof_ctype(other, target),
+    }
+}
+
+/// Like [`alignof_ctype`] but resolves lightweight tag references.
+pub fn alignof_ctype_resolved(
+    ty: &CType,
+    target: &Target,
+    tag_types: &std::collections::HashMap<String, CType>,
+) -> usize {
+    match ty {
+        CType::Struct {
+            name: Some(ref n),
+            fields,
+            ..
+        } if fields.is_empty() => {
+            if let Some(resolved) = tag_types.get(n) {
+                return alignof_ctype_resolved(resolved, target, tag_types);
+            }
+            1
+        }
+        CType::Union {
+            name: Some(ref n),
+            fields,
+            ..
+        } if fields.is_empty() => {
+            if let Some(resolved) = tag_types.get(n) {
+                return alignof_ctype_resolved(resolved, target, tag_types);
+            }
+            1
+        }
+        CType::Struct {
+            fields,
+            packed,
+            aligned,
+            ..
+        } => compute_struct_or_union_align_resolved(fields, *packed, *aligned, target, tag_types),
+        CType::Union {
+            fields,
+            packed,
+            aligned,
+            ..
+        } => compute_struct_or_union_align_resolved(fields, *packed, *aligned, target, tag_types),
+        CType::Array(elem, _) => alignof_ctype_resolved(elem, target, tag_types),
+        CType::Complex(base) => alignof_ctype_resolved(base, target, tag_types),
+        CType::Atomic(inner) => alignof_ctype_resolved(inner, target, tag_types),
+        CType::Typedef { underlying, .. } => {
+            alignof_ctype_resolved(underlying, target, tag_types)
+        }
+        CType::Qualified(inner, _) => alignof_ctype_resolved(inner, target, tag_types),
+        CType::Enum {
+            underlying_type, ..
+        } => alignof_ctype_resolved(underlying_type, target, tag_types),
+        other => alignof_ctype(other, target),
+    }
+}
+
+/// Struct size computation with tag-aware field resolution.
+fn compute_struct_size_resolved(
+    fields: &[StructField],
+    packed: bool,
+    aligned: Option<usize>,
+    target: &Target,
+    tag_types: &std::collections::HashMap<String, CType>,
+) -> usize {
+    if fields.is_empty() {
+        return if let Some(a) = aligned { a.max(1) } else { 0 };
+    }
+
+    let mut bit_offset: usize = 0;
+    let mut max_field_align: usize = 1;
+
+    for field in fields {
+        if let Some(bits) = field.bit_width {
+            let bits = bits as usize;
+            let unit_size_bytes = sizeof_ctype_resolved(&field.ty, target, tag_types);
+            let unit_size_bits = unit_size_bytes * 8;
+            let field_align = if packed {
+                1
+            } else {
+                alignof_ctype_resolved(&field.ty, target, tag_types)
+            };
+
+            if bits == 0 {
+                let align_bits = field_align * 8;
+                if align_bits > 0 {
+                    bit_offset = align_up(bit_offset, align_bits);
+                }
+                if field_align > max_field_align {
+                    max_field_align = field_align;
+                }
+                continue;
+            }
+
+            let unit_align_bits = if packed { 8 } else { field_align * 8 };
+            let unit_start = if unit_align_bits > 0 {
+                (bit_offset / unit_align_bits) * unit_align_bits
+            } else {
+                bit_offset
+            };
+            let bits_used_in_unit = bit_offset - unit_start;
+
+            if bits_used_in_unit + bits > unit_size_bits {
+                bit_offset = unit_start + unit_size_bits;
+                let byte_offset = (bit_offset + 7) / 8;
+                let aligned_byte = align_up(byte_offset, field_align);
+                bit_offset = aligned_byte * 8;
+            }
+
+            bit_offset += bits;
+
+            if field_align > max_field_align {
+                max_field_align = field_align;
+            }
+        } else {
+            let byte_offset = (bit_offset + 7) / 8;
+            let field_size = sizeof_ctype_resolved(&field.ty, target, tag_types);
+            let field_align = if packed {
+                1
+            } else {
+                alignof_ctype_resolved(&field.ty, target, tag_types)
+            };
+            let aligned_byte = align_up(byte_offset, field_align);
+            bit_offset = (aligned_byte + field_size) * 8;
+            if field_align > max_field_align {
+                max_field_align = field_align;
+            }
+        }
+    }
+
+    let byte_size = (bit_offset + 7) / 8;
+    let struct_align = match aligned {
+        Some(a) => a.max(max_field_align),
+        None => {
+            if packed {
+                1
+            } else {
+                max_field_align
+            }
+        }
+    };
+    align_up(byte_size, struct_align)
+}
+
+/// Union size computation with tag-aware field resolution.
+fn compute_union_size_resolved(
+    fields: &[StructField],
+    packed: bool,
+    aligned: Option<usize>,
+    target: &Target,
+    tag_types: &std::collections::HashMap<String, CType>,
+) -> usize {
+    if fields.is_empty() {
+        return if let Some(a) = aligned { a.max(1) } else { 0 };
+    }
+
+    let mut max_size: usize = 0;
+    let mut max_align: usize = 1;
+
+    for field in fields {
+        let field_size = sizeof_ctype_resolved(&field.ty, target, tag_types);
+        let field_align = if packed {
+            1
+        } else {
+            alignof_ctype_resolved(&field.ty, target, tag_types)
+        };
+        if field_size > max_size {
+            max_size = field_size;
+        }
+        if field_align > max_align {
+            max_align = field_align;
+        }
+    }
+
+    let union_align = match aligned {
+        Some(a) => a.max(max_align),
+        None => {
+            if packed {
+                1
+            } else {
+                max_align
+            }
+        }
+    };
+    align_up(max_size, union_align)
+}
+
+/// Alignment computation with tag-aware resolution.
+fn compute_struct_or_union_align_resolved(
+    fields: &[StructField],
+    packed: bool,
+    aligned: Option<usize>,
+    target: &Target,
+    tag_types: &std::collections::HashMap<String, CType>,
+) -> usize {
+    let natural = if packed {
+        1
+    } else {
+        let mut max_align: usize = 1;
+        for field in fields {
+            let a = alignof_ctype_resolved(&field.ty, target, tag_types);
+            if a > max_align {
+                max_align = a;
+            }
+        }
+        max_align
+    };
+    match aligned {
+        Some(a) => a.max(natural),
+        None => natural,
+    }
+}
+
+// ===========================================================================
 // Type Predicate Functions
 // ===========================================================================
 
@@ -652,6 +967,8 @@ pub fn is_integer(ty: &CType) -> bool {
             | CType::ULong
             | CType::LongLong
             | CType::ULongLong
+            | CType::Int128
+            | CType::UInt128
             | CType::Enum { .. }
     )
 }
@@ -660,7 +977,13 @@ pub fn is_integer(ty: &CType) -> bool {
 pub fn is_unsigned(ty: &CType) -> bool {
     matches!(
         resolve_and_strip(ty),
-        CType::Bool | CType::UChar | CType::UShort | CType::UInt | CType::ULong | CType::ULongLong
+        CType::Bool
+            | CType::UChar
+            | CType::UShort
+            | CType::UInt
+            | CType::ULong
+            | CType::ULongLong
+            | CType::UInt128
     )
 }
 
@@ -669,7 +992,13 @@ pub fn is_unsigned(ty: &CType) -> bool {
 pub fn is_signed(ty: &CType) -> bool {
     matches!(
         resolve_and_strip(ty),
-        CType::Char | CType::SChar | CType::Short | CType::Int | CType::Long | CType::LongLong
+        CType::Char
+            | CType::SChar
+            | CType::Short
+            | CType::Int
+            | CType::Long
+            | CType::LongLong
+            | CType::Int128
     )
 }
 
@@ -779,6 +1108,8 @@ fn is_compatible_inner(a: &CType, b: &CType) -> bool {
         (CType::ULong, CType::ULong) => true,
         (CType::LongLong, CType::LongLong) => true,
         (CType::ULongLong, CType::ULongLong) => true,
+        (CType::Int128, CType::Int128) => true,
+        (CType::UInt128, CType::UInt128) => true,
         (CType::Float, CType::Float) => true,
         (CType::Double, CType::Double) => true,
         (CType::LongDouble, CType::LongDouble) => true,
@@ -870,7 +1201,7 @@ fn is_compatible_inner(a: &CType, b: &CType) -> bool {
 
 /// Recursively strip `Qualified`, `Typedef`, and `Atomic` wrappers to
 /// reach the underlying undecorated type. Used by predicate functions.
-fn resolve_and_strip(ty: &CType) -> &CType {
+pub fn resolve_and_strip(ty: &CType) -> &CType {
     match ty {
         CType::Qualified(inner, _) => resolve_and_strip(inner),
         CType::Typedef { underlying, .. } => resolve_and_strip(underlying),
@@ -955,6 +1286,7 @@ pub fn integer_rank(ty: &CType) -> u8 {
         CType::Int | CType::UInt => 4,
         CType::Long | CType::ULong => 5,
         CType::LongLong | CType::ULongLong => 6,
+        CType::Int128 | CType::UInt128 => 7,
         // Enum rank equals the rank of its underlying integer type.
         CType::Enum {
             underlying_type, ..

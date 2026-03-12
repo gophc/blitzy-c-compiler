@@ -1465,6 +1465,7 @@ fn parse_direct_abstract_declarator_opt(
         };
         parser.expect(TokenKind::RightBracket)?;
         return Ok(Some(DirectAbstractDeclarator::Array {
+            base: None,
             size,
             qualifiers: Vec::new(),
             is_static: false,

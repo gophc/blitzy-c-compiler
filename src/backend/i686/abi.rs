@@ -401,6 +401,9 @@ impl I686Abi {
             // Long long — 8 bytes, returned in EDX:EAX pair.
             CType::LongLong | CType::ULongLong => ReturnLocation::InEDXEAX,
 
+            // __int128 — 16 bytes, returned via struct return on i686.
+            CType::Int128 | CType::UInt128 => ReturnLocation::StructReturn,
+
             // Float — returned in ST(0).
             CType::Float => ReturnLocation::InST0,
 

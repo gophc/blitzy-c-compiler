@@ -141,6 +141,13 @@ pub struct Parser<'src> {
     /// identifiers to correctly parse declarations vs. expressions. This set
     /// tracks all names introduced by `typedef` declarations.
     pub(crate) typedef_names: crate::common::fx_hash::FxHashSet<u32>,
+
+    /// Stack of typedef names that have been shadowed by non-typedef
+    /// declarations in inner scopes.  Each entry corresponds to one
+    /// compound-statement scope that called [`push_typedef_scope`].
+    /// When the scope exits via [`pop_typedef_scope`], the shadowed
+    /// names are re-registered as typedef names.
+    typedef_shadow_stack: Vec<Vec<u32>>,
 }
 
 // ===========================================================================
@@ -176,6 +183,7 @@ impl<'src> Parser<'src> {
             max_recursion_depth: MAX_RECURSION_DEPTH,
             panic_mode: false,
             typedef_names: crate::common::fx_hash::FxHashSet::default(),
+            typedef_shadow_stack: Vec::new(),
         };
 
         // Pre-register GCC builtin type names as typedefs so the parser
@@ -515,6 +523,44 @@ impl<'src> Parser<'src> {
         self.typedef_names.insert(sym.as_u32());
     }
 
+    /// Remove a symbol from the typedef name set (shadow it).
+    ///
+    /// When a non-typedef declaration in a block scope uses a name that
+    /// was previously registered as a typedef, the C standard requires
+    /// that the name be treated as a regular identifier for the remainder
+    /// of the enclosing scope.  This method removes the name from the
+    /// active typedef set and records it in the current scope's shadow
+    /// list so it can be restored when the scope exits.
+    pub fn shadow_typedef(&mut self, sym: Symbol) {
+        let id = sym.as_u32();
+        if self.typedef_names.remove(&id) {
+            // Record the shadowed name so it can be restored on scope exit.
+            if let Some(scope) = self.typedef_shadow_stack.last_mut() {
+                scope.push(id);
+            }
+        }
+    }
+
+    /// Push a new typedef shadow scope.
+    ///
+    /// Called when entering a compound statement (block) to establish a
+    /// restoration point for typedef names that may be shadowed within.
+    pub fn push_typedef_scope(&mut self) {
+        self.typedef_shadow_stack.push(Vec::new());
+    }
+
+    /// Pop the current typedef shadow scope, restoring any names that
+    /// were shadowed within it.
+    ///
+    /// Called when leaving a compound statement (block).
+    pub fn pop_typedef_scope(&mut self) {
+        if let Some(shadowed) = self.typedef_shadow_stack.pop() {
+            for id in shadowed {
+                self.typedef_names.insert(id);
+            }
+        }
+    }
+
     /// Skip an optional GCC `__asm__("symbol_name")` label on a declaration.
     ///
     /// This construct appears after a declarator to specify the assembly-level
@@ -841,6 +887,7 @@ impl<'src> Parser<'src> {
         init_declarators.push(InitDeclarator {
             declarator: first_declarator,
             initializer: first_init,
+            asm_register: None,
             span: first_span,
         });
 
@@ -865,6 +912,7 @@ impl<'src> Parser<'src> {
             init_declarators.push(InitDeclarator {
                 declarator: decl,
                 initializer: init,
+                asm_register: None,
                 span: decl_span,
             });
         }

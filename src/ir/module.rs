@@ -717,6 +717,12 @@ pub struct IrModule {
     /// lowering so the backend can emit RIP-relative (x86-64) or
     /// ADRP/LDR (AArch64) or LUI/LD (RISC-V) global accesses.
     pub global_var_refs: FxHashMap<Value, String>,
+
+    /// Maps function name to its C-level return type.  Populated during
+    /// IR lowering of function declarations and definitions so that
+    /// `lower_function_call` can recover the correct C return type even
+    /// when the callee IR value is typed as an opaque `Pointer(Void)`.
+    pub func_c_return_types: FxHashMap<String, crate::common::types::CType>,
 }
 
 // ===========================================================================
@@ -756,6 +762,7 @@ impl IrModule {
             string_map: FxHashMap::default(),
             func_ref_map: FxHashMap::default(),
             global_var_refs: FxHashMap::default(),
+            func_c_return_types: FxHashMap::default(),
         }
     }
 }

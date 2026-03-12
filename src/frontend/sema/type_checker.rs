@@ -93,7 +93,7 @@ impl<'a> TypeChecker<'a> {
 
     /// Strips typedefs and qualifiers from a type to get the underlying base type.
     fn strip_type(ty: &CType) -> CType {
-        types::unqualified(types::resolve_typedef(ty)).clone()
+        types::resolve_and_strip(ty).clone()
     }
 
     /// Performs lvalue-to-rvalue conversion, array-to-pointer decay,
@@ -478,7 +478,8 @@ impl<'a> TypeChecker<'a> {
             // ── sizeof(expr), sizeof(type), _Alignof(type) ─────────
             Expression::SizeofExpr { .. }
             | Expression::SizeofType { .. }
-            | Expression::AlignofType { .. } => Ok(self.size_t_type()),
+            | Expression::AlignofType { .. }
+            | Expression::AlignofExpr { .. } => Ok(self.size_t_type()),
 
             // ── Cast expression: (type)expr (needs TypeName resolution) ──
             Expression::Cast { operand, .. } => {
@@ -644,6 +645,7 @@ impl<'a> TypeChecker<'a> {
             }
             BuiltinKind::PrefetchData => Ok(CType::Void),
             BuiltinKind::ObjectSize => Ok(self.size_t_type()),
+            BuiltinKind::ExtractReturnAddr => Ok(CType::Pointer(Box::new(CType::Void), EMPTY_QUALS)),
         }
     }
 

@@ -137,6 +137,7 @@ struct SpecifierFlags {
     has_unsigned: bool,
     has_bool: bool,
     has_complex: bool,
+    has_int128: bool,
     has_struct_union_enum: bool,
     has_typedef_name: bool,
     has_atomic: bool,
@@ -157,6 +158,7 @@ impl SpecifierFlags {
             has_unsigned: false,
             has_bool: false,
             has_complex: false,
+            has_int128: false,
             has_struct_union_enum: false,
             has_typedef_name: false,
             has_atomic: false,
@@ -178,6 +180,7 @@ impl SpecifierFlags {
             || self.has_unsigned
             || self.has_bool
             || self.has_complex
+            || self.has_int128
             || self.has_struct_union_enum
             || self.has_typedef_name
             || self.has_atomic
@@ -319,6 +322,16 @@ pub fn parse_type_specifiers(parser: &mut Parser<'_>) -> Result<TypeSpecifierLis
                 flags.has_complex = true;
                 parser.advance();
                 specifiers.push(TypeSpecifier::Complex);
+            }
+            // __int128 — GCC 128-bit integer extension
+            TokenKind::Int128Keyword => {
+                if flags.has_int128 {
+                    let span = parser.current_span();
+                    parser.error(span, "duplicate __int128 specifier");
+                }
+                flags.has_int128 = true;
+                parser.advance();
+                specifiers.push(TypeSpecifier::Int128);
             }
             // Struct/Union — elaborated type specifier
             TokenKind::Struct | TokenKind::Union => {
@@ -609,6 +622,17 @@ pub fn parse_specifier_qualifier_list(
                 type_specifiers.push(TypeSpecifier::Complex);
             }
 
+            // __int128 — GCC 128-bit integer extension
+            TokenKind::Int128Keyword => {
+                if flags.has_int128 {
+                    let span = parser.current_span();
+                    parser.error(span, "duplicate __int128 specifier");
+                }
+                flags.has_int128 = true;
+                parser.advance();
+                type_specifiers.push(TypeSpecifier::Int128);
+            }
+
             // ----- Type qualifiers -----
             TokenKind::Const => {
                 parser.advance();
@@ -739,7 +763,8 @@ pub fn is_type_specifier_start(token: &TokenKind, parser: &Parser<'_>) -> bool {
         | TokenKind::Signed
         | TokenKind::Unsigned
         | TokenKind::Bool
-        | TokenKind::Complex => true,
+        | TokenKind::Complex
+        | TokenKind::Int128Keyword => true,
 
         // Aggregate type keywords
         TokenKind::Struct | TokenKind::Union | TokenKind::Enum => true,
@@ -1027,6 +1052,7 @@ fn parse_direct_abstract_declarator_opt(
         };
         parser.expect(TokenKind::RightBracket)?;
         return Ok(Some(DirectAbstractDeclarator::Array {
+            base: None,
             size,
             qualifiers: Vec::new(),
             is_static: false,

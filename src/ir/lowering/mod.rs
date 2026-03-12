@@ -914,6 +914,14 @@ pub fn lower_translation_unit(
                         &name_table,
                         &mut map,
                     );
+                    // Also collect block-scope enum constants from
+                    // inside the function body (e.g., kernel patterns
+                    // like `enum { MIX_INFLIGHT = 1U << 31 };`).
+                    collect_enum_constants_from_compound(
+                        &func_def.body,
+                        &name_table,
+                        &mut map,
+                    );
                 }
                 _ => {}
             }
@@ -1131,25 +1139,112 @@ fn collect_enum_constants_from_specifiers(
     out: &mut FxHashMap<String, i128>,
 ) {
     for spec in specs {
-        if let ast::TypeSpecifier::Enum(enum_spec) = spec {
-            if let Some(ref enumerators) = enum_spec.enumerators {
-                let mut next_val: i128 = 0;
-                for enumerator in enumerators {
-                    // Try to evaluate the explicit value expression.
-                    if let Some(ref val_expr) = enumerator.value {
-                        if let Some(v) = try_eval_const_int_expr(val_expr) {
-                            next_val = v;
+        match spec {
+            ast::TypeSpecifier::Enum(enum_spec) => {
+                if let Some(ref enumerators) = enum_spec.enumerators {
+                    let mut next_val: i128 = 0;
+                    for enumerator in enumerators {
+                        // Try to evaluate the explicit value expression.
+                        if let Some(ref val_expr) = enumerator.value {
+                            if let Some(v) = try_eval_const_int_expr(val_expr) {
+                                next_val = v;
+                            }
                         }
+                        // Resolve the enumerator name from the symbol.
+                        let idx = enumerator.name.as_u32() as usize;
+                        if idx < name_table.len() {
+                            out.insert(name_table[idx].clone(), next_val);
+                        }
+                        next_val += 1;
                     }
-                    // Resolve the enumerator name from the symbol.
-                    let idx = enumerator.name.as_u32() as usize;
-                    if idx < name_table.len() {
-                        out.insert(name_table[idx].clone(), next_val);
-                    }
-                    next_val += 1;
                 }
             }
+            // Recurse into struct/union member declarations to find
+            // anonymous enums used as member types.  In C, enum
+            // constants declared inside a struct member definition
+            // are visible at the enclosing scope (e.g., `struct S {
+            // enum { A, B } kind; };` makes `A` and `B` file-scope).
+            ast::TypeSpecifier::Struct(su_spec) | ast::TypeSpecifier::Union(su_spec) => {
+                if let Some(ref members) = su_spec.members {
+                    for member in members {
+                        collect_enum_constants_from_specifiers(
+                            &member.specifiers.type_specifiers,
+                            name_table,
+                            out,
+                        );
+                    }
+                }
+            }
+            _ => {}
         }
+    }
+}
+
+/// Recursively collect enum constants from block-scope declarations
+/// inside a compound statement (function body). The Linux kernel defines
+/// anonymous enums inside function bodies (e.g., `enum { MIX_INFLIGHT = 1U << 31 };`)
+/// and these must be resolvable during expression lowering.
+fn collect_enum_constants_from_compound(
+    compound: &ast::CompoundStatement,
+    name_table: &[String],
+    out: &mut FxHashMap<String, i128>,
+) {
+    for item in &compound.items {
+        match item {
+            ast::BlockItem::Declaration(decl) => {
+                collect_enum_constants_from_specifiers(
+                    &decl.specifiers.type_specifiers,
+                    name_table,
+                    out,
+                );
+            }
+            ast::BlockItem::Statement(stmt) => {
+                collect_enum_constants_from_statement(stmt, name_table, out);
+            }
+        }
+    }
+}
+
+/// Recursively collect enum constants from statements (handles nested
+/// compound statements, if/else, loops, switch, labeled statements, etc.)
+fn collect_enum_constants_from_statement(
+    stmt: &ast::Statement,
+    name_table: &[String],
+    out: &mut FxHashMap<String, i128>,
+) {
+    match stmt {
+        ast::Statement::Compound(compound) => {
+            collect_enum_constants_from_compound(compound, name_table, out);
+        }
+        ast::Statement::If { then_branch, else_branch, .. } => {
+            collect_enum_constants_from_statement(then_branch, name_table, out);
+            if let Some(eb) = else_branch {
+                collect_enum_constants_from_statement(eb, name_table, out);
+            }
+        }
+        ast::Statement::While { body, .. }
+        | ast::Statement::DoWhile { body, .. } => {
+            collect_enum_constants_from_statement(body, name_table, out);
+        }
+        ast::Statement::For { init, body, .. } => {
+            if let Some(ast::ForInit::Declaration(decl)) = init {
+                collect_enum_constants_from_specifiers(
+                    &decl.specifiers.type_specifiers,
+                    name_table,
+                    out,
+                );
+            }
+            collect_enum_constants_from_statement(body, name_table, out);
+        }
+        ast::Statement::Switch { body, .. } => {
+            collect_enum_constants_from_statement(body, name_table, out);
+        }
+        ast::Statement::Labeled { statement, .. }
+        | ast::Statement::Case { statement, .. }
+        | ast::Statement::Default { statement, .. } => {
+            collect_enum_constants_from_statement(statement, name_table, out);
+        }
+        _ => {}
     }
 }
 
