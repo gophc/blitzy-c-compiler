@@ -141,6 +141,8 @@ pub struct StmtLoweringContext<'a> {
     pub static_locals: &'a mut FxHashMap<String, String>,
     /// Struct/union tag → full CType definition registry.
     pub struct_defs: &'a FxHashMap<String, CType>,
+    /// Name of the function currently being lowered (for `__func__`).
+    pub current_function_name: Option<&'a str>,
 }
 
 // ===========================================================================
@@ -435,7 +437,7 @@ fn string_literal_length(expr: &ast::Expression) -> Option<usize> {
 /// This function creates allocas on demand for any declarator that is not
 /// already present in `ctx.local_vars`, so that subsequent initializer
 /// lowering and identifier lookups can find every variable.
-fn ensure_allocas_for_declaration(ctx: &mut StmtLoweringContext<'_>, decl: &ast::Declaration) {
+pub fn ensure_allocas_for_declaration(ctx: &mut StmtLoweringContext<'_>, decl: &ast::Declaration) {
     // Skip typedef declarations — they don't produce any runtime code.
     if matches!(
         decl.specifiers.storage_class,
@@ -679,6 +681,7 @@ pub fn lower_declaration_initializers(ctx: &mut StmtLoweringContext<'_>, decl: &
             static_locals: ctx.static_locals,
             struct_defs: ctx.struct_defs,
             label_blocks: ctx.label_blocks,
+            current_function_name: ctx.current_function_name,
         };
         decl_lowering::lower_local_initializer(alloca_val, initializer, &var_type, &mut expr_ctx);
     }
@@ -1816,6 +1819,7 @@ fn lower_expr_via_context(ctx: &mut StmtLoweringContext<'_>, expr: &ast::Express
         static_locals: ctx.static_locals,
         struct_defs: ctx.struct_defs,
         label_blocks: ctx.label_blocks,
+            current_function_name: ctx.current_function_name,
     };
     lower_expression(&mut expr_ctx, expr)
 }
@@ -1841,6 +1845,7 @@ fn lower_lvalue_via_context(ctx: &mut StmtLoweringContext<'_>, expr: &ast::Expre
         static_locals: ctx.static_locals,
         struct_defs: ctx.struct_defs,
         label_blocks: ctx.label_blocks,
+            current_function_name: ctx.current_function_name,
     };
     lower_lvalue(&mut expr_ctx, expr)
 }

@@ -303,6 +303,9 @@ pub struct DiagnosticEngine {
     error_count: usize,
     /// Number of diagnostics with [`Severity::Warning`].
     warning_count: usize,
+    /// When nonzero, diagnostics are silently discarded.
+    /// Incremented by [`begin_suppress`], decremented by [`end_suppress`].
+    suppress_depth: usize,
 }
 
 impl DiagnosticEngine {
@@ -314,7 +317,23 @@ impl DiagnosticEngine {
             diagnostics: Vec::new(),
             error_count: 0,
             warning_count: 0,
+            suppress_depth: 0,
         }
+    }
+
+    // -- Suppression ------------------------------------------------------
+
+    /// Begin suppressing diagnostics.  While suppressed, [`emit`] silently
+    /// drops all diagnostics without recording them or incrementing counters.
+    /// Supports nesting: call [`end_suppress`] exactly once per
+    /// `begin_suppress`.
+    pub fn begin_suppress(&mut self) {
+        self.suppress_depth += 1;
+    }
+
+    /// End one level of diagnostic suppression.
+    pub fn end_suppress(&mut self) {
+        self.suppress_depth = self.suppress_depth.saturating_sub(1);
     }
 
     // -- Emission ---------------------------------------------------------
@@ -322,7 +341,12 @@ impl DiagnosticEngine {
     /// Emit a diagnostic into the engine.
     ///
     /// The appropriate severity counter is incremented automatically.
+    /// If suppression is active (via [`begin_suppress`]), the diagnostic
+    /// is silently discarded.
     pub fn emit(&mut self, diag: Diagnostic) {
+        if self.suppress_depth > 0 {
+            return;
+        }
         match diag.severity {
             Severity::Error => self.error_count += 1,
             Severity::Warning => self.warning_count += 1,

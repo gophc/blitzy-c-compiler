@@ -100,6 +100,9 @@ pub struct ExprLoweringContext<'a> {
     /// When non-empty, `lower_address_of_label` can resolve label names to
     /// block IDs and produce meaningful pointer-sized integer values.
     pub label_blocks: &'a FxHashMap<String, crate::ir::instructions::BlockId>,
+    /// Name of the function currently being lowered.
+    /// Used for C99 `__func__` / GCC `__FUNCTION__` / `__PRETTY_FUNCTION__`.
+    pub current_function_name: Option<&'a str>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1193,6 +1196,44 @@ fn lower_identifier(ctx: &mut ExprLoweringContext<'_>, sym_idx: u32, span: Span)
             emit_inst(ctx, li);
             return TypedValue::new(loaded, var_cty);
         }
+    }
+
+    // C99 §6.4.2.2: __func__ is an implicit static const char[] in each
+    // function, expanding to the function name. GCC also supports
+    // __FUNCTION__ and __PRETTY_FUNCTION__ as synonyms.
+    if name == "__func__" || name == "__FUNCTION__" || name == "__PRETTY_FUNCTION__" {
+        let func_name = ctx.current_function_name.unwrap_or("(unknown)");
+        let mut bytes: Vec<u8> = func_name.as_bytes().to_vec();
+        bytes.push(0); // NUL terminator
+        let str_id = ctx.module.intern_string(bytes.clone());
+        let str_global_name = format!(".str.{}", str_id);
+        if ctx.module.get_global(&str_global_name).is_none() {
+            let str_arr_ty = IrType::Array(Box::new(IrType::I8), bytes.len());
+            let gv = crate::ir::module::GlobalVariable::new(
+                str_global_name.clone(),
+                str_arr_ty,
+                Some(crate::ir::module::Constant::String(bytes)),
+            );
+            ctx.module.add_global(gv);
+        }
+        let result = ctx.builder.fresh_value();
+        ctx.module
+            .global_var_refs
+            .insert(result, str_global_name.clone());
+        {
+            let current_func = &mut *ctx.function;
+            current_func.global_var_refs.insert(result, str_global_name);
+        }
+        return TypedValue::new(
+            result,
+            CType::Pointer(
+                Box::new(CType::Char),
+                crate::common::types::TypeQualifiers {
+                    is_const: true,
+                    ..Default::default()
+                },
+            ),
+        );
     }
 
     ctx.diagnostics
@@ -2706,6 +2747,7 @@ fn lower_statement_expression(
         enum_constants: ctx.enum_constants,
         static_locals: ctx.static_locals,
         struct_defs: ctx.struct_defs,
+        current_function_name: ctx.current_function_name,
     };
 
     // Second pass: lower each block item. Track the value of the last
@@ -2714,6 +2756,11 @@ fn lower_statement_expression(
     for item in &compound.items {
         match item {
             ast::BlockItem::Declaration(decl) => {
+                // Ensure allocas (or static local globals) exist for all
+                // declarators in this declaration. This handles static
+                // variables declared inside statement expressions (e.g.
+                // `DO_ONCE`, `WARN_ONCE` kernel macros).
+                super::stmt_lowering::ensure_allocas_for_declaration(&mut stmt_ctx, decl);
                 super::stmt_lowering::lower_declaration_initializers(&mut stmt_ctx, decl);
                 last_val = Value::UNDEF;
             }
@@ -2736,6 +2783,7 @@ fn lower_statement_expression(
                         static_locals: stmt_ctx.static_locals,
                         struct_defs: stmt_ctx.struct_defs,
                         label_blocks: stmt_ctx.label_blocks,
+                        current_function_name: stmt_ctx.current_function_name,
                     };
                     let tv = lower_expr_inner(&mut inner_expr_ctx, expr);
                     last_val = tv.value;

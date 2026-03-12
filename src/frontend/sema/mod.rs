@@ -2827,7 +2827,20 @@ impl<'a> SemanticAnalyzer<'a> {
             self.symbols.mark_used(name);
             Ok(ty)
         } else {
+            // C99 §6.4.2.2: __func__ is a predefined identifier equivalent to
+            // static const char __func__[] = "function-name";
+            // GCC also provides __FUNCTION__ and __PRETTY_FUNCTION__ as aliases.
             let name_str = self.interner.resolve(name);
+            if name_str == "__func__"
+                || name_str == "__FUNCTION__"
+                || name_str == "__PRETTY_FUNCTION__"
+            {
+                // Type is const char[] which decays to const char* in expressions.
+                return Ok(CType::Pointer(
+                    Box::new(CType::Char),
+                    crate::common::types::TypeQualifiers::default(),
+                ));
+            }
             self.diagnostics
                 .emit_error(span, format!("use of undeclared identifier '{}'", name_str));
             Err(())

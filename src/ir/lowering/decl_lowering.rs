@@ -408,6 +408,7 @@ pub fn lower_function_definition(
             enum_constants,
             static_locals: &mut static_locals,
             struct_defs,
+            current_function_name: Some(&func_name),
         };
         stmt_lowering::lower_statement(&mut stmt_ctx, &body_stmt);
     }

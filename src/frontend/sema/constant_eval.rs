@@ -1287,12 +1287,19 @@ impl<'a> ConstantEvaluator<'a> {
             }
             BuiltinKind::ChooseExpr => {
                 // __builtin_choose_expr(const_expr, expr1, expr2)
+                // GCC semantics: the first argument must be an integer
+                // constant expression.  If evaluation fails (e.g.,
+                // because `__is_constexpr(x)` contains a non-constant
+                // sub-expression), treat the condition as 0 (false) and
+                // select the third argument.  This matches GCC behaviour
+                // for kernel patterns like:
+                //   __builtin_choose_expr(__is_constexpr(val), ..., 1)
                 if args.len() >= 3 {
-                    let cond = self.evaluate_constant_expr(&args[0])?;
-                    let is_nonzero = match cond {
-                        ConstValue::SignedInt(v) => v != 0,
-                        ConstValue::UnsignedInt(v) => v != 0,
-                        _ => false,
+                    let cond_result = self.evaluate_constant_expr(&args[0]);
+                    let is_nonzero = match cond_result {
+                        Ok(ConstValue::SignedInt(v)) => v != 0,
+                        Ok(ConstValue::UnsignedInt(v)) => v != 0,
+                        _ => false, // evaluation failed or non-integer → treat as 0
                     };
                     if is_nonzero {
                         self.evaluate_constant_expr(&args[1])
@@ -1509,13 +1516,14 @@ impl<'a> ConstantEvaluator<'a> {
                     return Ok(CType::Atomic(Box::new(inner)));
                 }
 
-                // typeof — cannot evaluate without expression type inference
-                TypeSpecifier::Typeof(_) => {
-                    self.diagnostics.emit_error(
-                        span,
-                        "typeof in constant expression context is not supported",
-                    );
-                    return Err(());
+                // typeof(expr) / typeof(type) — resolve the argument type
+                TypeSpecifier::Typeof(typeof_arg) => {
+                    use crate::frontend::parser::ast::TypeofArg;
+                    let resolved = match typeof_arg {
+                        TypeofArg::TypeName(tn) => self.resolve_type_name(tn, span)?,
+                        TypeofArg::Expression(expr) => self.infer_expr_type(expr, span)?,
+                    };
+                    return Ok(resolved);
                 }
             }
         }
@@ -1744,11 +1752,99 @@ impl<'a> ConstantEvaluator<'a> {
                     Ok(CType::Int)
                 }
             }
-            Expression::Binary { left, right, .. } => {
-                // Binary ops: infer type from left operand
-                let lt = self.infer_expr_type(left, span)?;
-                let _rt = self.infer_expr_type(right, span)?;
-                Ok(lt)
+            Expression::Binary { op, left, right, .. } => {
+                use crate::frontend::parser::ast::BinaryOp;
+                // Comparison operators always produce int (0 or 1)
+                match op {
+                    BinaryOp::Equal
+                    | BinaryOp::NotEqual
+                    | BinaryOp::Less
+                    | BinaryOp::LessEqual
+                    | BinaryOp::Greater
+                    | BinaryOp::GreaterEqual
+                    | BinaryOp::LogicalAnd
+                    | BinaryOp::LogicalOr => Ok(CType::Int),
+                    _ => {
+                        // Binary ops: infer type from left operand
+                        let lt = self.infer_expr_type(left, span)?;
+                        let _rt = self.infer_expr_type(right, span)?;
+                        Ok(lt)
+                    }
+                }
+            }
+            Expression::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+                ..
+            } => {
+                // C11 §6.5.15: ternary type rules for pointer operands.
+                // When one arm is `void *` and the other is `T *`:
+                //   - If the `void *` is a null pointer constant → result is `T *`
+                //   - Otherwise → result is `void *`
+                // This distinction is critical for `__is_constexpr()`:
+                //   sizeof(*(8 ? (void *)((long)(x)*0l) : (int *)8))
+                //   → If x is constant: (void*)0 IS null → type int* → sizeof=4
+                //   → If x is runtime: (void*)expr NOT null const → void* → sizeof=1
+                let then_actual = then_expr.as_deref().unwrap_or(condition.as_ref());
+                let then_ty = self.infer_expr_type(then_actual, span)?;
+                let else_ty = self.infer_expr_type(else_expr, span)?;
+
+                let then_is_void_ptr = matches!(
+                    &then_ty,
+                    CType::Pointer(inner, _) if matches!(inner.as_ref(), CType::Void)
+                );
+                let else_is_void_ptr = matches!(
+                    &else_ty,
+                    CType::Pointer(inner, _) if matches!(inner.as_ref(), CType::Void)
+                );
+
+                if then_is_void_ptr && !else_is_void_ptr {
+                    // then is void*, else is T* — only use T* if then is
+                    // a null pointer constant
+                    if self.is_null_pointer_constant(then_actual) {
+                        Ok(else_ty)
+                    } else {
+                        Ok(then_ty) // keep void*
+                    }
+                } else if else_is_void_ptr && !then_is_void_ptr {
+                    if self.is_null_pointer_constant(else_expr) {
+                        Ok(then_ty)
+                    } else {
+                        Ok(else_ty) // keep void*
+                    }
+                } else {
+                    Ok(then_ty)
+                }
+            }
+            Expression::BuiltinCall { builtin, args, .. } => {
+                use crate::frontend::parser::ast::BuiltinKind;
+                match builtin {
+                    BuiltinKind::ChooseExpr if args.len() >= 3 => {
+                        // Try evaluating the condition; if it fails, infer from 3rd arg
+                        let cond = self.evaluate_constant_expr(&args[0]);
+                        let is_nonzero = match cond {
+                            Ok(ConstValue::SignedInt(v)) => v != 0,
+                            Ok(ConstValue::UnsignedInt(v)) => v != 0,
+                            _ => false,
+                        };
+                        if is_nonzero {
+                            self.infer_expr_type(&args[1], span)
+                        } else {
+                            self.infer_expr_type(&args[2], span)
+                        }
+                    }
+                    BuiltinKind::TypesCompatibleP => Ok(CType::Int),
+                    BuiltinKind::ConstantP => Ok(CType::Int),
+                    BuiltinKind::Offsetof => {
+                        if self.target.is_64bit() {
+                            Ok(CType::ULong)
+                        } else {
+                            Ok(CType::UInt)
+                        }
+                    }
+                    _ => Ok(CType::Int),
+                }
             }
             _ => {
                 // Default: assume int for expressions we can't easily type
@@ -1756,6 +1852,55 @@ impl<'a> ConstantEvaluator<'a> {
                 Ok(CType::Int)
             }
         }
+    }
+
+    /// Test whether an expression is a C11 *null pointer constant*.
+    ///
+    /// C11 §6.3.2.3p3: "An integer constant expression with the value 0,
+    /// or such an expression cast to type `void *`, is called a *null
+    /// pointer constant*."
+    ///
+    /// This is essential for determining the type of ternary expressions
+    /// such as the `__is_constexpr()` kernel macro:
+    ///   `8 ? (void *)(expr) : (int *)8`
+    /// When `expr` evaluates to a constant 0, the `void *` arm is a null
+    /// pointer constant and the result type is `int *`.  Otherwise the
+    /// result type is `void *`.
+    fn is_null_pointer_constant(&mut self, expr: &Expression) -> bool {
+        match expr {
+            Expression::Parenthesized { inner, .. } => {
+                self.is_null_pointer_constant(inner)
+            }
+            Expression::Cast { operand, type_name, .. } => {
+                // (void *)expr — check if inner is a null pointer constant
+                let dummy = Span { start: 0, end: 0, file_id: 0 };
+                if let Ok(ty) = self.resolve_type_name(type_name, dummy) {
+                    if matches!(&ty, CType::Pointer(inner, _) if matches!(inner.as_ref(), CType::Void))
+                    {
+                        return self.is_null_pointer_constant(operand);
+                    }
+                }
+                // Non-void* cast — try to evaluate silently
+                self.try_evaluate_as_zero(expr)
+            }
+            _ => {
+                // Try to evaluate as an integer constant expression equal to 0
+                self.try_evaluate_as_zero(expr)
+            }
+        }
+    }
+
+    /// Attempt to evaluate `expr` as a compile-time zero without emitting
+    /// diagnostics. Returns `true` only when the expression is a valid
+    /// integer constant expression whose value is exactly 0.
+    fn try_evaluate_as_zero(&mut self, expr: &Expression) -> bool {
+        self.diagnostics.begin_suppress();
+        let result = self.evaluate_constant_expr(expr);
+        self.diagnostics.end_suppress();
+        matches!(
+            result,
+            Ok(ConstValue::SignedInt(0)) | Ok(ConstValue::UnsignedInt(0))
+        )
     }
 
     /// Convert an integer suffix to the corresponding C type.
