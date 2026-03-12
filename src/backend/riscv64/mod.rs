@@ -414,7 +414,7 @@ impl RiscV64Codegen {
         if reg >= 100 {
             MachineOperand::VirtualRegister(reg as u32)
         } else {
-            MachineOperand::Register(reg as u16)
+            MachineOperand::Register(reg)
         }
     }
 
@@ -869,10 +869,7 @@ impl ArchCodegen for RiscV64Codegen {
         _diag: &mut DiagnosticEngine,
         _globals: &[crate::ir::module::GlobalVariable],
         func_ref_map: &crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>,
-        global_var_refs: &crate::common::fx_hash::FxHashMap<
-            crate::ir::instructions::Value,
-            String,
-        >,
+        global_var_refs: &crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>,
     ) -> Result<MachineFunction, String> {
         // Build constant cache from the IR function's constant_values map.
         // This was populated during IR lowering for every integer constant,
@@ -943,7 +940,7 @@ impl ArchCodegen for RiscV64Codegen {
         for rv_inst in &rv_instructions {
             if let Some(rd) = rv_inst.rd {
                 if rd < 100 && registers::is_callee_saved(rd) {
-                    let reg_u16 = rd as u16;
+                    let reg_u16 = rd;
                     if !mf.callee_saved_regs.contains(&reg_u16) {
                         mf.callee_saved_regs.push(reg_u16);
                     }
@@ -975,6 +972,7 @@ impl ArchCodegen for RiscV64Codegen {
         //         `.label:` comment are NOT emitted — they only define
         //         the label address.
         // ---------------------------------------------------------------
+        #[allow(dead_code)]
         struct InstructionRecord {
             rv_inst: codegen::RvInstruction,
             offset: usize,
@@ -1043,9 +1041,10 @@ impl ArchCodegen for RiscV64Codegen {
             let rv_inst = &rec.rv_inst;
 
             // Determine if the branch target is a local label.
-            let is_local_branch = rv_inst.symbol.as_ref().map_or(false, |sym| {
-                label_offsets.contains_key(sym.as_str())
-            });
+            let is_local_branch = rv_inst
+                .symbol
+                .as_ref()
+                .map_or(false, |sym| label_offsets.contains_key(sym.as_str()));
 
             if is_local_branch {
                 // Resolve the branch locally: compute PC-relative offset
@@ -1095,8 +1094,7 @@ impl ArchCodegen for RiscV64Codegen {
                         if let Some(ref cont) = encoded.continuation {
                             if let Some(ref cont_reloc) = cont.relocation {
                                 relocations.push(FunctionRelocation {
-                                    offset: (output.len() + cont_reloc.offset as usize)
-                                        as u64,
+                                    offset: (output.len() + cont_reloc.offset as usize) as u64,
                                     symbol: sym_name.clone(),
                                     rel_type_id: cont_reloc.reloc_type,
                                     addend: cont_reloc.addend,
@@ -1185,7 +1183,7 @@ impl ArchCodegen for RiscV64Codegen {
         let extra_callee_saved: usize = mf
             .callee_saved_regs
             .iter()
-            .filter(|&&r| r != FP as u16 && r != RA as u16)
+            .filter(|&&r| r != FP && r != RA)
             .count();
 
         // Recompute frame size to include callee-saved register space.
@@ -1208,8 +1206,8 @@ impl ArchCodegen for RiscV64Codegen {
             // addi sp, sp, -frame_size
             let mut adj = MachineInstruction::new(codegen::RvOpcode::ADDI as u32);
             adj = adj
-                .with_result(MachineOperand::Register(SP as u16))
-                .with_operand(MachineOperand::Register(SP as u16))
+                .with_result(MachineOperand::Register(SP))
+                .with_operand(MachineOperand::Register(SP))
                 .with_operand(MachineOperand::Immediate(-(aligned_frame as i64)));
             prologue.push(adj);
         } else {
@@ -1217,16 +1215,16 @@ impl ArchCodegen for RiscV64Codegen {
             // li t0, -frame_size
             let mut li = MachineInstruction::new(codegen::RvOpcode::LI as u32);
             li = li
-                .with_result(MachineOperand::Register(registers::T0 as u16))
+                .with_result(MachineOperand::Register(registers::T0))
                 .with_operand(MachineOperand::Immediate(-(aligned_frame as i64)));
             prologue.push(li);
 
             // add sp, sp, t0
             let mut add_sp = MachineInstruction::new(codegen::RvOpcode::ADD as u32);
             add_sp = add_sp
-                .with_result(MachineOperand::Register(SP as u16))
-                .with_operand(MachineOperand::Register(SP as u16))
-                .with_operand(MachineOperand::Register(registers::T0 as u16));
+                .with_result(MachineOperand::Register(SP))
+                .with_operand(MachineOperand::Register(SP))
+                .with_operand(MachineOperand::Register(registers::T0));
             prologue.push(add_sp);
         }
 
@@ -1235,8 +1233,8 @@ impl ArchCodegen for RiscV64Codegen {
         let ra_offset = (aligned_frame as i64) - 8;
         let mut save_ra = MachineInstruction::new(codegen::RvOpcode::SD as u32);
         save_ra = save_ra
-            .with_operand(MachineOperand::Register(SP as u16))
-            .with_operand(MachineOperand::Register(RA as u16))
+            .with_operand(MachineOperand::Register(SP))
+            .with_operand(MachineOperand::Register(RA))
             .with_operand(MachineOperand::Immediate(ra_offset));
         prologue.push(save_ra);
 
@@ -1244,16 +1242,16 @@ impl ArchCodegen for RiscV64Codegen {
         let fp_offset = (aligned_frame as i64) - 16;
         let mut save_fp = MachineInstruction::new(codegen::RvOpcode::SD as u32);
         save_fp = save_fp
-            .with_operand(MachineOperand::Register(SP as u16))
-            .with_operand(MachineOperand::Register(FP as u16))
+            .with_operand(MachineOperand::Register(SP))
+            .with_operand(MachineOperand::Register(FP))
             .with_operand(MachineOperand::Immediate(fp_offset));
         prologue.push(save_fp);
 
         // addi s0, sp, frame_size  (set frame pointer)
         let mut set_fp = MachineInstruction::new(codegen::RvOpcode::ADDI as u32);
         set_fp = set_fp
-            .with_result(MachineOperand::Register(FP as u16))
-            .with_operand(MachineOperand::Register(SP as u16))
+            .with_result(MachineOperand::Register(FP))
+            .with_operand(MachineOperand::Register(SP))
             .with_operand(MachineOperand::Immediate(aligned_frame as i64));
         prologue.push(set_fp);
 
@@ -1265,7 +1263,7 @@ impl ArchCodegen for RiscV64Codegen {
         let mut save_sp_offset = 0i64;
         for &reg in &mf.callee_saved_regs {
             // Skip FP (s0) and RA — already saved above.
-            if reg == FP as u16 || reg == RA as u16 {
+            if reg == FP || reg == RA {
                 continue;
             }
 
@@ -1277,7 +1275,7 @@ impl ArchCodegen for RiscV64Codegen {
 
             let mut save = MachineInstruction::new(opcode as u32);
             save = save
-                .with_operand(MachineOperand::Register(SP as u16))
+                .with_operand(MachineOperand::Register(SP))
                 .with_operand(MachineOperand::Register(reg))
                 .with_operand(MachineOperand::Immediate(save_sp_offset));
             prologue.push(save);
@@ -1307,7 +1305,7 @@ impl ArchCodegen for RiscV64Codegen {
         let extra_callee_saved: usize = mf
             .callee_saved_regs
             .iter()
-            .filter(|&&r| r != FP as u16 && r != RA as u16)
+            .filter(|&&r| r != FP && r != RA)
             .count();
         let frame_size = mf.frame_size + extra_callee_saved * 8;
 
@@ -1325,7 +1323,7 @@ impl ArchCodegen for RiscV64Codegen {
         let callee_regs: Vec<u16> = mf
             .callee_saved_regs
             .iter()
-            .filter(|&&r| r != FP as u16 && r != RA as u16)
+            .filter(|&&r| r != FP && r != RA)
             .copied()
             .collect();
 
@@ -1340,7 +1338,7 @@ impl ArchCodegen for RiscV64Codegen {
             let mut restore = MachineInstruction::new(opcode as u32);
             restore = restore
                 .with_result(MachineOperand::Register(reg))
-                .with_operand(MachineOperand::Register(SP as u16))
+                .with_operand(MachineOperand::Register(SP))
                 .with_operand(MachineOperand::Immediate(restore_sp_offset));
             epilogue.push(restore);
             restore_sp_offset += 8;
@@ -1351,8 +1349,8 @@ impl ArchCodegen for RiscV64Codegen {
         let fp_offset = (aligned_frame as i64) - 16;
         let mut restore_fp = MachineInstruction::new(codegen::RvOpcode::LD as u32);
         restore_fp = restore_fp
-            .with_result(MachineOperand::Register(FP as u16))
-            .with_operand(MachineOperand::Register(SP as u16))
+            .with_result(MachineOperand::Register(FP))
+            .with_operand(MachineOperand::Register(SP))
             .with_operand(MachineOperand::Immediate(fp_offset));
         epilogue.push(restore_fp);
 
@@ -1360,8 +1358,8 @@ impl ArchCodegen for RiscV64Codegen {
         let ra_offset = (aligned_frame as i64) - 8;
         let mut restore_ra = MachineInstruction::new(codegen::RvOpcode::LD as u32);
         restore_ra = restore_ra
-            .with_result(MachineOperand::Register(RA as u16))
-            .with_operand(MachineOperand::Register(SP as u16))
+            .with_result(MachineOperand::Register(RA))
+            .with_operand(MachineOperand::Register(SP))
             .with_operand(MachineOperand::Immediate(ra_offset));
         epilogue.push(restore_ra);
 
@@ -1369,22 +1367,22 @@ impl ArchCodegen for RiscV64Codegen {
         if aligned_frame <= 2047 {
             let mut adj = MachineInstruction::new(codegen::RvOpcode::ADDI as u32);
             adj = adj
-                .with_result(MachineOperand::Register(SP as u16))
-                .with_operand(MachineOperand::Register(SP as u16))
+                .with_result(MachineOperand::Register(SP))
+                .with_operand(MachineOperand::Register(SP))
                 .with_operand(MachineOperand::Immediate(aligned_frame as i64));
             epilogue.push(adj);
         } else {
             let mut li = MachineInstruction::new(codegen::RvOpcode::LI as u32);
             li = li
-                .with_result(MachineOperand::Register(registers::T0 as u16))
+                .with_result(MachineOperand::Register(registers::T0))
                 .with_operand(MachineOperand::Immediate(aligned_frame as i64));
             epilogue.push(li);
 
             let mut add_sp = MachineInstruction::new(codegen::RvOpcode::ADD as u32);
             add_sp = add_sp
-                .with_result(MachineOperand::Register(SP as u16))
-                .with_operand(MachineOperand::Register(SP as u16))
-                .with_operand(MachineOperand::Register(registers::T0 as u16));
+                .with_result(MachineOperand::Register(SP))
+                .with_operand(MachineOperand::Register(SP))
+                .with_operand(MachineOperand::Register(registers::T0));
             epilogue.push(add_sp);
         }
 
@@ -1398,13 +1396,13 @@ impl ArchCodegen for RiscV64Codegen {
     /// Returns the frame pointer register: x8 (s0/fp).
     #[inline]
     fn frame_pointer_reg(&self) -> u16 {
-        FP as u16
+        FP
     }
 
     /// Returns the stack pointer register: x2 (sp).
     #[inline]
     fn stack_pointer_reg(&self) -> u16 {
-        SP as u16
+        SP
     }
 
     /// Returns the return address register: x1 (ra).
@@ -1413,7 +1411,7 @@ impl ArchCodegen for RiscV64Codegen {
     /// uses the stack). Returns `Some(1)` for RA (x1).
     #[inline]
     fn return_address_reg(&self) -> Option<u16> {
-        Some(RA as u16)
+        Some(RA)
     }
 
     /// Classify where a function argument of the given IR type should be
@@ -1490,7 +1488,7 @@ impl RiscV64Codegen {
 
         // Extract rd from the result operand.
         let rd = mi.result.as_ref().and_then(|op| match op {
-            MachineOperand::Register(r) => Some(*r as u16),
+            MachineOperand::Register(r) => Some(*r),
             MachineOperand::VirtualRegister(v) => Some(*v as u16),
             _ => None,
         });
@@ -1507,9 +1505,9 @@ impl RiscV64Codegen {
             match op {
                 MachineOperand::Register(r) => {
                     match reg_idx {
-                        0 => rs1 = Some(*r as u16),
-                        1 => rs2 = Some(*r as u16),
-                        2 => rs3 = Some(*r as u16),
+                        0 => rs1 = Some(*r),
+                        1 => rs2 = Some(*r),
+                        2 => rs3 = Some(*r),
                         _ => {}
                     }
                     reg_idx += 1;
@@ -1549,13 +1547,13 @@ impl RiscV64Codegen {
                     //   SD zero, -112(t0)   instead of   SD t0, -112(s0)
                     if let Some(b) = base {
                         if rs1.is_none() {
-                            rs1 = Some(*b as u16);
+                            rs1 = Some(*b);
                             // Ensure next Register goes to rs2, not rs1.
                             if reg_idx < 1 {
                                 reg_idx = 1;
                             }
                         } else if rs2.is_none() {
-                            rs2 = Some(*b as u16);
+                            rs2 = Some(*b);
                             if reg_idx < 2 {
                                 reg_idx = 2;
                             }

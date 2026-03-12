@@ -39,7 +39,7 @@ pub mod registers;
 
 use crate::backend::elf_writer_common::{
     ElfSymbol, ElfWriter, Section, ET_REL, SHF_ALLOC, SHF_EXECINSTR, SHF_INFO_LINK, SHF_WRITE,
-    SHT_NOBITS, SHT_PROGBITS, SHT_RELA, STB_GLOBAL, STT_FUNC, STT_NOTYPE, STV_DEFAULT,
+    SHT_NOBITS, SHT_PROGBITS, SHT_RELA, STB_GLOBAL, STT_FUNC, STV_DEFAULT,
 };
 use crate::backend::traits::{
     ArchCodegen, ArgLocation, AssembledFunction, FunctionRelocation, MachineFunction,
@@ -279,7 +279,7 @@ impl AArch64Codegen {
             // use Register directly.
             if let Some(rd) = inst.rd {
                 if inst.rd_is_virtual() {
-                    mi.result = Some(MachineOperand::VirtualRegister(rd as u32));
+                    mi.result = Some(MachineOperand::VirtualRegister(rd));
                 } else {
                     mi.result = Some(MachineOperand::Register(rd as u16));
                 }
@@ -288,21 +288,21 @@ impl AArch64Codegen {
             // Map source registers as input operands.
             if let Some(rn) = inst.rn {
                 if inst.rn_is_virtual() {
-                    mi.operands.push(MachineOperand::VirtualRegister(rn as u32));
+                    mi.operands.push(MachineOperand::VirtualRegister(rn));
                 } else {
                     mi.operands.push(MachineOperand::Register(rn as u16));
                 }
             }
             if let Some(rm) = inst.rm {
                 if inst.rm_is_virtual() {
-                    mi.operands.push(MachineOperand::VirtualRegister(rm as u32));
+                    mi.operands.push(MachineOperand::VirtualRegister(rm));
                 } else {
                     mi.operands.push(MachineOperand::Register(rm as u16));
                 }
             }
             if let Some(ra) = inst.ra {
                 if inst.ra_is_virtual() {
-                    mi.operands.push(MachineOperand::VirtualRegister(ra as u32));
+                    mi.operands.push(MachineOperand::VirtualRegister(ra));
                 } else {
                     mi.operands.push(MachineOperand::Register(ra as u16));
                 }
@@ -447,6 +447,7 @@ impl AArch64Codegen {
     }
 
     /// Create a `MachineInstruction` for a MOV register operation.
+    #[allow(dead_code)]
     fn make_mov_reg(rd: u16, rn: u16) -> MachineInstruction {
         let mut mi = MachineInstruction::new(OPCODE_MOV_REG);
         mi.result = Some(MachineOperand::Register(rd));
@@ -764,10 +765,7 @@ impl ArchCodegen for AArch64Codegen {
         _diag: &mut DiagnosticEngine,
         _globals: &[crate::ir::module::GlobalVariable],
         func_ref_map: &crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>,
-        global_var_refs: &crate::common::fx_hash::FxHashMap<
-            crate::ir::instructions::Value,
-            String,
-        >,
+        global_var_refs: &crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>,
     ) -> Result<MachineFunction, String> {
         if !func.is_definition {
             return Err(format!(
@@ -817,7 +815,7 @@ impl ArchCodegen for AArch64Codegen {
         // above, because the heuristic can assign wrong constants when the
         // global constant list spans multiple functions.
         for (&val, &imm) in &func.constant_values {
-            constant_values.insert(val.index() + 64, imm as i64);
+            constant_values.insert(val.index() + 64, imm);
         }
 
         // Build float constant cache from func.float_constant_values.
@@ -825,7 +823,10 @@ impl ArchCodegen for AArch64Codegen {
         // rodata symbol names (.Lconst.f.N) for PC-relative loads.
         let mut float_constant_cache = crate::common::fx_hash::FxHashMap::default();
         if std::env::var("BCC_DEBUG_A64").is_ok() {
-            eprintln!("=== FLOAT_CONSTANT_VALUES count={} ===", func.float_constant_values.len());
+            eprintln!(
+                "=== FLOAT_CONSTANT_VALUES count={} ===",
+                func.float_constant_values.len()
+            );
             for (val, (name, fval)) in &func.float_constant_values {
                 eprintln!("  float_cv: Value({}) -> {} = {}", val.index(), name, fval);
             }
@@ -855,7 +856,11 @@ impl ArchCodegen for AArch64Codegen {
             for block in &func.blocks {
                 for inst in block.instructions() {
                     if let crate::ir::instructions::Instruction::BinOp {
-                        result, lhs, rhs, ty, ..
+                        result,
+                        lhs,
+                        rhs,
+                        ty,
+                        ..
                     } = inst
                     {
                         if *lhs == *result
@@ -868,18 +873,17 @@ impl ArchCodegen for AArch64Codegen {
                 }
             }
             // Map float sentinels to float globals in order.
-            for (val_idx, (_gidx, gname)) in
-                float_sentinel_values.iter().zip(float_consts.iter())
-            {
-                float_constant_cache.insert(
-                    crate::ir::instructions::Value(*val_idx),
-                    gname.clone(),
-                );
+            for (val_idx, (_gidx, gname)) in float_sentinel_values.iter().zip(float_consts.iter()) {
+                float_constant_cache
+                    .insert(crate::ir::instructions::Value(*val_idx), gname.clone());
             }
         }
 
         if std::env::var("BCC_DEBUG_A64").is_ok() {
-            eprintln!("=== FINAL float_constant_cache count={} ===", float_constant_cache.len());
+            eprintln!(
+                "=== FINAL float_constant_cache count={} ===",
+                float_constant_cache.len()
+            );
             for (v, n) in &float_constant_cache {
                 eprintln!("  fcc: Value({}) -> {}", v.index(), n);
             }
@@ -895,11 +899,16 @@ impl ArchCodegen for AArch64Codegen {
 
         // DEBUG: Print the A64 instructions for diagnosis
         if std::env::var("BCC_DEBUG_A64").is_ok() {
-            eprintln!("=== A64 instructions for '{}' ({} total) ===", func.name, a64_instructions.len());
+            eprintln!(
+                "=== A64 instructions for '{}' ({} total) ===",
+                func.name,
+                a64_instructions.len()
+            );
             for (i, inst) in a64_instructions.iter().enumerate() {
-                eprintln!("  [{:3}] {:?} rd={:?} rn={:?} rm={:?} imm={} sym={:?} comment={:?}",
-                    i, inst.opcode, inst.rd, inst.rn, inst.rm, inst.imm,
-                    inst.symbol, inst.comment);
+                eprintln!(
+                    "  [{:3}] {:?} rd={:?} rn={:?} rm={:?} imm={} sym={:?} comment={:?}",
+                    i, inst.opcode, inst.rd, inst.rn, inst.rm, inst.imm, inst.symbol, inst.comment
+                );
             }
             eprintln!("=== func_ref_names: {:?} ===", func_ref_map);
             eprintln!("=== global_var_refs: {:?} ===", global_var_refs);
@@ -940,7 +949,7 @@ impl ArchCodegen for AArch64Codegen {
             for inst in block.instructions() {
                 if let Some(result) = inst.result() {
                     if result != crate::ir::instructions::Value::UNDEF {
-                        let vreg_id = result.index() as u32 + 64; // VREG_BASE
+                        let vreg_id = result.index() + 64; // VREG_BASE
                         mf.vreg_to_ir_value.insert(vreg_id, result);
                     }
                 }
@@ -959,13 +968,20 @@ impl ArchCodegen for AArch64Codegen {
         let mut all_instructions: Vec<A64Instruction> = Vec::new();
         let debug = std::env::var("BCC_DEBUG_A64").is_ok();
         if debug {
-            eprintln!("=== emit_assembly for '{}' blocks={} frame_size={} ===",
-                mf.name, mf.blocks.len(), mf.frame_size);
+            eprintln!(
+                "=== emit_assembly for '{}' blocks={} frame_size={} ===",
+                mf.name,
+                mf.blocks.len(),
+                mf.frame_size
+            );
         }
         for block in &mf.blocks {
             if debug {
-                eprintln!("  Block '{}' instructions={}",
-                    block.label.as_deref().unwrap_or("?"), block.instructions.len());
+                eprintln!(
+                    "  Block '{}' instructions={}",
+                    block.label.as_deref().unwrap_or("?"),
+                    block.instructions.len()
+                );
             }
             for (idx, mi) in block.instructions.iter().enumerate() {
                 if debug {
@@ -980,8 +996,7 @@ impl ArchCodegen for AArch64Codegen {
                 if let Some(ref tmpl) = mi.asm_template {
                     if let Some(label) = tmpl.strip_prefix("LABEL:") {
                         all_instructions.push(
-                            A64Instruction::new(A64Opcode::NOP)
-                                .with_comment(format!("{}:", label)),
+                            A64Instruction::new(A64Opcode::NOP).with_comment(format!("{}:", label)),
                         );
                         if debug {
                             eprintln!("    -> LABEL NOP for '{}'", label);
@@ -992,8 +1007,15 @@ impl ArchCodegen for AArch64Codegen {
 
                 let a64_inst = Self::mi_to_a64(mi);
                 if debug {
-                    eprintln!("    -> A64 {:?} rd={:?} rn={:?} rm={:?} imm={} sym={:?}",
-                        a64_inst.opcode, a64_inst.rd, a64_inst.rn, a64_inst.rm, a64_inst.imm, a64_inst.symbol);
+                    eprintln!(
+                        "    -> A64 {:?} rd={:?} rn={:?} rm={:?} imm={} sym={:?}",
+                        a64_inst.opcode,
+                        a64_inst.rd,
+                        a64_inst.rn,
+                        a64_inst.rm,
+                        a64_inst.imm,
+                        a64_inst.symbol
+                    );
                 }
                 all_instructions.push(a64_inst);
             }
@@ -1104,7 +1126,8 @@ impl ArchCodegen for AArch64Codegen {
                 let mut mi = MachineInstruction::new(OPCODE_SUB_IMM);
                 mi.result = Some(MachineOperand::Register(sp));
                 mi.operands.push(MachineOperand::Register(sp));
-                mi.operands.push(MachineOperand::Immediate(frame_size as i64));
+                mi.operands
+                    .push(MachineOperand::Immediate(frame_size as i64));
                 mi.operand_size = 8;
                 prologue.push(mi);
             }
@@ -1373,7 +1396,8 @@ impl ArchCodegen for AArch64Codegen {
                 let mut mi = MachineInstruction::new(OPCODE_ADD_IMM);
                 mi.result = Some(MachineOperand::Register(sp));
                 mi.operands.push(MachineOperand::Register(sp));
-                mi.operands.push(MachineOperand::Immediate(frame_size as i64));
+                mi.operands
+                    .push(MachineOperand::Immediate(frame_size as i64));
                 mi.operand_size = 8;
                 epilogue.push(mi);
             }
@@ -1585,7 +1609,7 @@ impl AArch64Codegen {
                     // Surviving virtual register — treat identically
                     // to a physical register (may occur if allocation
                     // left some unresolved).
-                    let r = *v as u32;
+                    let r = *v;
                     match reg_idx {
                         0 => inst.rn = Some(r),
                         1 => inst.rm = Some(r),
@@ -1645,7 +1669,6 @@ impl AArch64Codegen {
         (31, 0) // default: SP, offset 0
     }
 
-    /// Map a `u32` opcode back to an `A64Opcode`.
     // ================================================================
     // Parallel-move resolution for call argument setup
     // ================================================================
@@ -1664,7 +1687,7 @@ impl AArch64Codegen {
         // argument-register move sequence.
         struct CallFixup {
             call_idx: usize,
-            mov_indices: Vec<usize>,       // indices into `insts` (execution order)
+            mov_indices: Vec<usize>, // indices into `insts` (execution order)
             resolved: Vec<(u32, u32, bool)>, // (dst, src, is_32bit)
         }
         let mut fixups: Vec<CallFixup> = Vec::new();
@@ -1774,16 +1797,10 @@ impl AArch64Codegen {
     /// Given a set of simultaneous register moves `(dst, src)`, produce
     /// a sequential ordering that preserves all source values.  If a
     /// cycle exists (e.g. swap X0↔X1), break it with `temp` (X16/IP0).
-    fn resolve_parallel_moves(
-        moves: &[(u32, u32, bool)],
-        temp: u32,
-    ) -> Vec<(u32, u32, bool)> {
+    fn resolve_parallel_moves(moves: &[(u32, u32, bool)], temp: u32) -> Vec<(u32, u32, bool)> {
         // Remove self-moves (dst == src) — they are no-ops.
-        let mut pending: Vec<(u32, u32, bool)> = moves
-            .iter()
-            .copied()
-            .filter(|&(d, s, _)| d != s)
-            .collect();
+        let mut pending: Vec<(u32, u32, bool)> =
+            moves.iter().copied().filter(|&(d, s, _)| d != s).collect();
         let mut result: Vec<(u32, u32, bool)> = Vec::with_capacity(pending.len() + 1);
 
         while !pending.is_empty() {

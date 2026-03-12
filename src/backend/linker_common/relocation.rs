@@ -582,6 +582,7 @@ pub fn process_relocations(
     section_data: &mut FxHashMap<String, Vec<u8>>,
     handler: &dyn RelocationHandler,
     diagnostics: &mut DiagnosticEngine,
+    precomputed_got: &FxHashMap<String, u64>,
 ) -> Result<RelocationProcessingResult, Vec<RelocationError>> {
     // Reference all Target variants for architecture-aware dispatch.
     let _arch_label = target_arch_name(target);
@@ -615,7 +616,8 @@ pub fn process_relocations(
     }
 
     // 3. Resolve.
-    let got_entries: FxHashMap<String, u64> = FxHashMap::default();
+    // Use precomputed GOT entries if provided; otherwise start empty.
+    let got_entries: FxHashMap<String, u64> = precomputed_got.clone();
     let plt_entries: FxHashMap<String, u64> = FxHashMap::default();
 
     // Validate section_addresses (uses FxHashMap accessors).

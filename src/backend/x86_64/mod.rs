@@ -284,6 +284,7 @@ impl ArchCodegen for X86_64Backend {
         global_var_refs: &crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>,
     ) -> Result<MachineFunction, String> {
         let mut codegen = X86_64CodeGen::new(self.target);
+        codegen.set_pic(self.pic_enabled);
         codegen.set_func_ref_names(func_ref_map.clone());
         codegen.set_global_var_refs(global_var_refs.clone());
         codegen.lower(func, diag, globals)

@@ -408,9 +408,7 @@ impl I686Assembler {
             if std::env::var("BCC_DEBUG_ASM").is_ok() {
                 eprintln!(
                     "[i686-asm] pass2 block {} (label={:?}) at offset 0x{:x}",
-                    block_idx,
-                    block.label,
-                    self.current_offset
+                    block_idx, block.label, self.current_offset
                 );
             }
             for instr in &block.instructions {

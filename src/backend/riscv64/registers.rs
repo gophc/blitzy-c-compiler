@@ -765,23 +765,23 @@ impl RiscV64RegisterInfo {
     /// backend into the `u16` IDs expected by [`RegisterInfo`] fields.
     pub fn to_register_info(&self) -> RegisterInfo {
         RegisterInfo {
-            allocatable_gpr: ALLOCATABLE_GPRS.iter().map(|&r| r as u16).collect(),
-            allocatable_fpr: ALLOCATABLE_FPRS.iter().map(|&r| r as u16).collect(),
+            allocatable_gpr: ALLOCATABLE_GPRS.to_vec(),
+            allocatable_fpr: ALLOCATABLE_FPRS.to_vec(),
             callee_saved: CALLEE_SAVED_GPRS
                 .iter()
                 .chain(CALLEE_SAVED_FPRS.iter())
-                .map(|&r| r as u16)
+                .copied()
                 .collect(),
             caller_saved: CALLER_SAVED_GPRS
                 .iter()
                 .chain(CALLER_SAVED_FPRS.iter())
-                .map(|&r| r as u16)
+                .copied()
                 .collect(),
-            reserved: RESERVED_GPRS.iter().map(|&r| r as u16).collect(),
-            argument_gpr: ARGUMENT_GPRS.iter().map(|&r| r as u16).collect(),
-            argument_fpr: ARGUMENT_FPRS.iter().map(|&r| r as u16).collect(),
-            return_gpr: RETURN_GPRS.iter().map(|&r| r as u16).collect(),
-            return_fpr: RETURN_FPRS.iter().map(|&r| r as u16).collect(),
+            reserved: RESERVED_GPRS.to_vec(),
+            argument_gpr: ARGUMENT_GPRS.to_vec(),
+            argument_fpr: ARGUMENT_FPRS.to_vec(),
+            return_gpr: RETURN_GPRS.to_vec(),
+            return_fpr: RETURN_FPRS.to_vec(),
         }
     }
 }

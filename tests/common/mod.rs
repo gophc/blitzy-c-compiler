@@ -387,10 +387,7 @@ pub fn run_binary(path: &str, target: &str) -> Output {
                         .arg(path)
                         .output()
                         .unwrap_or_else(|e| {
-                            panic!(
-                                "Failed to run i686 binary '{}' via qemu-i386: {}",
-                                path, e
-                            )
+                            panic!("Failed to run i686 binary '{}' via qemu-i386: {}", path, e)
                         })
                 }
             } else {

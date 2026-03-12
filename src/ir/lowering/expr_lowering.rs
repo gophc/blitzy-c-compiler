@@ -216,13 +216,15 @@ fn is_compile_time_constant(expr: &ast::Expression) -> bool {
             ..
         } => {
             is_compile_time_constant(condition)
-                && then_expr.as_ref().map_or(true, |e| is_compile_time_constant(e))
+                && then_expr
+                    .as_ref()
+                    .map_or(true, |e| is_compile_time_constant(e))
                 && is_compile_time_constant(else_expr)
         }
 
         // Comma: the last expression determines constness.
         ast::Expression::Comma { exprs, .. } => {
-            exprs.last().map_or(false, |e| is_compile_time_constant(e))
+            exprs.last().map_or(false, is_compile_time_constant)
         }
 
         // Everything else (variables, function calls, etc.) is NOT constant.
@@ -266,10 +268,7 @@ fn emit_int_const(
 /// This is a public wrapper around `emit_int_const` for use by
 /// `decl_lowering::make_index_value` which computes element byte
 /// offsets for aggregate initialiser stores.
-pub fn emit_int_const_for_index(
-    ctx: &mut ExprLoweringContext<'_>,
-    byte_offset: i64,
-) -> Value {
+pub fn emit_int_const_for_index(ctx: &mut ExprLoweringContext<'_>, byte_offset: i64) -> Value {
     let ir_ty = size_ir_type(ctx.target);
     emit_int_const(ctx, byte_offset as i128, ir_ty, Span::dummy())
 }
@@ -277,10 +276,7 @@ pub fn emit_int_const_for_index(
 /// Emit a zero constant with the given IR type.  Used by `zero_init_field`
 /// in `decl_lowering` to produce correctly-sized stores for aggregate
 /// member zero-initialization (C99 §6.7.9/19).
-pub fn emit_int_const_for_zero(
-    ctx: &mut ExprLoweringContext<'_>,
-    ir_ty: IrType,
-) -> Value {
+pub fn emit_int_const_for_zero(ctx: &mut ExprLoweringContext<'_>, ir_ty: IrType) -> Value {
     emit_int_const(ctx, 0, ir_ty, Span::dummy())
 }
 
@@ -676,19 +672,6 @@ fn lookup_var_type(ctx: &ExprLoweringContext<'_>, name: &str) -> CType {
 /// computed result.  For lvalue-capable expressions this performs an
 /// implicit load.
 pub fn lower_expression(ctx: &mut ExprLoweringContext<'_>, expr: &ast::Expression) -> Value {
-    // Verify function context is available — access function metadata.
-    let _fn_name = &ctx.function.name;
-    let _fn_ret = &ctx.function.return_type;
-    let _fn_params = &ctx.function.params;
-    let _fn_blocks = &ctx.function.blocks;
-    let _entry_blk = ctx.function.entry_block();
-
-    // Access module-level collections for resolution.
-    let _num_globals = ctx.module.globals().len();
-    let _num_funcs = ctx.module.functions().len();
-    let _num_decls = ctx.module.declarations().len();
-    let _num_strs = ctx.module.string_pool().len();
-
     lower_expr_inner(ctx, expr).value
 }
 
@@ -1928,8 +1911,34 @@ fn lower_function_call(
     let callee_tv = lower_expr_inner(ctx, callee);
 
     // Determine return type from the callee's function type.
+    // For direct function calls, lower_identifier returns a void pointer,
+    // so we look up the actual function return type from the IR module.
     let (ret_cty, _is_variadic) = extract_function_return_type(&callee_tv.ty);
-    let ret_ir = ctype_to_ir(&ret_cty, ctx.target);
+    let mut ret_ir = ctype_to_ir(&ret_cty, ctx.target);
+
+    // If the callee is a known function and the CType-derived return type
+    // doesn't capture struct layout (because lower_identifier returns a void
+    // pointer for function references), resolve the actual IR return type
+    // directly from the function definition or declaration.  This ensures
+    // the Call instruction carries the correct struct field layout for ABI
+    // classification (e.g., small structs returned in registers).
+    if let Some(fname) = ctx.function.func_ref_map.get(&callee_tv.value) {
+        if let Some(func) = ctx.module.get_function(fname) {
+            if !func.return_type.is_void() {
+                ret_ir = func.return_type.clone();
+            }
+        } else {
+            // Check function declarations.
+            for decl in ctx.module.declarations() {
+                if decl.name == *fname {
+                    if !decl.return_type.is_void() {
+                        ret_ir = decl.return_type.clone();
+                    }
+                    break;
+                }
+            }
+        }
+    }
 
     // Lower arguments left-to-right.
     let mut arg_vals = Vec::with_capacity(args.len());
@@ -2026,11 +2035,15 @@ fn lower_cast(
             emit_inst(ctx, i);
             return v;
         } else if is_unsigned(from) {
-            let (v, i) = ctx.builder.build_zext_from(value, from_ir.clone(), to_ir, span);
+            let (v, i) = ctx
+                .builder
+                .build_zext_from(value, from_ir.clone(), to_ir, span);
             emit_inst(ctx, i);
             return v;
         } else {
-            let (v, i) = ctx.builder.build_sext_from(value, from_ir.clone(), to_ir, span);
+            let (v, i) = ctx
+                .builder
+                .build_sext_from(value, from_ir.clone(), to_ir, span);
             emit_inst(ctx, i);
             return v;
         }
@@ -2790,7 +2803,8 @@ fn lower_builtin(
             // Per GCC semantics, if const_expr is nonzero, use expr1; else expr2.
             if args.len() >= 3 {
                 // Try to evaluate the condition as a compile-time constant.
-                let cond_val = try_eval_integer_constant(&args[0], ctx.name_table, ctx.enum_constants);
+                let cond_val =
+                    try_eval_integer_constant(&args[0], ctx.name_table, ctx.enum_constants);
                 if cond_val.unwrap_or(1) != 0 {
                     lower_expr_inner(ctx, &args[1])
                 } else {
@@ -3080,80 +3094,104 @@ fn lower_overflow_arith(
 
     // Step 1: sign-extend a and b from i32 to i64.
     let a64 = ctx.builder.fresh_value();
-    emit_inst(ctx, Instruction::SExt {
-        result: a64,
-        value: a.value,
-        to_type: IrType::I64,
-        from_type: IrType::I32,
-        span,
-    });
+    emit_inst(
+        ctx,
+        Instruction::SExt {
+            result: a64,
+            value: a.value,
+            to_type: IrType::I64,
+            from_type: IrType::I32,
+            span,
+        },
+    );
     let b64 = ctx.builder.fresh_value();
-    emit_inst(ctx, Instruction::SExt {
-        result: b64,
-        value: b.value,
-        to_type: IrType::I64,
-        from_type: IrType::I32,
-        span,
-    });
+    emit_inst(
+        ctx,
+        Instruction::SExt {
+            result: b64,
+            value: b.value,
+            to_type: IrType::I64,
+            from_type: IrType::I32,
+            span,
+        },
+    );
 
     // Step 2: 64-bit operation (a64 op b64).
     let result64 = ctx.builder.fresh_value();
-    emit_inst(ctx, Instruction::BinOp {
-        result: result64,
-        op,
-        lhs: a64,
-        rhs: b64,
-        ty: IrType::I64,
-        span,
-    });
+    emit_inst(
+        ctx,
+        Instruction::BinOp {
+            result: result64,
+            op,
+            lhs: a64,
+            rhs: b64,
+            ty: IrType::I64,
+            span,
+        },
+    );
 
     // Step 3: truncate to i32 for the stored result.
     let result32 = ctx.builder.fresh_value();
-    emit_inst(ctx, Instruction::Trunc {
-        result: result32,
-        value: result64,
-        to_type: IrType::I32,
-        span,
-    });
+    emit_inst(
+        ctx,
+        Instruction::Trunc {
+            result: result32,
+            value: result64,
+            to_type: IrType::I32,
+            span,
+        },
+    );
 
     // Step 4: store the i32 result through the pointer.
-    emit_inst(ctx, Instruction::Store {
-        value: result32,
-        ptr: result_ptr.value,
-        volatile: false,
-        span,
-    });
+    emit_inst(
+        ctx,
+        Instruction::Store {
+            value: result32,
+            ptr: result_ptr.value,
+            volatile: false,
+            span,
+        },
+    );
 
     // Step 5: sign-extend the truncated i32 back to i64.
     let extended64 = ctx.builder.fresh_value();
-    emit_inst(ctx, Instruction::SExt {
-        result: extended64,
-        value: result32,
-        to_type: IrType::I64,
-        from_type: IrType::I32,
-        span,
-    });
+    emit_inst(
+        ctx,
+        Instruction::SExt {
+            result: extended64,
+            value: result32,
+            to_type: IrType::I64,
+            from_type: IrType::I32,
+            span,
+        },
+    );
 
     // Step 6: compare original 64-bit result with sign-extended value.
     // If they differ, the 32-bit result overflowed.
     let overflow_i1 = ctx.builder.fresh_value();
-    emit_inst(ctx, Instruction::ICmp {
-        result: overflow_i1,
-        op: ICmpOp::Ne,
-        lhs: result64,
-        rhs: extended64,
-        span,
-    });
+    emit_inst(
+        ctx,
+        Instruction::ICmp {
+            result: overflow_i1,
+            op: ICmpOp::Ne,
+            lhs: result64,
+            rhs: extended64,
+            span,
+        },
+    );
 
     // Step 7: zero-extend i1 to i32 for the C int return value.
     let overflow_int = ctx.builder.fresh_value();
-    emit_inst(ctx, Instruction::ZExt {
-        result: overflow_int,
-        value: overflow_i1,
-        to_type: IrType::I32,
-        from_type: IrType::I1,
-        span,
-    });
+    emit_inst(
+        ctx,
+        Instruction::ZExt {
+            result: overflow_int,
+            value: overflow_i1,
+            to_type: IrType::I32,
+            from_type: IrType::I1,
+            span,
+        },
+    );
 
     TypedValue::new(overflow_int, CType::Int)
 }
@@ -3202,12 +3240,10 @@ fn emit_global_ref(ctx: &mut ExprLoweringContext<'_>, name: &str, span: Span) ->
 fn generic_lvalue_convert(ty: &CType) -> CType {
     let stripped = types::unqualified(ty);
     match stripped {
-        CType::Array(elem, _) => {
-            CType::Pointer(
-                Box::new(generic_lvalue_convert(elem)),
-                TypeQualifiers::default(),
-            )
-        }
+        CType::Array(elem, _) => CType::Pointer(
+            Box::new(generic_lvalue_convert(elem)),
+            TypeQualifiers::default(),
+        ),
         CType::Function { .. } => {
             CType::Pointer(Box::new(stripped.clone()), TypeQualifiers::default())
         }
@@ -3373,11 +3409,15 @@ fn insert_implicit_conversion(
             return v;
         }
         if is_unsigned(from) {
-            let (v, i) = ctx.builder.build_zext_from(value, from_ir.clone(), to_ir, span);
+            let (v, i) = ctx
+                .builder
+                .build_zext_from(value, from_ir.clone(), to_ir, span);
             emit_inst(ctx, i);
             return v;
         } else {
-            let (v, i) = ctx.builder.build_sext_from(value, from_ir.clone(), to_ir, span);
+            let (v, i) = ctx
+                .builder
+                .build_sext_from(value, from_ir.clone(), to_ir, span);
             emit_inst(ctx, i);
             return v;
         }
@@ -3456,7 +3496,9 @@ fn insert_implicit_conversion(
             emit_inst(ctx, i);
             return v;
         }
-        let (v, i) = ctx.builder.build_sext_from(value, from_ir.clone(), to_ir, span);
+        let (v, i) = ctx
+            .builder
+            .build_sext_from(value, from_ir.clone(), to_ir, span);
         emit_inst(ctx, i);
         return v;
     }
@@ -3659,30 +3701,38 @@ fn ctypes_structurally_equal(a: &CType, b: &CType) -> bool {
             ctypes_structurally_equal(strip_qualifiers(a_inner), strip_qualifiers(b_inner))
         }
         (CType::Array(a_elem, a_sz), CType::Array(b_elem, b_sz)) => {
-            a_sz == b_sz && ctypes_structurally_equal(strip_qualifiers(a_elem), strip_qualifiers(b_elem))
+            a_sz == b_sz
+                && ctypes_structurally_equal(strip_qualifiers(a_elem), strip_qualifiers(b_elem))
         }
-        (CType::Struct { name: an, .. }, CType::Struct { name: bn, .. }) => {
-            match (an, bn) {
-                (Some(a_name), Some(b_name)) => a_name == b_name,
-                _ => false,
-            }
-        }
-        (CType::Union { name: an, .. }, CType::Union { name: bn, .. }) => {
-            match (an, bn) {
-                (Some(a_name), Some(b_name)) => a_name == b_name,
-                _ => false,
-            }
-        }
-        (CType::Enum { name: an, .. }, CType::Enum { name: bn, .. }) => {
-            match (an, bn) {
-                (Some(a_name), Some(b_name)) => a_name == b_name,
-                _ => false,
-            }
-        }
-        (CType::Function { return_type: ar, params: ap, .. }, CType::Function { return_type: br, params: bp, .. }) => {
+        (CType::Struct { name: an, .. }, CType::Struct { name: bn, .. }) => match (an, bn) {
+            (Some(a_name), Some(b_name)) => a_name == b_name,
+            _ => false,
+        },
+        (CType::Union { name: an, .. }, CType::Union { name: bn, .. }) => match (an, bn) {
+            (Some(a_name), Some(b_name)) => a_name == b_name,
+            _ => false,
+        },
+        (CType::Enum { name: an, .. }, CType::Enum { name: bn, .. }) => match (an, bn) {
+            (Some(a_name), Some(b_name)) => a_name == b_name,
+            _ => false,
+        },
+        (
+            CType::Function {
+                return_type: ar,
+                params: ap,
+                ..
+            },
+            CType::Function {
+                return_type: br,
+                params: bp,
+                ..
+            },
+        ) => {
             ctypes_structurally_equal(strip_qualifiers(ar), strip_qualifiers(br))
                 && ap.len() == bp.len()
-                && ap.iter().zip(bp.iter()).all(|(pa, pb)| ctypes_structurally_equal(strip_qualifiers(pa), strip_qualifiers(pb)))
+                && ap.iter().zip(bp.iter()).all(|(pa, pb)| {
+                    ctypes_structurally_equal(strip_qualifiers(pa), strip_qualifiers(pb))
+                })
         }
         _ => false,
     }
@@ -3738,9 +3788,7 @@ fn extract_member_chain(expr: &ast::Expression, name_table: &[String]) -> Vec<St
             };
             vec![s]
         }
-        ast::Expression::MemberAccess {
-            object, member, ..
-        } => {
+        ast::Expression::MemberAccess { object, member, .. } => {
             let mut chain = extract_member_chain(object, name_table);
             let idx = member.as_u32() as usize;
             let s = if idx < name_table.len() {

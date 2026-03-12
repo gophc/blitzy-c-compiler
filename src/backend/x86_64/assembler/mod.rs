@@ -1100,9 +1100,7 @@ fn assemble_inline_asm_x86_64(
         let reg_name = if idx < num_outputs {
             // Output operand → use result register
             match result_op {
-                Some(crate::backend::traits::MachineOperand::Register(r)) => {
-                    x86_64_reg_name_32(*r)
-                }
+                Some(crate::backend::traits::MachineOperand::Register(r)) => x86_64_reg_name_32(*r),
                 _ => format!("%{}", idx),
             }
         } else {
@@ -1110,9 +1108,7 @@ fn assemble_inline_asm_x86_64(
             let input_idx = idx - num_outputs;
             if input_idx < input_operands.len() {
                 match &input_operands[input_idx] {
-                    crate::backend::traits::MachineOperand::Register(r) => {
-                        x86_64_reg_name_32(*r)
-                    }
+                    crate::backend::traits::MachineOperand::Register(r) => x86_64_reg_name_32(*r),
                     crate::backend::traits::MachineOperand::Immediate(imm) => {
                         format!("${}", imm)
                     }

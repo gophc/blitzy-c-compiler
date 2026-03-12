@@ -956,7 +956,7 @@ impl AArch64Encoder {
         let ra = hw_or_zr(inst.ra);
         let sf: u32 = if inst.is_32bit { 0 } else { 1 };
         let imm = inst.imm;
-        let zr: u32 = registers::XZR as u32;
+        let zr: u32 = registers::XZR;
         // The is_fp flag is consulted by FP load/store to select V-bit encoding
         // and by FP data processing to select ftype. It is carried on the
         // instruction but the opcode enum already encodes the FP vs GP distinction.
@@ -979,7 +979,7 @@ impl AArch64Encoder {
                 } else {
                     // Handle negative immediates by flipping ADD↔SUB.
                     let (actual_op, uimm) = if imm < 0 {
-                        (op ^ 1, (-(imm as i64)) as u64)
+                        (op ^ 1, (-imm) as u64)
                     } else {
                         (op, imm as u64)
                     };
@@ -1466,9 +1466,9 @@ impl AArch64Encoder {
                 // CMP is SUBS with Rd=XZR.  Negative immediates become
                 // CMN (ADDS with Rd=XZR).
                 let (actual_op, uimm) = if imm < 0 {
-                    (0u32, (-(imm as i64)) as u64) // ADDS (CMN)
+                    (0u32, (-imm) as u64) // ADDS (CMN)
                 } else {
-                    (1u32, imm as u64)              // SUBS (CMP)
+                    (1u32, imm as u64) // SUBS (CMP)
                 };
                 let (sh, imm12) = split_add_sub_imm(uimm)?;
                 ok(enc_add_sub_imm(sf, actual_op, 1, sh, imm12, rn, zr))
@@ -1483,9 +1483,9 @@ impl AArch64Encoder {
             A64Opcode::CMN_imm => {
                 // CMN is ADDS with Rd=XZR.  Negative → CMP (SUBS).
                 let (actual_op, uimm) = if imm < 0 {
-                    (1u32, (-(imm as i64)) as u64) // SUBS (CMP)
+                    (1u32, (-imm) as u64) // SUBS (CMP)
                 } else {
-                    (0u32, imm as u64)              // ADDS (CMN)
+                    (0u32, imm as u64) // ADDS (CMN)
                 };
                 let (sh, imm12) = split_add_sub_imm(uimm)?;
                 ok(enc_add_sub_imm(sf, actual_op, 1, sh, imm12, rn, zr))

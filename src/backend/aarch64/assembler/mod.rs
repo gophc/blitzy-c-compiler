@@ -383,7 +383,7 @@ impl AArch64Assembler {
             // this is a basic block label pseudo-instruction. Define the
             // label in the symbol table WITHOUT emitting an actual NOP so
             // conditional branch relocations can resolve locally.
-            A64Opcode::NOP if inst.comment.as_ref().is_some_and(|c| c.ends_with(':')) => {
+            A64Opcode::NOP if inst.comment.as_ref().map_or(false, |c| c.ends_with(':')) => {
                 let comment = inst.comment.as_ref().unwrap();
                 let label = &comment[..comment.len() - 1]; // strip trailing ':'
                 self.define_label(label);
@@ -1220,11 +1220,7 @@ impl AArch64Assembler {
                         let scaled = ((offset / 8) as u32) & 0xFFF;
                         // STR Xt, [Xn, #offset] (unsigned offset, 64-bit)
                         // opc=00 for STR 64-bit is bits [23:22] = 0
-                        (0b11 << 30)
-                            | (0b111001 << 24)
-                            | (scaled << 10)
-                            | ((rn as u32) << 5)
-                            | (rt as u32)
+                        (0b11 << 30) | (0b111001 << 24) | (scaled << 10) | (rn << 5) | (rt as u32)
                     } else {
                         return Err(format!("unsupported str operand format: {}", operands[1]));
                     }

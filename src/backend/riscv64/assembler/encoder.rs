@@ -1754,10 +1754,10 @@ impl RiscV64Encoder {
                 // [5]=offset[6], [4:2]=rd', [1:0]=00
                 let half: u16 = (0b010 << 13)
                     | (((off >> 3) & 0x7) << 10)
-                    | ((rs1_c as u16) << 7)
+                    | (rs1_c << 7)
                     | (((off >> 2) & 1) << 6)
                     | (((off >> 6) & 1) << 5)
-                    | ((rd_c as u16) << 2)
+                    | (rd_c << 2)
                     | C_OP_Q0;
                 Some(make_compressed(half))
             }
@@ -1773,9 +1773,9 @@ impl RiscV64Encoder {
                 // [4:2]=rd', [1:0]=00
                 let half: u16 = (0b011 << 13)
                     | (((off >> 3) & 0x7) << 10)
-                    | ((rs1_c as u16) << 7)
+                    | (rs1_c << 7)
                     | (((off >> 6) & 0x3) << 5)
-                    | ((rd_c as u16) << 2)
+                    | (rd_c << 2)
                     | C_OP_Q0;
                 Some(make_compressed(half))
             }
@@ -1791,10 +1791,10 @@ impl RiscV64Encoder {
                 // [5]=offset[6], [4:2]=rs2', [1:0]=00
                 let half: u16 = (0b110 << 13)
                     | (((off >> 3) & 0x7) << 10)
-                    | ((rs1_c as u16) << 7)
+                    | (rs1_c << 7)
                     | (((off >> 2) & 1) << 6)
                     | (((off >> 6) & 1) << 5)
-                    | ((rs2_c as u16) << 2)
+                    | (rs2_c << 2)
                     | C_OP_Q0;
                 Some(make_compressed(half))
             }
@@ -1810,9 +1810,9 @@ impl RiscV64Encoder {
                 // [4:2]=rs2', [1:0]=00
                 let half: u16 = (0b111 << 13)
                     | (((off >> 3) & 0x7) << 10)
-                    | ((rs1_c as u16) << 7)
+                    | (rs1_c << 7)
                     | (((off >> 6) & 0x3) << 5)
-                    | ((rs2_c as u16) << 2)
+                    | (rs2_c << 2)
                     | C_OP_Q0;
                 Some(make_compressed(half))
             }
@@ -1890,11 +1890,8 @@ impl RiscV64Encoder {
                 let rd_c = creg_encode(rd);
                 let rs2_c = creg_encode(rs2);
                 // [15:10]=100111, [9:7]=rd', [6:5]=01, [4:2]=rs2', [1:0]=01
-                let half: u16 = (0b100111 << 10)
-                    | ((rd_c as u16) << 7)
-                    | (0b01 << 5)
-                    | ((rs2_c as u16) << 2)
-                    | C_OP_Q1;
+                let half: u16 =
+                    (0b100111 << 10) | (rd_c << 7) | (0b01 << 5) | (rs2_c << 2) | C_OP_Q1;
                 Some(make_compressed(half))
             }
 
@@ -1903,8 +1900,7 @@ impl RiscV64Encoder {
                 let rd_c = creg_encode(rd);
                 let rs2_c = creg_encode(rs2);
                 // [15:10]=100111, [9:7]=rd', [6:5]=00, [4:2]=rs2', [1:0]=01
-                let half: u16 =
-                    (0b100111 << 10) | ((rd_c as u16) << 7) | ((rs2_c as u16) << 2) | C_OP_Q1;
+                let half: u16 = (0b100111 << 10) | (rd_c << 7) | (rs2_c << 2) | C_OP_Q1;
                 Some(make_compressed(half))
             }
 
@@ -1915,7 +1911,7 @@ impl RiscV64Encoder {
                 // [15:13]=100, [12]=shamt[5], [11:10]=00, [9:7]=rd', [6:2]=shamt[4:0], [1:0]=01
                 let half: u16 = (0b100 << 13)
                     | (((shamt >> 5) & 1) << 12)
-                    | ((rd_c as u16) << 7)
+                    | (rd_c << 7)
                     | ((shamt & 0x1F) << 2)
                     | C_OP_Q1;
                 Some(make_compressed(half))
@@ -1929,7 +1925,7 @@ impl RiscV64Encoder {
                 let half: u16 = (0b100 << 13)
                     | (((shamt >> 5) & 1) << 12)
                     | (0b01 << 10)
-                    | ((rd_c as u16) << 7)
+                    | (rd_c << 7)
                     | ((shamt & 0x1F) << 2)
                     | C_OP_Q1;
                 Some(make_compressed(half))
@@ -1943,7 +1939,7 @@ impl RiscV64Encoder {
                 let half: u16 = (0b100 << 13)
                     | (((imm6 >> 5) & 1) << 12)
                     | (0b10 << 10)
-                    | ((rd_c as u16) << 7)
+                    | (rd_c << 7)
                     | ((imm6 & 0x1F) << 2)
                     | C_OP_Q1;
                 Some(make_compressed(half))
@@ -2387,7 +2383,7 @@ fn encode_cb_branch(funct3: u16, rs1_c: u16, imm: i64) -> u16 {
     (funct3 << 13)
         | (((off >> 8) & 1) << 12)
         | (((off >> 3) & 0x3) << 10)
-        | ((rs1_c as u16) << 7)
+        | (rs1_c << 7)
         | (((off >> 6) & 0x3) << 5)
         | (((off >> 1) & 0x3) << 3)
         | (((off >> 5) & 1) << 2)
@@ -2428,7 +2424,7 @@ fn encode_cj(imm: i64) -> u16 {
 ///
 /// [15:10]=100011, [9:7]=rd'/rs1', [6:5]=funct2, [4:2]=rs2', [1:0]=01
 fn encode_ca(funct2: u16, rd_c: u16, rs2_c: u16) -> u16 {
-    (0b100011 << 10) | ((rd_c as u16) << 7) | (funct2 << 5) | ((rs2_c as u16) << 2) | C_OP_Q1
+    (0b100011 << 10) | (rd_c << 7) | (funct2 << 5) | (rs2_c << 2) | C_OP_Q1
 }
 
 // ===========================================================================

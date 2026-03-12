@@ -69,7 +69,7 @@ use bcc::passes::run_optimization_pipeline;
 
 /// Worker thread stack size: 64 MiB. Required for deeply nested kernel macro
 /// expansions and complex AST structures. Mandated by AAP §0.7.3.
-const WORKER_STACK_SIZE: usize = 64 * 1024 * 1024;
+const WORKER_STACK_SIZE: usize = 256 * 1024 * 1024;
 
 /// Maximum recursion depth for the parser and macro expander.
 /// Prevents stack overflow on deeply nested constructs. Mandated by AAP §0.7.3.
@@ -1441,6 +1441,8 @@ fn compile_single_file(
         output_path: output.to_string(),
         compile_only: args.compile_only,
         emit_assembly: args.emit_assembly,
+        library_paths: ctx.library_paths.clone(),
+        libraries: ctx.libraries.clone(),
     };
 
     let t_codegen_start = std::time::Instant::now();
@@ -1548,6 +1550,34 @@ fn link_object_files(
     config.library_paths = ctx.library_paths.clone();
     config.libraries = ctx.libraries.clone();
     config.emit_debug = ctx.debug_info;
+
+    // Resolve -l<lib> flags to DT_NEEDED entries.
+    // For each library name, search -L paths for lib<name>.so.
+    // Also add the implicit C library if not already present.
+    for lib_name in &ctx.libraries {
+        let so_name = format!("lib{}.so", lib_name);
+        let mut found = false;
+        for dir in &ctx.library_paths {
+            let candidate = std::path::Path::new(dir).join(&so_name);
+            if candidate.exists() {
+                found = true;
+                break;
+            }
+        }
+        // Add DT_NEEDED regardless of whether the .so was found on disk.
+        // The runtime dynamic linker will search LD_LIBRARY_PATH.
+        if found || !so_name.is_empty() {
+            config.needed_libs.push(so_name);
+        }
+    }
+
+    // Always add libc.so.6 for executables unless the user explicitly
+    // linked with -lc (which would already be in needed_libs).
+    if output_type == OutputType::Executable
+        && !config.needed_libs.iter().any(|n| n.starts_with("libc.so"))
+    {
+        config.needed_libs.push("libc.so.6".to_string());
+    }
 
     // Parse each object file into a LinkerInput.
     let mut inputs = Vec::with_capacity(object_files.len());

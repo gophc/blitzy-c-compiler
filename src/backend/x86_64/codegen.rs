@@ -501,6 +501,12 @@ pub struct X86_64CodeGen {
     /// global variable name.  Used to emit RIP-relative addressing for
     /// global variable loads/stores on x86-64.
     global_var_refs: FxHashMap<Value, String>,
+    /// Whether position-independent code generation is enabled (`-fPIC`).
+    /// When true, global data accesses go through the GOT with an extra
+    /// indirection: LEA becomes MOV (load address from GOT), and data
+    /// loads require a double dereference (load address from GOT, then
+    /// load value from that address).
+    pic: bool,
 }
 
 // =========================================================================
@@ -513,9 +519,9 @@ pub struct X86_64CodeGen {
 fn va_load_from_slot(slot: &MachineOperand, dst: MachineOperand) -> MachineInstruction {
     match slot {
         MachineOperand::Memory { .. } | MachineOperand::FrameSlot(_) => {
-            X86_64CodeGen::mk_inst(X86Opcode::Mov, Some(dst), &[slot.clone()])
+            X86_64CodeGen::mk_inst(X86Opcode::Mov, Some(dst), std::slice::from_ref(slot))
         }
-        _ => X86_64CodeGen::mk_inst(X86Opcode::LoadInd, Some(dst), &[slot.clone()]),
+        _ => X86_64CodeGen::mk_inst(X86Opcode::LoadInd, Some(dst), std::slice::from_ref(slot)),
     }
 }
 
@@ -556,7 +562,13 @@ impl X86_64CodeGen {
             vreg_ir_map: FxHashMap::default(),
             func_ref_names: FxHashMap::default(),
             global_var_refs: FxHashMap::default(),
+            pic: false,
         }
+    }
+
+    /// Set PIC flag for position-independent code generation.
+    pub fn set_pic(&mut self, pic: bool) {
+        self.pic = pic;
     }
 
     /// Set module-level function reference map for direct call resolution.
@@ -1439,7 +1451,7 @@ impl X86_64CodeGen {
             // ---------------------------------------------------------------
             // Alloca — no codegen; offsets tracked in FrameLayout
             // ---------------------------------------------------------------
-            Instruction::Alloca { result, ty, .. } => {
+            Instruction::Alloca { result, ty: _, .. } => {
                 // Retrieve the RBP-relative offset from the frame layout.
                 if let Some(ref frame) = self.frame {
                     if let Some(&offset) = frame.alloca_offsets.get(result) {
@@ -1483,12 +1495,41 @@ impl X86_64CodeGen {
                         vec![Self::mk_inst(opcode, Some(dst), &[src])]
                     }
                     MachineOperand::GlobalSymbol(name) => {
-                        // Global variable access: emit RIP-relative load.
-                        // On x86-64, this becomes `mov dst, [rip + sym]` with
-                        // a relocation for the symbol.
-                        let mem = MachineOperand::GlobalSymbol(name.clone());
-                        let opcode = Self::mov_opcode(ty);
-                        vec![Self::mk_inst(opcode, Some(dst), &[mem])]
+                        if self.pic {
+                            // PIC mode: global variable access goes through GOT.
+                            // Step 1: Load the variable's ADDRESS from GOT entry.
+                            //   mov tmp, [rip + GOT_sym]
+                            // Step 2: Load the variable's VALUE by dereferencing.
+                            //   mov dst, [tmp]
+                            let tmp = self.new_vreg();
+                            let load_got = Self::mk_inst(
+                                X86Opcode::Mov,
+                                Some(tmp.clone()),
+                                &[MachineOperand::GlobalSymbol(name.clone())],
+                            );
+                            let deref_opcode = if ty.is_float() {
+                                match ty {
+                                    IrType::F32 => X86Opcode::Movss,
+                                    _ => X86Opcode::Movsd,
+                                }
+                            } else {
+                                match ty {
+                                    IrType::I1 | IrType::I8 => X86Opcode::LoadInd8,
+                                    IrType::I16 => X86Opcode::LoadInd16,
+                                    IrType::I32 => X86Opcode::LoadInd32,
+                                    _ => X86Opcode::LoadInd,
+                                }
+                            };
+                            let deref = Self::mk_inst(deref_opcode, Some(dst), &[tmp]);
+                            vec![load_got, deref]
+                        } else {
+                            // Non-PIC: emit direct RIP-relative load.
+                            // On x86-64, this becomes `mov dst, [rip + sym]` with
+                            // a relocation for the symbol.
+                            let mem = MachineOperand::GlobalSymbol(name.clone());
+                            let opcode = Self::mov_opcode(ty);
+                            vec![Self::mk_inst(opcode, Some(dst), &[mem])]
+                        }
                     }
                     _ => {
                         // Pointer is in a register (virtual or physical).
@@ -1527,22 +1568,61 @@ impl X86_64CodeGen {
                         vec![Self::mk_inst(X86Opcode::Mov, None, &[dest_ptr, src])]
                     }
                     MachineOperand::GlobalSymbol(name) => {
-                        // Global variable store: emit RIP-relative store.
-                        // On x86-64, this becomes `mov [rip + sym], src`.
-                        // If src is an immediate, materialise it into a
-                        // register first so the encoder always gets a
-                        // (GlobalSymbol, Register) operand pair.
-                        let mem = MachineOperand::GlobalSymbol(name.clone());
-                        match &src {
-                            MachineOperand::Immediate(_) => {
-                                let tmp = self.new_vreg();
-                                let mov_imm =
-                                    Self::mk_inst(X86Opcode::Mov, Some(tmp.clone()), &[src]);
-                                let store = Self::mk_inst(X86Opcode::Mov, None, &[mem, tmp]);
-                                vec![mov_imm, store]
-                            }
-                            _ => {
-                                vec![Self::mk_inst(X86Opcode::Mov, None, &[mem, src])]
+                        if self.pic {
+                            // PIC mode: store through GOT indirection.
+                            // Step 1: Load the variable's ADDRESS from GOT.
+                            //   mov addr_tmp, [rip + GOT_sym]
+                            // Step 2: Store the value through that address.
+                            //   mov [addr_tmp], src_reg
+                            let addr_tmp = self.new_vreg();
+                            let load_got = Self::mk_inst(
+                                X86Opcode::Mov,
+                                Some(addr_tmp.clone()),
+                                &[MachineOperand::GlobalSymbol(name.clone())],
+                            );
+                            // Materialise immediate into register if needed.
+                            let src_reg = match &src {
+                                MachineOperand::Immediate(_) => {
+                                    let imm_tmp = self.new_vreg();
+                                    let mov_imm = Self::mk_inst(
+                                        X86Opcode::Mov,
+                                        Some(imm_tmp.clone()),
+                                        &[src],
+                                    );
+                                    return vec![
+                                        load_got,
+                                        mov_imm,
+                                        Self::mk_inst(
+                                            X86Opcode::StoreInd,
+                                            None,
+                                            &[addr_tmp, imm_tmp],
+                                        ),
+                                    ];
+                                }
+                                _ => src,
+                            };
+                            vec![
+                                load_got,
+                                Self::mk_inst(X86Opcode::StoreInd, None, &[addr_tmp, src_reg]),
+                            ]
+                        } else {
+                            // Non-PIC: direct RIP-relative store.
+                            // On x86-64, this becomes `mov [rip + sym], src`.
+                            // If src is an immediate, materialise it into a
+                            // register first so the encoder always gets a
+                            // (GlobalSymbol, Register) operand pair.
+                            let mem = MachineOperand::GlobalSymbol(name.clone());
+                            match &src {
+                                MachineOperand::Immediate(_) => {
+                                    let tmp = self.new_vreg();
+                                    let mov_imm =
+                                        Self::mk_inst(X86Opcode::Mov, Some(tmp.clone()), &[src]);
+                                    let store = Self::mk_inst(X86Opcode::Mov, None, &[mem, tmp]);
+                                    vec![mov_imm, store]
+                                }
+                                _ => {
+                                    vec![Self::mk_inst(X86Opcode::Mov, None, &[mem, src])]
+                                }
                             }
                         }
                     }
@@ -1817,7 +1897,7 @@ impl X86_64CodeGen {
                 result,
                 base,
                 indices,
-                result_type,
+                result_type: _,
                 ..
             } => {
                 let base_op = self.get_value(*base);
@@ -1913,15 +1993,12 @@ impl X86_64CodeGen {
                                 // When the base is a GlobalSymbol, the IMUL
                                 // will overwrite dst. Save the base LEA
                                 // result to a temp register first.
-                                if matches!(
-                                    &base_op_saved,
-                                    MachineOperand::GlobalSymbol(_)
-                                ) {
+                                if matches!(&base_op_saved, MachineOperand::GlobalSymbol(_)) {
                                     let base_tmp = self.new_vreg();
                                     out.push(Self::mk_inst(
                                         X86Opcode::Mov,
                                         Some(base_tmp.clone()),
-                                        &[dst.clone()],
+                                        std::slice::from_ref(&dst),
                                     ));
                                     // Three-operand IMUL: dst = idx * size
                                     out.push(Self::mk_inst(
@@ -2187,8 +2264,7 @@ impl X86_64CodeGen {
                             let op_idx = rw_start + rw_idx;
                             if op_idx < operands.len() {
                                 let src_op = self.get_value(operands[op_idx]);
-                                let mut mov =
-                                    MachineInstruction::new(X86Opcode::Mov.as_u32());
+                                let mut mov = MachineInstruction::new(X86Opcode::Mov.as_u32());
                                 mov.result = Some(dst.clone());
                                 mov.operands.push(src_op);
                                 pre_moves.push(mov);
@@ -2651,17 +2727,18 @@ impl X86_64CodeGen {
         args: &[Value],
     ) -> Option<Vec<MachineInstruction>> {
         // Helper: ensure an operand is in a register (load from memory if spilled).
-        let ensure_reg = |this: &mut Self, val: Value| -> (MachineOperand, Vec<MachineInstruction>) {
-            let op = this.get_value(val);
-            match &op {
-                MachineOperand::Register(_) => (op, vec![]),
-                _ => {
-                    let tmp = this.new_vreg();
-                    let mov = Self::mk_inst(X86Opcode::Mov, Some(tmp.clone()), &[op]);
-                    (tmp, vec![mov])
+        let _ensure_reg =
+            |this: &mut Self, val: Value| -> (MachineOperand, Vec<MachineInstruction>) {
+                let op = this.get_value(val);
+                match &op {
+                    MachineOperand::Register(_) => (op, vec![]),
+                    _ => {
+                        let tmp = this.new_vreg();
+                        let mov = Self::mk_inst(X86Opcode::Mov, Some(tmp.clone()), &[op]);
+                        (tmp, vec![mov])
+                    }
                 }
-            }
-        };
+            };
 
         match name {
             // ---- count leading zeros ----
@@ -2669,7 +2746,11 @@ impl X86_64CodeGen {
             // Uses physical register RCX for arg, physical RDX for BSR
             // result, then captures into dst vreg.
             "__builtin_clz" | "__builtin_clzl" | "__builtin_clzll" => {
-                let xor_val: i64 = if name == "__builtin_clzll" || name == "__builtin_clzl" { 63 } else { 31 };
+                let xor_val: i64 = if name == "__builtin_clzll" || name == "__builtin_clzl" {
+                    63
+                } else {
+                    31
+                };
                 let mut out = Vec::new();
                 let arg = self.get_value(args[0]);
                 let rcx = MachineOperand::Register(RCX);
@@ -2747,7 +2828,11 @@ impl X86_64CodeGen {
                 // MOV RCX, arg
                 out.push(Self::mk_inst(X86Opcode::Mov, Some(rcx.clone()), &[arg]));
                 // BSF RDX, RCX
-                out.push(Self::mk_inst(X86Opcode::Bsf, Some(rdx.clone()), &[rcx.clone()]));
+                out.push(Self::mk_inst(
+                    X86Opcode::Bsf,
+                    Some(rdx.clone()),
+                    std::slice::from_ref(&rcx),
+                ));
                 // ADD RDX, 1  (two-address)
                 out.push(Self::mk_inst(
                     X86Opcode::Add,
@@ -2759,7 +2844,11 @@ impl X86_64CodeGen {
                 // SETNE R10 (byte portion)
                 out.push(Self::mk_inst(X86Opcode::Setne, Some(r10.clone()), &[]));
                 // MOVZX R10, R10
-                out.push(Self::mk_inst(X86Opcode::MovZX, Some(r10.clone()), &[r10.clone()]));
+                out.push(Self::mk_inst(
+                    X86Opcode::MovZX,
+                    Some(r10.clone()),
+                    std::slice::from_ref(&r10),
+                ));
                 // IMUL R10, RDX  → R10 = R10 * RDX
                 out.push(Self::mk_inst(X86Opcode::Imul, Some(r10.clone()), &[rdx]));
                 // MOV dst, R10
@@ -2776,7 +2865,11 @@ impl X86_64CodeGen {
                 // MOV RCX, arg
                 out.push(Self::mk_inst(X86Opcode::Mov, Some(rcx.clone()), &[arg]));
                 // BSWAP32 RCX  (in-place byte swap; encoder uses 32-bit form)
-                let mut bswap = Self::mk_inst(X86Opcode::Bswap, Some(rcx.clone()), &[rcx.clone()]);
+                let mut bswap = Self::mk_inst(
+                    X86Opcode::Bswap,
+                    Some(rcx.clone()),
+                    std::slice::from_ref(&rcx),
+                );
                 bswap.operand_size = 4;
                 out.push(bswap);
                 // MOV dst, RCX
@@ -2792,7 +2885,11 @@ impl X86_64CodeGen {
                 // MOV RCX, arg
                 out.push(Self::mk_inst(X86Opcode::Mov, Some(rcx.clone()), &[arg]));
                 // BSWAP RCX  (64-bit in-place byte swap)
-                out.push(Self::mk_inst(X86Opcode::Bswap, Some(rcx.clone()), &[rcx.clone()]));
+                out.push(Self::mk_inst(
+                    X86Opcode::Bswap,
+                    Some(rcx.clone()),
+                    std::slice::from_ref(&rcx),
+                ));
                 // MOV dst, RCX
                 let dst = self.new_vreg();
                 self.set_value(result, dst.clone());
@@ -2806,7 +2903,11 @@ impl X86_64CodeGen {
                 // MOV RCX, arg
                 out.push(Self::mk_inst(X86Opcode::Mov, Some(rcx.clone()), &[arg]));
                 // BSWAP32 RCX then SHR 16 for 16-bit swap
-                let mut bswap = Self::mk_inst(X86Opcode::Bswap, Some(rcx.clone()), &[rcx.clone()]);
+                let mut bswap = Self::mk_inst(
+                    X86Opcode::Bswap,
+                    Some(rcx.clone()),
+                    std::slice::from_ref(&rcx),
+                );
                 bswap.operand_size = 4;
                 out.push(bswap);
                 out.push(Self::mk_inst(
@@ -2868,7 +2969,9 @@ impl X86_64CodeGen {
             }
             // ---- overflow arithmetic ----
             "__builtin_add_overflow" | "__builtin_sub_overflow" | "__builtin_mul_overflow" => {
-                if args.len() < 3 { return None; }
+                if args.len() < 3 {
+                    return None;
+                }
                 let a = self.get_value(args[0]);
                 let b = self.get_value(args[1]);
                 let result_ptr = self.get_value(args[2]);
@@ -2888,14 +2991,27 @@ impl X86_64CodeGen {
                 // 64-bit ADD/SUB/IMUL: va = va OP b (b used directly).
                 out.push(Self::mk_inst(op, Some(va.clone()), &[va.clone(), b]));
                 // Store low 32 bits to the result pointer.
-                let mut store = Self::mk_inst(X86Opcode::StoreInd32, None, &[result_ptr, va.clone()]);
+                let mut store =
+                    Self::mk_inst(X86Opcode::StoreInd32, None, &[result_ptr, va.clone()]);
                 store.operand_size = 4;
                 out.push(store);
                 // Overflow detection: check if the 64-bit result equals its
                 // 32-bit sign-extension.  SHL+SAR by 32 sign-extends low 32.
-                out.push(Self::mk_inst(X86Opcode::Mov, Some(r10.clone()), &[va.clone()]));
-                out.push(Self::mk_inst(X86Opcode::Shl, Some(r10.clone()), &[r10.clone(), MachineOperand::Immediate(32)]));
-                out.push(Self::mk_inst(X86Opcode::Sar, Some(r10.clone()), &[r10.clone(), MachineOperand::Immediate(32)]));
+                out.push(Self::mk_inst(
+                    X86Opcode::Mov,
+                    Some(r10.clone()),
+                    std::slice::from_ref(&va),
+                ));
+                out.push(Self::mk_inst(
+                    X86Opcode::Shl,
+                    Some(r10.clone()),
+                    &[r10.clone(), MachineOperand::Immediate(32)],
+                ));
+                out.push(Self::mk_inst(
+                    X86Opcode::Sar,
+                    Some(r10.clone()),
+                    &[r10.clone(), MachineOperand::Immediate(32)],
+                ));
                 // CMP R10, va — if they differ, 32-bit overflow occurred.
                 out.push(Self::mk_inst(X86Opcode::Cmp, None, &[r10, va]));
                 // SETNE captures "overflow" flag.
@@ -2913,7 +3029,9 @@ impl X86_64CodeGen {
             //
             // va_start: compute address of first variadic arg, store to ap.
             "__builtin_va_start" => {
-                if args.is_empty() { return None; }
+                if args.is_empty() {
+                    return None;
+                }
                 let ap_slot = self.get_value(args[0]);
                 let mut out = Vec::new();
                 if let Some(ref frame) = self.frame {
@@ -2947,7 +3065,9 @@ impl X86_64CodeGen {
             // va_arg: load current pointer from ap, dereference, advance, store back.
             // Uses RCX for current pointer, RDX for loaded value, R10 for next.
             "__builtin_va_arg" => {
-                if args.is_empty() { return None; }
+                if args.is_empty() {
+                    return None;
+                }
                 let ap_slot = self.get_value(args[0]);
                 let mut out = Vec::new();
                 let rcx = MachineOperand::Register(RCX);
@@ -2956,7 +3076,11 @@ impl X86_64CodeGen {
                 // Load current va_list pointer: RCX = *ap_slot
                 out.push(va_load_from_slot(&ap_slot, rcx.clone()));
                 // Dereference: RDX = *RCX (load the argument value)
-                out.push(Self::mk_inst(X86Opcode::LoadInd, Some(rdx.clone()), &[rcx.clone()]));
+                out.push(Self::mk_inst(
+                    X86Opcode::LoadInd,
+                    Some(rdx.clone()),
+                    std::slice::from_ref(&rcx),
+                ));
                 // Advance: R10 = RCX + 8  (use LEA for non-destructive add)
                 out.push(Self::mk_inst(
                     X86Opcode::Lea,
@@ -2988,7 +3112,9 @@ impl X86_64CodeGen {
             }
             // va_copy: copy pointer from src slot to dest slot.
             "__builtin_va_copy" => {
-                if args.len() < 2 { return None; }
+                if args.len() < 2 {
+                    return None;
+                }
                 let dest_slot = self.get_value(args[0]);
                 let src_slot = self.get_value(args[1]);
                 let mut out = Vec::new();
@@ -3020,7 +3146,7 @@ impl X86_64CodeGen {
         callee: Value,
         args: &[Value],
         return_type: &IrType,
-        func: &IrFunction,
+        _func: &IrFunction,
     ) -> Vec<MachineInstruction> {
         // Intercept __builtin_* intrinsic calls and emit inline code.
         if let Some(fname) = self.func_ref_names.get(&callee).cloned() {
@@ -3341,6 +3467,7 @@ impl X86_64CodeGen {
     }
 
     /// Static prologue emitter.
+    #[allow(dead_code)]
     fn emit_prologue_static(mf: &MachineFunction) -> Vec<MachineInstruction> {
         let mut prologue = Vec::new();
         let frame_size = mf.frame_size;

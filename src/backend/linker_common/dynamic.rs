@@ -263,6 +263,11 @@ impl DynamicSymbolTable {
     pub fn symbols(&self) -> &[DynamicSymbol] {
         &self.symbols
     }
+    /// Mutable borrow of the symbol list — used to patch values
+    /// after address layout computation.
+    pub fn symbols_mut(&mut self) -> &mut [DynamicSymbol] {
+        &mut self.symbols
+    }
     /// Count of local-binding symbols (used for `.dynsym` sh_info).
     pub fn local_count(&self) -> u32 {
         self.symbols
@@ -297,34 +302,44 @@ pub struct GnuHashTable {
 }
 
 impl GnuHashTable {
-    /// Build from dynamic symbols. Only defined global/weak symbols are hashed.
-    /// Symbols with `STB_GLOBAL` or `STB_WEAK` binding that are defined and
-    /// non-empty are included. `STT_OBJECT`, `STT_FUNC`, and `STT_NOTYPE` are
-    /// all valid symbol types for the hash table. Symbols with `STV_HIDDEN`
-    /// visibility are excluded since they are not exported, while `STV_PROTECTED`
-    /// symbols are included (they are still visible to the dynamic linker).
-    pub fn build(symbols: &[DynamicSymbol]) -> Self {
-        // Use FxHashSet for efficient deduplication of symbol names
+    /// Build from dynamic symbols and reorder them so that the `.dynsym`
+    /// layout matches the `.gnu.hash` lookup expectations.
+    ///
+    /// The GNU hash format requires that:
+    ///  1. Symbols 0..symoffset-1 are NOT in the hash table (null + undefined).
+    ///  2. Symbols symoffset..end are in the hash table, sorted by bucket.
+    ///  3. Symbols within a single bucket are contiguous — the dynamic linker
+    ///     walks chains by incrementing the dynsym index.
+    ///
+    /// This function partitions and reorders `symbols` in place to satisfy
+    /// those constraints, then builds the matching hash table.
+    pub fn build_and_reorder(symbols: &mut Vec<DynamicSymbol>) -> Self {
         let mut seen = FxHashSet::default();
-        let mut hashable: Vec<(usize, u32)> = Vec::new();
+
+        // Classify each symbol as hashable or non-hashable.
+        let mut hashable_indices: Vec<(usize, u32)> = Vec::new(); // (orig_index, hash)
+        let mut non_hashable_indices: Vec<usize> = Vec::new();
+
         for (i, sym) in symbols.iter().enumerate() {
             if i == 0 {
+                non_hashable_indices.push(i);
                 continue;
             }
-            // Only hash defined symbols with global or weak binding
             let is_exportable = sym.is_defined
                 && (sym.binding == STB_GLOBAL || sym.binding == STB_WEAK)
                 && !sym.name.is_empty()
                 && sym.visibility != STV_HIDDEN;
-            // Valid symbol types: STT_FUNC, STT_OBJECT, STT_NOTYPE
             let valid_type = sym.sym_type == STT_FUNC
                 || sym.sym_type == STT_OBJECT
                 || sym.sym_type == STT_NOTYPE;
             if is_exportable && valid_type && seen.insert(sym.name.clone()) {
-                hashable.push((i, gnu_hash(&sym.name)));
+                hashable_indices.push((i, gnu_hash(&sym.name)));
+            } else {
+                non_hashable_indices.push(i);
             }
         }
-        if hashable.is_empty() {
+
+        if hashable_indices.is_empty() {
             return Self {
                 bucket_count: 1,
                 symoffset: symbols.len() as u32,
@@ -335,35 +350,64 @@ impl GnuHashTable {
                 chains: Vec::new(),
             };
         }
-        let bucket_count =
-            std::cmp::max(1u32, ((hashable.len() * 4 / 3) as u32).next_power_of_two());
-        hashable.sort_by_key(|&(_, h)| h % bucket_count);
-        let symoffset = (symbols.len() - hashable.len()) as u32;
+
+        // Choose bucket count (power of two, ~4/3 of symbol count).
+        let bucket_count = std::cmp::max(
+            1u32,
+            ((hashable_indices.len() * 4 / 3) as u32).next_power_of_two(),
+        );
+
+        // Sort hashable symbols by bucket index for contiguous placement.
+        hashable_indices.sort_by_key(|&(_, h)| h % bucket_count);
+
+        let symoffset = non_hashable_indices.len() as u32;
+
+        // Reorder the symbol table: non-hashable first, then hashable.
+        let old_symbols = symbols.clone();
+        symbols.clear();
+        for &idx in &non_hashable_indices {
+            symbols.push(old_symbols[idx].clone());
+        }
+        for &(idx, _) in &hashable_indices {
+            symbols.push(old_symbols[idx].clone());
+        }
+
+        // Now symbols[symoffset + ci] corresponds to hashable_indices[ci].
+        // Build Bloom filter.
         let bloom_shift: u32 = 6;
-        let bloom_size = std::cmp::max(1u32, (hashable.len() as u32).next_power_of_two());
+        let bloom_size = std::cmp::max(1u32, (hashable_indices.len() as u32).next_power_of_two());
         let bloom_mask = bloom_size as u64 - 1;
         let mut bloom = vec![0u64; bloom_size as usize];
-        for &(_, h) in &hashable {
+        for &(_, h) in &hashable_indices {
             let wi = ((h as u64 / 64) & bloom_mask) as usize;
             bloom[wi] |= 1u64 << (h % 64);
             bloom[wi] |= 1u64 << ((h >> bloom_shift) % 64);
         }
+
+        // Build buckets and chains.
         let mut buckets = vec![0u32; bucket_count as usize];
-        let mut chains = vec![0u32; hashable.len()];
+        let mut chains = vec![0u32; hashable_indices.len()];
+
+        // Group symbols by bucket (indices into hashable_indices, which is
+        // already sorted by bucket so groups are contiguous).
         let mut groups: Vec<Vec<usize>> = vec![Vec::new(); bucket_count as usize];
-        for (ci, &(_, h)) in hashable.iter().enumerate() {
+        for (ci, &(_, h)) in hashable_indices.iter().enumerate() {
             groups[(h % bucket_count) as usize].push(ci);
         }
+
         for indices in &groups {
             if let Some(&first) = indices.first() {
-                let bkt = (hashable[first].1 % bucket_count) as usize;
+                let bkt = (hashable_indices[first].1 % bucket_count) as usize;
+                // Point to the actual dynsym index.
                 buckets[bkt] = first as u32 + symoffset;
             }
             for (pos, &ci) in indices.iter().enumerate() {
-                let h = hashable[ci].1;
+                let h = hashable_indices[ci].1;
+                // Store hash with low bit = 1 for last entry in chain.
                 chains[ci] = (h & !1) | u32::from(pos == indices.len() - 1);
             }
         }
+
         Self {
             bucket_count,
             symoffset,
@@ -373,6 +417,14 @@ impl GnuHashTable {
             buckets,
             chains,
         }
+    }
+
+    /// Legacy build function (does NOT reorder symbols).
+    /// Retained for backward compatibility with code paths that manage
+    /// symbol ordering externally. Prefer `build_and_reorder` for new code.
+    pub fn build(symbols: &[DynamicSymbol]) -> Self {
+        let mut v = symbols.to_vec();
+        Self::build_and_reorder(&mut v)
     }
 
     /// Encode the `.gnu.hash` section to bytes.
@@ -887,6 +939,12 @@ impl DynamicRelocationTable {
         }
     }
 
+    /// Return a mutable slice of `.rela.dyn` entries so Phase 9 can patch
+    /// offsets and addends after the address layout is finalized.
+    pub fn rela_dyn_mut(&mut self) -> &mut [DynamicRelocation] {
+        &mut self.rela_dyn
+    }
+
     pub fn encode_rela_dyn(&self, is_64bit: bool) -> Vec<u8> {
         encode_relocations(&self.rela_dyn, is_64bit)
     }
@@ -1144,8 +1202,9 @@ impl DynamicLinkContext {
             self.dynsym.add_dynstr_string(lib);
         }
 
-        // Build .gnu.hash from the symbol table
-        self.gnu_hash = GnuHashTable::build(&self.dynsym.symbols);
+        // Build .gnu.hash from the symbol table, reordering symbols to
+        // satisfy the contiguous-bucket layout required by the dynamic linker.
+        self.gnu_hash = GnuHashTable::build_and_reorder(&mut self.dynsym.symbols);
 
         // Build .dynamic from accumulated metadata
         self.dynamic = DynamicSection::build(self);

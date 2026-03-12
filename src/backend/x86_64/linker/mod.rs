@@ -448,10 +448,97 @@ impl X86_64Linker {
                 }
             }
 
+            // For shared libraries: export all defined global/weak symbols
+            // into .dynsym so consumers can link against them at runtime.
+            if self.is_shared {
+                let sym_table = self.symbol_resolver.build_symbol_table();
+                for sym in &sym_table.symbols {
+                    let is_defined = sym.section_index
+                        != crate::backend::linker_common::symbol_resolver::SHN_UNDEF;
+                    let is_global_or_weak = sym.binding == STB_GLOBAL
+                        || sym.binding == crate::backend::linker_common::symbol_resolver::STB_WEAK;
+                    let is_hidden = sym.visibility == crate::backend::elf_writer_common::STV_HIDDEN;
+                    if is_defined && is_global_or_weak && !sym.name.is_empty() && !is_hidden {
+                        // Check if already added as a PLT symbol
+                        let already_in = ctx.dynsym.symbols().iter().any(|s| s.name == sym.name);
+                        if !already_in {
+                            let ds = DynamicSymbol {
+                                name: sym.name.clone(),
+                                value: sym.value,
+                                size: sym.size,
+                                binding: sym.binding,
+                                sym_type: sym.sym_type,
+                                visibility: sym.visibility,
+                                section_index: sym.section_index,
+                                is_defined: true,
+                                is_plt_entry: false,
+                                got_offset: None,
+                                plt_index: None,
+                            };
+                            ctx.dynsym.add_symbol(ds);
+                        }
+                    }
+                }
+            }
+
             // Add needed library names to .dynstr so DT_NEEDED can reference them.
             let needed_libs_clone: Vec<String> = ctx.needed_libs.clone();
             for lib in &needed_libs_clone {
                 ctx.dynsym.add_dynstr_string(lib);
+            }
+
+            // For shared libraries: add R_X86_64_RELATIVE relocations for
+            // each .got entry that references a symbol defined in this DSO.
+            // For undefined symbols, use R_X86_64_GLOB_DAT instead.
+            // Offsets are .got-section-relative here; patched to VAs in Phase 9.
+            if self.is_shared {
+                use crate::backend::linker_common::dynamic::DynamicRelocation;
+                const R_X86_64_GLOB_DAT: u32 = 6;
+                const R_X86_64_RELATIVE: u32 = 8;
+
+                // Build a set of defined symbol names from the resolver.
+                let sym_table = self.symbol_resolver.build_symbol_table();
+                let defined_syms: FxHashSet<String> = sym_table
+                    .symbols
+                    .iter()
+                    .filter(|s| s.section_index != 0 && !s.name.is_empty())
+                    .map(|s| s.name.clone())
+                    .collect();
+
+                let got_entries_snap: Vec<(String, u64)> = ctx
+                    .got
+                    .got_entries()
+                    .iter()
+                    .map(|e| (e.symbol_name.clone(), e.offset))
+                    .collect();
+
+                for (sym_name, offset) in &got_entries_snap {
+                    if defined_syms.contains(sym_name) {
+                        // R_X86_64_RELATIVE: dynamic linker sets
+                        // GOT[offset] = load_base + addend.
+                        // Addend will be patched to the symbol's VA in Phase 9.
+                        ctx.rela.add_rela_dyn(DynamicRelocation {
+                            offset: *offset,
+                            sym_index: 0,
+                            rel_type: R_X86_64_RELATIVE,
+                            addend: 0, // patched in Phase 9
+                        });
+                    } else {
+                        // R_X86_64_GLOB_DAT: dynamic linker resolves symbol.
+                        let sym_idx = ctx
+                            .dynsym
+                            .symbols()
+                            .iter()
+                            .position(|s| s.name == *sym_name)
+                            .unwrap_or(0) as u32;
+                        ctx.rela.add_rela_dyn(DynamicRelocation {
+                            offset: *offset,
+                            sym_index: sym_idx,
+                            rel_type: R_X86_64_GLOB_DAT,
+                            addend: 0,
+                        });
+                    }
+                }
             }
 
             // Finalize: build .gnu.hash and .dynamic entries.
@@ -905,11 +992,56 @@ impl X86_64Linker {
                 ctx.rela.patch_rela_plt_offsets(addr);
             }
 
+            // Patch .rela.dyn offsets and RELATIVE addends.
+            // Offsets were stored as .got-section-relative; adjust to VAs.
+            if let Some(&got_va) = section_vaddr_map.get(".got") {
+                ctx.rela.patch_rela_dyn_offsets(got_va);
+            }
+
+            // Patch R_X86_64_RELATIVE addends with the symbol's final VA.
+            {
+                const R_X86_64_RELATIVE: u32 = 8;
+                let got_entries_snap: Vec<(String, u64)> = ctx
+                    .got
+                    .got_entries()
+                    .iter()
+                    .map(|e| (e.symbol_name.clone(), e.offset))
+                    .collect();
+
+                for r in ctx.rela.rela_dyn_mut() {
+                    if r.rel_type == R_X86_64_RELATIVE {
+                        // Find the GOT entry that matches this offset (before
+                        // VA adjustment it was got-relative; after, it's VA).
+                        // Find the symbol name from the GOT entry offset.
+                        let got_va = section_vaddr_map.get(".got").copied().unwrap_or(0);
+                        let got_rel_offset = r.offset.wrapping_sub(got_va);
+                        if let Some((sym_name, _)) = got_entries_snap
+                            .iter()
+                            .find(|(_, off)| *off == got_rel_offset)
+                        {
+                            if let Some(resolved) = symbol_addresses.get(sym_name) {
+                                r.addend = resolved.final_address as i64;
+                            }
+                        }
+                    }
+                }
+            }
+
             // Patch DT_NEEDED entries with dynstr offsets for library names.
             let needed_libs_clone: Vec<String> = ctx.needed_libs.clone();
             let dynstr_data = ctx.dynsym.encode_dynstr();
             ctx.dynamic
                 .patch_needed_libs(&needed_libs_clone, &dynstr_data);
+
+            // Patch exported symbol values in .dynsym with their final
+            // virtual addresses (resolved after layout computation).
+            for ds in ctx.dynsym.symbols_mut() {
+                if ds.is_defined && !ds.name.is_empty() {
+                    if let Some(resolved) = symbol_addresses.get(&ds.name) {
+                        ds.value = resolved.final_address;
+                    }
+                }
+            }
         }
 
         // ===================================================================

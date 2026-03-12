@@ -1828,12 +1828,11 @@ impl<'a> SemanticAnalyzer<'a> {
         // conversion, which includes array-to-pointer decay and
         // function-to-pointer decay, and qualifier stripping.
         let decayed = match self.strip_qualifiers(controlling_type) {
-            CType::Array(elem, _) => {
-                CType::Pointer(elem.clone(), TypeQualifiers::default())
-            }
-            CType::Function { .. } => {
-                CType::Pointer(Box::new(controlling_type.clone()), TypeQualifiers::default())
-            }
+            CType::Array(elem, _) => CType::Pointer(elem.clone(), TypeQualifiers::default()),
+            CType::Function { .. } => CType::Pointer(
+                Box::new(controlling_type.clone()),
+                TypeQualifiers::default(),
+            ),
             _ => controlling_type.clone(),
         };
         let ctrl_stripped = self.strip_qualifiers(&decayed).clone();

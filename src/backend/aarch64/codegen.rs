@@ -46,9 +46,10 @@ use crate::ir::types::IrType;
 const VREG_BASE: u32 = 64;
 
 /// Convert an IR `Value` to a virtual register number for A64 instructions.
+#[allow(dead_code)]
 #[inline]
 fn vreg(v: &Value) -> u32 {
-    v.index() as u32 + VREG_BASE
+    v.index() + VREG_BASE
 }
 
 // Re-import items used only in test verification module to avoid unused import warnings.
@@ -571,8 +572,8 @@ impl CondCode {
         match enc & 0xF {
             0 => CondCode::EQ,
             1 => CondCode::NE,
-            2 => CondCode::CS,  // HS
-            3 => CondCode::CC,  // LO
+            2 => CondCode::CS, // HS
+            3 => CondCode::CC, // LO
             4 => CondCode::MI,
             5 => CondCode::PL,
             6 => CondCode::VS,
@@ -861,17 +862,26 @@ impl AArch64InstructionSelector {
     }
 
     /// Set function reference name mappings.
-    pub fn set_func_ref_names(&mut self, refs: crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>) {
+    pub fn set_func_ref_names(
+        &mut self,
+        refs: crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>,
+    ) {
         self.func_ref_names = refs;
     }
 
     /// Set global variable reference flags.
-    pub fn set_global_var_refs(&mut self, refs: crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>) {
+    pub fn set_global_var_refs(
+        &mut self,
+        refs: crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>,
+    ) {
         self.global_var_refs = refs;
     }
 
     /// Set float constant cache mapping IR Values to their .rodata symbol names.
-    pub fn set_float_constant_cache(&mut self, cache: crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>) {
+    pub fn set_float_constant_cache(
+        &mut self,
+        cache: crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>,
+    ) {
         self.float_constant_cache = cache;
     }
 
@@ -1198,7 +1208,7 @@ impl AArch64InstructionSelector {
                     alloca_cursor = (alloca_cursor + mask) & !mask;
                     let fp_offset = (16 + alloca_cursor) as i64;
                     self.alloca_offsets
-                        .insert(result.index() as u32 + VREG_BASE, fp_offset);
+                        .insert(result.index() + VREG_BASE, fp_offset);
                     alloca_cursor += size;
                 }
             }
@@ -1222,6 +1232,7 @@ impl AArch64InstructionSelector {
     }
 
     /// Estimate total stack space needed for local allocas.
+    #[allow(dead_code)]
     fn estimate_locals_size(&self, func: &IrFunction) -> usize {
         let entry = func.entry_block();
         let mut total: usize = 0;
@@ -1650,7 +1661,7 @@ impl AArch64InstructionSelector {
         alignment: &Option<usize>,
         _span: &Span,
     ) -> Vec<A64Instruction> {
-        let rd = result.index() as u32 + VREG_BASE;
+        let rd = result.index() + VREG_BASE;
 
         // Look up the pre-computed FP-relative offset.
         if let Some(&fp_offset) = self.alloca_offsets.get(&rd) {
@@ -1703,7 +1714,10 @@ impl AArch64InstructionSelector {
                     .with_rd(rd)
                     .with_rn(FP_REG)
                     .with_rm(IP0)
-                    .with_comment(format!("alloca-dynamic {} bytes at FP+{} (large)", size, fp_offset)),
+                    .with_comment(format!(
+                        "alloca-dynamic {} bytes at FP+{} (large)",
+                        size, fp_offset
+                    )),
             );
             v
         }
@@ -1711,8 +1725,8 @@ impl AArch64InstructionSelector {
 
     /// Select load instructions based on the loaded type's size.
     fn select_load(&mut self, result: &Value, ptr: &Value, ty: &IrType) -> Vec<A64Instruction> {
-        let rd = result.index() as u32 + VREG_BASE;
-        let mut rn = ptr.index() as u32 + VREG_BASE;
+        let rd = result.index() + VREG_BASE;
+        let mut rn = ptr.index() + VREG_BASE;
         let size = self.type_size_for_mem(ty);
         let is_32 = Self::is_32bit_type(ty);
 
@@ -1762,8 +1776,8 @@ impl AArch64InstructionSelector {
     /// type directly, we default to a 64-bit store. The register allocator
     /// and type analysis passes refine this.
     fn select_store(&mut self, value: &Value, ptr: &Value) -> Vec<A64Instruction> {
-        let rd = value.index() as u32 + VREG_BASE;
-        let rn = ptr.index() as u32 + VREG_BASE;
+        let rd = value.index() + VREG_BASE;
+        let rn = ptr.index() + VREG_BASE;
 
         let mut insts = Vec::new();
 
@@ -1781,11 +1795,13 @@ impl AArch64InstructionSelector {
             rn
         };
 
-        insts.push(A64Instruction::new(A64Opcode::STR_imm)
-            .with_rd(rd)
-            .with_rn(actual_rn)
-            .with_imm(0)
-            .with_comment("store (64-bit default)"));
+        insts.push(
+            A64Instruction::new(A64Opcode::STR_imm)
+                .with_rd(rd)
+                .with_rn(actual_rn)
+                .with_imm(0)
+                .with_comment("store (64-bit default)"),
+        );
         insts
     }
 
@@ -1801,10 +1817,10 @@ impl AArch64InstructionSelector {
         // Handle constant sentinel: BinOp(Add, result, result, UNDEF)
         // generated by emit_int_const in the IR lowering.
         if *lhs == *result && *rhs == Value::UNDEF {
-            let rd = result.index() as u32 + VREG_BASE;
+            let rd = result.index() + VREG_BASE;
             let is_32 = Self::is_32bit_type(ty);
             // Look up constant from our cached constants.
-            if let Some(&imm) = self.constant_values.get(&(result.index() as u32 + VREG_BASE)) {
+            if let Some(&imm) = self.constant_values.get(&(result.index() + VREG_BASE)) {
                 let mut inst = A64Instruction::new(A64Opcode::MOVZ)
                     .with_rd(rd)
                     .with_imm(imm);
@@ -1821,9 +1837,9 @@ impl AArch64InstructionSelector {
             return vec![inst];
         }
 
-        let rd = result.index() as u32 + VREG_BASE;
-        let rn = lhs.index() as u32 + VREG_BASE;
-        let rm = rhs.index() as u32 + VREG_BASE;
+        let rd = result.index() + VREG_BASE;
+        let rn = lhs.index() + VREG_BASE;
+        let rm = rhs.index() + VREG_BASE;
         let is_32 = Self::is_32bit_type(ty);
         let mut insts = Vec::new();
 
@@ -2067,9 +2083,9 @@ impl AArch64InstructionSelector {
         lhs: &Value,
         rhs: &Value,
     ) -> Vec<A64Instruction> {
-        let rd = result.index() as u32 + VREG_BASE;
-        let rn = lhs.index() as u32 + VREG_BASE;
-        let rm = rhs.index() as u32 + VREG_BASE;
+        let rd = result.index() + VREG_BASE;
+        let rn = lhs.index() + VREG_BASE;
+        let rm = rhs.index() + VREG_BASE;
         let cc = CondCode::from_icmp(op);
 
         vec![
@@ -2094,9 +2110,9 @@ impl AArch64InstructionSelector {
         lhs: &Value,
         rhs: &Value,
     ) -> Vec<A64Instruction> {
-        let rd = result.index() as u32 + VREG_BASE;
-        let rn = lhs.index() as u32 + VREG_BASE;
-        let rm = rhs.index() as u32 + VREG_BASE;
+        let rd = result.index() + VREG_BASE;
+        let rn = lhs.index() + VREG_BASE;
+        let rm = rhs.index() + VREG_BASE;
         let cc = CondCode::from_fcmp(op);
 
         vec![
@@ -2132,7 +2148,7 @@ impl AArch64InstructionSelector {
         then_block: &BlockId,
         else_block: &BlockId,
     ) -> Vec<A64Instruction> {
-        let rn = condition.index() as u32 + VREG_BASE;
+        let rn = condition.index() + VREG_BASE;
         let then_label = if then_block.index() < self.block_labels.len() {
             self.block_labels[then_block.index()].clone()
         } else {
@@ -2163,7 +2179,7 @@ impl AArch64InstructionSelector {
         default: &BlockId,
         cases: &[(i64, BlockId)],
     ) -> Vec<A64Instruction> {
-        let rn = value.index() as u32 + VREG_BASE;
+        let rn = value.index() + VREG_BASE;
         let mut insts = Vec::new();
 
         for (case_val, target) in cases {
@@ -2215,17 +2231,18 @@ impl AArch64InstructionSelector {
     /// and copies the return value from X0 or V0.
     /// Try to inline a GCC __builtin_* call as native AArch64 instructions.
     /// Returns Some(instructions) if the builtin was handled, None otherwise.
+    #[allow(clippy::vec_init_then_push)]
     fn try_inline_builtin(
         &mut self,
         name: &str,
         result: &Value,
         args: &[Value],
     ) -> Option<Vec<A64Instruction>> {
-        let rd = result.index() as u32 + VREG_BASE;
+        let rd = result.index() + VREG_BASE;
         match name {
             // ---- byte swap builtins ----
             "__builtin_bswap16" => {
-                let src = args[0].index() as u32 + VREG_BASE;
+                let src = args[0].index() + VREG_BASE;
                 let mut insts = Vec::new();
                 // REV16: reverse bytes within each 16-bit halfword.
                 // We need REV Wd, Wn (32-bit byte reversal) then LSR Wd, Wd, #16
@@ -2248,47 +2265,39 @@ impl AArch64InstructionSelector {
                 Some(insts)
             }
             "__builtin_bswap32" => {
-                let src = args[0].index() as u32 + VREG_BASE;
-                Some(vec![
-                    A64Instruction::new(A64Opcode::REV)
-                        .with_rd(rd)
-                        .with_rn(src)
-                        .set_32bit()
-                        .with_comment("bswap32: rev w"),
-                ])
+                let src = args[0].index() + VREG_BASE;
+                Some(vec![A64Instruction::new(A64Opcode::REV)
+                    .with_rd(rd)
+                    .with_rn(src)
+                    .set_32bit()
+                    .with_comment("bswap32: rev w")])
             }
             "__builtin_bswap64" => {
-                let src = args[0].index() as u32 + VREG_BASE;
-                Some(vec![
-                    A64Instruction::new(A64Opcode::REV)
-                        .with_rd(rd)
-                        .with_rn(src)
-                        .with_comment("bswap64: rev x"),
-                ])
+                let src = args[0].index() + VREG_BASE;
+                Some(vec![A64Instruction::new(A64Opcode::REV)
+                    .with_rd(rd)
+                    .with_rn(src)
+                    .with_comment("bswap64: rev x")])
             }
             // ---- count leading zeros ----
             "__builtin_clz" => {
-                let src = args[0].index() as u32 + VREG_BASE;
-                Some(vec![
-                    A64Instruction::new(A64Opcode::CLZ)
-                        .with_rd(rd)
-                        .with_rn(src)
-                        .set_32bit()
-                        .with_comment("clz (32-bit)"),
-                ])
+                let src = args[0].index() + VREG_BASE;
+                Some(vec![A64Instruction::new(A64Opcode::CLZ)
+                    .with_rd(rd)
+                    .with_rn(src)
+                    .set_32bit()
+                    .with_comment("clz (32-bit)")])
             }
             "__builtin_clzl" | "__builtin_clzll" => {
-                let src = args[0].index() as u32 + VREG_BASE;
-                Some(vec![
-                    A64Instruction::new(A64Opcode::CLZ)
-                        .with_rd(rd)
-                        .with_rn(src)
-                        .with_comment("clz (64-bit)"),
-                ])
+                let src = args[0].index() + VREG_BASE;
+                Some(vec![A64Instruction::new(A64Opcode::CLZ)
+                    .with_rd(rd)
+                    .with_rn(src)
+                    .with_comment("clz (64-bit)")])
             }
             // ---- count trailing zeros ----
             "__builtin_ctz" => {
-                let src = args[0].index() as u32 + VREG_BASE;
+                let src = args[0].index() + VREG_BASE;
                 // RBIT Wd, Wn; CLZ Wd, Wd → count trailing zeros via reverse-then-count-leading
                 let mut insts = Vec::new();
                 insts.push(
@@ -2308,7 +2317,7 @@ impl AArch64InstructionSelector {
                 Some(insts)
             }
             "__builtin_ctzl" | "__builtin_ctzll" => {
-                let src = args[0].index() as u32 + VREG_BASE;
+                let src = args[0].index() + VREG_BASE;
                 let mut insts = Vec::new();
                 insts.push(
                     A64Instruction::new(A64Opcode::RBIT)
@@ -2330,7 +2339,7 @@ impl AArch64InstructionSelector {
                 // This is a multi-instruction SIMD sequence. For simplicity, use:
                 // FMOV Dd, Xn; CNT Vd.8B; UADDLV Hd, Vd.8B; FMOV Wd, Sd
                 // For now, emit a simple sequence using a temporary FP register.
-                let src = args[0].index() as u32 + VREG_BASE;
+                let src = args[0].index() + VREG_BASE;
                 let mut insts = Vec::new();
                 // Move GP -> FP: FMOV Dd, Xn
                 insts.push(
@@ -2368,7 +2377,7 @@ impl AArch64InstructionSelector {
             }
             // ---- find first set bit (1-indexed, 0 if input is 0) ----
             "__builtin_ffs" => {
-                let src = args[0].index() as u32 + VREG_BASE;
+                let src = args[0].index() + VREG_BASE;
                 let mut insts = Vec::new();
                 // RBIT + CLZ gives ctz, then add 1. But ffs(0) must be 0.
                 // Use: RBIT Wd, Wn; CLZ Wd, Wd; ADD Wd, Wd, #1;
@@ -2414,7 +2423,7 @@ impl AArch64InstructionSelector {
                 Some(insts)
             }
             "__builtin_ffsll" => {
-                let src = args[0].index() as u32 + VREG_BASE;
+                let src = args[0].index() + VREG_BASE;
                 let mut insts = Vec::new();
                 insts.push(
                     A64Instruction::new(A64Opcode::RBIT)
@@ -2454,42 +2463,34 @@ impl AArch64InstructionSelector {
             // ---- branch prediction and optimizer hints ----
             "__builtin_expect" => {
                 // Returns first argument unchanged (hint only).
-                let src = args[0].index() as u32 + VREG_BASE;
-                Some(vec![
-                    A64Instruction::new(A64Opcode::MOV_reg)
-                        .with_rd(rd)
-                        .with_rn(src)
-                        .with_comment("expect: passthrough"),
-                ])
+                let src = args[0].index() + VREG_BASE;
+                Some(vec![A64Instruction::new(A64Opcode::MOV_reg)
+                    .with_rd(rd)
+                    .with_rn(src)
+                    .with_comment("expect: passthrough")])
             }
             "__builtin_assume_aligned" => {
                 // Returns first argument unchanged (alignment hint only).
-                let src = args[0].index() as u32 + VREG_BASE;
-                Some(vec![
-                    A64Instruction::new(A64Opcode::MOV_reg)
-                        .with_rd(rd)
-                        .with_rn(src)
-                        .with_comment("assume_aligned: passthrough"),
-                ])
+                let src = args[0].index() + VREG_BASE;
+                Some(vec![A64Instruction::new(A64Opcode::MOV_reg)
+                    .with_rd(rd)
+                    .with_rn(src)
+                    .with_comment("assume_aligned: passthrough")])
             }
             // ---- frame/return address ----
             "__builtin_frame_address" => {
                 // Returns the frame pointer (X29/FP).
-                Some(vec![
-                    A64Instruction::new(A64Opcode::MOV_reg)
-                        .with_rd(rd)
-                        .with_rn(FP_REG)
-                        .with_comment("frame_address: mov from fp"),
-                ])
+                Some(vec![A64Instruction::new(A64Opcode::MOV_reg)
+                    .with_rd(rd)
+                    .with_rn(FP_REG)
+                    .with_comment("frame_address: mov from fp")])
             }
             "__builtin_return_address" => {
                 // Returns the link register (X30/LR).
-                Some(vec![
-                    A64Instruction::new(A64Opcode::MOV_reg)
-                        .with_rd(rd)
-                        .with_rn(LR)
-                        .with_comment("return_address: mov from lr"),
-                ])
+                Some(vec![A64Instruction::new(A64Opcode::MOV_reg)
+                    .with_rd(rd)
+                    .with_rn(LR)
+                    .with_comment("return_address: mov from lr")])
             }
             // ---- variadic argument builtins ----
             // AAPCS64 simplified model: va_list is a pointer to the save area
@@ -2499,8 +2500,10 @@ impl AArch64InstructionSelector {
                 // The caller's variadic args are spilled to stack starting at some offset
                 // above FP. For this simplified ABI, we compute the address of the first
                 // variadic argument and store it into the va_list pointer (args[0]).
-                if args.is_empty() { return None; }
-                let ap_ptr = args[0].index() as u32 + VREG_BASE;
+                if args.is_empty() {
+                    return None;
+                }
+                let ap_ptr = args[0].index() + VREG_BASE;
                 let mut insts = Vec::new();
                 // Compute address of first variadic arg: FP + 16 + (named_args * 8)
                 // For now, use FP+16 as the base of the caller's argument area.
@@ -2526,8 +2529,10 @@ impl AArch64InstructionSelector {
             "__builtin_va_arg" => {
                 // va_arg(ap, type): load current pointer from ap, dereference it,
                 // advance the pointer by 8, store back.
-                if args.is_empty() { return None; }
-                let ap_ptr = args[0].index() as u32 + VREG_BASE;
+                if args.is_empty() {
+                    return None;
+                }
+                let ap_ptr = args[0].index() + VREG_BASE;
                 let mut insts = Vec::new();
                 // Load current va_list pointer: tmp = *ap_ptr
                 let tmp = rd; // reuse result register as temporary
@@ -2575,18 +2580,18 @@ impl AArch64InstructionSelector {
             }
             "__builtin_va_end" => {
                 // va_end(ap): no-op on AArch64.
-                Some(vec![
-                    A64Instruction::new(A64Opcode::MOV_imm)
-                        .with_rd(rd)
-                        .with_imm(0)
-                        .with_comment("va_end: nop"),
-                ])
+                Some(vec![A64Instruction::new(A64Opcode::MOV_imm)
+                    .with_rd(rd)
+                    .with_imm(0)
+                    .with_comment("va_end: nop")])
             }
             "__builtin_va_copy" => {
                 // va_copy(dest, src): copy the va_list pointer.
-                if args.len() < 2 { return None; }
-                let dest_ptr = args[0].index() as u32 + VREG_BASE;
-                let src_ptr = args[1].index() as u32 + VREG_BASE;
+                if args.len() < 2 {
+                    return None;
+                }
+                let dest_ptr = args[0].index() + VREG_BASE;
+                let src_ptr = args[1].index() + VREG_BASE;
                 let mut insts = Vec::new();
                 // Load src: IP0 = *src_ptr
                 insts.push(
@@ -2618,10 +2623,12 @@ impl AArch64InstructionSelector {
                 // __builtin_{add,sub,mul}_overflow(a, b, result_ptr)
                 // Returns 1 if overflow occurred, 0 otherwise.
                 // Stores the (possibly wrapped) result to *result_ptr.
-                if args.len() < 3 { return None; }
-                let a_reg = args[0].index() as u32 + VREG_BASE;
-                let b_reg = args[1].index() as u32 + VREG_BASE;
-                let result_ptr = args[2].index() as u32 + VREG_BASE;
+                if args.len() < 3 {
+                    return None;
+                }
+                let a_reg = args[0].index() + VREG_BASE;
+                let b_reg = args[1].index() + VREG_BASE;
+                let result_ptr = args[2].index() + VREG_BASE;
                 let mut insts = Vec::new();
 
                 match name {
@@ -2751,7 +2758,7 @@ impl AArch64InstructionSelector {
         let mut fp_reg_idx = 0usize;
         let mut stack_offset: i64 = 0;
         for (i, arg) in args.iter().enumerate() {
-            let src = arg.index() as u32 + VREG_BASE;
+            let src = arg.index() + VREG_BASE;
             // Classify argument as FP if its IrType is F32/F64/F80.
             let is_fp_arg = self
                 .value_types
@@ -2795,7 +2802,10 @@ impl AArch64InstructionSelector {
                         A64Instruction::new(A64Opcode::LA)
                             .with_rd(dest)
                             .with_symbol(sym_name.clone())
-                            .with_comment(format!("load addr of global {} for arg {}", sym_name, i)),
+                            .with_comment(format!(
+                                "load addr of global {} for arg {}",
+                                sym_name, i
+                            )),
                     );
                 } else {
                     insts.push(
@@ -2816,14 +2826,20 @@ impl AArch64InstructionSelector {
                         A64Instruction::new(A64Opcode::LA)
                             .with_rd(IP0)
                             .with_symbol(sym_name.clone())
-                            .with_comment(format!("load addr of global {} for stack arg {}", sym_name, i)),
+                            .with_comment(format!(
+                                "load addr of global {} for stack arg {}",
+                                sym_name, i
+                            )),
                     );
                     insts.push(
                         A64Instruction::new(A64Opcode::STR_imm)
                             .with_rd(IP0)
                             .with_rn(SP_REG)
                             .with_imm(stack_offset)
-                            .with_comment(format!("stack arg {} (global) at sp+{}", i, stack_offset)),
+                            .with_comment(format!(
+                                "stack arg {} (global) at sp+{}",
+                                i, stack_offset
+                            )),
                     );
                 } else {
                     insts.push(
@@ -2843,8 +2859,12 @@ impl AArch64InstructionSelector {
         // or an indirect call through a register (→ BLR Xn).
         // DEBUG: temporarily log func_ref_names lookup
         if std::env::var("BCC_DEBUG_A64").is_ok() {
-            eprintln!("  SENTINEL: callee={:?} func_ref_names_count={} lookup={:?}",
-                callee, self.func_ref_names.len(), self.func_ref_names.get(callee));
+            eprintln!(
+                "  SENTINEL: callee={:?} func_ref_names_count={} lookup={:?}",
+                callee,
+                self.func_ref_names.len(),
+                self.func_ref_names.get(callee)
+            );
         }
         if let Some(func_name) = self.func_ref_names.get(callee) {
             insts.push(
@@ -2853,7 +2873,7 @@ impl AArch64InstructionSelector {
                     .with_comment(format!("call {}", func_name)),
             );
         } else {
-            let callee_reg = callee.index() as u32 + VREG_BASE;
+            let callee_reg = callee.index() + VREG_BASE;
             insts.push(
                 A64Instruction::new(A64Opcode::CALL)
                     .with_rn(callee_reg)
@@ -2863,7 +2883,7 @@ impl AArch64InstructionSelector {
 
         // Move return value from X0 (integer) or V0 (FP) to result vreg.
         if !return_type.is_void() {
-            let rd = result.index() as u32 + VREG_BASE;
+            let rd = result.index() + VREG_BASE;
             if return_type.is_float() {
                 // Both F32 and F64 return values are in V0 per AAPCS64.
                 insts.push(
@@ -2890,7 +2910,7 @@ impl AArch64InstructionSelector {
     fn select_return(&mut self, value: &Option<Value>) -> Vec<A64Instruction> {
         let mut insts = Vec::new();
         if let Some(val) = value {
-            let src = val.index() as u32 + VREG_BASE;
+            let src = val.index() + VREG_BASE;
             // Move return value to X0 (integer) for the caller.
             insts.push(
                 A64Instruction::new(A64Opcode::MOV_reg)
@@ -2911,7 +2931,7 @@ impl AArch64InstructionSelector {
         indices: &[Value],
         _result_type: &IrType,
     ) -> Vec<A64Instruction> {
-        let rd = result.index() as u32 + VREG_BASE;
+        let rd = result.index() + VREG_BASE;
         let mut insts = Vec::new();
 
         // Check if the base is a global variable reference — needs LA (Load Address) pseudo-instruction.
@@ -2926,7 +2946,7 @@ impl AArch64InstructionSelector {
             );
         } else {
             // Base is a regular virtual register — copy it into rd.
-            let rn = base.index() as u32 + VREG_BASE;
+            let rn = base.index() + VREG_BASE;
             insts.push(
                 A64Instruction::new(A64Opcode::MOV_reg)
                     .with_rd(rd)
@@ -2938,12 +2958,12 @@ impl AArch64InstructionSelector {
         // Add each index offset, skipping constant-zero indices.
         for idx in indices {
             // Check if this index is a known constant zero — skip the ADD entirely.
-            if let Some(&imm_val) = self.constant_values.get(&(idx.index() as u32 + VREG_BASE)) {
+            if let Some(&imm_val) = self.constant_values.get(&(idx.index() + VREG_BASE)) {
                 if imm_val == 0 {
                     continue; // Index is zero, no offset to add.
                 }
             }
-            let rm = idx.index() as u32 + VREG_BASE;
+            let rm = idx.index() + VREG_BASE;
             insts.push(
                 A64Instruction::new(A64Opcode::ADD_reg)
                     .with_rd(rd)
@@ -2963,8 +2983,8 @@ impl AArch64InstructionSelector {
         value: &Value,
         to_type: &IrType,
     ) -> Vec<A64Instruction> {
-        let rd = result.index() as u32 + VREG_BASE;
-        let rn = value.index() as u32 + VREG_BASE;
+        let rd = result.index() + VREG_BASE;
+        let rn = value.index() + VREG_BASE;
 
         if to_type.is_float() {
             // GP register -> FP register.
@@ -2993,8 +3013,8 @@ impl AArch64InstructionSelector {
         value: &Value,
         to_type: &IrType,
     ) -> Vec<A64Instruction> {
-        let rd = result.index() as u32 + VREG_BASE;
-        let rn = value.index() as u32 + VREG_BASE;
+        let rd = result.index() + VREG_BASE;
+        let rn = value.index() + VREG_BASE;
 
         match to_type {
             IrType::I1 => {
@@ -3044,8 +3064,8 @@ impl AArch64InstructionSelector {
         value: &Value,
         to_type: &IrType,
     ) -> Vec<A64Instruction> {
-        let rd = result.index() as u32 + VREG_BASE;
-        let rn = value.index() as u32 + VREG_BASE;
+        let rd = result.index() + VREG_BASE;
+        let rn = value.index() + VREG_BASE;
 
         // On AArch64, writing to a W-register implicitly zero-extends the
         // upper 32 bits of the containing X-register. For sub-32-bit sources,
@@ -3063,8 +3083,8 @@ impl AArch64InstructionSelector {
         value: &Value,
         to_type: &IrType,
     ) -> Vec<A64Instruction> {
-        let rd = result.index() as u32 + VREG_BASE;
-        let rn = value.index() as u32 + VREG_BASE;
+        let rd = result.index() + VREG_BASE;
+        let rn = value.index() + VREG_BASE;
 
         // Choose the appropriate sign-extend instruction based on target width.
         let opcode = match to_type {
@@ -3082,8 +3102,8 @@ impl AArch64InstructionSelector {
 
     /// Select integer-to-pointer conversion (no-op on LP64).
     fn select_int_to_ptr(&mut self, result: &Value, value: &Value) -> Vec<A64Instruction> {
-        let rd = result.index() as u32 + VREG_BASE;
-        let rn = value.index() as u32 + VREG_BASE;
+        let rd = result.index() + VREG_BASE;
+        let rn = value.index() + VREG_BASE;
         vec![A64Instruction::new(A64Opcode::MOV_reg)
             .with_rd(rd)
             .with_rn(rn)
@@ -3097,8 +3117,8 @@ impl AArch64InstructionSelector {
         value: &Value,
         _to_type: &IrType,
     ) -> Vec<A64Instruction> {
-        let rd = result.index() as u32 + VREG_BASE;
-        let rn = value.index() as u32 + VREG_BASE;
+        let rd = result.index() + VREG_BASE;
+        let rn = value.index() + VREG_BASE;
         vec![A64Instruction::new(A64Opcode::MOV_reg)
             .with_rd(rd)
             .with_rn(rn)

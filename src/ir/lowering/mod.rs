@@ -776,7 +776,10 @@ pub fn lower_translation_unit(
         // Pre-seed with the compiler builtin typedef.
         typedef_map.insert(
             "__builtin_va_list".to_string(),
-            CType::Pointer(Box::new(CType::Void), crate::common::types::TypeQualifiers::default()),
+            CType::Pointer(
+                Box::new(CType::Void),
+                crate::common::types::TypeQualifiers::default(),
+            ),
         );
         // Install the map into thread-local BEFORE the scan loop so that
         // resolve_base_type_fast can find __builtin_va_list when resolving
@@ -789,10 +792,15 @@ pub fn lower_translation_unit(
     // add resolved types to the map.
     for ext_decl in &translation_unit.declarations {
         if let ast::ExternalDeclaration::Declaration(decl) = ext_decl {
-            if matches!(decl.specifiers.storage_class, Some(ast::StorageClass::Typedef)) {
+            if matches!(
+                decl.specifiers.storage_class,
+                Some(ast::StorageClass::Typedef)
+            ) {
                 for init_decl in &decl.declarators {
                     let declarator = &init_decl.declarator;
-                    if let Some(td_name) = decl_lowering::extract_declarator_name(declarator, &name_table) {
+                    if let Some(td_name) =
+                        decl_lowering::extract_declarator_name(declarator, &name_table)
+                    {
                         let full_type = decl_lowering::resolve_declaration_type(
                             &decl.specifiers,
                             declarator,
@@ -922,6 +930,9 @@ pub fn lower_translation_unit(
     // ====================================================================
     for ext_decl in &translation_unit.declarations {
         if let ast::ExternalDeclaration::FunctionDefinition(func_def) = ext_decl {
+            // Lowering function definitions to IR follows the alloca-first
+            // pattern: local variables are allocated in the entry block, then
+            // the function body is lowered as statement/expression IR.
             decl_lowering::lower_function_definition(
                 func_def,
                 &mut module,

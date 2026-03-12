@@ -308,7 +308,12 @@ pub fn compute_live_intervals(func: &IrFunction) -> Vec<LiveInterval> {
     let num_blocks = func.block_count();
     let mut block_start: Vec<u32> = vec![0; num_blocks];
     let mut block_end: Vec<u32> = vec![0; num_blocks];
-    let mut idx: u32 = 0;
+    // Start instruction indices at 1, reserving index 0 for function
+    // parameters.  This ensures that a parameter whose live range
+    // spans a CALL at the very first instruction position is correctly
+    // detected as `crosses_call` (the check uses `cp > start`, so a
+    // parameter at start=0 with a call at index 1 yields `1 > 0` = true).
+    let mut idx: u32 = 1;
 
     for &bi in &rpo {
         if bi < num_blocks {
@@ -343,7 +348,9 @@ pub fn compute_live_intervals(func: &IrFunction) -> Vec<LiveInterval> {
     let mut call_positions: Vec<u32> = Vec::new();
 
     // Walk every instruction in RPO linear order.
-    idx = 0;
+    // Start at 1, matching the block-boundary computation above
+    // (index 0 is reserved for function parameters).
+    idx = 1;
     let debug_intervals = std::env::var("BCC_DEBUG_INTERVALS").is_ok();
     for &bi in &rpo {
         if bi >= num_blocks {
@@ -352,9 +359,23 @@ pub fn compute_live_intervals(func: &IrFunction) -> Vec<LiveInterval> {
         let block = &func.blocks[bi];
         for inst in block.instructions.iter() {
             if debug_intervals {
-                let res = inst.result().map(|v| format!("v{}", v.index())).unwrap_or_default();
-                let ops: Vec<String> = inst.operands().iter().map(|v| format!("v{}", v.index())).collect();
-                eprintln!("  IR idx={} block={} result={} ops=[{}] => {}", idx, bi, res, ops.join(","), inst);
+                let res = inst
+                    .result()
+                    .map(|v| format!("v{}", v.index()))
+                    .unwrap_or_default();
+                let ops: Vec<String> = inst
+                    .operands()
+                    .iter()
+                    .map(|v| format!("v{}", v.index()))
+                    .collect();
+                eprintln!(
+                    "  IR idx={} block={} result={} ops=[{}] => {}",
+                    idx,
+                    bi,
+                    res,
+                    ops.join(","),
+                    inst
+                );
             }
             // Detect call instructions.
             if matches!(inst, Instruction::Call { .. }) {
@@ -509,9 +530,7 @@ pub fn compute_live_intervals(func: &IrFunction) -> Vec<LiveInterval> {
                         while let Some(b) = worklist.pop() {
                             if loop_blocks.insert(b) {
                                 for &pred in func.blocks[b].predecessors() {
-                                    if pred < num_blocks
-                                        && !loop_blocks.contains(&pred)
-                                    {
+                                    if pred < num_blocks && !loop_blocks.contains(&pred) {
                                         worklist.push(pred);
                                     }
                                 }
@@ -539,9 +558,7 @@ pub fn compute_live_intervals(func: &IrFunction) -> Vec<LiveInterval> {
                             if let Some(end) = ends.get_mut(_val) {
                                 // Value is live at the loop header if
                                 // its interval reaches the header.
-                                if *end >= loop_header_start
-                                    && *end < loop_body_last_idx
-                                {
+                                if *end >= loop_header_start && *end < loop_body_last_idx {
                                     *end = loop_body_last_idx;
                                 }
                             }
@@ -662,9 +679,19 @@ pub fn allocate_registers(
     if debug_regalloc {
         eprintln!("=== REGALLOC INTERVALS ===");
         for iv in intervals.iter() {
-            eprintln!("  v{}: [{}, {}] {:?} cross_call={}", iv.vreg.index(), iv.start, iv.end, iv.reg_class, iv.crosses_call);
+            eprintln!(
+                "  v{}: [{}, {}] {:?} cross_call={}",
+                iv.vreg.index(),
+                iv.start,
+                iv.end,
+                iv.reg_class,
+                iv.crosses_call
+            );
         }
-        eprintln!("=== GPR pool: {:?} ===", free_gpr.iter().map(|r| r.0).collect::<Vec<_>>());
+        eprintln!(
+            "=== GPR pool: {:?} ===",
+            free_gpr.iter().map(|r| r.0).collect::<Vec<_>>()
+        );
     }
 
     for i in 0..intervals.len() {
@@ -710,7 +737,13 @@ pub fn allocate_registers(
             intervals[i].assigned = Some(reg);
             assignments.insert(intervals[i].vreg, reg);
             if debug_regalloc {
-                eprintln!("  ASSIGN v{} [{},{}] -> r{}", intervals[i].vreg.index(), intervals[i].start, intervals[i].end, reg.0);
+                eprintln!(
+                    "  ASSIGN v{} [{},{}] -> r{}",
+                    intervals[i].vreg.index(),
+                    intervals[i].start,
+                    intervals[i].end,
+                    reg.0
+                );
             }
 
             if reg_info.callee_saved.contains(&reg) {
@@ -736,10 +769,16 @@ pub fn allocate_registers(
                 if intervals[far_idx].end > intervals[i].end {
                     // Spill the farther interval; re-use its register.
                     if debug_regalloc {
-                        eprintln!("  SPILL-FAR v{} [{},{}] (was r{}), give to v{} [{},{}]",
-                            intervals[far_idx].vreg.index(), intervals[far_idx].start, intervals[far_idx].end,
+                        eprintln!(
+                            "  SPILL-FAR v{} [{},{}] (was r{}), give to v{} [{},{}]",
+                            intervals[far_idx].vreg.index(),
+                            intervals[far_idx].start,
+                            intervals[far_idx].end,
                             intervals[far_idx].assigned.unwrap().0,
-                            intervals[i].vreg.index(), intervals[i].start, intervals[i].end);
+                            intervals[i].vreg.index(),
+                            intervals[i].start,
+                            intervals[i].end
+                        );
                     }
                     let reg = intervals[far_idx].assigned.take().unwrap();
                     assignments.remove(&intervals[far_idx].vreg);

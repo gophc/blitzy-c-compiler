@@ -243,6 +243,30 @@ impl std::fmt::Display for FunctionParam {
 }
 
 // ===========================================================================
+// LocalVarDebugInfo — debug metadata for local variables
+// ===========================================================================
+
+/// Debug information for a local variable, threaded from IR lowering to
+/// the DWARF emitter so that `DW_TAG_variable` entries can be generated.
+///
+/// Each entry corresponds to one user-declared local variable in the
+/// original C source.  The `alloca_index` records the variable's
+/// sequential position among the function's alloca instructions (0-based),
+/// which the DWARF emitter uses to compute a `DW_OP_fbreg` stack offset.
+#[derive(Debug, Clone)]
+pub struct LocalVarDebugInfo {
+    /// Variable name as written in the C source.
+    pub name: String,
+    /// IR type of the variable (after C-to-IR type mapping).
+    pub ir_type: IrType,
+    /// Zero-based index of this variable among the function's allocas.
+    /// Used to derive a stack frame offset for the DWARF location.
+    pub alloca_index: u32,
+    /// Source line number where the variable is declared (1-based).
+    pub decl_line: u32,
+}
+
+// ===========================================================================
 // IrFunction — the central IR function representation
 // ===========================================================================
 
@@ -381,6 +405,15 @@ pub struct IrFunction {
     ///
     /// Scoped to this function for the same reason as `func_ref_map`.
     pub global_var_refs: crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>,
+
+    /// Debug metadata for local variables — used by the DWARF emitter to
+    /// generate `DW_TAG_variable` entries with names, types, and locations.
+    ///
+    /// Populated during Phase 6 (IR lowering) from the `local_vars` map.
+    /// Each entry records the variable name, IR type, alloca index, and
+    /// source line number.  The DWARF emitter iterates this list to
+    /// produce variable DIEs inside each `DW_TAG_subprogram`.
+    pub local_var_debug_info: Vec<LocalVarDebugInfo>,
 }
 
 // ===========================================================================
@@ -448,6 +481,7 @@ impl IrFunction {
             float_constant_values: crate::common::fx_hash::FxHashMap::default(),
             func_ref_map: crate::common::fx_hash::FxHashMap::default(),
             global_var_refs: crate::common::fx_hash::FxHashMap::default(),
+            local_var_debug_info: Vec::new(),
         }
     }
 }

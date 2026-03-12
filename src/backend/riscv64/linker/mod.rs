@@ -422,6 +422,7 @@ impl RiscV64Linker {
         // Phase 9: Apply Relocations
         // -------------------------------------------------------------------
         if !all_relocations.is_empty() {
+            let empty_got = crate::common::fx_hash::FxHashMap::default();
             let _reloc_result = process_relocations(
                 &Target::RiscV64,
                 all_relocations,
@@ -430,6 +431,7 @@ impl RiscV64Linker {
                 &mut section_data_map,
                 &self.relocation_handler,
                 diagnostics,
+                &empty_got,
             );
         }
 

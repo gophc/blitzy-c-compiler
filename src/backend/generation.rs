@@ -162,6 +162,12 @@ pub struct CodegenContext {
     /// When `true`, the output is AT&T-syntax assembly (x86-64/i686) or
     /// standard assembly (AArch64/RISC-V 64) instead of binary machine code.
     pub emit_assembly: bool,
+
+    /// Library search paths (`-L` flags).
+    pub library_paths: Vec<String>,
+
+    /// Libraries to link (`-l` flags — names without the `lib` prefix).
+    pub libraries: Vec<String>,
 }
 
 impl CodegenContext {
@@ -213,6 +219,8 @@ impl Default for CodegenContext {
             output_path: String::from("a.out"),
             compile_only: false,
             emit_assembly: false,
+            library_paths: Vec::new(),
+            libraries: Vec::new(),
         }
     }
 }
@@ -296,8 +304,7 @@ pub fn generate_code(
             generate_for_arch(&codegen, module, ctx, diagnostics, source_map)
         }
         Target::RiscV64 => {
-            let mut codegen =
-                crate::backend::riscv64::RiscV64Codegen::new(ctx.pic, ctx.debug_info);
+            let mut codegen = crate::backend::riscv64::RiscV64Codegen::new(ctx.pic, ctx.debug_info);
             // Populate the variadic function set from module declarations.
             // RISC-V LP64D ABI requires variadic FP arguments to be passed
             // in integer registers instead of FP registers.
@@ -847,7 +854,12 @@ fn apply_allocation_result(mf: &mut MachineFunction, alloc: &AllocationResult, t
         pairs.sort_by_key(|(&k, _)| k);
         for (&vreg, ir_val) in &pairs {
             let phys = vreg_phys.get(&vreg);
-            eprintln!("  vreg={} -> ir_v{} -> phys={:?}", vreg, ir_val.index(), phys);
+            eprintln!(
+                "  vreg={} -> ir_v{} -> phys={:?}",
+                vreg,
+                ir_val.index(),
+                phys
+            );
         }
         eprintln!("=== VREG_PHYS (full) ===");
         let mut vp: Vec<_> = vreg_phys.iter().collect();
@@ -886,8 +898,16 @@ fn apply_allocation_result(mf: &mut MachineFunction, alloc: &AllocationResult, t
             (16 + base_offset) as i64
         } else {
             // RISC-V: keep the original formula.
-            let num_gpr = mf.callee_saved_regs.iter().filter(|&&r| (r as u32) < 32).count();
-            let num_fpr = mf.callee_saved_regs.iter().filter(|&&r| (r as u32) >= 32).count();
+            let num_gpr = mf
+                .callee_saved_regs
+                .iter()
+                .filter(|&&r| (r as u32) < 32)
+                .count();
+            let num_fpr = mf
+                .callee_saved_regs
+                .iter()
+                .filter(|&&r| (r as u32) >= 32)
+                .count();
             let gpr_pairs = (num_gpr + 1) / 2;
             let fpr_pairs = (num_fpr + 1) / 2;
             let callee_save_bytes = (gpr_pairs + fpr_pairs) * 16;
@@ -944,9 +964,9 @@ fn apply_allocation_result(mf: &mut MachineFunction, alloc: &AllocationResult, t
     // - AArch64: X29 (FP) = 29
     // - RISC-V 64: X8 (s0/fp) = 8
     let frame_ptr_reg: u16 = match target {
-        Target::X86_64 | Target::I686 => 5,  // RBP
-        Target::AArch64 => 29,                // X29 / FP
-        Target::RiscV64 => 8,                 // X8 / s0 / fp
+        Target::X86_64 | Target::I686 => 5, // RBP
+        Target::AArch64 => 29,              // X29 / FP
+        Target::RiscV64 => 8,               // X8 / s0 / fp
     };
     // MOV/load opcodes are architecture-dependent:
     // x86-64: X86Opcode::Mov = 0, X86Opcode::Movsd = 86
@@ -959,30 +979,30 @@ fn apply_allocation_result(mf: &mut MachineFunction, alloc: &AllocationResult, t
     // (e.g. MUL, SMULL), all subsequent discriminants shift.
     // Current mapping: LDR_imm=59, STR_imm=72.
     let mov_opcode: u32 = match target {
-        Target::I686 => 0x100,    // I686_MOV
-        Target::AArch64 => 59,    // A64Opcode::LDR_imm (64-bit load)
-        Target::RiscV64 => 13,    // RvOpcode::LD
-        _ => 0,                   // X86Opcode::Mov
+        Target::I686 => 0x100, // I686_MOV
+        Target::AArch64 => 59, // A64Opcode::LDR_imm (64-bit load)
+        Target::RiscV64 => 13, // RvOpcode::LD
+        _ => 0,                // X86Opcode::Mov
     };
     let movsd_opcode: u32 = match target {
-        Target::I686 => 0x100,    // i686 uses MOV for all spills (no SSE)
-        Target::AArch64 => 59,    // AArch64: same LDR_imm for FP spills
-        Target::RiscV64 => 13,    // RISC-V: LD for FP spills (stored as 64-bit)
-        _ => 86,                  // X86Opcode::Movsd
+        Target::I686 => 0x100, // i686 uses MOV for all spills (no SSE)
+        Target::AArch64 => 59, // AArch64: same LDR_imm for FP spills
+        Target::RiscV64 => 13, // RISC-V: LD for FP spills (stored as 64-bit)
+        _ => 86,               // X86Opcode::Movsd
     };
     // Store opcodes for spill stores:
     // x86-64 / i686: same opcode as load (MOV is bidirectional via operand layout)
     // AArch64: STR_imm = 72 (A64Opcode::STR_imm enum discriminant)
     // RISC-V 64: SD = 20 (RvOpcode::SD)
     let store_opcode: u32 = match target {
-        Target::AArch64 => 72,    // A64Opcode::STR_imm
-        Target::RiscV64 => 20,    // RvOpcode::SD
-        _ => mov_opcode,          // x86: same opcode for load/store
+        Target::AArch64 => 72, // A64Opcode::STR_imm
+        Target::RiscV64 => 20, // RvOpcode::SD
+        _ => mov_opcode,       // x86: same opcode for load/store
     };
     let store_fp_opcode: u32 = match target {
-        Target::AArch64 => 72,    // AArch64 STR_imm
-        Target::RiscV64 => 20,    // RISC-V SD
-        _ => movsd_opcode,        // x86: MOVSD for float stores
+        Target::AArch64 => 72, // AArch64 STR_imm
+        Target::RiscV64 => 20, // RISC-V SD
+        _ => movsd_opcode,     // x86: MOVSD for float stores
     };
     // Spill scratch register is architecture-dependent:
     // - x86-64: R11 (index 11) — reserved from GPR allocation
@@ -990,10 +1010,10 @@ fn apply_allocation_result(mf: &mut MachineFunction, alloc: &AllocationResult, t
     // - AArch64: X16 (IP0, index 16) — scratch register
     // - RISC-V 64: X5 (T0, index 5) — temporary register
     let spill_scratch: u16 = match target {
-        Target::I686 => 1,      // ECX
-        Target::AArch64 => 16,  // X16 / IP0
-        Target::RiscV64 => 5,   // X5 / T0
-        _ => 11,                // R11 (x86-64)
+        Target::I686 => 1,     // ECX
+        Target::AArch64 => 16, // X16 / IP0
+        Target::RiscV64 => 5,  // X5 / T0
+        _ => 11,               // R11 (x86-64)
     };
     let float_spill_scratch: u16 = match target {
         Target::I686 => 1, // ECX (i686 uses x87 stack, no XMM15)
@@ -1027,7 +1047,7 @@ fn apply_allocation_result(mf: &mut MachineFunction, alloc: &AllocationResult, t
     // not in vreg_to_ir_value — e.g. the second pass of the mapping).
     // CRITICAL: Skip entries where val.index() collides with a known
     // codegen vreg to prevent marking an integer codegen vreg as float.
-    for (val, _slot_idx) in &alloc.spill_map {
+    for val in alloc.spill_map.keys() {
         if !codegen_vreg_ids.contains(&val.index()) {
             if let Some(ty) = alloc.value_types.get(val) {
                 if ty.is_float() {
@@ -1037,10 +1057,8 @@ fn apply_allocation_result(mf: &mut MachineFunction, alloc: &AllocationResult, t
         }
     }
     for (val, phys) in &alloc.assignments {
-        if !codegen_vreg_ids.contains(&val.index()) {
-            if phys.0 >= 16 && phys.0 < 32 {
-                vreg_is_float.insert(val.index());
-            }
+        if !codegen_vreg_ids.contains(&val.index()) && phys.0 >= 16 && phys.0 < 32 {
+            vreg_is_float.insert(val.index());
         }
     }
 
@@ -1191,9 +1209,9 @@ fn apply_allocation_result(mf: &mut MachineFunction, alloc: &AllocationResult, t
             //   → The FIRST spilled float operand loads into XMM15.
             //   → Additional operands of a class become Memory.
             // ----------------------------------------------------------
-            let int_scratch_reserved_for_result =
+            let _int_scratch_reserved_for_result =
                 result_spill_offset.is_some() && !result_is_float;
-            let float_scratch_reserved_for_result =
+            let _float_scratch_reserved_for_result =
                 result_spill_offset.is_some() && result_is_float;
             let mut int_scratch_used = false;
             let mut float_scratch_used = false;
@@ -1265,11 +1283,7 @@ fn apply_allocation_result(mf: &mut MachineFunction, alloc: &AllocationResult, t
                                 // both share the scratch register, and the
                                 // instruction will produce the correct value
                                 // which Step 5 stores back).
-                                let mut ld = make_spill_load(
-                                    spill_scratch,
-                                    offset,
-                                    mov_opcode,
-                                );
+                                let mut ld = make_spill_load(spill_scratch, offset, mov_opcode);
                                 ld.is_call_arg_setup = propagate_call_arg_setup;
                                 new_insts.push(ld);
                                 inst.operands[i] = MachineOperand::Register(spill_scratch);
@@ -1472,8 +1486,7 @@ fn resolve_param_load_conflicts(mf: &mut MachineFunction) {
             let (_, cycle_src, cycle_opcode) = pending[0];
 
             // Determine if this is a float (SSE) or integer move.
-            let is_float_cycle = cycle_opcode == MOVSD_OPCODE
-                || (cycle_src >= 16 && cycle_src < 32);
+            let is_float_cycle = cycle_opcode == MOVSD_OPCODE || (16..32).contains(&cycle_src);
             let (scratch, save_op) = if is_float_cycle {
                 (FLOAT_SCRATCH_REG, MOVSD_OPCODE)
             } else {
@@ -1529,10 +1542,10 @@ fn resolve_param_load_conflicts(mf: &mut MachineFunction) {
 /// This post-allocation pass detects these conflicts and saves the clobbered
 /// operand to a scratch register before it is overwritten.
 fn resolve_div_conflicts(mf: &mut MachineFunction) {
-    const MOV_OP: u32 = 0;   // X86Opcode::Mov
+    const MOV_OP: u32 = 0; // X86Opcode::Mov
     const IDIV_OP: u32 = 10; // X86Opcode::Idiv
-    const DIV_OP: u32 = 11;  // X86Opcode::Div
-    const XOR_OP: u32 = 17;  // X86Opcode::Xor
+    const DIV_OP: u32 = 11; // X86Opcode::Div
+    const XOR_OP: u32 = 17; // X86Opcode::Xor
     const CDQ_OP: u32 = 106; // X86Opcode::Cdq
     const CQO_OP: u32 = 107; // X86Opcode::Cqo
     const RAX: u16 = 0;
@@ -1593,7 +1606,7 @@ fn resolve_div_conflicts(mf: &mut MachineFunction) {
             let mut mov_rax_pos = None;
             let mut lhs_reg: Option<u16> = None;
             // Search backwards up to 3 instructions.
-            let search_start = if ni_len >= 3 { ni_len - 3 } else { 0 };
+            let search_start = ni_len.saturating_sub(3);
             for j in (search_start..ni_len).rev() {
                 if new_insts[j].opcode == MOV_OP {
                     if let Some(MachineOperand::Register(r)) = &new_insts[j].result {
@@ -1674,9 +1687,13 @@ fn resolve_div_conflicts(mf: &mut MachineFunction) {
                         // scratch is also needed for divisor).
                         let lhs_scratch = if div_in_rax || div_in_rdx {
                             // Need scratch for divisor, use another for lhs.
-                            if scratch != RCX && lhs_reg != Some(RCX) { RCX }
-                            else if scratch != R11 && lhs_reg != Some(R11) { R11 }
-                            else { 10 /* R10 */ }
+                            if scratch != RCX && lhs_reg != Some(RCX) {
+                                RCX
+                            } else if scratch != R11 && lhs_reg != Some(R11) {
+                                R11
+                            } else {
+                                10 /* R10 */
+                            }
                         } else {
                             scratch
                         };
@@ -1702,7 +1719,7 @@ fn resolve_div_conflicts(mf: &mut MachineFunction) {
                 if div_in_rax || div_in_rdx {
                     // Re-find mov_rax_pos after potential insertions above.
                     let cur_ni_len = new_insts.len();
-                    let search_start2 = if cur_ni_len >= 5 { cur_ni_len - 5 } else { 0 };
+                    let search_start2 = cur_ni_len.saturating_sub(5);
                     let mut real_insert_pos = None;
                     for j in (search_start2..cur_ni_len).rev() {
                         if new_insts[j].opcode == MOV_OP {
@@ -1718,7 +1735,7 @@ fn resolve_div_conflicts(mf: &mut MachineFunction) {
                     // insert BEFORE the XOR.
                     if div_in_rdx && opc == DIV_OP {
                         let cur_ni_len2 = new_insts.len();
-                        let ss = if cur_ni_len2 >= 5 { cur_ni_len2 - 5 } else { 0 };
+                        let ss = cur_ni_len2.saturating_sub(5);
                         for j in (ss..cur_ni_len2).rev() {
                             if new_insts[j].opcode == XOR_OP {
                                 if let Some(MachineOperand::Register(r)) = &new_insts[j].result {
@@ -1740,7 +1757,9 @@ fn resolve_div_conflicts(mf: &mut MachineFunction) {
                         // Insert: MOV scratch, divisor_reg BEFORE the clobbering instruction
                         let mut save_div = MachineInstruction::new(MOV_OP);
                         save_div.result = Some(MachineOperand::Register(scratch));
-                        save_div.operands.push(MachineOperand::Register(divisor_reg));
+                        save_div
+                            .operands
+                            .push(MachineOperand::Register(divisor_reg));
                         new_insts.insert(rip, save_div);
                     }
 
@@ -1802,16 +1821,16 @@ fn resolve_call_arg_conflicts(mf: &mut MachineFunction, target: &Target) {
     let (mov_opcode, movfp_opcode, scratch_reg, float_scratch_reg): (u32, u32, u16, u16) =
         match target {
             Target::X86_64 => (
-                0,   // X86Opcode::Mov
-                86,  // X86Opcode::Movsd
-                11,  // R11 (caller-saved, not an arg reg)
-                31,  // XMM15
+                0,  // X86Opcode::Mov
+                86, // X86Opcode::Movsd
+                11, // R11 (caller-saved, not an arg reg)
+                31, // XMM15
             ),
             Target::I686 => (
-                0,   // X86Opcode::Mov (same enum)
-                86,  // X86Opcode::Movsd
-                2,   // ECX (caller-saved scratch for i686)
-                31,  // XMM7
+                0,  // X86Opcode::Mov (same enum)
+                86, // X86Opcode::Movsd
+                2,  // ECX (caller-saved scratch for i686)
+                31, // XMM7
             ),
             Target::AArch64 => (
                 161, // A64Opcode::MOV_reg
@@ -1865,16 +1884,18 @@ fn resolve_call_arg_conflicts(mf: &mut MachineFunction, target: &Target) {
             // of the resolved move sequence.
             let indirect_save_needed: Option<u16> = {
                 let call_inst_ref = &new_insts[call_pos];
-                if let Some(MachineOperand::Register(target_reg)) =
-                    call_inst_ref.operands.first()
-                {
+                if let Some(MachineOperand::Register(target_reg)) = call_inst_ref.operands.first() {
                     let tr = *target_reg;
                     if tr != scratch_reg {
                         let clobbered = (seq_start..call_pos).any(|idx| {
                             matches!(&new_insts[idx].result,
                                 Some(MachineOperand::Register(dst)) if *dst == tr)
                         });
-                        if clobbered { Some(tr) } else { None }
+                        if clobbered {
+                            Some(tr)
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     }
@@ -1884,8 +1905,7 @@ fn resolve_call_arg_conflicts(mf: &mut MachineFunction, target: &Target) {
             };
             // If save needed, update CALL to use R11 now.
             if indirect_save_needed.is_some() {
-                new_insts[call_pos].operands[0] =
-                    MachineOperand::Register(scratch_reg);
+                new_insts[call_pos].operands[0] = MachineOperand::Register(scratch_reg);
             }
 
             // Partition instructions into:
@@ -1935,9 +1955,10 @@ fn resolve_call_arg_conflicts(mf: &mut MachineFunction, target: &Target) {
                     // to an arg register.  If so, they form a compound
                     // pair that must be emitted atomically to prevent the
                     // scratch register from being clobbered in between.
-                    let has_mem_src = si.operands.iter().any(|op| {
-                        matches!(op, MachineOperand::Memory { .. })
-                    });
+                    let has_mem_src = si
+                        .operands
+                        .iter()
+                        .any(|op| matches!(op, MachineOperand::Memory { .. }));
                     if has_mem_src {
                         if let Some(d_scratch) = dst_reg {
                             // Look at next instruction(s) for a MV from d_scratch
@@ -1950,15 +1971,14 @@ fn resolve_call_arg_conflicts(mf: &mut MachineFunction, target: &Target) {
                                     Some(MachineOperand::Register(r)) => Some(*r),
                                     _ => None,
                                 };
-                                if next_src == Some(d_scratch) && next_dst.is_some() {
-                                    // Compound pair found: load-then-move
-                                    let eff_dst = next_dst.unwrap();
-                                    compound_moves.push((
-                                        vec![si.clone(), next_si.clone()],
-                                        eff_dst,
-                                    ));
-                                    consumed.insert(idx + 1);
-                                    continue;
+                                if next_src == Some(d_scratch) {
+                                    if let Some(eff_dst) = next_dst {
+                                        // Compound pair found: load-then-move
+                                        compound_moves
+                                            .push((vec![si.clone(), next_si.clone()], eff_dst));
+                                        consumed.insert(idx + 1);
+                                        continue;
+                                    }
                                 }
                             }
                         }
@@ -1983,11 +2003,10 @@ fn resolve_call_arg_conflicts(mf: &mut MachineFunction, target: &Target) {
                 new_insts.push(call_inst);
                 continue;
             }
-            if !has_conflict && indirect_save_needed.is_some() {
+            if let (false, Some(target_reg)) = (has_conflict, indirect_save_needed) {
                 // No register-register conflicts, but we need to protect
                 // the indirect call target. Insert save before setup.
                 let call_inst = new_insts.remove(seq_start);
-                let target_reg = indirect_save_needed.unwrap();
                 let mut save_inst = MachineInstruction::new(mov_opcode_val);
                 save_inst.result = Some(MachineOperand::Register(scratch_reg));
                 save_inst
@@ -2122,7 +2141,7 @@ fn resolve_call_arg_conflicts(mf: &mut MachineFunction, target: &Target) {
                     // x86-64/i686: XMM regs 16..31, RISC-V/AArch64: FP regs >= 32
                     let is_float = cycle_opcode == movfp_opcode_val
                         || match target {
-                            Target::X86_64 | Target::I686 => cycle_src >= 16 && cycle_src < 32,
+                            Target::X86_64 | Target::I686 => (16..32).contains(&cycle_src),
                             Target::AArch64 => cycle_src >= 32,
                             Target::RiscV64 => cycle_src >= 32,
                         };
@@ -2290,6 +2309,7 @@ fn emit_global_variable(
 ///
 /// When a type is provided, integers are truncated to the correct byte
 /// width. Without a type, integers fall back to 8 bytes (i64 width).
+#[allow(dead_code)]
 fn constant_to_bytes(constant: &crate::ir::module::Constant) -> Vec<u8> {
     constant_to_bytes_typed(constant, None)
 }
@@ -2316,12 +2336,10 @@ fn constant_to_bytes_typed(
             let full = v.to_le_bytes();
             full[..width].to_vec()
         }
-        Constant::Float(v) => {
-            match ir_ty {
-                Some(IrType::F32) => (*v as f32).to_le_bytes().to_vec(),
-                _ => v.to_le_bytes().to_vec(),
-            }
-        }
+        Constant::Float(v) => match ir_ty {
+            Some(IrType::F32) => (*v as f32).to_le_bytes().to_vec(),
+            _ => v.to_le_bytes().to_vec(),
+        },
         Constant::LongDouble(bytes) => {
             // 80-bit extended precision — 10 raw bytes, padded to 16.
             let mut result = bytes.to_vec();
@@ -2430,7 +2448,7 @@ fn ir_type_size(ty: &crate::ir::types::IrType) -> u64 {
 fn patch_intra_module_reloc(
     text: &mut [u8],
     off: usize,
-    value: i64,        // S + A - P (byte offset)
+    value: i64, // S + A - P (byte offset)
     rel_type: u32,
     target: &Target,
 ) {
@@ -2515,10 +2533,16 @@ fn patch_intra_module_reloc(
                         let hi = ((value as i32 + 0x800) >> 12) & 0xFFFFF;
                         let lo = ((value as i32) & 0xFFF) as u32;
                         let auipc = u32::from_le_bytes([
-                            text[off], text[off + 1], text[off + 2], text[off + 3],
+                            text[off],
+                            text[off + 1],
+                            text[off + 2],
+                            text[off + 3],
                         ]);
                         let jalr = u32::from_le_bytes([
-                            text[off + 4], text[off + 5], text[off + 6], text[off + 7],
+                            text[off + 4],
+                            text[off + 5],
+                            text[off + 6],
+                            text[off + 7],
                         ]);
                         let p_auipc = (auipc & 0xFFF) | ((hi as u32) << 12);
                         let p_jalr = (jalr & 0x000F_FFFF) | (lo << 20);
@@ -2529,20 +2553,26 @@ fn patch_intra_module_reloc(
                 RV_JAL => {
                     // J-type: imm[20|10:1|11|19:12] in bits [31:12]
                     let inst = u32::from_le_bytes([
-                        text[off], text[off + 1], text[off + 2], text[off + 3],
+                        text[off],
+                        text[off + 1],
+                        text[off + 2],
+                        text[off + 3],
                     ]);
                     let v = value as u32;
                     let enc = ((v & 0x100000) << 11) // imm[20] -> bit 31
                         | ((v & 0x7FE) << 20)        // imm[10:1] -> bits [30:21]
                         | ((v & 0x800) << 9)          // imm[11] -> bit 20
-                        | (v & 0xFF000);              // imm[19:12] -> bits [19:12]
+                        | (v & 0xFF000); // imm[19:12] -> bits [19:12]
                     let patched = (inst & 0xFFF) | enc;
                     text[off..off + 4].copy_from_slice(&patched.to_le_bytes());
                 }
                 RV_BRANCH => {
                     // B-type: imm[12|10:5] in [31:25], imm[4:1|11] in [11:7]
                     let inst = u32::from_le_bytes([
-                        text[off], text[off + 1], text[off + 2], text[off + 3],
+                        text[off],
+                        text[off + 1],
+                        text[off + 2],
+                        text[off + 3],
                     ]);
                     let v = value as u32;
                     let hi = ((v & 0x1000) << 19) | ((v & 0x7E0) << 20);
@@ -2991,8 +3021,19 @@ fn link_to_final_output(
     // `DT_NEEDED` entry and `PT_INTERP` pointing to the system dynamic
     // linker.  Undefined symbols from libc (printf, malloc, etc.) are
     // resolved at runtime by `ld-linux`.
+    // Add user-specified -l libraries as DT_NEEDED entries.
+    config.library_paths = ctx.library_paths.clone();
+    config.libraries = ctx.libraries.clone();
+    for lib_name in &ctx.libraries {
+        let so_name = format!("lib{}.so", lib_name);
+        config.needed_libs.push(so_name);
+    }
+
     if output_type == OutputType::Executable {
-        config.needed_libs.push("libc.so.6".to_string());
+        // Add libc if not already present.
+        if !config.needed_libs.iter().any(|n| n.starts_with("libc.so")) {
+            config.needed_libs.push("libc.so.6".to_string());
+        }
         // Allow undefined symbols — they will be resolved at runtime by
         // the dynamic linker via the DT_NEEDED entry.
         config.allow_undefined = true;
@@ -3283,7 +3324,7 @@ fn inject_crt_start(input: &mut LinkerInput, target: Target) {
                 | 0x6F;
             // AUIPC ra, 0 — upper 20 bits filled by linker relocation
             let auipc_exit = 0x0000_0097u32; // auipc ra, 0
-            // JALR ra, ra, 0 — lower 12 bits filled by linker relocation
+                                             // JALR ra, ra, 0 — lower 12 bits filled by linker relocation
             let jalr_exit = 0x000080E7u32; // jalr ra, 0(ra)
             let ebreak = 0x0010_0073u32;
             let nop = 0x0000_0013u32; // addi x0, x0, 0

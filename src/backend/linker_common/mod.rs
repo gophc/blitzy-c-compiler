@@ -769,15 +769,9 @@ pub fn link(
                                 };
                                 let off = plt0_sz + stub_idx as u64 * pltn_sz;
                                 plt_buf.extend_from_slice(
-                                    &plt_table.generate_plt_entry(
-                                        &stub,
-                                        got_plt_va,
-                                        plt_va,
-                                        off,
-                                    ),
+                                    &plt_table.generate_plt_entry(&stub, got_plt_va, plt_va, off),
                                 );
-                                ordered_plt_syms
-                                    .push((reloc.symbol_name.clone(), gp_off));
+                                ordered_plt_syms.push((reloc.symbol_name.clone(), gp_off));
                                 stub_idx += 1;
                             }
                         }
@@ -847,14 +841,12 @@ pub fn link(
                 } else {
                     // i686: Elf32_Rel format (8 bytes, no addend)
                     let r_info = (sym_idx << 8) | (js_reltype & 0xFF);
-                    rela_plt_data
-                        .extend_from_slice(&(r_offset as u32).to_le_bytes());
+                    rela_plt_data.extend_from_slice(&(r_offset as u32).to_le_bytes());
                     rela_plt_data.extend_from_slice(&r_info.to_le_bytes());
                 }
             }
             if !rela_plt_data.is_empty() {
-                section_data_map
-                    .insert(".rela.plt".to_string(), rela_plt_data);
+                section_data_map.insert(".rela.plt".to_string(), rela_plt_data);
             }
         }
 
@@ -870,19 +862,15 @@ pub fn link(
                 for i in 0..num_entries {
                     let base = i * entry_size;
                     if config.target.is_64bit() {
-                        let old_off = u64::from_le_bytes(
-                            rela_dyn_data[base..base + 8].try_into().unwrap(),
-                        );
+                        let old_off =
+                            u64::from_le_bytes(rela_dyn_data[base..base + 8].try_into().unwrap());
                         let new_off = old_off + got_va;
-                        rela_dyn_data[base..base + 8]
-                            .copy_from_slice(&new_off.to_le_bytes());
+                        rela_dyn_data[base..base + 8].copy_from_slice(&new_off.to_le_bytes());
                     } else {
-                        let old_off = u32::from_le_bytes(
-                            rela_dyn_data[base..base + 4].try_into().unwrap(),
-                        );
+                        let old_off =
+                            u32::from_le_bytes(rela_dyn_data[base..base + 4].try_into().unwrap());
                         let new_off = old_off + got_va as u32;
-                        rela_dyn_data[base..base + 4]
-                            .copy_from_slice(&new_off.to_le_bytes());
+                        rela_dyn_data[base..base + 4].copy_from_slice(&new_off.to_le_bytes());
                     }
                 }
             }
@@ -894,19 +882,138 @@ pub fn link(
                 for i in 0..num_entries {
                     let base = i * entry_size;
                     if config.target.is_64bit() {
-                        let old_off = u64::from_le_bytes(
-                            rela_plt_data[base..base + 8].try_into().unwrap(),
-                        );
+                        let old_off =
+                            u64::from_le_bytes(rela_plt_data[base..base + 8].try_into().unwrap());
                         let new_off = old_off + got_plt_va;
-                        rela_plt_data[base..base + 8]
-                            .copy_from_slice(&new_off.to_le_bytes());
+                        rela_plt_data[base..base + 8].copy_from_slice(&new_off.to_le_bytes());
                     } else {
-                        let old_off = u32::from_le_bytes(
-                            rela_plt_data[base..base + 4].try_into().unwrap(),
-                        );
+                        let old_off =
+                            u32::from_le_bytes(rela_plt_data[base..base + 4].try_into().unwrap());
                         let new_off = old_off + got_plt_va as u32;
-                        rela_plt_data[base..base + 4]
-                            .copy_from_slice(&new_off.to_le_bytes());
+                        rela_plt_data[base..base + 4].copy_from_slice(&new_off.to_le_bytes());
+                    }
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 5.9: Build per-symbol GOT address map
+    // -----------------------------------------------------------------------
+    // Scan relocations for GOT-needing symbols and assign sequential GOT
+    // slot addresses using the .got VA computed in Phase 5.5.  This map
+    // is consumed by the relocation processor so that GOT-relative
+    // relocations (e.g. R_AARCH64_ADR_GOT_PAGE, R_X86_64_GOTPCRELX) can
+    // resolve to the correct GOT entry address.
+    // Build GOT section if relocations need it.
+    // In PIC shared libraries, even locally-defined symbols (e.g. global
+    // variables, string literals) are accessed through the GOT because the
+    // shared library's load address is not known at link time. The
+    // build_dynamic_sections only creates GOT entries for imported symbols.
+    // Here we scan all relocations, create GOT entries for any symbol with
+    // a GOT-needing relocation, and ensure the .got section exists.
+    let mut precomputed_got: FxHashMap<String, u64> = FxHashMap::default();
+    {
+        let pw = if config.target.is_64bit() { 8u64 } else { 4u64 };
+        let mut got_syms_ordered: Vec<String> = Vec::new();
+        let mut seen_got: FxHashSet<String> = FxHashSet::default();
+        for reloc in all_relocations.iter() {
+            if handler.needs_got(reloc.rel_type)
+                && !reloc.symbol_name.is_empty()
+                && !seen_got.contains(&reloc.symbol_name)
+            {
+                seen_got.insert(reloc.symbol_name.clone());
+                got_syms_ordered.push(reloc.symbol_name.clone());
+            }
+        }
+
+        if !got_syms_ordered.is_empty() {
+            // Ensure a .got section exists with the right number of slots.
+            let existing_got_size = section_data_map.get(".got").map(|d| d.len()).unwrap_or(0);
+            let needed_size = got_syms_ordered.len() * pw as usize;
+            if needed_size > existing_got_size {
+                // Create or extend the .got section with zero-filled slots.
+                // The dynamic linker (or our static initialization below)
+                // fills these at load time.
+                section_data_map.insert(".got".to_string(), vec![0u8; needed_size]);
+            }
+
+            // Ensure .got has a VA in dyn_section_addresses.
+            if !dyn_section_addresses.contains_key(".got") {
+                // Compute VA for .got following the existing dynamic sections.
+                let align = if config.target.is_64bit() { 8u64 } else { 4u64 };
+                let mut cursor_va: u64 = 0;
+                let mut cursor_fo: u64 = 0;
+                for info in address_map.section_addresses.values() {
+                    let end_va = info.virtual_address + info.mem_size;
+                    let end_fo = info.file_offset + info.size;
+                    if end_va > cursor_va {
+                        cursor_va = end_va;
+                    }
+                    if end_fo > cursor_fo {
+                        cursor_fo = end_fo;
+                    }
+                }
+                for (_, &(va, fo)) in dyn_section_addresses.iter() {
+                    let data_len = section_data_map
+                        .values()
+                        .map(|d| d.len() as u64)
+                        .max()
+                        .unwrap_or(0);
+                    let end_va = va + data_len;
+                    let end_fo = fo + data_len;
+                    if end_va > cursor_va {
+                        cursor_va = end_va;
+                    }
+                    if end_fo > cursor_fo {
+                        cursor_fo = end_fo;
+                    }
+                }
+                // Re-walk dyn_section_addresses to find the true max end
+                for (sec_name, &(va, fo)) in dyn_section_addresses.iter() {
+                    if let Some(data) = section_data_map.get(sec_name.as_str()) {
+                        let end_va = va + data.len() as u64;
+                        let end_fo = fo + data.len() as u64;
+                        if end_va > cursor_va {
+                            cursor_va = end_va;
+                        }
+                        if end_fo > cursor_fo {
+                            cursor_fo = end_fo;
+                        }
+                    }
+                }
+                cursor_va = (cursor_va + align - 1) & !(align - 1);
+                cursor_fo = (cursor_fo + align - 1) & !(align - 1);
+                dyn_section_addresses.insert(".got".to_string(), (cursor_va, cursor_fo));
+            }
+
+            // Now compute per-symbol GOT addresses.
+            if let Some(&(got_va, _)) = dyn_section_addresses.get(".got") {
+                for (idx, sym_name) in got_syms_ordered.iter().enumerate() {
+                    let slot_addr = got_va + idx as u64 * pw;
+                    precomputed_got.insert(sym_name.clone(), slot_addr);
+                }
+
+                // Pre-fill GOT entries for defined symbols with their
+                // final addresses. This is needed for non-lazy binding of
+                // locally-defined symbols in PIC shared libraries.
+                if let Some(got_data) = section_data_map.get_mut(".got") {
+                    for (idx, sym_name) in got_syms_ordered.iter().enumerate() {
+                        if let Some(sym) = symbol_address_map.get(sym_name) {
+                            if sym.is_defined {
+                                let offset = idx * pw as usize;
+                                if offset + pw as usize <= got_data.len() {
+                                    if pw == 8 {
+                                        got_data[offset..offset + 8]
+                                            .copy_from_slice(&sym.final_address.to_le_bytes());
+                                    } else {
+                                        got_data[offset..offset + 4].copy_from_slice(
+                                            &(sym.final_address as u32).to_le_bytes(),
+                                        );
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -927,6 +1034,7 @@ pub fn link(
             &mut section_data_map,
             handler,
             diagnostics,
+            &precomputed_got,
         );
     }
 
@@ -997,11 +1105,9 @@ fn dynsym_index_for_name(
     let num_entries = dynsym.len() / entry_size;
     for i in 0..num_entries {
         let base = i * entry_size;
-        let st_name = if is_64bit {
-            u32::from_le_bytes(dynsym[base..base + 4].try_into().ok()?) as usize
-        } else {
-            u32::from_le_bytes(dynsym[base..base + 4].try_into().ok()?) as usize
-        };
+        // st_name is always a 32-bit offset in both ELF32 and ELF64 symbol entries.
+        let _ = is_64bit;
+        let st_name = u32::from_le_bytes(dynsym[base..base + 4].try_into().ok()?) as usize;
         if st_name < dynstr.len() {
             // Read null-terminated string from dynstr.
             let end = dynstr[st_name..]

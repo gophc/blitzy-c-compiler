@@ -579,8 +579,7 @@ impl ArchCodegen for I686Codegen {
         // this map accumulates EVERY vreg created, including intermediates
         // (e.g. SETCC result before MOVZX). This is critical for the
         // register allocator to assign physical registers to ALL vregs.
-        let mut vreg_ir_map: FxHashMap<u32, crate::ir::instructions::Value> =
-            FxHashMap::default();
+        let mut vreg_ir_map: FxHashMap<u32, crate::ir::instructions::Value> = FxHashMap::default();
 
         // Build constant cache using the authoritative constant_values map
         // stored on the IR function by the lowering phase.  This is a
@@ -682,9 +681,11 @@ impl ArchCodegen for I686Codegen {
                 }
             }
             for dest_val in phi_copy_dests {
-                if !value_map.contains_key(&dest_val.index()) {
+                if let std::collections::hash_map::Entry::Vacant(e) =
+                    value_map.entry(dest_val.index())
+                {
                     let vreg = vregs.alloc();
-                    value_map.insert(dest_val.index(), MachineOperand::VirtualRegister(vreg));
+                    e.insert(MachineOperand::VirtualRegister(vreg));
                     // CRITICAL: Also register in vreg_ir_map so that the
                     // auto-registration loop (which uses entry().or_insert)
                     // does NOT overwrite this association when the vreg
@@ -786,7 +787,7 @@ impl ArchCodegen for I686Codegen {
         // Pass 2: Re-encode with the accurate label offsets so that branch
         //         displacement fields contain the correct values.  Collect
         //         relocations for the linker.
-        use crate::common::fx_hash::{FxHashMap, FxHashSet};
+        use crate::common::fx_hash::FxHashMap;
 
         // --- Pass 1: compute real instruction sizes and label offsets ----
         //
@@ -1362,8 +1363,14 @@ impl I686Codegen {
                 let callee_name = self.func_ref_names.get(callee).cloned();
                 let handled = if let Some(ref fname) = callee_name {
                     self.try_emit_i686_builtin(
-                        fname, result, args, return_type,
-                        value_map, alloca_offsets, vregs, &mut out,
+                        fname,
+                        result,
+                        args,
+                        return_type,
+                        value_map,
+                        alloca_offsets,
+                        vregs,
+                        &mut out,
                     )
                 } else {
                     false
@@ -1712,18 +1719,14 @@ impl I686Codegen {
                     scale: 1,
                     displacement: 0,
                 };
-                insts.push(
-                    MachineInstruction::new(I686_PUSH).with_operand(rhs_op),
-                );
+                insts.push(MachineInstruction::new(I686_PUSH).with_operand(rhs_op));
                 insts.push(
                     MachineInstruction::new(I686_MOV)
                         .with_operand(lhs_op)
                         .with_result(MachineOperand::Register(registers::EAX)),
                 );
                 insts.push(MachineInstruction::new(I686_CDQ));
-                insts.push(
-                    MachineInstruction::new(I686_IDIV).with_operand(esp_mem),
-                );
+                insts.push(MachineInstruction::new(I686_IDIV).with_operand(esp_mem));
                 insts.push(
                     MachineInstruction::new(I686_ADD)
                         .with_operand(MachineOperand::Register(registers::ESP))
@@ -1744,9 +1747,7 @@ impl I686Codegen {
                     scale: 1,
                     displacement: 0,
                 };
-                insts.push(
-                    MachineInstruction::new(I686_PUSH).with_operand(rhs_op),
-                );
+                insts.push(MachineInstruction::new(I686_PUSH).with_operand(rhs_op));
                 insts.push(
                     MachineInstruction::new(I686_MOV)
                         .with_operand(lhs_op)
@@ -1758,9 +1759,7 @@ impl I686Codegen {
                         .with_operand(MachineOperand::Register(registers::EDX))
                         .with_result(MachineOperand::Register(registers::EDX)),
                 );
-                insts.push(
-                    MachineInstruction::new(I686_DIV).with_operand(esp_mem),
-                );
+                insts.push(MachineInstruction::new(I686_DIV).with_operand(esp_mem));
                 insts.push(
                     MachineInstruction::new(I686_ADD)
                         .with_operand(MachineOperand::Register(registers::ESP))
@@ -1781,18 +1780,14 @@ impl I686Codegen {
                     scale: 1,
                     displacement: 0,
                 };
-                insts.push(
-                    MachineInstruction::new(I686_PUSH).with_operand(rhs_op),
-                );
+                insts.push(MachineInstruction::new(I686_PUSH).with_operand(rhs_op));
                 insts.push(
                     MachineInstruction::new(I686_MOV)
                         .with_operand(lhs_op)
                         .with_result(MachineOperand::Register(registers::EAX)),
                 );
                 insts.push(MachineInstruction::new(I686_CDQ));
-                insts.push(
-                    MachineInstruction::new(I686_IDIV).with_operand(esp_mem),
-                );
+                insts.push(MachineInstruction::new(I686_IDIV).with_operand(esp_mem));
                 insts.push(
                     MachineInstruction::new(I686_ADD)
                         .with_operand(MachineOperand::Register(registers::ESP))
@@ -1813,9 +1808,7 @@ impl I686Codegen {
                     scale: 1,
                     displacement: 0,
                 };
-                insts.push(
-                    MachineInstruction::new(I686_PUSH).with_operand(rhs_op),
-                );
+                insts.push(MachineInstruction::new(I686_PUSH).with_operand(rhs_op));
                 insts.push(
                     MachineInstruction::new(I686_MOV)
                         .with_operand(lhs_op)
@@ -1827,9 +1820,7 @@ impl I686Codegen {
                         .with_operand(MachineOperand::Register(registers::EDX))
                         .with_result(MachineOperand::Register(registers::EDX)),
                 );
-                insts.push(
-                    MachineInstruction::new(I686_DIV).with_operand(esp_mem),
-                );
+                insts.push(MachineInstruction::new(I686_DIV).with_operand(esp_mem));
                 insts.push(
                     MachineInstruction::new(I686_ADD)
                         .with_operand(MachineOperand::Register(registers::ESP))

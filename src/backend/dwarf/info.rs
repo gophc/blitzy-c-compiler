@@ -186,7 +186,6 @@ struct AbbrevCodes {
     /// Code for `DW_TAG_subprogram` without children (leaf function).
     subprogram_no_children: u32,
     /// Code for `DW_TAG_variable` (local variables inside functions).
-    #[allow(dead_code)]
     variable: u32,
     /// Code for `DW_TAG_formal_parameter`.
     formal_parameter: u32,
@@ -689,7 +688,7 @@ impl<'a> DebugInfoGenerator<'a> {
     /// "with children" abbreviation and is followed by
     /// `DW_TAG_formal_parameter` DIEs and a null terminator.
     fn emit_subprogram_die(&mut self, func: &IrFunction, text_offsets: &[(String, u64, u64)]) {
-        let has_children = !func.params.is_empty();
+        let has_children = !func.params.is_empty() || !func.local_var_debug_info.is_empty();
 
         // Look up text section offset for this function
         let (func_low_pc, func_size) = text_offsets
@@ -739,11 +738,17 @@ impl<'a> DebugInfoGenerator<'a> {
 
         // DW_AT_prototyped (DW_FORM_flag_present) — no data bytes emitted.
 
-        // Emit children if the function has parameters
+        // Emit children (parameters and local variables)
         if has_children {
             // Emit DW_TAG_formal_parameter for each parameter
             for (idx, param) in func.params.iter().enumerate() {
                 self.emit_formal_parameter_die(param, idx as i64);
+            }
+
+            // Emit DW_TAG_variable for each local variable
+            let param_count = func.params.len();
+            for var_info in &func.local_var_debug_info {
+                self.emit_variable_die(var_info, param_count);
             }
 
             // Null terminator for subprogram children
@@ -801,6 +806,55 @@ impl<'a> DebugInfoGenerator<'a> {
         let mut loc_expr = Vec::with_capacity(8);
         loc_expr.push(DW_OP_FBREG);
         encode_sleb128(stack_offset * -(self.address_size as i64), &mut loc_expr);
+        encode_uleb128(loc_expr.len() as u64, &mut self.buffer);
+        self.buffer.extend_from_slice(&loc_expr);
+    }
+
+    // ======================================================================
+    // DW_TAG_variable DIE emission
+    // ======================================================================
+
+    /// Emit a `DW_TAG_variable` DIE for a local variable.
+    ///
+    /// Attributes (matching `AbbrevTable::add_variable_abbrev()`):
+    /// 1. `DW_AT_name`      (DW_FORM_strp)    — variable name
+    /// 2. `DW_AT_decl_file` (DW_FORM_udata)   — file index
+    /// 3. `DW_AT_decl_line` (DW_FORM_udata)   — line number
+    /// 4. `DW_AT_type`      (DW_FORM_ref4)    — type DIE reference
+    /// 5. `DW_AT_location`  (DW_FORM_exprloc) — stack location
+    ///
+    /// The stack offset is computed as `-(param_count + alloca_index + 1) *
+    /// address_size` from the frame base, placing local variables below
+    /// parameters in the stack frame.
+    fn emit_variable_die(
+        &mut self,
+        var: &crate::ir::function::LocalVarDebugInfo,
+        param_count: usize,
+    ) {
+        // Abbreviation code for DW_TAG_variable
+        encode_uleb128(self.codes.variable as u64, &mut self.buffer);
+
+        // DW_AT_name (DW_FORM_strp)
+        let name_off = self.str_table.add_string(&var.name);
+        self.buffer.extend_from_slice(&name_off.to_le_bytes());
+
+        // DW_AT_decl_file (DW_FORM_udata) — file index (1-based)
+        encode_uleb128(1, &mut self.buffer);
+
+        // DW_AT_decl_line (DW_FORM_udata) — declaration line number
+        encode_uleb128(u64::from(var.decl_line), &mut self.buffer);
+
+        // DW_AT_type (DW_FORM_ref4) — type DIE reference
+        let type_offset = self.resolve_type_die_offset(&var.ir_type);
+        self.buffer.extend_from_slice(&type_offset.to_le_bytes());
+
+        // DW_AT_location (DW_FORM_exprloc) — DW_OP_fbreg <offset>
+        // Local variables are placed after parameters on the stack frame.
+        let slot = (param_count as i64) + (var.alloca_index as i64) + 1;
+        let offset = -(slot * (self.address_size as i64));
+        let mut loc_expr = Vec::with_capacity(8);
+        loc_expr.push(DW_OP_FBREG);
+        encode_sleb128(offset, &mut loc_expr);
         encode_uleb128(loc_expr.len() as u64, &mut self.buffer);
         self.buffer.extend_from_slice(&loc_expr);
     }

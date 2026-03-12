@@ -401,7 +401,10 @@ fn infer_array_size_from_init(
                             c_type.clone()
                         }
                     }
-                    ast::Initializer::List { designators_and_initializers, .. } => {
+                    ast::Initializer::List {
+                        designators_and_initializers,
+                        ..
+                    } => {
                         // Brace-init list: `int a[] = {1,2,3}` → size=3
                         CType::Array(elem.clone(), Some(designators_and_initializers.len()))
                     }
@@ -499,56 +502,61 @@ fn ensure_allocas_for_declaration(ctx: &mut StmtLoweringContext<'_>, decl: &ast:
             let mangled_name = format!("{}.{}", func_name, var_name);
 
             // Evaluate constant initializer if present.
-            let constant =
-                if let Some(ast::Initializer::Expression(expr)) = init_decl.initializer.as_ref() {
-                    match &**expr {
-                        ast::Expression::IntegerLiteral { value, .. } => {
-                            Some(crate::ir::module::Constant::Integer(*value as i128))
-                        }
-                        ast::Expression::FloatLiteral { value, .. } => {
-                            Some(crate::ir::module::Constant::Float(*value))
-                        }
-                        ast::Expression::CharLiteral { value, .. } => {
-                            Some(crate::ir::module::Constant::Integer(*value as i128))
-                        }
-                        ast::Expression::StringLiteral { segments, .. } => {
-                            let mut bytes = Vec::new();
-                            for seg in segments {
-                                bytes.extend_from_slice(&seg.value);
-                            }
-                            bytes.push(0); // null terminator
-                            Some(crate::ir::module::Constant::String(bytes))
-                        }
-                        _ => Some(crate::ir::module::Constant::ZeroInit),
+            let constant = if let Some(ast::Initializer::Expression(expr)) =
+                init_decl.initializer.as_ref()
+            {
+                match &**expr {
+                    ast::Expression::IntegerLiteral { value, .. } => {
+                        Some(crate::ir::module::Constant::Integer(*value as i128))
                     }
-                } else if let Some(ast::Initializer::List { designators_and_initializers, .. }) = init_decl.initializer.as_ref() {
-                    // Brace-init list for static local arrays.
-                    let mut elems = Vec::new();
-                    for di in designators_and_initializers {
-                        if let ast::Initializer::Expression(expr) = &di.initializer {
-                            match expr.as_ref() {
-                                ast::Expression::IntegerLiteral { value, .. } => {
-                                    elems.push(crate::ir::module::Constant::Integer(*value as i128));
-                                }
-                                ast::Expression::CharLiteral { value, .. } => {
-                                    elems.push(crate::ir::module::Constant::Integer(*value as i128));
-                                }
-                                _ => {
-                                    elems.push(crate::ir::module::Constant::ZeroInit);
-                                }
-                            }
-                        } else {
-                            elems.push(crate::ir::module::Constant::ZeroInit);
-                        }
+                    ast::Expression::FloatLiteral { value, .. } => {
+                        Some(crate::ir::module::Constant::Float(*value))
                     }
-                    if elems.is_empty() {
-                        Some(crate::ir::module::Constant::ZeroInit)
+                    ast::Expression::CharLiteral { value, .. } => {
+                        Some(crate::ir::module::Constant::Integer(*value as i128))
+                    }
+                    ast::Expression::StringLiteral { segments, .. } => {
+                        let mut bytes = Vec::new();
+                        for seg in segments {
+                            bytes.extend_from_slice(&seg.value);
+                        }
+                        bytes.push(0); // null terminator
+                        Some(crate::ir::module::Constant::String(bytes))
+                    }
+                    _ => Some(crate::ir::module::Constant::ZeroInit),
+                }
+            } else if let Some(ast::Initializer::List {
+                designators_and_initializers,
+                ..
+            }) = init_decl.initializer.as_ref()
+            {
+                // Brace-init list for static local arrays.
+                let mut elems = Vec::new();
+                for di in designators_and_initializers {
+                    if let ast::Initializer::Expression(expr) = &di.initializer {
+                        match expr.as_ref() {
+                            ast::Expression::IntegerLiteral { value, .. } => {
+                                elems.push(crate::ir::module::Constant::Integer(*value as i128));
+                            }
+                            ast::Expression::CharLiteral { value, .. } => {
+                                elems.push(crate::ir::module::Constant::Integer(*value as i128));
+                            }
+                            _ => {
+                                elems.push(crate::ir::module::Constant::ZeroInit);
+                            }
+                        }
                     } else {
-                        Some(crate::ir::module::Constant::Array(elems))
+                        elems.push(crate::ir::module::Constant::ZeroInit);
                     }
-                } else {
+                }
+                if elems.is_empty() {
                     Some(crate::ir::module::Constant::ZeroInit)
-                };
+                } else {
+                    Some(crate::ir::module::Constant::Array(elems))
+                }
+            } else {
+                Some(crate::ir::module::Constant::ZeroInit)
+            };
 
             // Infer array size from initializer when declaration uses [].
             let ir_type = match (&c_type, &constant) {
@@ -596,7 +604,8 @@ fn ensure_allocas_for_declaration(ctx: &mut StmtLoweringContext<'_>, decl: &ast:
         // For unsized arrays (e.g., `char data[] = "hello"` or `int a[] = {1,2,3}`),
         // infer the size from the initializer BEFORE creating the alloca so that
         // the frame layout allocates the correct number of bytes.
-        let c_type = infer_array_size_from_init(&c_type, init_decl.initializer.as_ref(), ctx.name_table);
+        let c_type =
+            infer_array_size_from_init(&c_type, init_decl.initializer.as_ref(), ctx.name_table);
         let ir_type = IrType::from_ctype(&c_type, ctx.target);
         let (alloca_val, alloca_inst) = ctx.builder.build_alloca(ir_type, decl.span);
         ctx.function.entry_block_mut().push_alloca(alloca_inst);

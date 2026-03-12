@@ -100,6 +100,12 @@ const DW_LANG_C11: u16 = 0x001d;
 /// information (`.debug_frame` or `.eh_frame`).
 const DW_OP_CALL_FRAME_CFA: u8 = 0x9c;
 
+/// `DW_OP_fbreg` — DWARF location expression opcode: frame-base-relative.
+///
+/// Used in `DW_AT_location` for parameters and local variables, encoding
+/// a signed byte offset from the frame base (set by `DW_OP_call_frame_cfa`).
+const DW_OP_FBREG: u8 = 0x91;
+
 /// DW_ATE_signed — base type encoding for signed integers.
 const DW_ATE_SIGNED: u8 = 0x05;
 
@@ -281,13 +287,18 @@ pub fn generate_dwarf_sections(
     // will be referenced by DIEs in the .debug_info section.
     let mut abbrev_table = AbbrevTable::new();
     let cu_abbrev_code = abbrev_table.add_compile_unit_abbrev();
-    let subprog_abbrev_code = abbrev_table.add_subprogram_abbrev(false);
-    let _var_abbrev_code = abbrev_table.add_variable_abbrev();
+    let subprog_no_children = abbrev_table.add_subprogram_abbrev(false);
+    let subprog_with_children = abbrev_table.add_subprogram_abbrev(true);
+    let formal_param_code = abbrev_table.add_formal_parameter_abbrev();
+    let var_abbrev_code = abbrev_table.add_variable_abbrev();
     let base_type_abbrev_code = abbrev_table.add_base_type_abbrev();
     let ptr_type_abbrev_code = abbrev_table.add_pointer_type_abbrev();
     let codes = AbbrevCodes {
         compile_unit: cu_abbrev_code,
-        subprogram: subprog_abbrev_code,
+        subprogram: subprog_no_children,
+        subprogram_with_children: subprog_with_children,
+        formal_parameter: formal_param_code,
+        variable: var_abbrev_code,
         base_type: base_type_abbrev_code,
         pointer_type: ptr_type_abbrev_code,
     };
@@ -340,6 +351,12 @@ struct AbbrevCodes {
     compile_unit: u32,
     /// Abbreviation code for `DW_TAG_subprogram` DIE (no children).
     subprogram: u32,
+    /// Abbreviation code for `DW_TAG_subprogram` DIE (with children).
+    subprogram_with_children: u32,
+    /// Abbreviation code for `DW_TAG_formal_parameter` DIE.
+    formal_parameter: u32,
+    /// Abbreviation code for `DW_TAG_variable` DIE.
+    variable: u32,
     /// Abbreviation code for `DW_TAG_base_type` DIE.
     base_type: u32,
     /// Abbreviation code for `DW_TAG_pointer_type` DIE.
@@ -472,10 +489,13 @@ fn generate_debug_info_section(
 
         // Access all schema-required members of IrFunction
         let func_name: &str = &func.name;
-        let param_count = func.params.len();
         let return_type_display = format!("{}", func.return_type);
         let is_external = func.linkage == crate::ir::function::Linkage::External
             || func.linkage == crate::ir::function::Linkage::Weak;
+        let _ = is_external;
+
+        // Determine if this subprogram has child DIEs (params or locals)
+        let has_children = !func.params.is_empty() || !func.local_var_debug_info.is_empty();
 
         // Look up text section offset for this function
         let (func_low_pc, func_size) = text_section_offsets
@@ -493,8 +513,13 @@ fn generate_debug_info_section(
                 (0, 0)
             });
 
-        // Emit subprogram DIE
-        encode_uleb128(codes.subprogram as u64, &mut buffer);
+        // Emit subprogram DIE — choose abbreviation based on children
+        let subprog_code = if has_children {
+            codes.subprogram_with_children
+        } else {
+            codes.subprogram
+        };
+        encode_uleb128(subprog_code as u64, &mut buffer);
 
         // DW_AT_name (strp)
         let fn_name_off = str_table.add_string(func_name);
@@ -526,11 +551,64 @@ fn generate_debug_info_section(
 
         // DW_AT_prototyped (flag_present) — no data bytes emitted
 
-        // Log diagnostic if function has unusual properties
-        if param_count > 0 && !is_external {
-            // Internal function with parameters — note for debug info
-            // (diagnostic usage satisfies emit_warning/emit_error schema requirement)
-            let _ = is_external; // suppress unused warning
+        // Emit child DIEs if present
+        if has_children {
+            // DW_TAG_formal_parameter for each function parameter
+            for (idx, param) in func.params.iter().enumerate() {
+                encode_uleb128(codes.formal_parameter as u64, &mut buffer);
+
+                // DW_AT_name (strp)
+                let param_name_off = str_table.add_string(&param.name);
+                buffer.extend_from_slice(&param_name_off.to_le_bytes());
+
+                // DW_AT_decl_file (udata) — file index
+                encode_uleb128(1, &mut buffer);
+
+                // DW_AT_decl_line (udata) — line number
+                encode_uleb128(1, &mut buffer);
+
+                // DW_AT_type (ref4) — default to int type
+                buffer.extend_from_slice(&int_type_die_offset.to_le_bytes());
+
+                // DW_AT_location (exprloc) — DW_OP_fbreg <offset>
+                let param_offset = -(((idx as i64) + 1) * (address_size as i64));
+                let mut loc_expr = Vec::with_capacity(8);
+                loc_expr.push(DW_OP_FBREG);
+                encode_sleb128(param_offset, &mut loc_expr);
+                encode_uleb128(loc_expr.len() as u64, &mut buffer);
+                buffer.extend_from_slice(&loc_expr);
+            }
+
+            // DW_TAG_variable for each local variable
+            let param_count = func.params.len();
+            for var_info in &func.local_var_debug_info {
+                encode_uleb128(codes.variable as u64, &mut buffer);
+
+                // DW_AT_name (strp)
+                let var_name_off = str_table.add_string(&var_info.name);
+                buffer.extend_from_slice(&var_name_off.to_le_bytes());
+
+                // DW_AT_decl_file (udata) — file index
+                encode_uleb128(1, &mut buffer);
+
+                // DW_AT_decl_line (udata) — declaration line
+                encode_uleb128(u64::from(var_info.decl_line), &mut buffer);
+
+                // DW_AT_type (ref4) — default to int type
+                buffer.extend_from_slice(&int_type_die_offset.to_le_bytes());
+
+                // DW_AT_location (exprloc) — DW_OP_fbreg <offset>
+                let slot = (param_count as i64) + (var_info.alloca_index as i64) + 1;
+                let var_offset = -(slot * (address_size as i64));
+                let mut loc_expr = Vec::with_capacity(8);
+                loc_expr.push(DW_OP_FBREG);
+                encode_sleb128(var_offset, &mut loc_expr);
+                encode_uleb128(loc_expr.len() as u64, &mut buffer);
+                buffer.extend_from_slice(&loc_expr);
+            }
+
+            // Null terminator for subprogram children
+            buffer.push(0x00);
         }
     }
 

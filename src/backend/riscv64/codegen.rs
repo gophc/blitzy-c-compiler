@@ -563,6 +563,7 @@ impl RvInstruction {
     /// The post-register-allocation parallel-move resolver uses this flag
     /// to identify the contiguous window of argument-loading instructions
     /// that precede a CALL instruction.
+    #[allow(clippy::wrong_self_convention)]
     fn as_call_arg_setup(mut self) -> Self {
         self.is_call_arg_setup = true;
         self
@@ -815,10 +816,7 @@ impl RiscV64InstructionSelector {
 
     /// Set the variadic function names so the call emitter knows to pass
     /// FP arguments in integer registers (RISC-V LP64D ABI requirement).
-    pub fn set_variadic_functions(
-        &mut self,
-        set: crate::common::fx_hash::FxHashSet<String>,
-    ) {
+    pub fn set_variadic_functions(&mut self, set: crate::common::fx_hash::FxHashSet<String>) {
         self.variadic_functions = set;
     }
 
@@ -1600,10 +1598,18 @@ impl RiscV64InstructionSelector {
             // CLZ / CTZ / popcount / ffs — these require loop labels which
             // are complex in the RISC-V instruction selection phase.
             // Fall through to a real function call for now.
-            "__builtin_clz" | "__builtin_clzl" | "__builtin_clzll"
-            | "__builtin_ctz" | "__builtin_ctzl" | "__builtin_ctzll"
-            | "__builtin_popcount" | "__builtin_popcountl" | "__builtin_popcountll"
-            | "__builtin_ffs" | "__builtin_ffsl" | "__builtin_ffsll" => {
+            "__builtin_clz"
+            | "__builtin_clzl"
+            | "__builtin_clzll"
+            | "__builtin_ctz"
+            | "__builtin_ctzl"
+            | "__builtin_ctzll"
+            | "__builtin_popcount"
+            | "__builtin_popcountl"
+            | "__builtin_popcountll"
+            | "__builtin_ffs"
+            | "__builtin_ffsl"
+            | "__builtin_ffsll" => {
                 false // Let these fall through to emit_call
             }
             // ── trap ─────────────────────────────────────────────────
@@ -1621,7 +1627,7 @@ impl RiscV64InstructionSelector {
         // Strategy: extract each byte, shift to its swapped position, OR together.
         // We use rd as accumulator and T0 (5) as scratch.
         let t0: u16 = 5; // t0 = x5
-        // Byte 0 (bits 0-7) → bits 56-63
+                         // Byte 0 (bits 0-7) → bits 56-63
         self.emit_i(RvOpcode::ANDI, rd, src, 0xFF);
         self.emit_i(RvOpcode::SLLI, rd, rd, 56);
         // Byte 1 (bits 8-15) → bits 48-55
@@ -1680,7 +1686,7 @@ impl RiscV64InstructionSelector {
     /// Emit byte-swap for 16-bit value: swap the two bottom bytes.
     fn emit_bswap16(&mut self, rd: u16, src: u16) {
         let t0: u16 = 5; // t0 = x5
-        // low byte → bits 8-15
+                         // low byte → bits 8-15
         self.emit_i(RvOpcode::ANDI, rd, src, 0xFF);
         self.emit_i(RvOpcode::SLLI, rd, rd, 8);
         // high byte → bits 0-7
@@ -1689,20 +1695,18 @@ impl RiscV64InstructionSelector {
         self.emit_r(RvOpcode::OR, rd, rd, t0);
     }
 
-
-/// - Integer args in a0–a7, FP args in fa0–fa7
-    /// - Stack-passed args aligned to 8 bytes
-    /// - Return value in a0 (integer) or fa0 (FP)
-    /// - Caller saves: t0–t6, a0–a7, ft0–ft11, fa0–fa7
     /// Emit a sequence of GPR register-to-register moves that correctly
     /// handles the parallel-copy problem (no source clobbered before read).
     ///
+    /// The RISC-V calling convention places:
+    /// - Integer args in a0–a7, FP args in fa0–fa7
+    /// - Stack-passed args aligned to 8 bytes
+    /// - Return value in a0 (integer) or fa0 (FP)
+    /// - Caller saves: t0–t6, a0–a7, ft0–ft11, fa0–fa7
+    ///
     /// Uses topological ordering with T0 (x5) as the scratch register
     /// to break cycles.
-    fn emit_parallel_gpr_moves(
-        instructions: &mut Vec<RvInstruction>,
-        moves: &[(u16, u16)],
-    ) {
+    fn emit_parallel_gpr_moves(instructions: &mut Vec<RvInstruction>, moves: &[(u16, u16)]) {
         if moves.is_empty() {
             return;
         }
@@ -1713,10 +1717,8 @@ impl RiscV64InstructionSelector {
         if !has_conflict {
             // No conflicts — emit in order.
             for &(dst, src) in moves {
-                instructions.push(
-                    RvInstruction::i_type(RvOpcode::ADDI, dst, src, 0)
-                        .as_call_arg_setup(),
-                );
+                instructions
+                    .push(RvInstruction::i_type(RvOpcode::ADDI, dst, src, 0).as_call_arg_setup());
             }
             return;
         }
@@ -1725,16 +1727,14 @@ impl RiscV64InstructionSelector {
         let mut emitted = true;
         while emitted && !pending.is_empty() {
             emitted = false;
-            let srcs: std::collections::HashSet<u16> =
-                pending.iter().map(|m| m.1).collect();
+            let srcs: std::collections::HashSet<u16> = pending.iter().map(|m| m.1).collect();
             let mut next_pending = Vec::new();
             for &(dst, src) in &pending {
                 if !srcs.contains(&dst) || dst == src {
                     // Safe to emit: no other pending move reads from dst.
                     if dst != src {
                         instructions.push(
-                            RvInstruction::i_type(RvOpcode::ADDI, dst, src, 0)
-                                .as_call_arg_setup(),
+                            RvInstruction::i_type(RvOpcode::ADDI, dst, src, 0).as_call_arg_setup(),
                         );
                     }
                     emitted = true;
@@ -1748,10 +1748,8 @@ impl RiscV64InstructionSelector {
         while !pending.is_empty() {
             let (_first_dst, first_src) = pending[0];
             // Save first_src to T0
-            instructions.push(
-                RvInstruction::i_type(RvOpcode::ADDI, T0, first_src, 0)
-                    .as_call_arg_setup(),
-            );
+            instructions
+                .push(RvInstruction::i_type(RvOpcode::ADDI, T0, first_src, 0).as_call_arg_setup());
             // Replace first_src in all pending moves with T0
             for m in pending.iter_mut() {
                 if m.1 == first_src {
@@ -1761,12 +1759,10 @@ impl RiscV64InstructionSelector {
             // Now first move can be emitted: dst ← T0
             pending[0].1 = T0;
             // Re-run topological resolution
-            let mut still_pending = Vec::new();
             let mut progress = true;
             while progress && !pending.is_empty() {
                 progress = false;
-                let srcs: std::collections::HashSet<u16> =
-                    pending.iter().map(|m| m.1).collect();
+                let srcs: std::collections::HashSet<u16> = pending.iter().map(|m| m.1).collect();
                 let mut next = Vec::new();
                 for &(dst, src) in &pending {
                     if !srcs.contains(&dst) || dst == src {
@@ -1783,19 +1779,16 @@ impl RiscV64InstructionSelector {
                 }
                 pending = next;
             }
-            if !pending.is_empty() {
-                still_pending = pending.clone();
-                pending = still_pending;
-            }
+            // Any remaining pending moves that couldn't be resolved
+            // are left in `pending` — this handles residual cycles
+            // that the single-scratch-register approach didn't break.
+            let _ = &pending;
         }
     }
 
     /// Emit a sequence of FPR register-to-register moves with parallel-copy
     /// resolution. Uses FT0 as the scratch register.
-    fn emit_parallel_fpr_moves(
-        instructions: &mut Vec<RvInstruction>,
-        moves: &[(u16, u16)],
-    ) {
+    fn emit_parallel_fpr_moves(instructions: &mut Vec<RvInstruction>, moves: &[(u16, u16)]) {
         if moves.is_empty() {
             return;
         }
@@ -1803,8 +1796,8 @@ impl RiscV64InstructionSelector {
         let has_conflict = moves.iter().any(|m| dsts.contains(&m.1) && m.0 != m.1);
         if !has_conflict {
             for &(dst, src) in moves {
-                let mut inst = RvInstruction::r_type(RvOpcode::FSGNJ_D, dst, src, src)
-                    .as_call_arg_setup();
+                let mut inst =
+                    RvInstruction::r_type(RvOpcode::FSGNJ_D, dst, src, src).as_call_arg_setup();
                 inst.is_fp = true;
                 instructions.push(inst);
             }
@@ -1816,15 +1809,13 @@ impl RiscV64InstructionSelector {
         let mut emitted = true;
         while emitted && !pending.is_empty() {
             emitted = false;
-            let srcs: std::collections::HashSet<u16> =
-                pending.iter().map(|m| m.1).collect();
+            let srcs: std::collections::HashSet<u16> = pending.iter().map(|m| m.1).collect();
             let mut next_pending = Vec::new();
             for &(dst, src) in &pending {
                 if !srcs.contains(&dst) || dst == src {
                     if dst != src {
-                        let mut inst = RvInstruction::r_type(
-                            RvOpcode::FSGNJ_D, dst, src, src,
-                        ).as_call_arg_setup();
+                        let mut inst = RvInstruction::r_type(RvOpcode::FSGNJ_D, dst, src, src)
+                            .as_call_arg_setup();
                         inst.is_fp = true;
                         instructions.push(inst);
                     }
@@ -1849,15 +1840,13 @@ impl RiscV64InstructionSelector {
             let mut progress = true;
             while progress && !pending.is_empty() {
                 progress = false;
-                let srcs: std::collections::HashSet<u16> =
-                    pending.iter().map(|m| m.1).collect();
+                let srcs: std::collections::HashSet<u16> = pending.iter().map(|m| m.1).collect();
                 let mut next = Vec::new();
                 for &(dst, src) in &pending {
                     if !srcs.contains(&dst) || dst == src {
                         if dst != src {
-                            let mut inst2 = RvInstruction::r_type(
-                                RvOpcode::FSGNJ_D, dst, src, src,
-                            ).as_call_arg_setup();
+                            let mut inst2 = RvInstruction::r_type(RvOpcode::FSGNJ_D, dst, src, src)
+                                .as_call_arg_setup();
                             inst2.is_fp = true;
                             instructions.push(inst2);
                         }
@@ -2724,9 +2713,7 @@ impl RiscV64InstructionSelector {
                         // Load the double/float from memory into the FPR.
                         self.emit_load(fd, T0, 0, ty);
                         self.value_types.insert(result.index(), ty.clone());
-                    } else if let Some(gname) =
-                        self.global_var_refs.get(result).cloned()
-                    {
+                    } else if let Some(gname) = self.global_var_refs.get(result).cloned() {
                         // Global variable reference: load address of global.
                         let rd = self.dest_reg(*result, ty);
                         let addr_insts = self.materialize_address(rd, &gname);
@@ -2856,7 +2843,7 @@ impl RiscV64InstructionSelector {
                     let is_fp_arg = self
                         .value_types
                         .get(&arg.index())
-                        .map(|ty| Self::uses_fpr(ty))
+                        .map(Self::uses_fpr)
                         .unwrap_or(false);
                     // NOTE: For variadic calls, the FP→GPR conversion
                     // (FMV.X.D) is deferred to emit_call where physical
@@ -2870,9 +2857,8 @@ impl RiscV64InstructionSelector {
                 // ── Builtin interception ──────────────────────────────
                 // Check if this is a compiler builtin that can be emitted
                 // inline without a real function call.
-                let handled_as_builtin = self.try_emit_rv_builtin(
-                    &callee_name, result, args, return_type,
-                );
+                let handled_as_builtin =
+                    self.try_emit_rv_builtin(&callee_name, result, args, return_type);
 
                 if !handled_as_builtin {
                     // result is a Value; allocate a register for it
@@ -2887,7 +2873,13 @@ impl RiscV64InstructionSelector {
                     };
                     let result_is_fp = Self::uses_fpr(return_type);
 
-                    self.emit_call(&callee_name, &arg_regs, result_reg, result_is_fp, is_variadic_call);
+                    self.emit_call(
+                        &callee_name,
+                        &arg_regs,
+                        result_reg,
+                        result_is_fp,
+                        is_variadic_call,
+                    );
                 }
                 // Record the return type so Store picks the right width.
                 if *result != Value::UNDEF {
@@ -3142,10 +3134,7 @@ impl RiscV64InstructionSelector {
         // (or even within a function with nested ifs), so we always
         // prefix with the function name and block index.
         for (i, block) in func.blocks().iter().enumerate() {
-            let base = block
-                .label
-                .as_deref()
-                .unwrap_or("bb");
+            let base = block.label.as_deref().unwrap_or("bb");
             let label = format!(".L_{}_{}_{}", func.name, base, i);
             self.block_labels.insert(block.index, label);
         }

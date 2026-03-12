@@ -298,10 +298,7 @@ impl ArchCodegen for I686Codegen {
         diag: &mut DiagnosticEngine,
         globals: &[crate::ir::module::GlobalVariable],
         func_ref_map: &crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>,
-        global_var_refs: &crate::common::fx_hash::FxHashMap<
-            crate::ir::instructions::Value,
-            String,
-        >,
+        global_var_refs: &crate::common::fx_hash::FxHashMap<crate::ir::instructions::Value, String>,
     ) -> Result<MachineFunction, String> {
         // Create a fresh inner codegen instance with the current
         // function-reference and global-variable-reference maps, so that

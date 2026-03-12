@@ -597,7 +597,12 @@ fn encode_mov_load_global(instr: &MachineInstruction) -> Result<EncodedInstructi
     }
     let name = match &instr.operands[0] {
         MachineOperand::GlobalSymbol(n) => n.clone(),
-        other => return Err(format!("MOV_LOAD_GLOBAL: expected GlobalSymbol, got {}", other)),
+        other => {
+            return Err(format!(
+                "MOV_LOAD_GLOBAL: expected GlobalSymbol, got {}",
+                other
+            ))
+        }
     };
     let mut bytes = Vec::new();
     // MOV r32, [disp32] → 0x8B ModR/M(00, reg, 101=disp32)
@@ -666,7 +671,10 @@ fn encode_mov_store_global(instr: &MachineInstruction) -> Result<EncodedInstruct
 /// After register allocation, `operands[0]` is a physical `Register`
 /// holding the memory address to dereference.
 fn encode_mov_load_indirect(instr: &MachineInstruction) -> Result<EncodedInstruction, String> {
-    let d = gpr(instr.result.as_ref().ok_or("MOV_LOAD_INDIRECT: no result")?)?;
+    let d = gpr(instr
+        .result
+        .as_ref()
+        .ok_or("MOV_LOAD_INDIRECT: no result")?)?;
     if instr.operands.is_empty() {
         return Err("MOV_LOAD_INDIRECT: need source pointer register".into());
     }
@@ -1108,13 +1116,7 @@ fn encode_imul(instr: &MachineInstruction) -> Result<EncodedInstruction, String>
         // When `result` is set and there are ≥2 operands, ops[0] is a
         // copy of the destination register (lhs); the actual source
         // (rhs multiplicand) is ops[1].
-        let src_idx = if instr.result.is_some() && ops.len() >= 2 {
-            1
-        } else if ops.len() >= 2 {
-            1
-        } else {
-            0
-        };
+        let src_idx = if ops.len() >= 2 { 1 } else { 0 };
         let src = &ops[src_idx];
 
         b.push(0x0F);
@@ -1943,9 +1945,9 @@ pub fn compute_instruction_size(instr: &MachineInstruction) -> usize {
         I686_LEAVE => 1, // C9
 
         // ---- Misc ----
-        I686_NOP => 1,  // 90
-        I686_INT3 => 1, // CC
-        I686_UD2 => 2,  // 0F 0B
+        I686_NOP => 1,   // 90
+        I686_INT3 => 1,  // CC
+        I686_UD2 => 2,   // 0F 0B
         I686_BSWAP => 2, // 0F C8+rd
 
         // Unknown opcode — pessimistic estimate

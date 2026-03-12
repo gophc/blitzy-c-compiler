@@ -273,7 +273,7 @@ impl RiscV64Abi {
         if self.int_regs_used < NUM_INT_ARG_REGS {
             let reg = INT_ARG_REGS[self.int_regs_used];
             self.int_regs_used += 1;
-            Some(ArgLocation::Register(reg as u16))
+            Some(ArgLocation::Register(reg))
         } else {
             None
         }
@@ -286,7 +286,7 @@ impl RiscV64Abi {
         if self.fp_regs_used < NUM_FP_ARG_REGS {
             let reg = FP_ARG_REGS[self.fp_regs_used];
             self.fp_regs_used += 1;
-            Some(ArgLocation::Register(reg as u16))
+            Some(ArgLocation::Register(reg))
         } else {
             None
         }
@@ -415,7 +415,7 @@ impl RiscV64Abi {
 
         match resolved {
             // Void: no return value.
-            CType::Void => ArgLocation::Register(X10 as u16),
+            CType::Void => ArgLocation::Register(X10),
 
             // Scalar integers, pointers, enums, booleans: returned in a0.
             CType::Bool
@@ -429,28 +429,26 @@ impl RiscV64Abi {
             | CType::Long
             | CType::ULong
             | CType::LongLong
-            | CType::ULongLong => ArgLocation::Register(X10 as u16),
+            | CType::ULongLong => ArgLocation::Register(X10),
 
-            CType::Pointer(_, _) => ArgLocation::Register(X10 as u16),
-            CType::Enum { .. } => ArgLocation::Register(X10 as u16),
+            CType::Pointer(_, _) => ArgLocation::Register(X10),
+            CType::Enum { .. } => ArgLocation::Register(X10),
 
             // Float: returned in fa0.
-            CType::Float => ArgLocation::Register(F10 as u16),
+            CType::Float => ArgLocation::Register(F10),
 
             // Double: returned in fa0.
-            CType::Double => ArgLocation::Register(F10 as u16),
+            CType::Double => ArgLocation::Register(F10),
 
             // Long double (128-bit): returned in a0+a1 (integer pair).
-            CType::LongDouble => ArgLocation::RegisterPair(X10 as u16, X11 as u16),
+            CType::LongDouble => ArgLocation::RegisterPair(X10, X11),
 
             // Complex float: fa0 + fa1.
             CType::Complex(ref base) => {
                 let base_resolved = resolve_type(base);
                 match base_resolved {
-                    CType::Float | CType::Double => {
-                        ArgLocation::RegisterPair(F10 as u16, F11 as u16)
-                    }
-                    _ => ArgLocation::RegisterPair(X10 as u16, X11 as u16),
+                    CType::Float | CType::Double => ArgLocation::RegisterPair(F10, F11),
+                    _ => ArgLocation::RegisterPair(X10, X11),
                 }
             }
 
@@ -473,20 +471,20 @@ impl RiscV64Abi {
                 let field_types: Vec<CType> = fields.iter().map(|f| f.ty.clone()).collect();
                 let layout = tb.compute_union_layout(&field_types, *packed, *aligned);
                 if layout.size <= 8 {
-                    ArgLocation::Register(X10 as u16)
+                    ArgLocation::Register(X10)
                 } else if layout.size <= MAX_STRUCT_REG_SIZE {
-                    ArgLocation::RegisterPair(X10 as u16, X11 as u16)
+                    ArgLocation::RegisterPair(X10, X11)
                 } else {
                     // Large union: returned via hidden pointer in a0.
-                    ArgLocation::Register(X10 as u16)
+                    ArgLocation::Register(X10)
                 }
             }
 
             // Array: returned via hidden pointer.
-            CType::Array(_, _) => ArgLocation::Register(X10 as u16),
+            CType::Array(_, _) => ArgLocation::Register(X10),
 
             // Function type: returned as pointer in a0.
-            CType::Function { .. } => ArgLocation::Register(X10 as u16),
+            CType::Function { .. } => ArgLocation::Register(X10),
 
             // Atomic, Typedef, Qualified: resolve through.
             CType::Atomic(ref inner) => self.classify_return(inner),
@@ -777,8 +775,8 @@ impl RiscV64Abi {
 
         if self.int_regs_used + 1 < NUM_INT_ARG_REGS {
             // Both halves fit in registers (2 × 64-bit = 128-bit).
-            let r1 = INT_ARG_REGS[self.int_regs_used] as u16;
-            let r2 = INT_ARG_REGS[self.int_regs_used + 1] as u16;
+            let r1 = INT_ARG_REGS[self.int_regs_used];
+            let r2 = INT_ARG_REGS[self.int_regs_used + 1];
             self.int_regs_used += 2;
             ArgLocation::RegisterPair(r1, r2)
         } else if self.int_regs_used < NUM_INT_ARG_REGS {
@@ -789,7 +787,7 @@ impl RiscV64Abi {
             // goes on the stack.  We represent this as a RegisterPair
             // where the first register holds the low half.  The caller
             // must emit the high half to the appropriate stack slot.
-            let r1 = INT_ARG_REGS[self.int_regs_used] as u16;
+            let r1 = INT_ARG_REGS[self.int_regs_used];
             self.int_regs_used += 1;
             // Allocate 8 bytes of stack for the high half, aligned to 8.
             let stack_offset = self.alloc_stack(8, 8);
@@ -817,8 +815,8 @@ impl RiscV64Abi {
                 // Complex float = 2 × float = 8 bytes.
                 // Try to pass as two FP registers.
                 if self.fp_regs_used + 1 < NUM_FP_ARG_REGS {
-                    let r1 = FP_ARG_REGS[self.fp_regs_used] as u16;
-                    let r2 = FP_ARG_REGS[self.fp_regs_used + 1] as u16;
+                    let r1 = FP_ARG_REGS[self.fp_regs_used];
+                    let r2 = FP_ARG_REGS[self.fp_regs_used + 1];
                     self.fp_regs_used += 2;
                     ArgLocation::RegisterPair(r1, r2)
                 } else {
@@ -829,8 +827,8 @@ impl RiscV64Abi {
             CType::Double => {
                 // Complex double = 2 × double = 16 bytes.
                 if self.fp_regs_used + 1 < NUM_FP_ARG_REGS {
-                    let r1 = FP_ARG_REGS[self.fp_regs_used] as u16;
-                    let r2 = FP_ARG_REGS[self.fp_regs_used + 1] as u16;
+                    let r1 = FP_ARG_REGS[self.fp_regs_used];
+                    let r2 = FP_ARG_REGS[self.fp_regs_used + 1];
                     self.fp_regs_used += 2;
                     ArgLocation::RegisterPair(r1, r2)
                 } else {
@@ -871,7 +869,7 @@ impl RiscV64Abi {
 
         // Empty struct: no argument passed.
         if fields.is_empty() || layout.size == 0 {
-            return ArgLocation::Register(X10 as u16);
+            return ArgLocation::Register(X10);
         }
 
         // Classify fields to determine the optimal passing strategy.
@@ -881,8 +879,8 @@ impl RiscV64Abi {
             StructClassification::FloatPair => {
                 // Two float/double fields → try two FP registers.
                 if self.fp_regs_used + 1 < NUM_FP_ARG_REGS {
-                    let r1 = FP_ARG_REGS[self.fp_regs_used] as u16;
-                    let r2 = FP_ARG_REGS[self.fp_regs_used + 1] as u16;
+                    let r1 = FP_ARG_REGS[self.fp_regs_used];
+                    let r2 = FP_ARG_REGS[self.fp_regs_used + 1];
                     self.fp_regs_used += 2;
                     ArgLocation::RegisterPair(r1, r2)
                 } else {
@@ -893,8 +891,8 @@ impl RiscV64Abi {
             StructClassification::FloatInteger => {
                 // One FP field (first) + one integer field (second).
                 if self.fp_regs_used < NUM_FP_ARG_REGS && self.int_regs_used < NUM_INT_ARG_REGS {
-                    let fp = FP_ARG_REGS[self.fp_regs_used] as u16;
-                    let gp = INT_ARG_REGS[self.int_regs_used] as u16;
+                    let fp = FP_ARG_REGS[self.fp_regs_used];
+                    let gp = INT_ARG_REGS[self.int_regs_used];
                     self.fp_regs_used += 1;
                     self.int_regs_used += 1;
                     ArgLocation::RegisterPair(fp, gp)
@@ -905,8 +903,8 @@ impl RiscV64Abi {
             StructClassification::IntegerFloat => {
                 // One integer field (first) + one FP field (second).
                 if self.int_regs_used < NUM_INT_ARG_REGS && self.fp_regs_used < NUM_FP_ARG_REGS {
-                    let gp = INT_ARG_REGS[self.int_regs_used] as u16;
-                    let fp = FP_ARG_REGS[self.fp_regs_used] as u16;
+                    let gp = INT_ARG_REGS[self.int_regs_used];
+                    let fp = FP_ARG_REGS[self.fp_regs_used];
                     self.int_regs_used += 1;
                     self.fp_regs_used += 1;
                     ArgLocation::RegisterPair(gp, fp)
@@ -939,8 +937,8 @@ impl RiscV64Abi {
     /// Classify a two-integer-register argument (for 9–16 byte values).
     fn classify_integer_pair_arg(&mut self) -> ArgLocation {
         if self.int_regs_used + 1 < NUM_INT_ARG_REGS {
-            let r1 = INT_ARG_REGS[self.int_regs_used] as u16;
-            let r2 = INT_ARG_REGS[self.int_regs_used + 1] as u16;
+            let r1 = INT_ARG_REGS[self.int_regs_used];
+            let r2 = INT_ARG_REGS[self.int_regs_used + 1];
             self.int_regs_used += 2;
             ArgLocation::RegisterPair(r1, r2)
         } else if self.int_regs_used < NUM_INT_ARG_REGS {
@@ -1005,11 +1003,11 @@ impl RiscV64Abi {
 
         // Large structs: returned via hidden pointer in a0.
         if layout.size > MAX_STRUCT_REG_SIZE {
-            return ArgLocation::Register(X10 as u16);
+            return ArgLocation::Register(X10);
         }
 
         if fields.is_empty() || layout.size == 0 {
-            return ArgLocation::Register(X10 as u16);
+            return ArgLocation::Register(X10);
         }
 
         let classification = classify_struct_fields(fields);
@@ -1017,25 +1015,25 @@ impl RiscV64Abi {
         match classification {
             StructClassification::FloatPair => {
                 // Return in fa0 + fa1.
-                ArgLocation::RegisterPair(F10 as u16, F11 as u16)
+                ArgLocation::RegisterPair(F10, F11)
             }
             StructClassification::FloatInteger => {
                 // Return in fa0 + a0.
-                ArgLocation::RegisterPair(F10 as u16, X10 as u16)
+                ArgLocation::RegisterPair(F10, X10)
             }
             StructClassification::IntegerFloat => {
                 // Return in a0 + fa0.
-                ArgLocation::RegisterPair(X10 as u16, F10 as u16)
+                ArgLocation::RegisterPair(X10, F10)
             }
             StructClassification::SingleFloat => {
                 // Single float/double field: return in fa0.
-                ArgLocation::Register(F10 as u16)
+                ArgLocation::Register(F10)
             }
             StructClassification::Integer => {
                 if layout.size <= 8 {
-                    ArgLocation::Register(X10 as u16)
+                    ArgLocation::Register(X10)
                 } else {
-                    ArgLocation::RegisterPair(X10 as u16, X11 as u16)
+                    ArgLocation::RegisterPair(X10, X11)
                 }
             }
         }
