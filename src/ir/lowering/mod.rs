@@ -1069,8 +1069,24 @@ pub fn size_of(ctype: &CType, target: &Target) -> usize {
 /// `Function` variant, indicating a parameter list rather than a simple
 /// identifier or array shape.
 fn declarator_has_function_shape(decl: &ast::Declarator) -> bool {
+    // Distinguish between function declarations and function pointer variables:
+    //   void foo(int);          → Function { base: Identifier("foo") }  → true
+    //   void (*fp)(int);        → Function { base: Parenthesized(Declarator{ pointer: Some(..) }) } → false
+    //   void (**fp)(int);       → same pattern, still a variable → false
+    //   void (*fp[5])(int);     → array of fn ptrs, still a variable → false
+    //   void (foo)(int);        → Function { base: Parenthesized(Declarator{ pointer: None }) } → true
     match &decl.direct {
-        ast::DirectDeclarator::Function { .. } => true,
+        ast::DirectDeclarator::Function { base, .. } => {
+            // If the base of the function declarator is a parenthesized
+            // declarator that contains a pointer, this is a function-pointer
+            // variable (e.g., `void (*fp)(int)`) — NOT a function declaration.
+            if let ast::DirectDeclarator::Parenthesized(inner_decl) = base.as_ref() {
+                if inner_decl.pointer.is_some() {
+                    return false;
+                }
+            }
+            true
+        }
         ast::DirectDeclarator::Parenthesized(inner) => declarator_has_function_shape(inner),
         _ => false,
     }

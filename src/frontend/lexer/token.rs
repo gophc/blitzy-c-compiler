@@ -1150,6 +1150,7 @@ pub fn lookup_keyword(s: &str) -> Option<TokenKind> {
         // GCC extension keywords
         // =================================================================
         "__attribute__" => Some(TokenKind::Attribute),
+        "__attribute" => Some(TokenKind::Attribute),
         // `typeof`, `__typeof`, and `__typeof__` all map to the same variant.
         "typeof" => Some(TokenKind::Typeof),
         "__typeof" => Some(TokenKind::Typeof),

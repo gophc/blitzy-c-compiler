@@ -889,6 +889,90 @@ fn evaluate_constant_expr(
             diagnostics,
             name_table,
         ),
+        // BuiltinCall in constant context (e.g. __builtin_constant_p,
+        // __builtin_choose_expr) — evaluate known builtins.
+        ast::Expression::BuiltinCall {
+            builtin, args, ..
+        } => match builtin {
+            ast::BuiltinKind::ConstantP => Some(Constant::Integer(0)),
+            ast::BuiltinKind::ChooseExpr if args.len() >= 3 => {
+                let cond = evaluate_constant_expr(
+                    &args[0],
+                    _expected_type,
+                    target,
+                    type_builder,
+                    diagnostics,
+                    name_table,
+                );
+                match cond {
+                    Some(Constant::Integer(v)) if v != 0 => evaluate_constant_expr(
+                        &args[1],
+                        _expected_type,
+                        target,
+                        type_builder,
+                        diagnostics,
+                        name_table,
+                    ),
+                    _ => evaluate_constant_expr(
+                        &args[2],
+                        _expected_type,
+                        target,
+                        type_builder,
+                        diagnostics,
+                        name_table,
+                    ),
+                }
+            }
+            ast::BuiltinKind::TypesCompatibleP => Some(Constant::Integer(0)),
+            ast::BuiltinKind::Expect if !args.is_empty() => evaluate_constant_expr(
+                &args[0],
+                _expected_type,
+                target,
+                type_builder,
+                diagnostics,
+                name_table,
+            ),
+            _ => Some(Constant::Undefined),
+        },
+        // Comma operator — evaluate both, return last.
+        ast::Expression::Comma { exprs, .. } => {
+            if let Some(last) = exprs.last() {
+                evaluate_constant_expr(
+                    last,
+                    _expected_type,
+                    target,
+                    type_builder,
+                    diagnostics,
+                    name_table,
+                )
+            } else {
+                Some(Constant::Undefined)
+            }
+        }
+        // Statement expression ({...}) — treat as non-constant but don't
+        // error out if it produces a known value (e.g. kernel macros).
+        ast::Expression::StatementExpression { .. } => {
+            // Conservatively treat as undefined — not evaluable at
+            // compile time in the general case.
+            Some(Constant::Undefined)
+        }
+        // FunctionCall — not a compile-time constant, but don't error
+        // (some kernel macros produce these in initializer context).
+        ast::Expression::FunctionCall { .. } => Some(Constant::Undefined),
+        // MemberAccess and PointerMemberAccess — not compile-time.
+        ast::Expression::MemberAccess { .. }
+        | ast::Expression::PointerMemberAccess { .. } => Some(Constant::Undefined),
+        // AddressOfLabel (GCC &&label) — address constant.
+        ast::Expression::AddressOfLabel { label, .. } => {
+            let label_str = resolve_sym(name_table, label).to_string();
+            Some(Constant::GlobalRef(label_str))
+        }
+        // ArraySubscript — not compile-time constant.
+        ast::Expression::ArraySubscript { .. } => Some(Constant::Undefined),
+        // Generic (_Generic) — not evaluated here.
+        ast::Expression::Generic { .. } => Some(Constant::Undefined),
+        // CompoundLiteral — may be constant in certain cases.
+        ast::Expression::CompoundLiteral { .. } => Some(Constant::Undefined),
         _ => {
             diagnostics.emit_error(
                 Span::dummy(),

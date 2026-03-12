@@ -1104,10 +1104,136 @@ impl<'a> Preprocessor<'a> {
                     break;
                 }
 
-                // Skip newlines that occur inside macro argument lists (treat
-                // them as whitespace — C11 §5.1.1.2 translation phases).
+                // When inside macro argument lists and we hit a newline,
+                // check whether subsequent lines start with preprocessing
+                // directives (#ifdef, #ifndef, #if, #elif, #else, #endif).
+                // GCC processes conditional directives that appear inside
+                // macro arguments — the Linux kernel relies on this (e.g.,
+                // `unlikely(expr | \n #ifdef CONFIG_X \n val | \n #endif \n rest)`).
+                // §6.10.3p11: behavior is undefined but GCC extends it.
+                //
+                // We loop here to handle consecutive and nested directive
+                // blocks (e.g., `#ifdef A \n #ifdef B \n ... #endif \n #endif`).
                 if tok.kind == PPTokenKind::Newline && in_macro_args {
                     pos += 1;
+                    // Process any run of consecutive directive lines.
+                    loop {
+                        // Skip whitespace to find start of the next logical line.
+                        let saved_pos = pos;
+                        while pos < len && tokens[pos].kind == PPTokenKind::Whitespace {
+                            pos += 1;
+                        }
+                        // Not a `#` → not a directive, stop loop.
+                        if pos >= len
+                            || tokens[pos].kind != PPTokenKind::Punctuator
+                            || tokens[pos].text != "#"
+                        {
+                            pos = saved_pos;
+                            break;
+                        }
+                        let hash_pos = pos;
+                        pos += 1;
+                        while pos < len && tokens[pos].kind == PPTokenKind::Whitespace {
+                            pos += 1;
+                        }
+                        // Check for a conditional directive keyword.
+                        if pos >= len || tokens[pos].kind != PPTokenKind::Identifier {
+                            pos = saved_pos;
+                            break;
+                        }
+                        let dname = tokens[pos].text.clone();
+                        if !matches!(
+                            dname.as_str(),
+                            "ifdef" | "ifndef" | "if" | "elif" | "else" | "endif"
+                        ) {
+                            // Not a conditional directive — restore and
+                            // treat as ordinary tokens.
+                            pos = saved_pos;
+                            break;
+                        }
+                        // Consume directive keyword.
+                        pos += 1;
+                        // Skip leading whitespace before directive arguments.
+                        while pos < len && tokens[pos].kind == PPTokenKind::Whitespace {
+                            pos += 1;
+                        }
+                        // Collect directive argument tokens until end of line.
+                        let mut dir_tokens = Vec::new();
+                        while pos < len
+                            && tokens[pos].kind != PPTokenKind::Newline
+                            && tokens[pos].kind != PPTokenKind::EndOfFile
+                        {
+                            dir_tokens.push(tokens[pos].clone());
+                            pos += 1;
+                        }
+                        if pos < len && tokens[pos].kind == PPTokenKind::Newline {
+                            pos += 1;
+                        }
+                        // Process the conditional directive with proper
+                        // inactive-region nesting (matching the behaviour
+                        // of the top-level process_directive_line).
+                        match dname.as_str() {
+                            "ifdef" | "ifndef" | "if" => {
+                                if !self.is_active() {
+                                    self.conditional_stack.push(ConditionalState::new(
+                                        false,
+                                        tokens[hash_pos].span,
+                                    ));
+                                } else {
+                                    match dname.as_str() {
+                                        "ifdef" => self.process_ifdef(
+                                            &dir_tokens,
+                                            tokens[hash_pos].span,
+                                        ),
+                                        "ifndef" => self.process_ifndef(
+                                            &dir_tokens,
+                                            tokens[hash_pos].span,
+                                        ),
+                                        "if" => self.process_if(
+                                            &dir_tokens,
+                                            tokens[hash_pos].span,
+                                        ),
+                                        _ => unreachable!(),
+                                    }
+                                }
+                            }
+                            "elif" => self.process_elif(&tokens[hash_pos], &dir_tokens),
+                            "else" => self.process_else(&tokens[hash_pos]),
+                            "endif" => self.process_endif(&tokens[hash_pos]),
+                            _ => unreachable!(),
+                        }
+                        // If we just entered an inactive region, skip non-
+                        // directive lines until we become active again (or
+                        // hit more directives which the next loop iteration
+                        // handles).
+                        while pos < len && !self.is_active() {
+                            // Skip whitespace.
+                            while pos < len && tokens[pos].kind == PPTokenKind::Whitespace {
+                                pos += 1;
+                            }
+                            // Check for a directive line.
+                            if pos < len
+                                && tokens[pos].kind == PPTokenKind::Punctuator
+                                && tokens[pos].text == "#"
+                            {
+                                // This is a directive — break out so the
+                                // outer loop processes it (it might be
+                                // #elif, #else, #endif, or nested #ifdef).
+                                break;
+                            }
+                            // Non-directive line in inactive region — skip.
+                            while pos < len
+                                && tokens[pos].kind != PPTokenKind::Newline
+                                && tokens[pos].kind != PPTokenKind::EndOfFile
+                            {
+                                pos += 1;
+                            }
+                            if pos < len && tokens[pos].kind == PPTokenKind::Newline {
+                                pos += 1;
+                            }
+                        }
+                        // Loop back to check if the next line is also a directive.
+                    }
                     continue;
                 }
 
@@ -1127,6 +1253,29 @@ impl<'a> Preprocessor<'a> {
                                     if let Some(md) = self.macro_defs.get(&prev.text) {
                                         if matches!(md.kind, MacroKind::FunctionLike { .. }) {
                                             macro_arg_depths.push(paren_depth);
+                                        } else if matches!(md.kind, MacroKind::ObjectLike) {
+                                            // Object-like macro followed by `(`: check
+                                            // if the replacement list is a single token
+                                            // that is itself a function-like macro name.
+                                            // This handles the kernel pattern:
+                                            //   #define ALIAS FUNC
+                                            //   ALIAS(args across\n lines)
+                                            // where FUNC is a function-like macro.
+                                            if md.replacement.len() == 1
+                                                && md.replacement[0].kind
+                                                    == PPTokenKind::Identifier
+                                            {
+                                                if let Some(target_md) =
+                                                    self.macro_defs.get(&md.replacement[0].text)
+                                                {
+                                                    if matches!(
+                                                        target_md.kind,
+                                                        MacroKind::FunctionLike { .. }
+                                                    ) {
+                                                        macro_arg_depths.push(paren_depth);
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }

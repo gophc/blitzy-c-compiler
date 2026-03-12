@@ -2210,10 +2210,12 @@ impl<'a> SemanticAnalyzer<'a> {
                 }
                 TypeSpecifier::Typeof(typeof_arg) => {
                     // typeof support: expression type inference or identity.
+                    // Must use resolve_type_name() for TypeName to handle
+                    // abstract declarators (arrays, pointers, functions).
+                    // E.g. typeof(struct irq_work [2]) must yield Array type.
                     match typeof_arg {
                         TypeofArg::TypeName(tn) => {
-                            return self
-                                .resolve_type_from_spec_qualifier_list(&tn.specifier_qualifiers);
+                            return self.resolve_type_name(tn);
                         }
                         TypeofArg::Expression(expr) => {
                             return self.infer_typeof_expr_type(expr);
