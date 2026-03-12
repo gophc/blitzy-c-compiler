@@ -1045,6 +1045,7 @@ fn parse_primary_expression(parser: &mut Parser<'_>) -> Result<Expression, ()> {
         TokenKind::BuiltinSubOverflow => parse_builtin_simple(parser, BuiltinKind::SubOverflow),
         TokenKind::BuiltinMulOverflow => parse_builtin_simple(parser, BuiltinKind::MulOverflow),
         TokenKind::BuiltinObjectSize => parse_builtin_simple(parser, BuiltinKind::ObjectSize),
+        TokenKind::BuiltinPrefetch => parse_builtin_simple(parser, BuiltinKind::PrefetchData),
 
         // __extension__ — suppress pedantic warnings for the next expr.
         TokenKind::Extension => {

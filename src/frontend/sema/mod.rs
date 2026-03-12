@@ -3153,6 +3153,13 @@ impl<'a> SemanticAnalyzer<'a> {
         match op {
             // Arithmetic operators: usual arithmetic conversions.
             BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
+                // Pointer subtraction (ptr - ptr) yields ptrdiff_t (long).
+                if matches!(op, BinaryOp::Sub)
+                    && self.is_pointer_type(self.strip_qualifiers(left))
+                    && self.is_pointer_type(self.strip_qualifiers(right))
+                {
+                    return Ok(CType::Long);
+                }
                 Ok(self.common_type(left, right))
             }
             // Bitwise operators: usual arithmetic conversions.

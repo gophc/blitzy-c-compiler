@@ -343,6 +343,8 @@ pub enum TokenKind {
     BuiltinMulOverflow,
     /// `__builtin_object_size`
     BuiltinObjectSize,
+    /// `__builtin_prefetch`
+    BuiltinPrefetch,
 
     // =======================================================================
     // Identifiers
@@ -643,6 +645,7 @@ impl TokenKind {
             | TokenKind::BuiltinSubOverflow
             | TokenKind::BuiltinMulOverflow
             | TokenKind::BuiltinObjectSize
+            | TokenKind::BuiltinPrefetch
         )
     }
 
@@ -855,6 +858,7 @@ impl TokenKind {
             TokenKind::BuiltinSubOverflow => Some("__builtin_sub_overflow"),
             TokenKind::BuiltinMulOverflow => Some("__builtin_mul_overflow"),
             TokenKind::BuiltinObjectSize => Some("__builtin_object_size"),
+            TokenKind::BuiltinPrefetch => Some("__builtin_prefetch"),
             _ => None,
         }
     }
@@ -1209,6 +1213,7 @@ pub fn lookup_keyword(s: &str) -> Option<TokenKind> {
         "__builtin_sub_overflow" => Some(TokenKind::BuiltinSubOverflow),
         "__builtin_mul_overflow" => Some(TokenKind::BuiltinMulOverflow),
         "__builtin_object_size" => Some(TokenKind::BuiltinObjectSize),
+        "__builtin_prefetch" => Some(TokenKind::BuiltinPrefetch),
 
         // Not a keyword — the lexer should treat it as a plain identifier.
         _ => None,
