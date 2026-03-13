@@ -1179,24 +1179,17 @@ impl<'a> Preprocessor<'a> {
                         match dname.as_str() {
                             "ifdef" | "ifndef" | "if" => {
                                 if !self.is_active() {
-                                    self.conditional_stack.push(ConditionalState::new(
-                                        false,
-                                        tokens[hash_pos].span,
-                                    ));
+                                    self.conditional_stack
+                                        .push(ConditionalState::new(false, tokens[hash_pos].span));
                                 } else {
                                     match dname.as_str() {
-                                        "ifdef" => self.process_ifdef(
-                                            &dir_tokens,
-                                            tokens[hash_pos].span,
-                                        ),
-                                        "ifndef" => self.process_ifndef(
-                                            &dir_tokens,
-                                            tokens[hash_pos].span,
-                                        ),
-                                        "if" => self.process_if(
-                                            &dir_tokens,
-                                            tokens[hash_pos].span,
-                                        ),
+                                        "ifdef" => {
+                                            self.process_ifdef(&dir_tokens, tokens[hash_pos].span)
+                                        }
+                                        "ifndef" => {
+                                            self.process_ifndef(&dir_tokens, tokens[hash_pos].span)
+                                        }
+                                        "if" => self.process_if(&dir_tokens, tokens[hash_pos].span),
                                         _ => unreachable!(),
                                     }
                                 }
@@ -1266,8 +1259,7 @@ impl<'a> Preprocessor<'a> {
                                             //   ALIAS(args across\n lines)
                                             // where FUNC is a function-like macro.
                                             if md.replacement.len() == 1
-                                                && md.replacement[0].kind
-                                                    == PPTokenKind::Identifier
+                                                && md.replacement[0].kind == PPTokenKind::Identifier
                                             {
                                                 if let Some(target_md) =
                                                     self.macro_defs.get(&md.replacement[0].text)
@@ -1314,11 +1306,16 @@ impl<'a> Preprocessor<'a> {
                         &mut *self.diagnostics,
                         self.max_recursion_depth,
                         &mut self.counter_value,
-                        &self.source_map,
+                        self.source_map,
                     );
                     expander.expand_tokens(&line_tokens)
                 };
-                output.extend(expanded);
+                // C99/C11 §6.10.9: Handle `_Pragma( string-literal )`
+                // operator.  After macro expansion, any remaining
+                // `_Pragma("...")` sequences are consumed and discarded
+                // (BCC ignores GCC diagnostic pragmas, etc.).
+                let filtered = strip_pragma_operator(&expanded);
+                output.extend(filtered);
             }
 
             // Emit a newline token so that `-E` output preserves line
@@ -1418,6 +1415,11 @@ impl<'a> Preprocessor<'a> {
             "include" => {
                 // process_include returns Ok(tokens) on success.
                 self.process_include(&rest).ok()
+            }
+            "include_next" => {
+                // GCC extension: search for the header starting after the
+                // current file's directory in the include path.
+                self.process_include_next(&rest).ok()
             }
             "if" => {
                 self.process_if(&rest, directive.span);
@@ -1710,7 +1712,7 @@ impl<'a> Preprocessor<'a> {
                         &mut *self.diagnostics,
                         self.max_recursion_depth,
                         &mut self.counter_value,
-                        &self.source_map,
+                        self.source_map,
                     );
                     expander.expand_tokens(&non_ws)
                 };
@@ -1854,6 +1856,151 @@ impl<'a> Preprocessor<'a> {
 
         // Filter out the EOF token from included output to avoid premature
         // termination of the parent file's token stream.
+        let filtered: Vec<PPToken> = result
+            .into_iter()
+            .filter(|t| t.kind != PPTokenKind::EndOfFile)
+            .collect();
+
+        Ok(filtered)
+    }
+
+    /// Process `#include_next` directive (GCC extension).
+    ///
+    /// `#include_next` searches for the header starting from the directory
+    /// **after** the current file's directory in the include search path.
+    /// This is used by system headers (e.g., glibc's `<limits.h>`) to chain
+    /// to the compiler's built-in header of the same name.
+    fn process_include_next(&mut self, tokens: &[PPToken]) -> Result<Vec<PPToken>, ()> {
+        if tokens.is_empty() {
+            self.diagnostics
+                .emit_error(Span::dummy(), "expected header name after #include_next");
+            return Err(());
+        }
+
+        let directive_span = tokens[0].span;
+
+        // Parse the header name (same logic as #include).
+        let (header_name, _is_system) = match tokens[0].kind {
+            PPTokenKind::HeaderName => {
+                let text = &tokens[0].text;
+                if text.starts_with('<') && text.ends_with('>') {
+                    (text[1..text.len() - 1].to_string(), true)
+                } else if text.starts_with('"') && text.ends_with('"') {
+                    (text[1..text.len() - 1].to_string(), false)
+                } else {
+                    (text.clone(), false)
+                }
+            }
+            PPTokenKind::StringLiteral => {
+                let text = &tokens[0].text;
+                let inner = if text.starts_with('"') && text.ends_with('"') && text.len() >= 2 {
+                    text[1..text.len() - 1].to_string()
+                } else {
+                    text.clone()
+                };
+                (inner, false)
+            }
+            PPTokenKind::Punctuator if tokens[0].text == "<" => {
+                let mut header = String::new();
+                let mut i = 1;
+                while i < tokens.len() {
+                    if tokens[i].kind == PPTokenKind::Punctuator && tokens[i].text == ">" {
+                        break;
+                    }
+                    header.push_str(&tokens[i].text);
+                    i += 1;
+                }
+                (header, true)
+            }
+            _ => {
+                self.diagnostics.emit_error(
+                    tokens[0].span,
+                    "expected header name in #include_next directive",
+                );
+                return Err(());
+            }
+        };
+
+        // Determine the including file for path resolution.
+        let including_file = self
+            .source_map
+            .get_filename(directive_span.file_id)
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+        if self.include_depth >= self.max_include_depth {
+            self.diagnostics.emit_error(
+                directive_span,
+                format!(
+                    "#include_next nested too deeply ({} levels, maximum is {})",
+                    self.include_depth, self.max_include_depth
+                ),
+            );
+            return Err(());
+        }
+
+        let handler = include_handler::IncludeHandler::new(
+            self.include_paths.clone(),
+            self.system_include_paths.clone(),
+        );
+
+        // Use #include_next resolution: skip to the directory AFTER the
+        // current file's directory in the search path.
+        let resolved_path = match handler.resolve_include_next(&header_name, &including_file) {
+            Some(path) => path,
+            None => {
+                // Fall back to normal include resolution if include_next
+                // doesn't find it (matches GCC behavior for edge cases).
+                match handler.resolve_include(&header_name, true, &including_file) {
+                    Some(path) => path,
+                    None => {
+                        self.diagnostics.emit_error(
+                            directive_span,
+                            format!("'{}' file not found", header_name),
+                        );
+                        return Err(());
+                    }
+                }
+            }
+        };
+
+        // Apply include guards and circular detection identically to #include.
+        if handler.should_skip_file(&resolved_path, &self.macro_defs) {
+            return Ok(Vec::new());
+        }
+
+        let canonical_path =
+            std::fs::canonicalize(&resolved_path).unwrap_or_else(|_| resolved_path.clone());
+
+        if self.include_stack.contains(&canonical_path) {
+            return Ok(Vec::new());
+        }
+
+        let source_content = match crate::common::encoding::read_source_file(&resolved_path) {
+            Ok(content) => content,
+            Err(e) => {
+                self.diagnostics.emit_error(
+                    directive_span,
+                    format!("cannot read '{}': {}", resolved_path.display(), e),
+                );
+                return Err(());
+            }
+        };
+
+        let file_id = self.source_map.add_file(
+            resolved_path.to_string_lossy().to_string(),
+            source_content.clone(),
+        );
+
+        let processed = phase1_line_splice(&phase1_trigraphs(&source_content));
+        let included_tokens = tokenize_preprocessing(&processed, file_id);
+
+        self.include_stack.push(canonical_path.clone());
+        self.include_depth += 1;
+        let result = self.process_tokens(&included_tokens);
+        self.include_depth -= 1;
+        self.include_stack.pop();
+
         let filtered: Vec<PPToken> = result
             .into_iter()
             .filter(|t| t.kind != PPTokenKind::EndOfFile)
@@ -2059,7 +2206,7 @@ impl<'a> Preprocessor<'a> {
                 &mut *self.diagnostics,
                 self.max_recursion_depth,
                 &mut self.counter_value,
-                &self.source_map,
+                self.source_map,
             );
             expander.expand_tokens(&with_defined)
         };
@@ -2207,6 +2354,63 @@ impl<'a> Preprocessor<'a> {
 
         (result, pos)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Helper: C99/C11 _Pragma operator stripping
+// ---------------------------------------------------------------------------
+
+/// Remove `_Pragma ( "string-literal" )` sequences from a token stream.
+///
+/// C99 §6.10.9 defines `_Pragma` as a unary operator on string literals that
+/// behaves like `#pragma`.  BCC currently does not execute the pragma content
+/// (e.g. GCC diagnostic push/pop) — we simply strip the entire expression so
+/// it does not confuse the parser.
+///
+/// The function scans for the 4-token pattern:
+///   `_Pragma` `(` `<string-literal>` `)`
+/// skipping whitespace tokens between them.
+fn strip_pragma_operator(tokens: &[PPToken]) -> Vec<PPToken> {
+    let mut result = Vec::with_capacity(tokens.len());
+    let mut i = 0;
+    let len = tokens.len();
+
+    while i < len {
+        // Check for `_Pragma` identifier.
+        if tokens[i].kind == PPTokenKind::Identifier && tokens[i].text == "_Pragma" {
+            // Scan ahead for `( string-literal )`, skipping whitespace.
+            let mut j = i + 1;
+            // Skip whitespace.
+            while j < len && tokens[j].kind == PPTokenKind::Whitespace {
+                j += 1;
+            }
+            if j < len && tokens[j].kind == PPTokenKind::Punctuator && tokens[j].text == "(" {
+                j += 1;
+                // Skip whitespace.
+                while j < len && tokens[j].kind == PPTokenKind::Whitespace {
+                    j += 1;
+                }
+                if j < len && tokens[j].kind == PPTokenKind::StringLiteral {
+                    j += 1;
+                    // Skip whitespace.
+                    while j < len && tokens[j].kind == PPTokenKind::Whitespace {
+                        j += 1;
+                    }
+                    if j < len && tokens[j].kind == PPTokenKind::Punctuator && tokens[j].text == ")"
+                    {
+                        // Matched full `_Pragma("...")` — skip all tokens [i..=j].
+                        i = j + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        // No match — emit the current token.
+        result.push(tokens[i].clone());
+        i += 1;
+    }
+
+    result
 }
 
 // ---------------------------------------------------------------------------

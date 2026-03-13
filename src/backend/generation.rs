@@ -42,7 +42,7 @@ use crate::backend::dwarf::{
 use crate::backend::elf_writer_common::{
     Elf32Rel, Elf64Rela, ElfSymbol, ElfWriter, Section, ET_REL, SHF_ALLOC, SHF_EXECINSTR,
     SHF_INFO_LINK, SHF_WRITE, SHT_NOBITS, SHT_PROGBITS, SHT_REL, SHT_RELA, STB_GLOBAL, STB_LOCAL,
-    STT_FUNC, STT_NOTYPE, STT_OBJECT, STV_DEFAULT, STV_HIDDEN, STV_PROTECTED,
+    STB_WEAK, STT_FUNC, STT_NOTYPE, STT_OBJECT, STV_DEFAULT, STV_HIDDEN, STV_PROTECTED,
 };
 use crate::backend::linker_common::relocation::RelocationHandler;
 use crate::backend::linker_common::{link, LinkerConfig, LinkerInput, LinkerOutput, OutputType};
@@ -541,6 +541,11 @@ fn generate_for_arch<A: ArchCodegen>(
             size: func_size,
             is_global: func.linkage == FunctionLinkage::External
                 || func.linkage == FunctionLinkage::Weak,
+            elf_binding: match func.linkage {
+                FunctionLinkage::Weak => STB_WEAK,
+                FunctionLinkage::External => STB_GLOBAL,
+                _ => STB_LOCAL,
+            },
             visibility: elf_visibility,
         });
 
@@ -572,6 +577,7 @@ fn generate_for_arch<A: ArchCodegen>(
                 offset: thunk_offset,
                 size: thunk_size,
                 is_global: true,
+                elf_binding: STB_GLOBAL,
                 visibility: STV_DEFAULT,
             });
             text_section_data.extend_from_slice(thunk_bytes);
@@ -634,6 +640,12 @@ fn generate_for_arch<A: ArchCodegen>(
     let mut global_symbols: Vec<GlobalSymbolInfo> = Vec::new();
 
     for global in module.globals() {
+        // Skip non-definition globals (extern declarations with no storage
+        // in this translation unit).  They become SHN_UNDEF symbol table
+        // entries, NOT BSS allocations.
+        if !global.is_definition {
+            continue;
+        }
         let sym_info = emit_global_variable(
             global,
             &mut data_section,
@@ -743,6 +755,9 @@ struct CompiledFunction {
     size: u64,
     /// Whether this function has external/global linkage.
     is_global: bool,
+    /// ELF symbol binding (STB_LOCAL, STB_GLOBAL, STB_WEAK).
+    /// Tracks weak vs. strong linkage for correct linker resolution.
+    elf_binding: u8,
     /// ELF symbol visibility (STV_DEFAULT, STV_HIDDEN, STV_PROTECTED).
     /// Propagated from the IR function's visibility attribute.
     visibility: u8,
@@ -2729,18 +2744,15 @@ fn write_relocatable_object(
 
     // --- Symbol table entries ---
 
-    // Add function symbols with proper visibility from the IR.
+    // Add function symbols with proper visibility and binding from the IR.
+    // Weak functions (e.g. __attribute__((weak))) get STB_WEAK binding so
+    // the static linker can override them with strong definitions.
     for func in functions {
-        let binding = if func.is_global {
-            STB_GLOBAL
-        } else {
-            STB_LOCAL
-        };
         let sym = ElfSymbol {
             name: func.name.clone(),
             value: func.offset,
             size: func.size,
-            binding,
+            binding: func.elf_binding,
             sym_type: STT_FUNC,
             visibility: func.visibility,
             section_index: text_section_index,
@@ -2791,6 +2803,33 @@ fn write_relocatable_object(
             section_index: 0, // SHN_UNDEF
         };
         writer.add_symbol(sym);
+    }
+
+    // Add external variable declaration symbols (undefined).
+    // These are `extern` declarations with no definition in this TU.
+    // They must appear as SHN_UNDEF STT_OBJECT entries so the linker
+    // resolves them against definitions in other translation units.
+    {
+        let mut seen_extern_vars: crate::common::fx_hash::FxHashSet<String> =
+            crate::common::fx_hash::FxHashSet::default();
+        for global in module.globals() {
+            if !global.is_definition && seen_extern_vars.insert(global.name.clone()) {
+                let binding = match global.linkage {
+                    crate::ir::module::Linkage::Weak => STB_WEAK,
+                    _ => STB_GLOBAL,
+                };
+                let sym = ElfSymbol {
+                    name: global.name.clone(),
+                    value: 0,
+                    size: 0,
+                    binding,
+                    sym_type: STT_NOTYPE,
+                    visibility: STV_DEFAULT,
+                    section_index: 0, // SHN_UNDEF
+                };
+                writer.add_symbol(sym);
+            }
+        }
     }
 
     // --- .rela.text section (relocations for the .text section) ---
@@ -2844,14 +2883,9 @@ fn write_relocatable_object(
         }
         let mut all_syms: Vec<SymEntry> = Vec::new();
         for func in functions.iter() {
-            let b = if func.is_global {
-                STB_GLOBAL
-            } else {
-                STB_LOCAL
-            };
             all_syms.push(SymEntry {
                 name: func.name.clone(),
-                binding: b,
+                binding: func.elf_binding,
             });
         }
         for gsym in globals.iter() {

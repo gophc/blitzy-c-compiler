@@ -333,6 +333,26 @@ pub fn parse_type_specifiers(parser: &mut Parser<'_>) -> Result<TypeSpecifierLis
                 parser.advance();
                 specifiers.push(TypeSpecifier::Int128);
             }
+            // _Float128 / __float128 — GCC/C23 128-bit float
+            TokenKind::Float128Keyword => {
+                parser.advance();
+                specifiers.push(TypeSpecifier::Float128);
+            }
+            // _Float16 — IEC 60559 half precision
+            TokenKind::Float16Keyword => {
+                parser.advance();
+                specifiers.push(TypeSpecifier::Float16);
+            }
+            // _Float32 / _Float32x — IEC 60559 single precision
+            TokenKind::Float32Keyword => {
+                parser.advance();
+                specifiers.push(TypeSpecifier::Float32);
+            }
+            // _Float64 / _Float64x — IEC 60559 double precision
+            TokenKind::Float64Keyword => {
+                parser.advance();
+                specifiers.push(TypeSpecifier::Float64);
+            }
             // Struct/Union — elaborated type specifier
             TokenKind::Struct | TokenKind::Union => {
                 if flags.has_any_primary() {
@@ -632,6 +652,22 @@ pub fn parse_specifier_qualifier_list(
                 parser.advance();
                 type_specifiers.push(TypeSpecifier::Int128);
             }
+            TokenKind::Float128Keyword => {
+                parser.advance();
+                type_specifiers.push(TypeSpecifier::Float128);
+            }
+            TokenKind::Float16Keyword => {
+                parser.advance();
+                type_specifiers.push(TypeSpecifier::Float16);
+            }
+            TokenKind::Float32Keyword => {
+                parser.advance();
+                type_specifiers.push(TypeSpecifier::Float32);
+            }
+            TokenKind::Float64Keyword => {
+                parser.advance();
+                type_specifiers.push(TypeSpecifier::Float64);
+            }
 
             // ----- Type qualifiers -----
             TokenKind::Const => {
@@ -764,7 +800,11 @@ pub fn is_type_specifier_start(token: &TokenKind, parser: &Parser<'_>) -> bool {
         | TokenKind::Unsigned
         | TokenKind::Bool
         | TokenKind::Complex
-        | TokenKind::Int128Keyword => true,
+        | TokenKind::Int128Keyword
+        | TokenKind::Float128Keyword
+        | TokenKind::Float16Keyword
+        | TokenKind::Float32Keyword
+        | TokenKind::Float64Keyword => true,
 
         // Aggregate type keywords
         TokenKind::Struct | TokenKind::Union | TokenKind::Enum => true,

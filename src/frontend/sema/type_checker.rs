@@ -645,7 +645,9 @@ impl<'a> TypeChecker<'a> {
             }
             BuiltinKind::PrefetchData => Ok(CType::Void),
             BuiltinKind::ObjectSize => Ok(self.size_t_type()),
-            BuiltinKind::ExtractReturnAddr => Ok(CType::Pointer(Box::new(CType::Void), EMPTY_QUALS)),
+            BuiltinKind::ExtractReturnAddr => {
+                Ok(CType::Pointer(Box::new(CType::Void), EMPTY_QUALS))
+            }
         }
     }
 

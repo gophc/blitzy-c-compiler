@@ -105,10 +105,11 @@ pub const EF_RISCV_RVC: u32 = 0x0001;
 
 /// Combined ELF flags for BCC RISC-V 64 output.
 ///
-/// `EF_RISCV_FLOAT_ABI_DOUBLE | EF_RISCV_RVC` = 0x0005.
-/// These flags are set on every `.o`, executable, and shared object
-/// produced by this backend.
-pub const ELF_FLAGS: u32 = EF_RISCV_FLOAT_ABI_DOUBLE | EF_RISCV_RVC;
+/// `EF_RISCV_RVC` = 0x0001.  The float ABI bits are 0 (soft-float /
+/// lp64) to match the Linux kernel's compilation model.  The kernel
+/// uses `-mabi=lp64` and never generates hardware FP instructions, so
+/// BCC must emit soft-float flags for link-time ABI compatibility.
+pub const ELF_FLAGS: u32 = EF_RISCV_RVC;
 
 /// Default base virtual address for RISC-V 64 static executables.
 ///
@@ -1614,7 +1615,7 @@ mod tests {
         assert_eq!(EM_RISCV, 243);
         assert_eq!(EF_RISCV_FLOAT_ABI_DOUBLE, 0x0004);
         assert_eq!(EF_RISCV_RVC, 0x0001);
-        assert_eq!(ELF_FLAGS, 0x0005);
+        assert_eq!(ELF_FLAGS, 0x0001);
         assert_eq!(DEFAULT_BASE_ADDRESS, 0x10000);
         assert_eq!(PAGE_SIZE, 4096);
     }

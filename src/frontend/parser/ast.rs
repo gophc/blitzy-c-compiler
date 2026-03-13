@@ -208,6 +208,14 @@ pub enum TypeSpecifier {
     Complex,
     /// `__int128` — GCC 128-bit integer extension.
     Int128,
+    /// `_Float128` / `__float128` — GCC/C23 128-bit float.
+    Float128,
+    /// `_Float16` — IEC 60559 half-precision float.
+    Float16,
+    /// `_Float32` / `_Float32x` — IEC 60559 32-bit float.
+    Float32,
+    /// `_Float64` / `_Float64x` — IEC 60559 64-bit float.
+    Float64,
     /// `struct { ... }` or `struct tag`
     Struct(StructOrUnionSpecifier),
     /// `union { ... }` or `union tag`
@@ -728,10 +736,7 @@ pub enum Expression {
         span: Span,
     },
     /// `__alignof__(expr)` — GCC extension: alignment of an expression's type.
-    AlignofExpr {
-        expr: Box<Expression>,
-        span: Span,
-    },
+    AlignofExpr { expr: Box<Expression>, span: Span },
 
     // -- Cast expression ---------------------------------------------------
     /// `(type-name) expr` — explicit type cast.

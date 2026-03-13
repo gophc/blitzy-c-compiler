@@ -24,3 +24,4 @@ Thumbs.db
 
 # External test dependencies (NEVER commit)
 /external/
+*.core

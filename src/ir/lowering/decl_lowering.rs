@@ -120,6 +120,13 @@ pub fn lower_global_variable(
 
         let c_type = resolve_declaration_type(specifiers, declarator, target, name_table);
 
+        // Declarations whose resolved type is a function type (e.g. using
+        // a function typedef: `fs_param_type fs_param_is_bool;`) are function
+        // declarations, NOT variable tentative definitions.  They must never
+        // produce BSS storage — they are implicitly extern.
+        // Use is_function() which resolves through typedefs.
+        let is_function_type = crate::common::types::is_function(&c_type);
+
         let (initializer, is_definition) = if let Some(ref init) = init_decl.initializer {
             let constant = evaluate_initializer_constant(
                 init,
@@ -130,7 +137,7 @@ pub fn lower_global_variable(
                 name_table,
             );
             (constant, true)
-        } else if matches!(storage_class, Some(ast::StorageClass::Extern)) {
+        } else if matches!(storage_class, Some(ast::StorageClass::Extern)) || is_function_type {
             (None, false)
         } else {
             (Some(Constant::ZeroInit), true)
@@ -204,14 +211,26 @@ pub fn lower_function_definition(
         }
     };
 
-    // Resolve the return type from specifiers, then apply pointer
-    // indirection from the declarator.  In C, `void *foo(void)` has
-    // specifiers `void` and declarator `*foo(void)`, so the pointer `*`
-    // makes the return type `void *`, not bare `void`.
-    let mut return_c_type = resolve_base_type_fast(specifiers, name_table);
-    if let Some(ref ptr) = declarator.pointer {
-        return_c_type = apply_pointer_layers(return_c_type, ptr);
-    }
+    // Build the complete function type using the full declarator.
+    // This correctly handles complex cases like function-returning-function-pointer:
+    //   void (*memdbDlSym(sqlite3_vfs *pVfs, void *p, const char *zSym))(void)
+    // where the return type is `void (*)(void)` and the simple approach of only
+    // applying top-level pointer from the declarator would yield bare `void`.
+    let base_spec_type = resolve_base_type_fast(specifiers, name_table);
+    let full_type = apply_declarator_type(base_spec_type.clone(), declarator, name_table);
+    let mut return_c_type = if let CType::Function {
+        ref return_type, ..
+    } = full_type
+    {
+        return_type.as_ref().clone()
+    } else {
+        // Fallback: simple pointer application (shouldn't happen for func defs).
+        let mut rt = base_spec_type;
+        if let Some(ref ptr) = declarator.pointer {
+            rt = apply_pointer_layers(rt, ptr);
+        }
+        rt
+    };
     // Resolve forward-referenced struct/union in the return type so that
     // ABI classification can see the actual struct fields (e.g., for
     // small-struct register return).
@@ -399,11 +418,8 @@ pub fn lower_function_definition(
     // final `module.add_function()` will add the full definition, but
     // identifier lookup needs to find *something* during body lowering.
     {
-        let fwd_param_types: Vec<IrType> = ir_function
-            .params
-            .iter()
-            .map(|p| p.ty.clone())
-            .collect();
+        let fwd_param_types: Vec<IrType> =
+            ir_function.params.iter().map(|p| p.ty.clone()).collect();
         let fwd_decl = crate::ir::module::FunctionDeclaration::new(
             func_name.clone(),
             return_ir_type.clone(),
@@ -434,6 +450,7 @@ pub fn lower_function_definition(
             static_locals: &mut static_locals,
             struct_defs,
             current_function_name: Some(&func_name),
+            scope_type_overrides: FxHashMap::default(),
         };
         stmt_lowering::lower_statement(&mut stmt_ctx, &body_stmt);
     }
@@ -926,9 +943,7 @@ fn evaluate_constant_expr(
         ),
         // BuiltinCall in constant context (e.g. __builtin_constant_p,
         // __builtin_choose_expr) — evaluate known builtins.
-        ast::Expression::BuiltinCall {
-            builtin, args, ..
-        } => match builtin {
+        ast::Expression::BuiltinCall { builtin, args, .. } => match builtin {
             ast::BuiltinKind::ConstantP => Some(Constant::Integer(0)),
             ast::BuiltinKind::ChooseExpr if args.len() >= 3 => {
                 let cond = evaluate_constant_expr(
@@ -995,8 +1010,9 @@ fn evaluate_constant_expr(
         // (some kernel macros produce these in initializer context).
         ast::Expression::FunctionCall { .. } => Some(Constant::Undefined),
         // MemberAccess and PointerMemberAccess — not compile-time.
-        ast::Expression::MemberAccess { .. }
-        | ast::Expression::PointerMemberAccess { .. } => Some(Constant::Undefined),
+        ast::Expression::MemberAccess { .. } | ast::Expression::PointerMemberAccess { .. } => {
+            Some(Constant::Undefined)
+        }
         // AddressOfLabel (GCC &&label) — address constant.
         ast::Expression::AddressOfLabel { label, .. } => {
             let label_str = resolve_sym(name_table, label).to_string();
@@ -1829,8 +1845,13 @@ fn resolve_struct_forward_ref_inner(
         CType::Struct { ref mut fields, .. } => {
             // Non-empty struct: recurse into field types to resolve nested
             // forward references (e.g., struct Nested { struct Point origin; }).
+            // Each field gets its own copy of the visited set so that sibling
+            // fields referencing the same struct type can both be resolved.
+            // Without this, only the first `struct Inner` field would get
+            // resolved and subsequent siblings would be left empty.
             for field in fields.iter_mut() {
-                resolve_struct_forward_ref_inner(&mut field.ty, struct_defs, visited);
+                let mut field_visited = visited.clone();
+                resolve_struct_forward_ref_inner(&mut field.ty, struct_defs, &mut field_visited);
             }
         }
         CType::Union {
@@ -2149,6 +2170,10 @@ fn map_single_type_specifier_with_names(spec: &ast::TypeSpecifier, name_table: &
         ast::TypeSpecifier::Signed => CType::Int,
         ast::TypeSpecifier::Unsigned => CType::UInt,
         ast::TypeSpecifier::Int128 => CType::Int128,
+        ast::TypeSpecifier::Float128 => CType::LongDouble,
+        ast::TypeSpecifier::Float64 => CType::Double,
+        ast::TypeSpecifier::Float32 => CType::Float,
+        ast::TypeSpecifier::Float16 => CType::Float,
         ast::TypeSpecifier::Struct(s) => {
             let fields = extract_struct_union_fields(s);
             CType::Struct {
@@ -2414,12 +2439,35 @@ fn extract_function_params_from_dd(
 ) -> (Vec<ast::ParameterDeclaration>, bool) {
     match dd {
         ast::DirectDeclarator::Function {
+            base,
             params,
             is_variadic,
             ..
-        } => (params.clone(), *is_variadic),
+        } => {
+            // For function-returning-function-pointer patterns like:
+            //   void (*memdbDlSym(real_params))(return_type_params)
+            // The outer Function's params belong to the returned function pointer,
+            // NOT the actual function parameters. The real params are in the inner
+            // nested Function declarator. Detect and recurse.
+            if let ast::DirectDeclarator::Parenthesized(inner_decl) = base.as_ref() {
+                if dd_has_nested_function(&inner_decl.direct) {
+                    return extract_function_params(inner_decl);
+                }
+            }
+            (params.clone(), *is_variadic)
+        }
         ast::DirectDeclarator::Parenthesized(inner) => extract_function_params(inner),
         _ => (Vec::new(), false),
+    }
+}
+
+/// Check if a direct declarator contains a nested Function declarator.
+fn dd_has_nested_function(dd: &ast::DirectDeclarator) -> bool {
+    match dd {
+        ast::DirectDeclarator::Function { .. } => true,
+        ast::DirectDeclarator::Parenthesized(inner) => dd_has_nested_function(&inner.direct),
+        ast::DirectDeclarator::Array { base, .. } => dd_has_nested_function(base),
+        ast::DirectDeclarator::Identifier(..) => false,
     }
 }
 

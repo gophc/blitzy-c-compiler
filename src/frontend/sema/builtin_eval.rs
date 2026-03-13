@@ -326,9 +326,10 @@ impl<'a> BuiltinEvaluator<'a> {
             BuiltinKind::ObjectSize => self.size_t_type(),
 
             // __builtin_extract_return_addr returns void*.
-            BuiltinKind::ExtractReturnAddr => {
-                CType::Pointer(Box::new(CType::Void), crate::common::types::TypeQualifiers::default())
-            }
+            BuiltinKind::ExtractReturnAddr => CType::Pointer(
+                Box::new(CType::Void),
+                crate::common::types::TypeQualifiers::default(),
+            ),
         }
     }
 
@@ -1076,7 +1077,6 @@ impl<'a> BuiltinEvaluator<'a> {
     }
 
     fn typename_specifiers_to_ctype(specs: &[TypeSpecifier]) -> CType {
-
         // Count occurrences of various specifiers to build the type.
         let mut has_void = false;
         let mut has_char = false;
@@ -1110,6 +1110,10 @@ impl<'a> BuiltinEvaluator<'a> {
                     }
                     return CType::Int128;
                 }
+                TypeSpecifier::Float128 => return CType::LongDouble,
+                TypeSpecifier::Float64 => return CType::Double,
+                TypeSpecifier::Float32 => return CType::Float,
+                TypeSpecifier::Float16 => return CType::Float,
                 TypeSpecifier::Struct(s) => {
                     let name = s.tag.map(|sym| format!("struct_{}", sym.as_u32()));
                     struct_type = Some(CType::Struct {

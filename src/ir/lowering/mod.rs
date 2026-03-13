@@ -917,11 +917,7 @@ pub fn lower_translation_unit(
                     // Also collect block-scope enum constants from
                     // inside the function body (e.g., kernel patterns
                     // like `enum { MIX_INFLIGHT = 1U << 31 };`).
-                    collect_enum_constants_from_compound(
-                        &func_def.body,
-                        &name_table,
-                        &mut map,
-                    );
+                    collect_enum_constants_from_compound(&func_def.body, &name_table, &mut map);
                 }
                 _ => {}
             }
@@ -1216,14 +1212,17 @@ fn collect_enum_constants_from_statement(
         ast::Statement::Compound(compound) => {
             collect_enum_constants_from_compound(compound, name_table, out);
         }
-        ast::Statement::If { then_branch, else_branch, .. } => {
+        ast::Statement::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
             collect_enum_constants_from_statement(then_branch, name_table, out);
             if let Some(eb) = else_branch {
                 collect_enum_constants_from_statement(eb, name_table, out);
             }
         }
-        ast::Statement::While { body, .. }
-        | ast::Statement::DoWhile { body, .. } => {
+        ast::Statement::While { body, .. } | ast::Statement::DoWhile { body, .. } => {
             collect_enum_constants_from_statement(body, name_table, out);
         }
         ast::Statement::For { init, body, .. } => {

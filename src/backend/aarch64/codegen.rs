@@ -1772,9 +1772,9 @@ impl AArch64InstructionSelector {
         insts
     }
 
-    /// Select store instructions. Since the IR Store does not carry the stored
-    /// type directly, we default to a 64-bit store. The register allocator
-    /// and type analysis passes refine this.
+    /// Select store instructions.  The correct store width is determined by
+    /// looking up the value's type in `value_types`.  If the type is unknown
+    /// we conservatively fall back to a 64-bit store.
     fn select_store(&mut self, value: &Value, ptr: &Value) -> Vec<A64Instruction> {
         let rd = value.index() + VREG_BASE;
         let rn = ptr.index() + VREG_BASE;
@@ -1795,13 +1795,36 @@ impl AArch64InstructionSelector {
             rn
         };
 
-        insts.push(
-            A64Instruction::new(A64Opcode::STR_imm)
-                .with_rd(rd)
-                .with_rn(actual_rn)
-                .with_imm(0)
-                .with_comment("store (64-bit default)"),
-        );
+        // Determine the stored value's type from value_types, defaulting to
+        // 64-bit if unknown (safe: the upper bits are simply ignored).
+        let val_ty = self.value_types.get(value).cloned();
+        let (opcode, is_fp, is_32, comment) = match val_ty.as_ref() {
+            Some(IrType::I1) | Some(IrType::I8) => {
+                (A64Opcode::STRB_imm, false, false, "store byte")
+            }
+            Some(IrType::I16) => (A64Opcode::STRH_imm, false, false, "store halfword"),
+            Some(IrType::I32) => (A64Opcode::STR_imm, false, true, "store 32-bit"),
+            Some(IrType::F32) => (A64Opcode::STR_fp_imm, true, true, "store f32"),
+            Some(IrType::F64) | Some(IrType::F80) => {
+                (A64Opcode::STR_fp_imm, true, false, "store f64")
+            }
+            _ => (A64Opcode::STR_imm, false, false, "store 64-bit"),
+        };
+
+        let mut inst = A64Instruction::new(opcode)
+            .with_rd(rd)
+            .with_rn(actual_rn)
+            .with_imm(0)
+            .with_comment(comment);
+
+        if is_32 && !is_fp {
+            inst = inst.set_32bit();
+        }
+        if is_fp {
+            inst = inst.set_fp();
+        }
+
+        insts.push(inst);
         insts
     }
 

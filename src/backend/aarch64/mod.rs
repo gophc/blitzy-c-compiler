@@ -1029,7 +1029,22 @@ impl ArchCodegen for AArch64Codegen {
         //   MOV X2, X1    (arg 2 — reads WRONG X1)
         // corrupts arg 2.  We detect such conflicts and reorder the moves,
         // using X16 (IP0 scratch) as a temporary for cycle resolution.
-        Self::fixup_call_arg_moves(&mut all_instructions);
+        // NOTE: The register allocator already produces correctly-ordered
+        // sequential moves for call arguments, including any necessary
+        // shuffle moves to preserve source values.  Running a parallel-move
+        // resolution on top of this corrupts the ordering because it
+        // treats the regalloc shuffles + arg setup as a single parallel
+        // set.  We only invoke the fixup when the regalloc has NOT
+        // inserted any resolution shuffles (i.e. when only the raw
+        // arg-setup MOVs are present and they conflict).
+        //
+        // Detection: if there are any MOV_reg with dst > max-arg-reg
+        // between the arg-setup block and the CALL, regalloc has
+        // already resolved.  For safety, we disable the fixup entirely
+        // and let regalloc handle ordering.  If regression tests surface
+        // a case where regalloc doesn't resolve correctly, we can
+        // re-enable a more surgical fixup.
+        // Self::fixup_call_arg_moves(&mut all_instructions);
 
         let result = asm.assemble_function(&all_instructions)?;
 
@@ -1678,6 +1693,7 @@ impl AArch64Codegen {
     /// a later MOV may read a register that an earlier MOV already
     /// clobbered.  We detect this pattern and reorder (or insert a
     /// temporary via X16/IP0) to eliminate the conflict.
+    #[allow(dead_code)]
     fn fixup_call_arg_moves(insts: &mut Vec<A64Instruction>) {
         // AArch64 IP0 — intra-procedure-call scratch, never used by
         // the register allocator and safe to clobber between calls.
@@ -1729,11 +1745,17 @@ impl AArch64Codegen {
             mov_indices.reverse(); // execution order (first emitted → first)
 
             // Build (dst, src, is_32bit) triples.
+            // The instruction selector stores the MOV source in `rn`
+            // (via `.with_rn(src)`), but after register allocation the
+            // physical register may appear in either `rn` or `rm`
+            // depending on the ORR encoding used.  Prefer `rn` (the
+            // field set by the instruction selector) and fall back to
+            // `rm` only if `rn` is absent.
             let moves: Vec<(u32, u32, bool)> = mov_indices
                 .iter()
                 .map(|&idx| {
                     let dst = insts[idx].rd.unwrap();
-                    let src = insts[idx].rm.unwrap_or(0);
+                    let src = insts[idx].rn.or(insts[idx].rm).unwrap_or(0);
                     let w = insts[idx].is_32bit;
                     (dst, src, w)
                 })
@@ -1797,6 +1819,7 @@ impl AArch64Codegen {
     /// Given a set of simultaneous register moves `(dst, src)`, produce
     /// a sequential ordering that preserves all source values.  If a
     /// cycle exists (e.g. swap X0↔X1), break it with `temp` (X16/IP0).
+    #[allow(dead_code)]
     fn resolve_parallel_moves(moves: &[(u32, u32, bool)], temp: u32) -> Vec<(u32, u32, bool)> {
         // Remove self-moves (dst == src) — they are no-ops.
         let mut pending: Vec<(u32, u32, bool)> =

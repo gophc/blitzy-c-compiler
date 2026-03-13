@@ -144,6 +144,11 @@ pub struct StmtLoweringContext<'a> {
     pub struct_defs: &'a FxHashMap<String, CType>,
     /// Name of the function currently being lowered (for `__func__`).
     pub current_function_name: Option<&'a str>,
+    /// Scope-local type overrides for block-scoped variable shadowing.
+    /// When a compound statement declares a variable with the same name as
+    /// one in an outer scope but with a different type, this map holds the
+    /// CURRENT scope's type, overriding `local_types`.
+    pub scope_type_overrides: FxHashMap<String, CType>,
 }
 
 // ===========================================================================
@@ -438,6 +443,37 @@ fn string_literal_length(expr: &ast::Expression) -> Option<usize> {
 /// This function creates allocas on demand for any declarator that is not
 /// already present in `ctx.local_vars`, so that subsequent initializer
 /// lowering and identifier lookups can find every variable.
+/// Compare two CTypes for the purpose of scope-shadowing detection.
+///
+/// This handles the common case where `resolve_declaration_type` produces
+/// a named struct/union with an empty field list (forward-reference style)
+/// while the pre-scanned `local_types` entry has the full definition with
+/// fields populated.  Named structs/unions with the same tag name are
+/// treated as equivalent regardless of whether their field lists differ.
+/// For compound types (arrays, pointers), the comparison recurses into
+/// element/pointee types.  Scalar and other types fall through to an
+/// IR-type comparison that ignores minor CType representation differences
+/// (e.g. `int` vs `typedef int my_int`).
+fn ctypes_compatible_for_scope_shadowing(a: &CType, b: &CType, target: &Target) -> bool {
+    match (a, b) {
+        // Named struct — same tag means same type regardless of field resolution.
+        (CType::Struct { name: Some(na), .. }, CType::Struct { name: Some(nb), .. }) => na == nb,
+        // Named union — same tag means same type.
+        (CType::Union { name: Some(na), .. }, CType::Union { name: Some(nb), .. }) => na == nb,
+        // Array — recurse into element type and compare sizes.
+        (CType::Array(ea, sa), CType::Array(eb, sb)) => {
+            sa == sb && ctypes_compatible_for_scope_shadowing(ea, eb, target)
+        }
+        // Pointer — recurse into pointee type.
+        (CType::Pointer(pa, _), CType::Pointer(pb, _)) => {
+            ctypes_compatible_for_scope_shadowing(pa, pb, target)
+        }
+        // For all other types, compare via IR types which normalises
+        // typedefs and minor representation differences.
+        _ => IrType::from_ctype(a, target) == IrType::from_ctype(b, target),
+    }
+}
+
 pub fn ensure_allocas_for_declaration(ctx: &mut StmtLoweringContext<'_>, decl: &ast::Declaration) {
     // Skip typedef declarations — they don't produce any runtime code.
     if matches!(
@@ -592,18 +628,50 @@ pub fn ensure_allocas_for_declaration(ctx: &mut StmtLoweringContext<'_>, decl: &
             None => continue,
         };
 
-        // If the variable already has an alloca, nothing to do.
-        if ctx.local_vars.contains_key(&var_name) {
-            continue;
-        }
-
-        // Resolve the C type and create an alloca in the entry block.
+        // Resolve the C type for this declaration.
         let c_type = decl_lowering::resolve_declaration_type(
             &decl.specifiers,
             &init_decl.declarator,
             ctx.target,
             ctx.name_table,
         );
+
+        // If the variable already has an alloca, check if the type matches.
+        // In C, different block scopes can declare variables with the same
+        // name but different types (e.g. `u32 t` in one case block and
+        // `void *t` in another within the same switch statement).  When the
+        // declared type differs from the pre-scanned type, we must create a
+        // new alloca with the correct IR type and update the scope overrides.
+        if ctx.local_vars.contains_key(&var_name) {
+            let effective_type = ctx
+                .scope_type_overrides
+                .get(&var_name)
+                .or_else(|| ctx.local_types.get(&var_name));
+            let types_match = effective_type.map_or(false, |et| {
+                // Use structural compatibility that treats named
+                // structs/unions with the same tag as equivalent,
+                // avoiding false positives when resolve_declaration_type
+                // returns an incomplete struct reference (empty fields)
+                // while the pre-scan resolved the full definition.
+                ctypes_compatible_for_scope_shadowing(et, &c_type, ctx.target)
+            });
+            if !types_match {
+                // Scope shadowing: create a new alloca with the correct type
+                // and update both local_vars and scope_type_overrides.
+                let sized_c_type = infer_array_size_from_init(
+                    &c_type,
+                    init_decl.initializer.as_ref(),
+                    ctx.name_table,
+                );
+                let ir_type = IrType::from_ctype(&sized_c_type, ctx.target);
+                let (alloca_val, alloca_inst) = ctx.builder.build_alloca(ir_type, decl.span);
+                ctx.function.entry_block_mut().push_alloca(alloca_inst);
+                ctx.local_vars.insert(var_name.clone(), alloca_val);
+                ctx.scope_type_overrides
+                    .insert(var_name.clone(), sized_c_type);
+            }
+            continue;
+        }
         // For unsized arrays (e.g., `char data[] = "hello"` or `int a[] = {1,2,3}`),
         // infer the size from the initializer BEFORE creating the alloca so that
         // the frame layout allocates the correct number of bytes.
@@ -684,6 +752,7 @@ pub fn lower_declaration_initializers(ctx: &mut StmtLoweringContext<'_>, decl: &
             label_blocks: ctx.label_blocks,
             current_function_name: ctx.current_function_name,
             enclosing_loop_stack: ctx.loop_stack.clone(),
+            scope_type_overrides: &ctx.scope_type_overrides,
         };
         decl_lowering::lower_local_initializer(alloca_val, initializer, &var_type, &mut expr_ctx);
     }
@@ -1823,6 +1892,7 @@ fn lower_expr_via_context(ctx: &mut StmtLoweringContext<'_>, expr: &ast::Express
         label_blocks: ctx.label_blocks,
         current_function_name: ctx.current_function_name,
         enclosing_loop_stack: ctx.loop_stack.clone(),
+        scope_type_overrides: &ctx.scope_type_overrides,
     };
     lower_expression(&mut expr_ctx, expr)
 }
@@ -1850,6 +1920,7 @@ fn lower_lvalue_via_context(ctx: &mut StmtLoweringContext<'_>, expr: &ast::Expre
         label_blocks: ctx.label_blocks,
         current_function_name: ctx.current_function_name,
         enclosing_loop_stack: ctx.loop_stack.clone(),
+        scope_type_overrides: &ctx.scope_type_overrides,
     };
     lower_lvalue(&mut expr_ctx, expr)
 }

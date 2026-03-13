@@ -793,6 +793,28 @@ impl IrModule {
     /// assert!(module.get_global("x").is_some());
     /// ```
     pub fn add_global(&mut self, global: GlobalVariable) {
+        // Deduplicate by name: if a global with the same name already exists,
+        // a definition takes priority over a declaration (extern).  This
+        // correctly merges the common C pattern where the same extern
+        // declaration appears in multiple included headers within one TU.
+        if let Some(&existing_idx) = self.global_map.get(&global.name) {
+            let existing = &self.globals[existing_idx];
+            if global.is_definition && !existing.is_definition {
+                // New entry is a definition replacing an extern declaration —
+                // overwrite the existing slot so that the definition's storage
+                // attributes (initializer, linkage, section, alignment) are
+                // used for code generation.
+                self.globals[existing_idx] = global;
+            } else if global.is_definition && existing.is_definition {
+                // Both are definitions (tentative definitions in the same TU).
+                // C allows multiple tentative definitions; the latest one's
+                // type and initializer are canonical.  Replace to match GCC.
+                self.globals[existing_idx] = global;
+            }
+            // Otherwise the new entry is a plain extern declaration and the
+            // existing entry already has equal or greater information — skip.
+            return;
+        }
         let index = self.globals.len();
         self.global_map.insert(global.name.clone(), index);
         self.globals.push(global);
@@ -1407,9 +1429,10 @@ mod tests {
             Some(Constant::Integer(2)),
         ));
 
-        // The lookup should return the latest entry
+        // Deduplication: same-name globals merge into a single entry.
+        // The latest definition replaces the earlier one.
         let g = m.get_global("x").unwrap();
         assert!(matches!(g.initializer, Some(Constant::Integer(2))));
-        assert_eq!(m.globals().len(), 2); // both remain in the vector
+        assert_eq!(m.globals().len(), 1); // deduplicated to single entry
     }
 }

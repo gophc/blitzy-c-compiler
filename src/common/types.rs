@@ -394,7 +394,11 @@ fn compute_struct_size(
             let bits = bits as usize;
             let unit_size_bytes = sizeof_ctype(&field.ty, target);
             let unit_size_bits = unit_size_bytes * 8;
-            let field_align = if packed { 1 } else { alignof_ctype(&field.ty, target) };
+            let field_align = if packed {
+                1
+            } else {
+                alignof_ctype(&field.ty, target)
+            };
 
             if bits == 0 {
                 // Zero-width bitfield: pad to next alignment boundary of the
@@ -440,7 +444,11 @@ fn compute_struct_size(
             let byte_offset = (bit_offset + 7) / 8;
 
             let field_size = sizeof_ctype(&field.ty, target);
-            let field_align = if packed { 1 } else { alignof_ctype(&field.ty, target) };
+            let field_align = if packed {
+                1
+            } else {
+                alignof_ctype(&field.ty, target)
+            };
 
             // Align the byte offset.
             let aligned_byte = align_up(byte_offset, field_align);
@@ -721,9 +729,7 @@ pub fn sizeof_ctype_resolved(
         },
         CType::Complex(base) => 2 * sizeof_ctype_resolved(base, target, tag_types),
         CType::Atomic(inner) => sizeof_ctype_resolved(inner, target, tag_types),
-        CType::Typedef { underlying, .. } => {
-            sizeof_ctype_resolved(underlying, target, tag_types)
-        }
+        CType::Typedef { underlying, .. } => sizeof_ctype_resolved(underlying, target, tag_types),
         CType::Qualified(inner, _) => sizeof_ctype_resolved(inner, target, tag_types),
         CType::Enum {
             underlying_type, ..
@@ -774,9 +780,7 @@ pub fn alignof_ctype_resolved(
         CType::Array(elem, _) => alignof_ctype_resolved(elem, target, tag_types),
         CType::Complex(base) => alignof_ctype_resolved(base, target, tag_types),
         CType::Atomic(inner) => alignof_ctype_resolved(inner, target, tag_types),
-        CType::Typedef { underlying, .. } => {
-            alignof_ctype_resolved(underlying, target, tag_types)
-        }
+        CType::Typedef { underlying, .. } => alignof_ctype_resolved(underlying, target, tag_types),
         CType::Qualified(inner, _) => alignof_ctype_resolved(inner, target, tag_types),
         CType::Enum {
             underlying_type, ..

@@ -209,6 +209,30 @@ pub const I686_MOV_LOAD_INDIRECT: u32 = 0x805;
 /// Used when an IR Store writes through a pointer held in a virtual register.
 /// `operands = [dst_pointer_register, src_value]`.
 pub const I686_MOV_STORE_INDIRECT: u32 = 0x806;
+/// MOVZX_LOAD_INDIRECT_BYTE — zero-extending byte load through a register
+/// pointer.  Encodes as `MOVZX r32, BYTE PTR [reg]` (0x0F 0xB6 with ModR/M
+/// indirect addressing).  Used when an IR Load dereferences a pointer for an
+/// I8 type, avoiding the 32-bit MOV_LOAD_INDIRECT which would read 4 bytes
+/// and then require a separate byte-extraction that is unreliable for
+/// registers without 8-bit aliases (ESI, EDI, EBP, ESP) on i686.
+/// `result = dst_register, operands = [src_pointer_register]`.
+pub const I686_MOVZX_LOAD_INDIRECT_BYTE: u32 = 0x808;
+/// MOVZX_LOAD_INDIRECT_WORD — zero-extending word load through a register
+/// pointer.  Encodes as `MOVZX r32, WORD PTR [reg]` (0x0F 0xB7 with ModR/M
+/// indirect addressing).
+/// `result = dst_register, operands = [src_pointer_register]`.
+pub const I686_MOVZX_LOAD_INDIRECT_WORD: u32 = 0x809;
+/// MOV_STORE_INDIRECT_BYTE — byte store through a register pointer.
+/// Encodes as `MOV BYTE PTR [reg], r8` (0x88 with ModR/M indirect
+/// addressing).  Ensures that only one byte is written when storing I8
+/// values, preventing corruption of adjacent memory.
+/// `operands = [dst_pointer_register, src_value]`.
+pub const I686_MOV_STORE_INDIRECT_BYTE: u32 = 0x80A;
+/// MOV_STORE_INDIRECT_WORD — word store through a register pointer.
+/// Encodes as `MOV WORD PTR [reg], r16` (0x66 0x89 with ModR/M indirect
+/// addressing).
+/// `operands = [dst_pointer_register, src_value]`.
+pub const I686_MOV_STORE_INDIRECT_WORD: u32 = 0x80B;
 /// BSWAP reg — reverse bytes in a 32-bit register (opcode 0F C8+rd).
 /// `result = Register(rd)`, `operands = [Register(src)]`.
 /// For in-place swap, `result == operands[0]`.
@@ -1052,10 +1076,19 @@ impl I686Codegen {
                     value_map.insert(result.index(), MachineOperand::VirtualRegister(vreg));
                 } else if matches!(&src, MachineOperand::VirtualRegister(_)) {
                     // Pointer held in a virtual register (e.g. GEP result).
-                    // Use dedicated LOAD_INDIRECT opcode so the encoder
-                    // dereferences the pointer ([reg]) instead of treating
-                    // it as a register-to-register copy.
-                    let mov = MachineInstruction::new(I686_MOV_LOAD_INDIRECT)
+                    // For sub-32-bit types (I8, I16), use a zero-extending
+                    // byte/word load so we read the correct number of bytes
+                    // from memory.  A plain 32-bit MOV_LOAD_INDIRECT would
+                    // read 4 bytes (including adjacent memory) and then
+                    // require a register-level byte extraction which is
+                    // unreliable on i686 where only EAX–EDX have 8-bit
+                    // sub-register aliases.
+                    let opcode = match ty {
+                        IrType::I1 | IrType::I8 => I686_MOVZX_LOAD_INDIRECT_BYTE,
+                        IrType::I16 => I686_MOVZX_LOAD_INDIRECT_WORD,
+                        _ => I686_MOV_LOAD_INDIRECT,
+                    };
+                    let mov = MachineInstruction::new(opcode)
                         .with_operand(src)
                         .with_result(MachineOperand::VirtualRegister(vreg));
                     out.push(mov);

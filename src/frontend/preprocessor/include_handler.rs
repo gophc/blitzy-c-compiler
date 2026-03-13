@@ -349,6 +349,49 @@ impl IncludeHandler {
         None
     }
 
+    /// Resolve a `#include_next` directive.
+    ///
+    /// `#include_next` searches for the header starting from the directory
+    /// **after** the directory that contains `including_file` in the
+    /// include-path list.  This is a GCC extension used by system headers
+    /// (e.g., `/usr/include/limits.h` chains to the compiler's built-in
+    /// `limits.h` via `#include_next`).
+    pub fn resolve_include_next(&self, header: &str, including_file: &Path) -> Option<PathBuf> {
+        // Determine which directory the current file lives in.
+        let current_dir = including_file
+            .parent()
+            .and_then(|p| std::fs::canonicalize(p).ok());
+
+        // Build a combined search list: user paths, then system paths.
+        let all_paths: Vec<&PathBuf> = self
+            .user_paths
+            .iter()
+            .chain(self.system_paths.iter())
+            .collect();
+
+        // Find the index of the current directory in the search list.
+        let mut skip_until = 0;
+        if let Some(ref cur) = current_dir {
+            for (i, p) in all_paths.iter().enumerate() {
+                if let Ok(canon) = std::fs::canonicalize(p) {
+                    if &canon == cur {
+                        skip_until = i + 1; // start searching AFTER this entry
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Search from skip_until onwards.
+        for p in &all_paths[skip_until..] {
+            let candidate = p.join(header);
+            if candidate.exists() && candidate.is_file() {
+                return Some(canonicalize_path(&candidate));
+            }
+        }
+        None
+    }
+
     /// Search a list of directories for a header file.
     ///
     /// Returns the canonical path of the first directory/header combination

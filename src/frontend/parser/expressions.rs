@@ -671,28 +671,48 @@ fn parse_sizeof_expression(parser: &mut Parser<'_>) -> Result<Expression, ()> {
 // _Alignof Expression
 // ===========================================================================
 
-/// Parse an `_Alignof` expression: `_Alignof(type-name)`.
+/// Parse an `_Alignof` / `__alignof__` expression.
 ///
-/// Unlike `sizeof`, `_Alignof` can only take a type name in parentheses
-/// (not an expression).
+/// C11 `_Alignof` only accepts a type-name in parentheses, but the GCC
+/// extension `__alignof__` also accepts an arbitrary expression operand
+/// (like `sizeof`).  We support both forms so that kernel code such as
+/// `__alignof__(tfm->__crt_ctx)` or `__alignof__(*hdr)` compiles.
 ///
-/// # Grammar
+/// # Grammar (GCC-extended)
 ///
 /// ```text
 /// alignof-expression:
-///     '_Alignof' '(' type-name ')'
+///     '_Alignof'    '(' type-name ')'
+///     '__alignof__' '(' type-name ')'
+///     '__alignof__' '(' expression ')'
+///     '__alignof__' unary-expression      // GCC allows without parens
 /// ```
 fn parse_alignof_expression(parser: &mut Parser<'_>) -> Result<Expression, ()> {
     let start = parser.current_span();
-    parser.advance(); // consume `_Alignof`
+    parser.advance(); // consume `_Alignof` / `__alignof__`
 
-    parser.expect(TokenKind::LeftParen)?;
-    let type_name = parse_type_name(parser)?;
-    parser.expect(TokenKind::RightParen)?;
+    // Parenthesised form — try type-name first, fall back to expression.
+    if parser.check(&TokenKind::LeftParen) {
+        let next = parser.peek_nth(0);
+        if types::is_type_specifier_start(&next.kind, parser) {
+            parser.advance(); // consume `(`
+            let type_name = parse_type_name(parser)?;
+            parser.expect(TokenKind::RightParen)?;
+            let span = parser.make_span(start);
+            return Ok(Expression::AlignofType {
+                type_name: Box::new(type_name),
+                span,
+            });
+        }
+        // Not a type — fall through to parse as expression.
+        // The `(` will be parsed as part of a parenthesised expression.
+    }
 
-    let span = parser.make_span(start);
-    Ok(Expression::AlignofType {
-        type_name: Box::new(type_name),
+    // Expression operand (GCC extension).
+    let operand = parse_unary_expression(parser)?;
+    let span = start.merge(operand.span());
+    Ok(Expression::AlignofExpr {
+        expr: Box::new(operand),
         span,
     })
 }
@@ -1040,6 +1060,9 @@ fn parse_primary_expression(parser: &mut Parser<'_>) -> Result<Expression, ()> {
         TokenKind::BuiltinFfsll => parse_builtin_simple(parser, BuiltinKind::Ffsll),
         TokenKind::BuiltinFrameAddress => parse_builtin_simple(parser, BuiltinKind::FrameAddress),
         TokenKind::BuiltinReturnAddress => parse_builtin_simple(parser, BuiltinKind::ReturnAddress),
+        TokenKind::BuiltinExtractReturnAddr => {
+            parse_builtin_simple(parser, BuiltinKind::ExtractReturnAddr)
+        }
         TokenKind::BuiltinAssumeAligned => parse_builtin_simple(parser, BuiltinKind::AssumeAligned),
         TokenKind::BuiltinAddOverflow => parse_builtin_simple(parser, BuiltinKind::AddOverflow),
         TokenKind::BuiltinSubOverflow => parse_builtin_simple(parser, BuiltinKind::SubOverflow),
@@ -1261,12 +1284,13 @@ fn parse_builtin_va_arg(parser: &mut Parser<'_>) -> Result<Expression, ()> {
     let ap_expr = parse_assignment_expression(parser)?;
     parser.expect(TokenKind::Comma)?;
 
-    // Second argument: type name.
+    // Second argument: type name — wrap as SizeofType so the semantic
+    // analyzer can extract the resolved type from args[1].
     let type_name = parse_type_name(parser)?;
-    let type_placeholder = Expression::IntegerLiteral {
-        value: 0,
-        suffix: IntegerSuffix::None,
-        span: type_name.span,
+    let tn_span = type_name.span;
+    let type_expr = Expression::SizeofType {
+        type_name: Box::new(type_name),
+        span: tn_span,
     };
 
     parser.expect(TokenKind::RightParen)?;
@@ -1274,7 +1298,7 @@ fn parse_builtin_va_arg(parser: &mut Parser<'_>) -> Result<Expression, ()> {
     let span = parser.make_span(start);
     Ok(Expression::BuiltinCall {
         builtin: BuiltinKind::VaArg,
-        args: vec![ap_expr, type_placeholder],
+        args: vec![ap_expr, type_expr],
         span,
     })
 }
@@ -1319,17 +1343,10 @@ fn parse_builtin_simple(parser: &mut Parser<'_>, kind: BuiltinKind) -> Result<Ex
 ///     specifier-qualifier-list abstract-declarator?
 /// ```
 fn parse_type_name(parser: &mut Parser<'_>) -> Result<TypeName, ()> {
-    let start_span = parser.current_span();
-
-    let specifier_qualifiers = types::parse_specifier_qualifier_list(parser)?;
-    let abstract_declarator = parse_abstract_declarator_opt(parser)?;
-
-    let span = parser.make_span(start_span);
-    Ok(TypeName {
-        specifier_qualifiers,
-        abstract_declarator,
-        span,
-    })
+    // Delegate to the declarations module which has full support for complex
+    // abstract declarators including function pointer types like
+    // `void (*)(struct rq *)` and multi-dimensional arrays.
+    super::declarations::parse_type_name(parser)
 }
 
 /// Parse an optional abstract declarator.
@@ -1345,6 +1362,7 @@ fn parse_type_name(parser: &mut Parser<'_>) -> Result<TypeName, ()> {
 ///     pointer
 ///     pointer? direct-abstract-declarator
 /// ```
+#[allow(dead_code)]
 fn parse_abstract_declarator_opt(
     parser: &mut Parser<'_>,
 ) -> Result<Option<AbstractDeclarator>, ()> {
@@ -1389,6 +1407,7 @@ fn parse_abstract_declarator_opt(
 ///
 /// Recursively parses nested pointer levels, each with optional type
 /// qualifiers (`const`, `volatile`, `restrict`, `_Atomic`).
+#[allow(dead_code)]
 fn parse_pointer_chain(parser: &mut Parser<'_>) -> Result<Option<Pointer>, ()> {
     if !parser.match_token(&TokenKind::Star) {
         return Ok(None);
@@ -1438,6 +1457,7 @@ fn parse_pointer_chain(parser: &mut Parser<'_>) -> Result<Option<Pointer>, ()> {
 
 /// Parse an optional direct abstract declarator suffix: array `[size]`
 /// or parenthesized `(abstract-declarator)`.
+#[allow(dead_code)]
 fn parse_direct_abstract_declarator_opt(
     parser: &mut Parser<'_>,
 ) -> Result<Option<DirectAbstractDeclarator>, ()> {

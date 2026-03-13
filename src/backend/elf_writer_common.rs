@@ -2004,7 +2004,7 @@ mod tests {
         let elf = writer.write();
         assert_eq!(u16::from_le_bytes([elf[18], elf[19]]), EM_RISCV);
         let e_flags = u32::from_le_bytes([elf[48], elf[49], elf[50], elf[51]]);
-        assert_eq!(e_flags, 0x0005);
+        assert_eq!(e_flags, 0x0001);
     }
 
     #[test]

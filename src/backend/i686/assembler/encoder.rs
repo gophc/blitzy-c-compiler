@@ -444,6 +444,12 @@ pub fn encode_instruction(
         // Register-indirect load/store (pointer in a register)
         codegen::I686_MOV_LOAD_INDIRECT => encode_mov_load_indirect(instr),
         codegen::I686_MOV_STORE_INDIRECT => encode_mov_store_indirect(instr),
+        // Byte/word-sized register-indirect load (MOVZX from memory)
+        codegen::I686_MOVZX_LOAD_INDIRECT_BYTE => encode_movzx_load_indirect(instr, false),
+        codegen::I686_MOVZX_LOAD_INDIRECT_WORD => encode_movzx_load_indirect(instr, true),
+        // Byte/word-sized register-indirect store
+        codegen::I686_MOV_STORE_INDIRECT_BYTE => encode_mov_store_indirect_byte(instr),
+        codegen::I686_MOV_STORE_INDIRECT_WORD => encode_mov_store_indirect_word(instr),
         // BSWAP — byte-swap a 32-bit register (0F C8+rd)
         codegen::I686_BSWAP => encode_bswap(instr),
         _ => Err(format!("i686 encoder: unknown opcode 0x{:X}", instr.opcode)),
@@ -713,6 +719,197 @@ fn encode_mov_load_indirect(instr: &MachineInstruction) -> Result<EncodedInstruc
     Ok(enc(b))
 }
 
+/// Encode `MOVZX_LOAD_INDIRECT_BYTE` / `MOVZX_LOAD_INDIRECT_WORD` — load a
+/// byte or word through a register pointer with zero extension to 32 bits.
+///
+/// Byte variant:  `MOVZX r32, BYTE PTR [reg]`  (0x0F 0xB6 + ModR/M)
+/// Word variant:  `MOVZX r32, WORD PTR [reg]`  (0x0F 0xB7 + ModR/M)
+///
+/// This avoids the i686 8-bit register alias problem: a 32-bit
+/// `MOV_LOAD_INDIRECT` followed by a register-to-register `MOVZX` fails
+/// when the source register is ESI, EDI, EBP, or ESP because those
+/// registers have no 8-bit aliases on i686 (register codes 4–7 in 8-bit
+/// mode map to AH, CH, DH, BH — the HIGH bytes, not low bytes).
+///
+/// Layout: `result = dst, operands = [src_pointer_register]`.
+fn encode_movzx_load_indirect(
+    instr: &MachineInstruction,
+    word: bool,
+) -> Result<EncodedInstruction, String> {
+    let d = gpr(instr
+        .result
+        .as_ref()
+        .ok_or("MOVZX_LOAD_INDIRECT: no result")?)?;
+    if instr.operands.is_empty() {
+        return Err("MOVZX_LOAD_INDIRECT: need source pointer register".into());
+    }
+    let base_reg = match &instr.operands[0] {
+        MachineOperand::Register(r) => *r as u8,
+        op if is_mem(op) => {
+            let op2: u8 = if word { 0xB7 } else { 0xB6 };
+            let mut b = vec![0x0F, op2];
+            b.extend(encode_mem(d, op)?);
+            return Ok(enc(b));
+        }
+        other => {
+            return Err(format!(
+                "MOVZX_LOAD_INDIRECT: expected Register or Memory, got {}",
+                other
+            ))
+        }
+    };
+    let op2: u8 = if word { 0xB7 } else { 0xB6 };
+    let mut b = vec![0x0F, op2];
+    if base_reg == 5 {
+        // [EBP] → ModR/M(01, dst, 101) + disp8(0)
+        b.push(modrm(0b01, d, 5));
+        b.push(0x00);
+    } else if base_reg == 4 {
+        // [ESP] → ModR/M(00, dst, 100) + SIB(00, 100, 100)
+        b.push(modrm(0b00, d, 4));
+        b.push(sib_byte(0, 4, 4));
+    } else {
+        // [reg] → ModR/M(00, dst, base)
+        b.push(modrm(0b00, d, base_reg));
+    }
+    Ok(enc(b))
+}
+
+/// Encode `MOV_STORE_INDIRECT_BYTE` — store a byte through a register
+/// pointer: `MOV BYTE PTR [reg], r8` (0x88 + ModR/M).
+///
+/// Layout: `operands = [dst_pointer_register, src_value]`.
+fn encode_mov_store_indirect_byte(
+    instr: &MachineInstruction,
+) -> Result<EncodedInstruction, String> {
+    if instr.operands.len() < 2 {
+        return Err("MOV_STORE_INDIRECT_BYTE: need [ptr, src]".into());
+    }
+    let base_reg = match &instr.operands[0] {
+        MachineOperand::Register(r) => *r as u8,
+        op if is_mem(op) => {
+            let s = match &instr.operands[1] {
+                MachineOperand::Register(r) => *r as u8,
+                MachineOperand::Immediate(v) => {
+                    // MOV BYTE PTR [mem], imm8 → 0xC6 /0 + mem + imm8
+                    let mut b = vec![0xC6];
+                    b.extend(encode_mem(0, op)?);
+                    b.push(*v as u8);
+                    return Ok(enc(b));
+                }
+                other => return Err(format!("MOV_STORE_INDIRECT_BYTE: bad src {}", other)),
+            };
+            // 0x88 /r: MOV r/m8, r8
+            let mut b = vec![0x88];
+            b.extend(encode_mem(s, op)?);
+            return Ok(enc(b));
+        }
+        other => {
+            return Err(format!(
+                "MOV_STORE_INDIRECT_BYTE: expected Register, got {}",
+                other
+            ))
+        }
+    };
+    let src_reg = match &instr.operands[1] {
+        MachineOperand::Register(r) => *r as u8,
+        MachineOperand::Immediate(v) => {
+            // MOV BYTE PTR [reg], imm8 → 0xC6 + ModR/M + imm8
+            let mut b = vec![0xC6];
+            if base_reg == 5 {
+                b.push(modrm(0b01, 0, 5));
+                b.push(0x00);
+            } else if base_reg == 4 {
+                b.push(modrm(0b00, 0, 4));
+                b.push(sib_byte(0, 4, 4));
+            } else {
+                b.push(modrm(0b00, 0, base_reg));
+            }
+            b.push(*v as u8);
+            return Ok(enc(b));
+        }
+        other => return Err(format!("MOV_STORE_INDIRECT_BYTE: bad src {}", other)),
+    };
+    // 0x88 /r: MOV BYTE PTR [base_reg], r8
+    let mut b = vec![0x88];
+    if base_reg == 5 {
+        b.push(modrm(0b01, src_reg, 5));
+        b.push(0x00);
+    } else if base_reg == 4 {
+        b.push(modrm(0b00, src_reg, 4));
+        b.push(sib_byte(0, 4, 4));
+    } else {
+        b.push(modrm(0b00, src_reg, base_reg));
+    }
+    Ok(enc(b))
+}
+
+/// Encode `MOV_STORE_INDIRECT_WORD` — store a word through a register
+/// pointer: `MOV WORD PTR [reg], r16` (0x66 0x89 + ModR/M).
+///
+/// Layout: `operands = [dst_pointer_register, src_value]`.
+fn encode_mov_store_indirect_word(
+    instr: &MachineInstruction,
+) -> Result<EncodedInstruction, String> {
+    if instr.operands.len() < 2 {
+        return Err("MOV_STORE_INDIRECT_WORD: need [ptr, src]".into());
+    }
+    let base_reg = match &instr.operands[0] {
+        MachineOperand::Register(r) => *r as u8,
+        op if is_mem(op) => {
+            let s = match &instr.operands[1] {
+                MachineOperand::Register(r) => *r as u8,
+                MachineOperand::Immediate(v) => {
+                    // 0x66 0xC7 /0 + mem + imm16
+                    let mut b = vec![0x66, 0xC7];
+                    b.extend(encode_mem(0, op)?);
+                    b.extend_from_slice(&(*v as u16).to_le_bytes());
+                    return Ok(enc(b));
+                }
+                other => return Err(format!("MOV_STORE_INDIRECT_WORD: bad src {}", other)),
+            };
+            let mut b = vec![0x66, 0x89];
+            b.extend(encode_mem(s, op)?);
+            return Ok(enc(b));
+        }
+        other => {
+            return Err(format!(
+                "MOV_STORE_INDIRECT_WORD: expected Register, got {}",
+                other
+            ))
+        }
+    };
+    let src_reg = match &instr.operands[1] {
+        MachineOperand::Register(r) => *r as u8,
+        MachineOperand::Immediate(v) => {
+            let mut b = vec![0x66, 0xC7];
+            if base_reg == 5 {
+                b.push(modrm(0b01, 0, 5));
+                b.push(0x00);
+            } else if base_reg == 4 {
+                b.push(modrm(0b00, 0, 4));
+                b.push(sib_byte(0, 4, 4));
+            } else {
+                b.push(modrm(0b00, 0, base_reg));
+            }
+            b.extend_from_slice(&(*v as u16).to_le_bytes());
+            return Ok(enc(b));
+        }
+        other => return Err(format!("MOV_STORE_INDIRECT_WORD: bad src {}", other)),
+    };
+    let mut b = vec![0x66, 0x89];
+    if base_reg == 5 {
+        b.push(modrm(0b01, src_reg, 5));
+        b.push(0x00);
+    } else if base_reg == 4 {
+        b.push(modrm(0b00, src_reg, 4));
+        b.push(sib_byte(0, 4, 4));
+    } else {
+        b.push(modrm(0b00, src_reg, base_reg));
+    }
+    Ok(enc(b))
+}
+
 /// Encode `MOV_STORE_INDIRECT` — store a value through a pointer held in a
 /// register: `MOV [reg], src`.
 ///
@@ -812,6 +1009,34 @@ fn encode_movzx(instr: &MachineInstruction) -> Result<EncodedInstruction, String
     } else {
         8
     };
+    // On i686, the register-to-register form of `MOVZX r32, r8` only
+    // works correctly for registers 0–3 (AL, CL, DL, BL). Register
+    // codes 4–7 in 8-bit mode map to AH, CH, DH, BH (the HIGH bytes)
+    // rather than the low bytes of ESP–EDI, because those 8-bit aliases
+    // do not exist on i686.
+    //
+    // When the source register is >= 4 and we need an 8-bit zero-extend,
+    // fall back to: MOV dst, src; AND dst, 0xFF (or 0xFFFF for 16-bit).
+    if w != 16 {
+        if let MachineOperand::Register(s) = &instr.operands[0] {
+            let sr = *s as u8;
+            if sr >= 4 {
+                // MOV dst, src (32-bit copy)
+                let mut b = vec![0x8B, modrm(0b11, d, sr)];
+                // AND dst, 0xFF
+                if d == 0 {
+                    // Shorter form: AND EAX, imm32 (0x25)
+                    b.extend_from_slice(&[0x25]);
+                    b.extend_from_slice(&0xFFu32.to_le_bytes());
+                } else {
+                    // AND r32, imm32 (0x81 /4)
+                    b.extend_from_slice(&[0x81, modrm(0b11, 4, d)]);
+                    b.extend_from_slice(&0xFFu32.to_le_bytes());
+                }
+                return Ok(enc(b));
+            }
+        }
+    }
     let op2 = if w == 16 { 0xB7u8 } else { 0xB6u8 };
     let mut b = vec![0x0F, op2];
     match &instr.operands[0] {
@@ -833,6 +1058,23 @@ fn encode_movsx(instr: &MachineInstruction) -> Result<EncodedInstruction, String
     } else {
         8
     };
+    // Same i686 8-bit register alias issue as encode_movzx: register
+    // codes 4–7 in 8-bit mode map to AH/CH/DH/BH not the low bytes
+    // of ESP–EDI.  Fall back to MOV + shift-based sign extension.
+    if w != 16 {
+        if let MachineOperand::Register(s) = &instr.operands[0] {
+            let sr = *s as u8;
+            if sr >= 4 {
+                // MOV dst, src; SHL dst, 24; SAR dst, 24
+                let mut b = vec![0x8B, modrm(0b11, d, sr)];
+                // SHL dst, 24 (0xC1 /4 ib)
+                b.extend_from_slice(&[0xC1, modrm(0b11, 4, d), 24]);
+                // SAR dst, 24 (0xC1 /7 ib)
+                b.extend_from_slice(&[0xC1, modrm(0b11, 7, d), 24]);
+                return Ok(enc(b));
+            }
+        }
+    }
     let op2 = if w == 16 { 0xBFu8 } else { 0xBEu8 };
     let mut b = vec![0x0F, op2];
     match &instr.operands[0] {
@@ -1290,6 +1532,20 @@ fn encode_test(instr: &MachineInstruction) -> Result<EncodedInstruction, String>
 // ===========================================================================
 
 /// Encode `SETcc r/m8` → `0x0F 0x90+cc ModR/M`.
+///
+/// On i686, the `SETcc r8` form uses the legacy 8-bit register encoding
+/// where register codes 4–7 map to AH/CH/DH/BH (high bytes), NOT the
+/// low bytes of ESP–EDI.  When the destination register is >= 4, this
+/// function falls back to an equivalent sequence that avoids 8-bit
+/// register aliasing:
+///
+/// ```text
+/// MOV reg, 0        ; clear to 0 (preserves flags)
+/// Jcc_inverse +1    ; skip INC if condition NOT met
+/// INC reg           ; set to 1
+/// ```
+///
+/// This produces the same 0-or-1 result without touching byte registers.
 fn encode_setcc(instr: &MachineInstruction) -> Result<EncodedInstruction, String> {
     let cc = extract_cc(instr)?;
     let dst = instr
@@ -1297,13 +1553,43 @@ fn encode_setcc(instr: &MachineInstruction) -> Result<EncodedInstruction, String
         .as_ref()
         .or_else(|| instr.operands.first())
         .ok_or("SETCC: no destination")?;
-    let mut b = vec![0x0Fu8, 0x90 + cc];
     match dst {
-        MachineOperand::Register(r) => b.push(modrm(0b11, 0, *r as u8)),
-        m if is_mem(m) => b.extend(encode_mem(0, m)?),
-        o => return Err(format!("SETCC: bad dst {}", o)),
+        MachineOperand::Register(r) => {
+            let rd = *r as u8;
+            if rd >= 4 {
+                // Registers ESP–EDI have no low-byte alias on i686.
+                // We cannot use `SETcc r8` because register codes 4–7
+                // in 8-bit mode map to AH/CH/DH/BH, not the low bytes.
+                //
+                // Emit the equivalent flag-safe sequence:
+                //     MOV reg, 0        ; does NOT modify flags
+                //     Jcc_inverse +1    ; skip INC if condition NOT met
+                //     INC reg           ; set to 1
+                let mut b = Vec::new();
+                // MOV reg, imm32(0) — B8+rd 00 00 00 00 (5 bytes, flag-safe)
+                b.push(0xB8 + rd);
+                b.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+                // Jcc_inverse over INC (short jump: 0x70+inv_cc disp8)
+                // INC r32 is 1 byte (0x40+rd), so disp8 = 1
+                let inv_cc = cc ^ 1; // flip low bit: E↔NE, L↔GE, etc.
+                b.push(0x70 + inv_cc);
+                b.push(0x01); // skip 1 byte (the INC)
+                              // INC reg (0x40+rd)
+                b.push(0x40 + rd);
+                return Ok(enc(b));
+            }
+            // Registers 0–3 (EAX–EBX) have safe low-byte aliases.
+            let mut b = vec![0x0Fu8, 0x90 + cc];
+            b.push(modrm(0b11, 0, rd));
+            Ok(enc(b))
+        }
+        m if is_mem(m) => {
+            let mut b = vec![0x0Fu8, 0x90 + cc];
+            b.extend(encode_mem(0, m)?);
+            Ok(enc(b))
+        }
+        o => Err(format!("SETCC: bad dst {}", o)),
     }
-    Ok(enc(b))
 }
 
 /// Encode `CMOVcc r32, r/m32` → `0x0F 0x40+cc ModR/M`.

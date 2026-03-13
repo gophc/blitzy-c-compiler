@@ -317,6 +317,16 @@ pub fn register_predefined_macros(macro_defs: &mut FxHashMap<String, MacroDef>, 
     register_object_macro(macro_defs, "__GNUC_STDC_INLINE__", "1");
 
     // -------------------------------------------------------------------
+    // 4b. Atomic memory order constants (GCC __atomic builtins)
+    // -------------------------------------------------------------------
+    register_object_macro(macro_defs, "__ATOMIC_RELAXED", "0");
+    register_object_macro(macro_defs, "__ATOMIC_CONSUME", "1");
+    register_object_macro(macro_defs, "__ATOMIC_ACQUIRE", "2");
+    register_object_macro(macro_defs, "__ATOMIC_RELEASE", "3");
+    register_object_macro(macro_defs, "__ATOMIC_ACQ_REL", "4");
+    register_object_macro(macro_defs, "__ATOMIC_SEQ_CST", "5");
+
+    // -------------------------------------------------------------------
     // 5. Byte order macros
     // -------------------------------------------------------------------
     register_object_macro(macro_defs, "__ORDER_LITTLE_ENDIAN__", "1234");
@@ -440,6 +450,55 @@ pub fn register_predefined_macros(macro_defs: &mut FxHashMap<String, MacroDef>, 
     for (name, value) in target.predefined_macros() {
         register_object_macro(macro_defs, name, value);
     }
+
+    // -------------------------------------------------------------------
+    // 10. GCC-compatible floating-point constant macros
+    //     Required by system math headers and real-world C projects.
+    //     Values match IEEE 754 double-precision and single-precision.
+    // -------------------------------------------------------------------
+    // Double-precision (64-bit) constants
+    register_object_macro(macro_defs, "__DBL_EPSILON__", "2.2204460492503131e-16");
+    register_object_macro(macro_defs, "__DBL_MIN__", "2.2250738585072014e-308");
+    register_object_macro(macro_defs, "__DBL_MAX__", "1.7976931348623157e+308");
+    register_object_macro(macro_defs, "__DBL_DIG__", "15");
+    register_object_macro(macro_defs, "__DBL_MANT_DIG__", "53");
+    register_object_macro(macro_defs, "__DBL_MIN_EXP__", "(-1021)");
+    register_object_macro(macro_defs, "__DBL_MAX_EXP__", "1024");
+    register_object_macro(macro_defs, "__DBL_MIN_10_EXP__", "(-307)");
+    register_object_macro(macro_defs, "__DBL_MAX_10_EXP__", "308");
+    register_object_macro(macro_defs, "__DBL_HAS_INFINITY__", "1");
+    register_object_macro(macro_defs, "__DBL_HAS_QUIET_NAN__", "1");
+    register_object_macro(macro_defs, "__DBL_DENORM_MIN__", "4.9406564584124654e-324");
+    // Single-precision (32-bit) constants
+    register_object_macro(macro_defs, "__FLT_EPSILON__", "1.19209290e-7F");
+    register_object_macro(macro_defs, "__FLT_MIN__", "1.17549435e-38F");
+    register_object_macro(macro_defs, "__FLT_MAX__", "3.40282347e+38F");
+    register_object_macro(macro_defs, "__FLT_DIG__", "6");
+    register_object_macro(macro_defs, "__FLT_MANT_DIG__", "24");
+    register_object_macro(macro_defs, "__FLT_MIN_EXP__", "(-125)");
+    register_object_macro(macro_defs, "__FLT_MAX_EXP__", "128");
+    register_object_macro(macro_defs, "__FLT_MIN_10_EXP__", "(-37)");
+    register_object_macro(macro_defs, "__FLT_MAX_10_EXP__", "38");
+    register_object_macro(macro_defs, "__FLT_HAS_INFINITY__", "1");
+    register_object_macro(macro_defs, "__FLT_HAS_QUIET_NAN__", "1");
+    register_object_macro(macro_defs, "__FLT_DENORM_MIN__", "1.40129846e-45F");
+    // Long-double constants (80-bit extended / 128-bit on some arches)
+    register_object_macro(
+        macro_defs,
+        "__LDBL_EPSILON__",
+        "1.08420217248550443401e-19L",
+    );
+    register_object_macro(macro_defs, "__LDBL_MIN__", "3.36210314311209350626e-4932L");
+    register_object_macro(macro_defs, "__LDBL_MAX__", "1.18973149535723176502e+4932L");
+    register_object_macro(macro_defs, "__LDBL_DIG__", "18");
+    register_object_macro(macro_defs, "__LDBL_MANT_DIG__", "64");
+    register_object_macro(macro_defs, "__LDBL_MIN_EXP__", "(-16381)");
+    register_object_macro(macro_defs, "__LDBL_MAX_EXP__", "16384");
+    // Decimal floating-point radix
+    register_object_macro(macro_defs, "__FLT_RADIX__", "2");
+    // GCC misc float macros
+    register_object_macro(macro_defs, "__GCC_IEC_559__", "2");
+    register_object_macro(macro_defs, "__DECIMAL_DIG__", "21");
 }
 
 // ---------------------------------------------------------------------------

@@ -355,6 +355,22 @@ pub fn parse_declaration_specifiers(parser: &mut Parser<'_>) -> Result<Declarati
                 parser.advance();
                 type_specifiers.push(TypeSpecifier::Int128);
             }
+            TokenKind::Float128Keyword => {
+                parser.advance();
+                type_specifiers.push(TypeSpecifier::Float128);
+            }
+            TokenKind::Float16Keyword => {
+                parser.advance();
+                type_specifiers.push(TypeSpecifier::Float16);
+            }
+            TokenKind::Float32Keyword => {
+                parser.advance();
+                type_specifiers.push(TypeSpecifier::Float32);
+            }
+            TokenKind::Float64Keyword => {
+                parser.advance();
+                type_specifiers.push(TypeSpecifier::Float64);
+            }
 
             // =================================================================
             // Elaborated type specifiers: struct/union/enum
@@ -1946,6 +1962,22 @@ fn parse_specifier_qualifier_list_for_type_name(
             TokenKind::Int128Keyword => {
                 parser.advance();
                 type_specifiers.push(TypeSpecifier::Int128);
+            }
+            TokenKind::Float128Keyword => {
+                parser.advance();
+                type_specifiers.push(TypeSpecifier::Float128);
+            }
+            TokenKind::Float16Keyword => {
+                parser.advance();
+                type_specifiers.push(TypeSpecifier::Float16);
+            }
+            TokenKind::Float32Keyword => {
+                parser.advance();
+                type_specifiers.push(TypeSpecifier::Float32);
+            }
+            TokenKind::Float64Keyword => {
+                parser.advance();
+                type_specifiers.push(TypeSpecifier::Float64);
             }
 
             // Type qualifiers.

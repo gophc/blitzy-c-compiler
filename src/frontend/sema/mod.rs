@@ -354,21 +354,38 @@ impl<'a> SemanticAnalyzer<'a> {
     pub fn analyze_function_definition(&mut self, func: &mut FunctionDefinition) -> Result<(), ()> {
         let func_span = func.span;
 
-        // Step 1: Resolve base return type from declaration specifiers,
-        // then apply pointer indirection from the declarator.
-        // In C, `void *foo(void)` has specifiers `void` and declarator `*foo(void)`,
-        // so the pointer `*` makes the return type `void *`, not `void`.
-        let mut return_type = self.resolve_type_from_specifiers(&func.specifiers);
-        if let Some(ref ptr) = func.declarator.pointer {
-            return_type = self.apply_pointer_to_type(return_type, ptr);
-        }
+        // Step 1: Build the complete function type using the full declarator.
+        // This correctly handles complex cases like function-returning-function-pointer:
+        //   void (*memdbDlSym(sqlite3_vfs *pVfs, void *p, const char *zSym))(void)
+        // where the return type is `void (*)(void)` and params are the inner ones.
+        let base_specifier_type = self.resolve_type_from_specifiers(&func.specifiers);
+        let full_type =
+            self.apply_declarator_to_type(base_specifier_type.clone(), &func.declarator);
 
-        // Step 2: Extract function name and parameter info from declarator.
+        // Extract return type, param types, and variadic flag from the full type.
+        let (return_type, param_types, is_variadic) = if let CType::Function {
+            ref return_type,
+            ref params,
+            variadic,
+        } = full_type
+        {
+            (return_type.as_ref().clone(), params.clone(), variadic)
+        } else {
+            // Fallback for non-function types (shouldn't happen for definitions).
+            let mut rt = base_specifier_type;
+            if let Some(ref ptr) = func.declarator.pointer {
+                rt = self.apply_pointer_to_type(rt, ptr);
+            }
+            (rt, Vec::new(), false)
+        };
+
+        // Step 2: Extract function name and parameter NAMES from the declarator.
+        // For complex declarators, extract_function_params finds the innermost
+        // Function declarator (the one with the actual parameter names).
         let func_name = self.extract_declarator_name(&func.declarator);
-        let (param_types, param_names, is_variadic) =
-            self.extract_function_params(&func.declarator);
+        let (_, param_names, _) = self.extract_function_params(&func.declarator);
 
-        // Step 3: Build the complete function type.
+        // Step 3: Build the complete function type for symbol table registration.
         let func_type = CType::Function {
             return_type: Box::new(return_type.clone()),
             params: param_types.clone(),
@@ -2238,13 +2255,11 @@ impl<'a> SemanticAnalyzer<'a> {
             // Statement expression — infer from last expression in compound.
             Expression::StatementExpression { compound, .. } => {
                 // The type is the type of the last expression statement.
-                if let Some(last) = compound.items.last() {
-                    if let crate::frontend::parser::ast::BlockItem::Statement(
-                        Statement::Expression(Some(ref expr)),
-                    ) = last
-                    {
-                        return self.infer_typeof_expr_type(expr);
-                    }
+                if let Some(crate::frontend::parser::ast::BlockItem::Statement(
+                    Statement::Expression(Some(ref expr)),
+                )) = compound.items.last()
+                {
+                    return self.infer_typeof_expr_type(expr);
                 }
                 CType::Int
             }
@@ -2263,17 +2278,11 @@ impl<'a> SemanticAnalyzer<'a> {
         let member_str = self.interner.resolve(member);
         let stripped = crate::common::types::resolve_and_strip(ty);
         match stripped {
-            CType::Struct {
-                name, fields, ..
-            }
-            | CType::Union {
-                name, fields, ..
-            } => {
+            CType::Struct { name, fields, .. } | CType::Union { name, fields, .. } => {
                 // If fields is empty, try resolving from tag namespace
                 let resolved_fields = if fields.is_empty() {
                     if let Some(ref tag_name) = name {
-                        if let Some(entry) =
-                            self.scopes.lookup_tag_by_str(tag_name, self.interner)
+                        if let Some(entry) = self.scopes.lookup_tag_by_str(tag_name, self.interner)
                         {
                             if entry.is_complete {
                                 match &entry.ty {
@@ -2341,6 +2350,23 @@ impl<'a> SemanticAnalyzer<'a> {
                 TypeSpecifier::Bool => has_bool = true,
                 TypeSpecifier::Complex => has_complex = true,
                 TypeSpecifier::Int128 => has_int128 = true,
+                // IEC 60559 / GCC floating-point types map to built-in
+                // C types for code generation purposes:
+                TypeSpecifier::Float128 => {
+                    return CType::LongDouble; // 128-bit float → long double
+                }
+                TypeSpecifier::Float64 => {
+                    return CType::Double; // 64-bit float → double
+                }
+                TypeSpecifier::Float32 => {
+                    return CType::Float; // 32-bit float → float
+                }
+                TypeSpecifier::Float16 => {
+                    // _Float16 maps to a half-precision type; use unsigned
+                    // short as storage type (16-bit) since we don't have
+                    // native half-float support in the backend.
+                    return CType::Float; // approximate: treat as float
+                }
                 TypeSpecifier::TypedefName(sym) => {
                     // Look up the typedef in the scope.
                     if let Some(id) = self.scopes.lookup_ordinary(*sym) {
@@ -2745,18 +2771,32 @@ impl<'a> SemanticAnalyzer<'a> {
     ) -> (Vec<CType>, Vec<Option<Symbol>>, bool) {
         match dd {
             DirectDeclarator::Function {
+                base,
                 params,
                 is_variadic,
                 ..
             } => {
+                // For function-returning-function-pointer patterns like:
+                //   void (*memdbDlSym(real_params))(return_type_params)
+                // The outer Function's params describe the returned function
+                // pointer's parameter list, NOT the actual function params.
+                // The real params are in the inner (nested) Function declarator.
+                // Detect this by checking if the base Parenthesized contains
+                // another Function declarator.
+                if let DirectDeclarator::Parenthesized(inner_decl) = base.as_ref() {
+                    if Self::direct_declarator_has_nested_function(&inner_decl.direct) {
+                        return self.extract_function_params(inner_decl);
+                    }
+                }
+
                 let types: Vec<CType> = params
                     .iter()
                     .map(|p| {
-                        let base = self.resolve_type_from_specifiers(&p.specifiers);
+                        let base_ty = self.resolve_type_from_specifiers(&p.specifiers);
                         if let Some(ref d) = p.declarator {
-                            self.apply_declarator_to_type(base, d)
+                            self.apply_declarator_to_type(base_ty, d)
                         } else {
-                            base
+                            base_ty
                         }
                     })
                     .collect();
@@ -2772,6 +2812,22 @@ impl<'a> SemanticAnalyzer<'a> {
             }
             DirectDeclarator::Parenthesized(inner) => self.extract_function_params(inner),
             _ => (Vec::new(), Vec::new(), false),
+        }
+    }
+
+    /// Check if a direct declarator contains a nested Function declarator.
+    /// Used to detect function-returning-function-pointer patterns where
+    /// the actual function params are in an inner Function, not the outer one.
+    fn direct_declarator_has_nested_function(dd: &DirectDeclarator) -> bool {
+        match dd {
+            DirectDeclarator::Function { .. } => true,
+            DirectDeclarator::Parenthesized(inner) => {
+                Self::direct_declarator_has_nested_function(&inner.direct)
+            }
+            DirectDeclarator::Array { base, .. } => {
+                Self::direct_declarator_has_nested_function(base)
+            }
+            DirectDeclarator::Identifier(..) => false,
         }
     }
 
@@ -2792,13 +2848,18 @@ impl<'a> SemanticAnalyzer<'a> {
                 "packed" => result.push(ValidatedAttribute::Packed),
                 "aligned" => {
                     if let Some(AttributeArg::Expression(ref boxed_expr)) = attr.args.first() {
-                        if let Expression::IntegerLiteral { value, .. } = boxed_expr.as_ref() {
-                            result.push(ValidatedAttribute::Aligned(*value as u64));
+                        if let Some(val) = self.try_eval_attr_const_expr(boxed_expr) {
+                            result.push(ValidatedAttribute::Aligned(val));
                         } else {
-                            result.push(ValidatedAttribute::Aligned(16));
+                            // Fallback: max alignment when expression
+                            // cannot be evaluated (matches GCC's
+                            // `__attribute__((aligned))` without args).
+                            result
+                                .push(ValidatedAttribute::Aligned(self.target.max_align() as u64));
                         }
                     } else {
-                        result.push(ValidatedAttribute::Aligned(16));
+                        // No argument: default to target max alignment.
+                        result.push(ValidatedAttribute::Aligned(self.target.max_align() as u64));
                     }
                 }
                 "section" => {
@@ -2841,6 +2902,113 @@ impl<'a> SemanticAnalyzer<'a> {
             }
         }
         result
+    }
+
+    /// Try to evaluate a constant expression found in an attribute argument
+    /// (e.g. `__attribute__((aligned(sizeof(void *)))))`).
+    ///
+    /// Handles the most common expression forms encountered in kernel and
+    /// system headers: integer literals, parenthesized expressions, sizeof,
+    /// alignof, and basic arithmetic.  Returns `None` when the expression
+    /// cannot be evaluated — the caller should fall back to a safe default.
+    fn try_eval_attr_const_expr(&self, expr: &Expression) -> Option<u64> {
+        use crate::common::types::sizeof_ctype_resolved;
+        match expr {
+            Expression::IntegerLiteral { value, .. } => Some(*value as u64),
+            Expression::Parenthesized { inner, .. } => self.try_eval_attr_const_expr(inner),
+            Expression::SizeofType { type_name, .. } => {
+                let ctype = self.resolve_type_name(type_name);
+                let size = sizeof_ctype_resolved(&ctype, &self.target, &self.tag_types_by_name);
+                Some(size as u64)
+            }
+            Expression::SizeofExpr { operand, .. } => {
+                // For sizeof(expr) we attempt to infer the expression's
+                // type so we can compute its size.  Only trivial cases
+                // are handled here — compound expressions fall through.
+                let ctype = self.infer_expression_type_simple(operand)?;
+                let size = sizeof_ctype_resolved(&ctype, &self.target, &self.tag_types_by_name);
+                Some(size as u64)
+            }
+            Expression::AlignofType { type_name, .. } => {
+                use crate::common::types::alignof_ctype_resolved;
+                let ctype = self.resolve_type_name(type_name);
+                let align = alignof_ctype_resolved(&ctype, &self.target, &self.tag_types_by_name);
+                Some(align as u64)
+            }
+            Expression::Binary {
+                op, left, right, ..
+            } => {
+                let l = self.try_eval_attr_const_expr(left)?;
+                let r = self.try_eval_attr_const_expr(right)?;
+                match op {
+                    BinaryOp::Add => Some(l.wrapping_add(r)),
+                    BinaryOp::Sub => Some(l.wrapping_sub(r)),
+                    BinaryOp::Mul => Some(l.wrapping_mul(r)),
+                    BinaryOp::Div if r != 0 => Some(l / r),
+                    BinaryOp::Mod if r != 0 => Some(l % r),
+                    BinaryOp::ShiftLeft => Some(l.wrapping_shl(r as u32)),
+                    BinaryOp::ShiftRight => Some(l.wrapping_shr(r as u32)),
+                    BinaryOp::BitwiseAnd => Some(l & r),
+                    BinaryOp::BitwiseOr => Some(l | r),
+                    BinaryOp::BitwiseXor => Some(l ^ r),
+                    _ => None,
+                }
+            }
+            Expression::Cast { operand, .. } => {
+                // Evaluate the inner expression; ignore the cast for
+                // attribute-argument purposes (e.g. `(int)sizeof(...)`).
+                self.try_eval_attr_const_expr(operand)
+            }
+            Expression::UnaryOp { op, operand, .. } => {
+                let v = self.try_eval_attr_const_expr(operand)?;
+                match op {
+                    UnaryOp::Negate => Some((-(v as i64)) as u64),
+                    UnaryOp::BitwiseNot => Some(!v),
+                    UnaryOp::Plus => Some(v),
+                    _ => None,
+                }
+            }
+            Expression::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+                ..
+            } => {
+                let c = self.try_eval_attr_const_expr(condition)?;
+                if c != 0 {
+                    then_expr
+                        .as_ref()
+                        .and_then(|e| self.try_eval_attr_const_expr(e))
+                } else {
+                    self.try_eval_attr_const_expr(else_expr)
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Simple type inference for an expression (used by attribute
+    /// evaluation to resolve `sizeof(expr)` without a full type checker).
+    /// Returns `None` for expressions whose type cannot be trivially
+    /// determined.
+    fn infer_expression_type_simple(&self, expr: &Expression) -> Option<CType> {
+        match expr {
+            Expression::IntegerLiteral { .. } => Some(CType::Int),
+            Expression::Identifier { name, .. } => {
+                // Look up the variable's declared type.
+                self.scopes
+                    .lookup_ordinary(*name)
+                    .map(|sym_id| self.symbols.get(sym_id).ty.clone())
+            }
+            Expression::StringLiteral { .. } => {
+                let quals = TypeQualifiers {
+                    is_const: true,
+                    ..TypeQualifiers::default()
+                };
+                Some(CType::Pointer(Box::new(CType::Char), quals))
+            }
+            _ => None,
+        }
     }
 
     /// Propagate a validated attribute to a symbol entry.
@@ -3024,8 +3192,7 @@ impl<'a> SemanticAnalyzer<'a> {
             // __builtin_memmove, __builtin_strlen, __builtin_strcmp, etc.
             // These are regular function calls that GCC treats as built-in.
             // Return the appropriate function type so the call type-checks.
-            let void_ptr =
-                CType::Pointer(Box::new(CType::Void), TypeQualifiers::default());
+            let void_ptr = CType::Pointer(Box::new(CType::Void), TypeQualifiers::default());
             let const_void_ptr = CType::Pointer(
                 Box::new(CType::Void),
                 TypeQualifiers {
@@ -3122,6 +3289,208 @@ impl<'a> SemanticAnalyzer<'a> {
                 | "__builtin_fprintf" => Some(CType::Function {
                     return_type: Box::new(CType::Int),
                     params: vec![const_char_ptr.clone()],
+                    variadic: true,
+                }),
+                // Floating-point classification builtins
+                "__builtin_isnan"
+                | "__builtin_isinf"
+                | "__builtin_isfinite"
+                | "__builtin_isnormal"
+                | "__builtin_signbit"
+                | "__builtin_isnan_sign"
+                | "__builtin_isinf_sign"
+                | "__builtin_fpclassify" => Some(CType::Function {
+                    return_type: Box::new(CType::Int),
+                    params: vec![CType::Double],
+                    variadic: false,
+                }),
+                "__builtin_isnanf"
+                | "__builtin_isinff"
+                | "__builtin_isfinitef"
+                | "__builtin_signbitf" => Some(CType::Function {
+                    return_type: Box::new(CType::Int),
+                    params: vec![CType::Float],
+                    variadic: false,
+                }),
+                "__builtin_isnanl"
+                | "__builtin_isinfl"
+                | "__builtin_isfinitel"
+                | "__builtin_signbitl" => Some(CType::Function {
+                    return_type: Box::new(CType::Int),
+                    params: vec![CType::LongDouble],
+                    variadic: false,
+                }),
+                // NaN / infinity / huge_val generation builtins
+                "__builtin_nan" | "__builtin_huge_val" | "__builtin_inf" => Some(CType::Function {
+                    return_type: Box::new(CType::Double),
+                    params: vec![const_char_ptr.clone()],
+                    variadic: false,
+                }),
+                "__builtin_nanf" | "__builtin_huge_valf" | "__builtin_inff" => {
+                    Some(CType::Function {
+                        return_type: Box::new(CType::Float),
+                        params: vec![const_char_ptr.clone()],
+                        variadic: false,
+                    })
+                }
+                "__builtin_nanl" | "__builtin_huge_vall" | "__builtin_infl" => {
+                    Some(CType::Function {
+                        return_type: Box::new(CType::LongDouble),
+                        params: vec![const_char_ptr.clone()],
+                        variadic: false,
+                    })
+                }
+                // Math builtins (common)
+                "__builtin_fabs" | "__builtin_sqrt" | "__builtin_floor" | "__builtin_ceil"
+                | "__builtin_round" | "__builtin_log" | "__builtin_log2" | "__builtin_exp"
+                | "__builtin_pow" | "__builtin_sin" | "__builtin_cos" | "__builtin_copysign" => {
+                    Some(CType::Function {
+                        return_type: Box::new(CType::Double),
+                        params: vec![CType::Double],
+                        variadic: false,
+                    })
+                }
+                "__builtin_fabsf"
+                | "__builtin_sqrtf"
+                | "__builtin_floorf"
+                | "__builtin_ceilf"
+                | "__builtin_roundf"
+                | "__builtin_copysignf" => Some(CType::Function {
+                    return_type: Box::new(CType::Float),
+                    params: vec![CType::Float],
+                    variadic: false,
+                }),
+                "__builtin_fabsl" => Some(CType::Function {
+                    return_type: Box::new(CType::LongDouble),
+                    params: vec![CType::LongDouble],
+                    variadic: false,
+                }),
+                // Object size builtin
+                "__builtin_object_size" => Some(CType::Function {
+                    return_type: Box::new(if self.target.pointer_width() == 8 {
+                        CType::ULong
+                    } else {
+                        CType::UInt
+                    }),
+                    params: vec![void_ptr.clone(), CType::Int],
+                    variadic: false,
+                }),
+                // Atomic builtins
+                "__sync_synchronize" => Some(CType::Function {
+                    return_type: Box::new(CType::Void),
+                    params: vec![],
+                    variadic: false,
+                }),
+                // GCC __atomic builtins (C11 atomics via compiler builtins)
+                // __atomic_store_n(ptr, val, memorder) -> void
+                "__atomic_store_n" | "__atomic_store" => Some(CType::Function {
+                    return_type: Box::new(CType::Void),
+                    params: vec![void_ptr.clone(), CType::Int, CType::Int],
+                    variadic: false,
+                }),
+                // __atomic_load_n(ptr, memorder) -> value
+                "__atomic_load_n" | "__atomic_load" => Some(CType::Function {
+                    return_type: Box::new(CType::Int),
+                    params: vec![void_ptr.clone(), CType::Int],
+                    variadic: false,
+                }),
+                // __atomic_exchange_n(ptr, val, memorder) -> old value
+                "__atomic_exchange_n" | "__atomic_exchange" => Some(CType::Function {
+                    return_type: Box::new(CType::Int),
+                    params: vec![void_ptr.clone(), CType::Int, CType::Int],
+                    variadic: false,
+                }),
+                // __atomic_compare_exchange_n(ptr, expected, desired, weak, success, failure) -> bool
+                "__atomic_compare_exchange_n" | "__atomic_compare_exchange" => {
+                    Some(CType::Function {
+                        return_type: Box::new(CType::Bool),
+                        params: vec![
+                            void_ptr.clone(),
+                            void_ptr.clone(),
+                            CType::Int,
+                            CType::Bool,
+                            CType::Int,
+                            CType::Int,
+                        ],
+                        variadic: false,
+                    })
+                }
+                // __atomic_add_fetch, __atomic_sub_fetch, etc.
+                "__atomic_add_fetch"
+                | "__atomic_sub_fetch"
+                | "__atomic_and_fetch"
+                | "__atomic_or_fetch"
+                | "__atomic_xor_fetch"
+                | "__atomic_nand_fetch"
+                | "__atomic_fetch_add"
+                | "__atomic_fetch_sub"
+                | "__atomic_fetch_and"
+                | "__atomic_fetch_or"
+                | "__atomic_fetch_xor"
+                | "__atomic_fetch_nand" => Some(CType::Function {
+                    return_type: Box::new(CType::Int),
+                    params: vec![void_ptr.clone(), CType::Int, CType::Int],
+                    variadic: false,
+                }),
+                // __atomic_test_and_set(ptr, memorder) -> bool
+                "__atomic_test_and_set" => Some(CType::Function {
+                    return_type: Box::new(CType::Bool),
+                    params: vec![void_ptr.clone(), CType::Int],
+                    variadic: false,
+                }),
+                // __atomic_clear(ptr, memorder) -> void
+                "__atomic_clear" => Some(CType::Function {
+                    return_type: Box::new(CType::Void),
+                    params: vec![void_ptr.clone(), CType::Int],
+                    variadic: false,
+                }),
+                // __atomic_thread_fence(memorder) / __atomic_signal_fence(memorder) -> void
+                "__atomic_thread_fence" | "__atomic_signal_fence" => Some(CType::Function {
+                    return_type: Box::new(CType::Void),
+                    params: vec![CType::Int],
+                    variadic: false,
+                }),
+                // __atomic_always_lock_free(size, ptr) -> bool
+                "__atomic_always_lock_free" | "__atomic_is_lock_free" => Some(CType::Function {
+                    return_type: Box::new(CType::Bool),
+                    params: vec![size_t.clone(), void_ptr.clone()],
+                    variadic: false,
+                }),
+                // Legacy __sync builtins
+                "__sync_fetch_and_add"
+                | "__sync_fetch_and_sub"
+                | "__sync_fetch_and_or"
+                | "__sync_fetch_and_and"
+                | "__sync_fetch_and_xor"
+                | "__sync_fetch_and_nand"
+                | "__sync_add_and_fetch"
+                | "__sync_sub_and_fetch"
+                | "__sync_or_and_fetch"
+                | "__sync_and_and_fetch"
+                | "__sync_xor_and_fetch"
+                | "__sync_nand_and_fetch" => Some(CType::Function {
+                    return_type: Box::new(CType::Int),
+                    params: vec![void_ptr.clone(), CType::Int],
+                    variadic: true,
+                }),
+                "__sync_bool_compare_and_swap" => Some(CType::Function {
+                    return_type: Box::new(CType::Bool),
+                    params: vec![void_ptr.clone(), CType::Int, CType::Int],
+                    variadic: true,
+                }),
+                "__sync_val_compare_and_swap" => Some(CType::Function {
+                    return_type: Box::new(CType::Int),
+                    params: vec![void_ptr.clone(), CType::Int, CType::Int],
+                    variadic: true,
+                }),
+                "__sync_lock_test_and_set" => Some(CType::Function {
+                    return_type: Box::new(CType::Int),
+                    params: vec![void_ptr.clone(), CType::Int],
+                    variadic: true,
+                }),
+                "__sync_lock_release" => Some(CType::Function {
+                    return_type: Box::new(CType::Void),
+                    params: vec![void_ptr.clone()],
                     variadic: true,
                 }),
                 _ => None,

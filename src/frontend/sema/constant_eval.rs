@@ -1498,6 +1498,11 @@ impl<'a> ConstantEvaluator<'a> {
                     }
                     return Ok(CType::Int128);
                 }
+                // IEC 60559 floating-point types
+                TypeSpecifier::Float128 => return Ok(CType::LongDouble),
+                TypeSpecifier::Float64 => return Ok(CType::Double),
+                TypeSpecifier::Float32 => return Ok(CType::Float),
+                TypeSpecifier::Float16 => return Ok(CType::Float),
 
                 // Struct/Union/Enum — look up the tag type from the
                 // registered tag map if available, otherwise fall back to
@@ -1794,7 +1799,9 @@ impl<'a> ConstantEvaluator<'a> {
                     Ok(CType::Int)
                 }
             }
-            Expression::Binary { op, left, right, .. } => {
+            Expression::Binary {
+                op, left, right, ..
+            } => {
                 use crate::frontend::parser::ast::BinaryOp;
                 // Comparison operators always produce int (0 or 1)
                 match op {
@@ -1910,12 +1917,16 @@ impl<'a> ConstantEvaluator<'a> {
     /// result type is `void *`.
     fn is_null_pointer_constant(&mut self, expr: &Expression) -> bool {
         match expr {
-            Expression::Parenthesized { inner, .. } => {
-                self.is_null_pointer_constant(inner)
-            }
-            Expression::Cast { operand, type_name, .. } => {
+            Expression::Parenthesized { inner, .. } => self.is_null_pointer_constant(inner),
+            Expression::Cast {
+                operand, type_name, ..
+            } => {
                 // (void *)expr — check if inner is a null pointer constant
-                let dummy = Span { start: 0, end: 0, file_id: 0 };
+                let dummy = Span {
+                    start: 0,
+                    end: 0,
+                    file_id: 0,
+                };
                 if let Ok(ty) = self.resolve_type_name(type_name, dummy) {
                     if matches!(&ty, CType::Pointer(inner, _) if matches!(inner.as_ref(), CType::Void))
                     {

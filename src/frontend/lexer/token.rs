@@ -275,6 +275,14 @@ pub enum TokenKind {
     Label,
     /// `__int128` — GCC 128-bit integer type extension.
     Int128Keyword,
+    /// `_Float128` / `__float128` — GCC 128-bit floating-point type.
+    Float128Keyword,
+    /// `_Float16` — IEC 60559 16-bit float (maps to half precision).
+    Float16Keyword,
+    /// `_Float32` / `_Float32x` — IEC 60559 32-bit float / extended.
+    Float32Keyword,
+    /// `_Float64` / `_Float64x` — IEC 60559 64-bit float / extended.
+    Float64Keyword,
     /// `__auto_type` (GCC auto type inference)
     AutoType,
 
@@ -616,6 +624,10 @@ impl TokenKind {
             | TokenKind::AsmVolatile
             | TokenKind::Label
             | TokenKind::Int128Keyword
+            | TokenKind::Float128Keyword
+            | TokenKind::Float16Keyword
+            | TokenKind::Float32Keyword
+            | TokenKind::Float64Keyword
             | TokenKind::AutoType
             // GCC builtins
             | TokenKind::BuiltinVaStart
@@ -831,6 +843,10 @@ impl TokenKind {
             TokenKind::AsmVolatile => Some("__volatile__"),
             TokenKind::Label => Some("__label__"),
             TokenKind::Int128Keyword => Some("__int128"),
+            TokenKind::Float128Keyword => Some("_Float128"),
+            TokenKind::Float16Keyword => Some("_Float16"),
+            TokenKind::Float32Keyword => Some("_Float32"),
+            TokenKind::Float64Keyword => Some("_Float64"),
             TokenKind::AutoType => Some("__auto_type"),
             // GCC builtins
             TokenKind::BuiltinVaStart => Some("__builtin_va_start"),
@@ -1178,6 +1194,13 @@ pub fn lookup_keyword(s: &str) -> Option<TokenKind> {
         "__label__" => Some(TokenKind::Label),
         "__int128" => Some(TokenKind::Int128Keyword),
         "__int128_t" => Some(TokenKind::Int128Keyword),
+        "_Float128" => Some(TokenKind::Float128Keyword),
+        "__float128" => Some(TokenKind::Float128Keyword),
+        "_Float16" => Some(TokenKind::Float16Keyword),
+        "_Float32" => Some(TokenKind::Float32Keyword),
+        "_Float32x" => Some(TokenKind::Float32Keyword),
+        "_Float64" => Some(TokenKind::Float64Keyword),
+        "_Float64x" => Some(TokenKind::Float64Keyword),
         "__auto_type" => Some(TokenKind::AutoType),
         // GCC alternate spellings for C keywords used in system headers
         "__const" => Some(TokenKind::Const),

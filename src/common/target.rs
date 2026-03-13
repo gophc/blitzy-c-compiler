@@ -274,7 +274,12 @@ impl Target {
     #[inline]
     pub fn elf_flags(&self) -> u32 {
         match self {
-            Target::RiscV64 => 0x0005, // EF_RISCV_FLOAT_ABI_DOUBLE | EF_RISCV_RVC
+            // EF_RISCV_RVC (0x1): objects may contain compressed (C extension)
+            // instructions.  Float ABI bits are 0 → soft-float (lp64), which
+            // is the ABI used by the Linux kernel (`-mabi=lp64`).  Using
+            // double-float (0x4) here would prevent linking with kernel
+            // objects that use the soft-float ABI.
+            Target::RiscV64 => 0x0001, // EF_RISCV_RVC only; soft-float ABI
             Target::X86_64 | Target::I686 | Target::AArch64 => 0,
         }
     }
@@ -435,19 +440,37 @@ impl Target {
         // cross-compiling on an x86-64 host without cross-compilation
         // headers installed, the host's `bits/` headers are still found.
         // This matches GCC's behavior of falling back to host headers.
+        //
+        // GCC internal headers (float.h, stddef.h, stdarg.h, etc.) live
+        // in /usr/lib/gcc[-cross]/<triple>/<version>/include.  We include
+        // these so that system headers that chain via `#include_next`
+        // (e.g., glibc's <limits.h> → GCC's <limits.h>) resolve correctly.
         match self {
-            Target::X86_64 => vec!["/usr/include/x86_64-linux-gnu", "/usr/include"],
+            Target::X86_64 => vec![
+                "/usr/lib/gcc/x86_64-linux-gnu/13/include",
+                "/usr/lib/gcc/x86_64-linux-gnu/14/include",
+                "/usr/include/x86_64-linux-gnu",
+                "/usr/include",
+            ],
             Target::I686 => vec![
+                "/usr/lib/gcc/x86_64-linux-gnu/13/include",
+                "/usr/lib/gcc/x86_64-linux-gnu/14/include",
                 "/usr/include/i386-linux-gnu",
                 "/usr/include/x86_64-linux-gnu",
                 "/usr/include",
             ],
             Target::AArch64 => vec![
+                "/usr/lib/gcc-cross/aarch64-linux-gnu/13/include",
+                "/usr/lib/gcc-cross/aarch64-linux-gnu/14/include",
+                "/usr/lib/gcc/x86_64-linux-gnu/13/include",
                 "/usr/include/aarch64-linux-gnu",
                 "/usr/include/x86_64-linux-gnu",
                 "/usr/include",
             ],
             Target::RiscV64 => vec![
+                "/usr/lib/gcc-cross/riscv64-linux-gnu/13/include",
+                "/usr/lib/gcc-cross/riscv64-linux-gnu/14/include",
+                "/usr/lib/gcc/x86_64-linux-gnu/13/include",
                 "/usr/include/riscv64-linux-gnu",
                 "/usr/include/x86_64-linux-gnu",
                 "/usr/include",
@@ -675,7 +698,7 @@ mod tests {
         assert_eq!(Target::X86_64.elf_flags(), 0);
         assert_eq!(Target::I686.elf_flags(), 0);
         assert_eq!(Target::AArch64.elf_flags(), 0);
-        assert_eq!(Target::RiscV64.elf_flags(), 0x0005);
+        assert_eq!(Target::RiscV64.elf_flags(), 0x0001);
     }
 
     // -- Predefined macros --------------------------------------------------
