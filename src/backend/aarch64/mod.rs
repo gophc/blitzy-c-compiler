@@ -742,6 +742,21 @@ impl AArch64Codegen {
             elf.add_section(rela_section);
         }
 
+        // .note.GNU-stack section — non-executable stack marker.
+        elf.add_section(Section {
+            name: ".note.GNU-stack".to_string(),
+            sh_type: SHT_PROGBITS,
+            sh_flags: 0,
+            data: Vec::new(),
+            sh_addralign: 1,
+            sh_link: 0,
+            sh_info: 0,
+            sh_entsize: 0,
+            logical_size: 0,
+            virtual_address: 0,
+            file_offset_hint: 0,
+        });
+
         // Phase 4: Write the ELF object.
         let elf_bytes = elf.write();
 

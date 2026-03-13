@@ -839,6 +839,25 @@ impl RiscV64Codegen {
             file_offset_hint: 0,
         });
 
+        // .note.GNU-stack section — non-executable stack marker.
+        // This is required by the Linux kernel build and modern toolchains
+        // to indicate that the generated code does not require an executable
+        // stack. Without this section, the linker may default to an executable
+        // stack, which is a security concern.
+        elf.add_section(Section {
+            name: ".note.GNU-stack".to_string(),
+            sh_type: SHT_PROGBITS,
+            sh_flags: 0, // No SHF_EXECINSTR = non-executable stack.
+            data: Vec::new(),
+            sh_addralign: 1,
+            sh_link: 0,
+            sh_info: 0,
+            sh_entsize: 0,
+            logical_size: 0,
+            virtual_address: 0,
+            file_offset_hint: 0,
+        });
+
         // Add all symbols.
         for sym in symbols {
             elf.add_symbol(sym);
