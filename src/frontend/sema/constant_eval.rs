@@ -1572,6 +1572,10 @@ impl<'a> ConstantEvaluator<'a> {
                     };
                     return Ok(resolved);
                 }
+                // __auto_type — placeholder, actual type inferred from init
+                TypeSpecifier::AutoType => {
+                    return Ok(CType::Int);
+                }
             }
         }
 

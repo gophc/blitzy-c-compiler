@@ -386,6 +386,11 @@ pub fn parse_type_specifiers(parser: &mut Parser<'_>) -> Result<TypeSpecifierLis
                 let spec = parse_typeof(parser)?;
                 specifiers.push(spec);
             }
+            // __auto_type — GCC automatic type inference
+            TokenKind::AutoType => {
+                parser.advance(); // consume __auto_type
+                specifiers.push(TypeSpecifier::AutoType);
+            }
             // _Atomic — could be specifier `_Atomic(type)` or qualifier `_Atomic`
             TokenKind::Atomic => {
                 // Disambiguate: `_Atomic(` is a type specifier,
@@ -809,8 +814,8 @@ pub fn is_type_specifier_start(token: &TokenKind, parser: &Parser<'_>) -> bool {
         // Aggregate type keywords
         TokenKind::Struct | TokenKind::Union | TokenKind::Enum => true,
 
-        // GCC typeof and _Atomic
-        TokenKind::Typeof | TokenKind::Atomic => true,
+        // GCC typeof, _Atomic, __auto_type
+        TokenKind::Typeof | TokenKind::Atomic | TokenKind::AutoType => true,
 
         // __extension__ may precede type specifiers
         TokenKind::Extension => true,

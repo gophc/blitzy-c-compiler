@@ -393,6 +393,14 @@ pub fn parse_declaration_specifiers(parser: &mut Parser<'_>) -> Result<Declarati
             }
 
             // =================================================================
+            // __auto_type — GCC auto type inference
+            // =================================================================
+            TokenKind::AutoType => {
+                parser.advance();
+                type_specifiers.push(TypeSpecifier::AutoType);
+            }
+
+            // =================================================================
             // _Atomic — could be type specifier `_Atomic(type)` or qualifier
             // =================================================================
             TokenKind::Atomic => {

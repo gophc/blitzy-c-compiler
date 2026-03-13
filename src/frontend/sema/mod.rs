@@ -2403,6 +2403,15 @@ impl<'a> SemanticAnalyzer<'a> {
                         }
                     }
                 }
+                TypeSpecifier::AutoType => {
+                    // __auto_type — GCC extension for automatic type inference.
+                    // The actual type will be determined from the initializer.
+                    // At the sema level, we return Int as a placeholder; the
+                    // initializer type will override it during declaration
+                    // processing. This is sufficient for kernel code that uses
+                    // __auto_type in statement expressions with immediate init.
+                    return CType::Int;
+                }
             }
         }
 

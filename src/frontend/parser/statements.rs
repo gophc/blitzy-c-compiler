@@ -480,8 +480,8 @@ pub fn is_declaration_start(parser: &Parser<'_>) -> bool {
         // Function specifiers
         TokenKind::Inline | TokenKind::Noreturn => true,
 
-        // GCC typeof / __typeof__
-        TokenKind::Typeof => true,
+        // GCC typeof / __typeof__ / __auto_type
+        TokenKind::Typeof | TokenKind::AutoType => true,
 
         // GCC __attribute__ — can precede declarations
         TokenKind::Attribute => true,
@@ -1251,6 +1251,14 @@ fn parse_block_declaration(parser: &mut Parser<'_>) -> Result<Declaration, ()> {
     loop {
         let decl_start = parser.current_span();
         let declarator = declarations::parse_declarator(parser)?;
+
+        // Skip optional GCC asm register binding or asm label:
+        //   register int x asm("a0") = val;
+        //   void foo(void) asm("_foo");
+        declarations::skip_asm_label(parser);
+
+        // Skip optional trailing __attribute__
+        declarations::skip_trailing_attributes(parser);
 
         // Parse optional initializer: '=' initializer
         let initializer = if parser.match_token(&TokenKind::Equal) {

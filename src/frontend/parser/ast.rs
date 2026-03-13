@@ -228,6 +228,9 @@ pub enum TypeSpecifier {
     Atomic(Box<TypeName>),
     /// `typeof(expr)` or `typeof(type-name)` — GCC type deduction extension.
     Typeof(TypeofArg),
+    /// `__auto_type` — GCC automatic type inference (similar to C++ `auto`).
+    /// The actual type is inferred from the initializer expression.
+    AutoType,
 }
 
 /// Argument to `typeof` / `__typeof__`.

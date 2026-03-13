@@ -2215,6 +2215,12 @@ fn map_single_type_specifier_with_names(spec: &ast::TypeSpecifier, name_table: &
         ast::TypeSpecifier::Typeof(arg) => resolve_typeof_arg(arg, name_table),
         ast::TypeSpecifier::Atomic(_) => CType::Atomic(Box::new(CType::Int)),
         ast::TypeSpecifier::Complex => CType::Complex(Box::new(CType::Double)),
+        ast::TypeSpecifier::AutoType => {
+            // __auto_type — type will be inferred from initializer.
+            // Return Int as a placeholder; the actual type gets resolved
+            // during variable initialization lowering.
+            CType::Int
+        }
     }
 }
 

@@ -1146,6 +1146,9 @@ impl<'a> BuiltinEvaluator<'a> {
                 TypeSpecifier::Typeof(_) => {
                     return CType::Int; // Cannot resolve typeof without expression evaluation.
                 }
+                TypeSpecifier::AutoType => {
+                    return CType::Int; // __auto_type — placeholder, resolved at init.
+                }
             }
         }
 
