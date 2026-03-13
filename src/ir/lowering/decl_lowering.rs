@@ -169,6 +169,7 @@ pub fn lower_global_variable(
         let section = extract_section_attribute(attributes, name_table);
         let alignment = extract_alignment_attribute(attributes, name_table);
 
+        let var_name_owned = var_name.clone();
         let mut global = GlobalVariable::new(var_name, ir_type, initializer);
         global.is_definition = is_definition;
         global.linkage = linkage;
@@ -176,6 +177,11 @@ pub fn lower_global_variable(
         global.section = section;
         global.alignment = alignment;
         global.is_constant = is_const;
+
+        // Store the original C type so that expression lowering can
+        // recover full struct field information (including field names
+        // and function pointer signatures) for member access operations.
+        module.global_c_types.insert(var_name_owned, c_type.clone());
 
         module.add_global(global);
     }
@@ -1136,7 +1142,34 @@ fn lower_designated_initializer(
     diagnostics: &mut DiagnosticEngine,
     name_table: &[String],
 ) -> Option<Constant> {
-    let resolved = crate::common::types::resolve_typedef(target_type);
+    let resolved_ref = crate::common::types::resolve_typedef(target_type);
+
+    // Resolve forward-referenced (empty-field) named structs/unions using the
+    // thread-local struct definitions registry populated during Pass 0.
+    // When a variable is declared as `struct Foo x = {...};`, the AST stores
+    // the struct type with the tag name but without field information (the
+    // definition body is in a separate AST node).  We look up the full
+    // definition so the initializer can be correctly lowered.
+    let resolved_owned: Option<CType> = match resolved_ref {
+        CType::Struct {
+            name: Some(ref tag),
+            ref fields,
+            ..
+        } if fields.is_empty() => super::SIZEOF_STRUCT_DEFS.with(|defs| {
+            let borrow = defs.borrow();
+            borrow.as_ref().and_then(|m| m.get(tag.as_str()).cloned())
+        }),
+        CType::Union {
+            name: Some(ref tag),
+            ref fields,
+            ..
+        } if fields.is_empty() => super::SIZEOF_STRUCT_DEFS.with(|defs| {
+            let borrow = defs.borrow();
+            borrow.as_ref().and_then(|m| m.get(tag.as_str()).cloned())
+        }),
+        _ => None,
+    };
+    let resolved = resolved_owned.as_ref().unwrap_or(resolved_ref);
 
     match resolved {
         CType::Array(element_type, size_opt) => {

@@ -28,7 +28,8 @@ use crate::backend::x86_64::abi::{
     self, RetLocation, X86_64Abi, INTEGER_ARG_REGS, RED_ZONE_SIZE, SSE_ARG_REGS,
 };
 use crate::backend::x86_64::registers::{
-    self, CALLEE_SAVED_GPRS, R10, R11, R8, R9, RAX, RBP, RCX, RDI, RDX, RSI, RSP, XMM0, XMM1,
+    self, CALLEE_SAVED_GPRS, R10, R11, R8, R9, RAX, RBP, RCX, RDI, RDX, RSI, RSP, XMM0, XMM1, XMM2,
+    XMM3, XMM4, XMM5, XMM6, XMM7,
 };
 use crate::common::diagnostics::{DiagnosticEngine, Span};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
@@ -448,9 +449,20 @@ pub struct FrameLayout {
     /// Set only for variadic functions.  The save area holds 6 GPR slots
     /// (RDI, RSI, RDX, RCX, R8, R9) at consecutive 8-byte offsets.
     pub va_save_area_offset: Option<i32>,
+    /// RBP-relative offset of the XMM save area for variadic functions.
+    /// Holds 8 XMM slots (XMM0–XMM7, low 64-bit each) at 8-byte offsets.
+    pub va_fp_save_area_offset: Option<i32>,
+    /// RBP-relative offset of the 16-byte va_control block for variadic
+    /// functions.  Layout: [gp_ptr (8 bytes), fp_ptr (8 bytes)].
+    /// va_start stores the address of this block into the va_list variable.
+    /// va_arg loads the correct pointer from the block based on type.
+    pub va_control_offset: Option<i32>,
     /// Number of named (non-variadic) GPR parameters.  Used by va_start
     /// to compute the address of the first variadic argument.
     pub named_gpr_count: usize,
+    /// Number of named (non-variadic) FP parameters.  Used by va_start
+    /// to compute the address of the first variadic FP argument.
+    pub named_fp_count: usize,
 }
 
 // ===========================================================================
@@ -964,25 +976,39 @@ impl X86_64CodeGen {
             Vec::new()
         };
 
-        // For variadic functions: reserve a 48-byte register save area
-        // (6 GPR parameter registers × 8 bytes) so that va_start/va_arg
-        // can walk the variadic arguments.  Count how many named parameters
-        // are passed in GPRs (up to 6).
+        // For variadic functions: reserve register save areas so that
+        // va_start/va_arg can access all variadic arguments uniformly.
+        // Layout (all RBP-relative, growing downward):
+        //   [va_save_area_offset + 0..47]:  6 GPR saves (RDI..R9), 48 bytes
+        //   [va_fp_save_area_offset + 0..63]: 8 XMM saves (XMM0..XMM7 low 64-bit), 64 bytes
+        //   [va_control_offset + 0..15]:  va_control block (gp_ptr, fp_ptr), 16 bytes
         let mut va_save_area_offset: Option<i32> = None;
+        let mut va_fp_save_area_offset: Option<i32> = None;
+        let mut va_control_offset: Option<i32> = None;
         let mut named_gpr_count: usize = 0;
+        let mut named_fp_count: usize = 0;
         if func.is_variadic {
-            // Count named GPR parameters.
+            // Count named GPR and FP parameters.
             for p in &func.params {
                 let is_fp = matches!(p.ty, IrType::F32 | IrType::F64 | IrType::F80);
-                if !is_fp {
+                if is_fp {
+                    named_fp_count += 1;
+                } else {
                     named_gpr_count += 1;
                 }
             }
             // Reserve 48 bytes for the 6 GPR save slots (RDI..R9).
             current_offset -= 48;
-            // Align to 8.
             current_offset &= !7;
             va_save_area_offset = Some(current_offset as i32);
+            // Reserve 64 bytes for the 8 XMM save slots (XMM0..XMM7).
+            current_offset -= 64;
+            current_offset &= !7;
+            va_fp_save_area_offset = Some(current_offset as i32);
+            // Reserve 16 bytes for the va_control block (gp_ptr + fp_ptr).
+            current_offset -= 16;
+            current_offset &= !7;
+            va_control_offset = Some(current_offset as i32);
         }
 
         // Spill area starts after local allocas (and va save area if any).
@@ -1008,7 +1034,10 @@ impl X86_64CodeGen {
             has_calls,
             callee_saved,
             va_save_area_offset,
+            va_fp_save_area_offset,
+            va_control_offset,
             named_gpr_count,
+            named_fp_count,
         }
     }
 
@@ -1112,15 +1141,12 @@ impl X86_64CodeGen {
         }
 
         // For variadic functions: save the 6 integer parameter registers
-        // (RDI, RSI, RDX, RCX, R8, R9) to the register save area so that
+        // (RDI, RSI, RDX, RCX, R8, R9) to the GPR save area so that
         // va_start / va_arg can access all variadic arguments uniformly.
-        // Read from MachineFunction (persists across trait boundary).
         if let Some(va_offset) = mf.va_save_area_offset {
             let save_regs = [RDI, RSI, RDX, RCX, R8, R9];
             for (i, &reg) in save_regs.iter().enumerate() {
                 let disp = va_offset as i64 + (i as i64) * 8;
-                // Use Mov with Memory destination (not StoreInd) because
-                // the destination is a known RBP-relative stack slot.
                 prologue.push(Self::mk_inst(
                     X86Opcode::Mov,
                     None,
@@ -1135,6 +1161,91 @@ impl X86_64CodeGen {
                     ],
                 ));
             }
+        }
+
+        // For variadic functions: save XMM0–XMM7 (low 64-bit each) to
+        // the FP save area so va_arg can retrieve floating-point variadic
+        // arguments.  Uses movsd [rbp+offset], xmmN.
+        if let Some(fp_offset) = mf.va_fp_save_area_offset {
+            let xmm_regs: [u16; 8] = [XMM0, XMM1, XMM2, XMM3, XMM4, XMM5, XMM6, XMM7];
+            for (i, &reg) in xmm_regs.iter().enumerate() {
+                let disp = fp_offset as i64 + (i as i64) * 8;
+                prologue.push(Self::mk_inst(
+                    X86Opcode::Movsd,
+                    None,
+                    &[
+                        MachineOperand::Memory {
+                            base: Some(RBP),
+                            index: None,
+                            scale: 1,
+                            displacement: disp,
+                        },
+                        MachineOperand::Register(reg),
+                    ],
+                ));
+            }
+        }
+
+        // For variadic functions: initialize the 16-byte va_control block.
+        // Layout: [gp_ptr (8 bytes), fp_ptr (8 bytes)].
+        // gp_ptr = &gpr_save_area[named_gpr_count]
+        // fp_ptr = &fp_save_area[named_fp_count]
+        if let (Some(ctrl_offset), Some(gpr_offset), Some(fp_offset)) = (
+            mf.va_control_offset,
+            mf.va_save_area_offset,
+            mf.va_fp_save_area_offset,
+        ) {
+            let rax = MachineOperand::Register(RAX);
+            // gp_ptr = RBP + gpr_save_offset + named_gpr_count * 8
+            let gp_ptr_disp = gpr_offset as i64 + (mf.named_gpr_count as i64) * 8;
+            prologue.push(Self::mk_inst(
+                X86Opcode::Lea,
+                Some(rax.clone()),
+                &[MachineOperand::Memory {
+                    base: Some(RBP),
+                    index: None,
+                    scale: 1,
+                    displacement: gp_ptr_disp,
+                }],
+            ));
+            prologue.push(Self::mk_inst(
+                X86Opcode::Mov,
+                None,
+                &[
+                    MachineOperand::Memory {
+                        base: Some(RBP),
+                        index: None,
+                        scale: 1,
+                        displacement: ctrl_offset as i64,
+                    },
+                    rax.clone(),
+                ],
+            ));
+            // fp_ptr = RBP + fp_save_offset + named_fp_count * 8
+            let fp_ptr_disp = fp_offset as i64 + (mf.named_fp_count as i64) * 8;
+            prologue.push(Self::mk_inst(
+                X86Opcode::Lea,
+                Some(rax.clone()),
+                &[MachineOperand::Memory {
+                    base: Some(RBP),
+                    index: None,
+                    scale: 1,
+                    displacement: fp_ptr_disp,
+                }],
+            ));
+            prologue.push(Self::mk_inst(
+                X86Opcode::Mov,
+                None,
+                &[
+                    MachineOperand::Memory {
+                        base: Some(RBP),
+                        index: None,
+                        scale: 1,
+                        displacement: ctrl_offset as i64 + 8,
+                    },
+                    rax,
+                ],
+            ));
         }
 
         prologue
@@ -1408,7 +1519,10 @@ impl X86_64CodeGen {
             mf.is_leaf = !frame.has_calls;
             mf.callee_saved_regs = frame.callee_saved.clone();
             mf.va_save_area_offset = frame.va_save_area_offset;
+            mf.va_fp_save_area_offset = frame.va_fp_save_area_offset;
+            mf.va_control_offset = frame.va_control_offset;
             mf.named_gpr_count = frame.named_gpr_count;
+            mf.named_fp_count = frame.named_fp_count;
         }
 
         // Mark calls.
@@ -2725,6 +2839,7 @@ impl X86_64CodeGen {
         name: &str,
         result: Value,
         args: &[Value],
+        ret_type: &IrType,
     ) -> Option<Vec<MachineInstruction>> {
         // Helper: ensure an operand is in a register (load from memory if spilled).
         let _ensure_reg =
@@ -3035,10 +3150,12 @@ impl X86_64CodeGen {
                 let ap_slot = self.get_value(args[0]);
                 let mut out = Vec::new();
                 if let Some(ref frame) = self.frame {
-                    if let Some(va_offset) = frame.va_save_area_offset {
-                        let first_va_offset = va_offset as i64 + (frame.named_gpr_count as i64) * 8;
+                    if let Some(ctrl_offset) = frame.va_control_offset {
                         let rcx = MachineOperand::Register(RCX);
-                        // LEA RCX, [RBP + first_va_offset]
+                        // LEA RCX, [RBP + va_control_offset]
+                        // The va_control block is pre-initialized in the
+                        // prologue with gp_ptr and fp_ptr.  va_start just
+                        // stores a pointer to it into the va_list variable.
                         out.push(Self::mk_inst(
                             X86Opcode::Lea,
                             Some(rcx.clone()),
@@ -3046,7 +3163,7 @@ impl X86_64CodeGen {
                                 base: Some(RBP),
                                 index: None,
                                 scale: 1,
-                                displacement: first_va_offset,
+                                displacement: ctrl_offset as i64,
                             }],
                         ));
                         // Store RCX to the va_list slot.
@@ -3062,42 +3179,122 @@ impl X86_64CodeGen {
                 ));
                 Some(out)
             }
-            // va_arg: load current pointer from ap, dereference, advance, store back.
-            // Uses RCX for current pointer, RDX for loaded value, R10 for next.
+            // va_arg: load the appropriate pointer (GP or FP) from the
+            // va_control block, dereference to get the value, advance the
+            // pointer, and store it back.
+            //
+            // va_control block layout (pointed to by va_list value):
+            //   [+0] gp_ptr — current position in GPR save area
+            //   [+8] fp_ptr — current position in FP save area
+            //
+            // For integer/pointer args: use gp_ptr at [ctrl+0]
+            // For floating-point args:  use fp_ptr at [ctrl+8]
             "__builtin_va_arg" => {
                 if args.is_empty() {
                     return None;
                 }
                 let ap_slot = self.get_value(args[0]);
+                let is_float_arg = matches!(ret_type, IrType::F32 | IrType::F64 | IrType::F80);
                 let mut out = Vec::new();
+
+                // Use a fully physical-register sequence that completes
+                // ALL loads and the store-back before yielding control.
+                // We use RCX (va_control ptr), RDX (sub-pointer), R10
+                // (advanced), and R8 (loaded value / ctrl address for
+                // store-back) — all caller-saved registers.  The final
+                // result is copied to a virtual register at the end.
+
                 let rcx = MachineOperand::Register(RCX);
                 let rdx = MachineOperand::Register(RDX);
                 let r10 = MachineOperand::Register(R10);
-                // Load current va_list pointer: RCX = *ap_slot
+                let r8_op = MachineOperand::Register(R8);
+
+                // Step 1: Load va_control pointer: RCX = *ap_slot
                 out.push(va_load_from_slot(&ap_slot, rcx.clone()));
-                // Dereference: RDX = *RCX (load the argument value)
+
+                // Step 2: For float args, we need offset 8 from ctrl.
+                // Save RCX in R8 so we can restore for the store-back.
+                out.push(Self::mk_inst(
+                    X86Opcode::Mov,
+                    Some(r8_op.clone()),
+                    std::slice::from_ref(&rcx),
+                ));
+
+                // Step 3: Load the appropriate sub-pointer from va_control.
+                let ctrl_disp: i64 = if is_float_arg { 8 } else { 0 };
+                if ctrl_disp != 0 {
+                    // For float: add offset to RCX to point at fp_ptr slot
+                    out.push(Self::mk_inst(
+                        X86Opcode::Add,
+                        Some(rcx.clone()),
+                        &[rcx.clone(), MachineOperand::Immediate(ctrl_disp)],
+                    ));
+                }
+                // RDX = *RCX (load gp_ptr or fp_ptr)
                 out.push(Self::mk_inst(
                     X86Opcode::LoadInd,
                     Some(rdx.clone()),
                     std::slice::from_ref(&rcx),
                 ));
-                // Advance: R10 = RCX + 8  (use LEA for non-destructive add)
+
+                // Step 4: Load the actual value from the save area.
+                // Use R10 as temporary for the value to avoid clobbering
+                // RCX/RDX which we need for the store-back.
+                if is_float_arg {
+                    // For float: use Movsd with physical register memory
+                    // movsd xmm0_tmp, [RDX]
+                    let xmm0_op = MachineOperand::Register(XMM0);
+                    out.push(Self::mk_inst(
+                        X86Opcode::Movsd,
+                        Some(xmm0_op.clone()),
+                        std::slice::from_ref(&rdx),
+                    ));
+                } else {
+                    // For int: R10 = [RDX]
+                    out.push(Self::mk_inst(
+                        X86Opcode::LoadInd,
+                        Some(r10.clone()),
+                        std::slice::from_ref(&rdx),
+                    ));
+                }
+
+                // Step 5: Advance the sub-pointer: RDX = RDX + 8
                 out.push(Self::mk_inst(
-                    X86Opcode::Lea,
-                    Some(r10.clone()),
-                    &[MachineOperand::Memory {
-                        base: Some(RCX),
-                        index: None,
-                        scale: 1,
-                        displacement: 8,
-                    }],
+                    X86Opcode::Add,
+                    Some(rdx.clone()),
+                    &[rdx.clone(), MachineOperand::Immediate(8)],
                 ));
-                // Store back: *ap_slot = R10
-                out.push(va_store_to_slot(&ap_slot, r10));
-                // Capture result value into allocated vreg.
+
+                // Step 6: Store advanced pointer back.
+                // For int: [R8+0] = RDX  (R8 is the original ctrl ptr)
+                // For float: [R8+8] = RDX
+                if ctrl_disp != 0 {
+                    // Restore RCX = R8 + disp for the store
+                    out.push(Self::mk_inst(
+                        X86Opcode::Mov,
+                        Some(rcx.clone()),
+                        std::slice::from_ref(&r8_op),
+                    ));
+                    out.push(Self::mk_inst(
+                        X86Opcode::Add,
+                        Some(rcx.clone()),
+                        &[rcx.clone(), MachineOperand::Immediate(ctrl_disp)],
+                    ));
+                    out.push(Self::mk_inst(X86Opcode::StoreInd, None, &[rcx, rdx]));
+                } else {
+                    out.push(Self::mk_inst(X86Opcode::StoreInd, None, &[r8_op, rdx]));
+                }
+
+                // Step 7: Copy the loaded value to a virtual register
+                // so the register allocator manages it from here on.
                 let dst = self.new_vreg();
                 self.set_value(result, dst.clone());
-                out.push(Self::mk_inst(X86Opcode::Mov, Some(dst), &[rdx]));
+                if is_float_arg {
+                    let xmm0_op = MachineOperand::Register(XMM0);
+                    out.push(Self::mk_inst(X86Opcode::Movsd, Some(dst), &[xmm0_op]));
+                } else {
+                    out.push(Self::mk_inst(X86Opcode::Mov, Some(dst), &[r10]));
+                }
                 Some(out)
             }
             // va_end: no-op.
@@ -3119,10 +3316,69 @@ impl X86_64CodeGen {
                 let src_slot = self.get_value(args[1]);
                 let mut out = Vec::new();
                 let rcx = MachineOperand::Register(RCX);
-                // Load: RCX = *src_slot
+                let rdx = MachineOperand::Register(RDX);
+                let r10 = MachineOperand::Register(R10);
+                let rsp_op = MachineOperand::Register(RSP);
+
+                // Deep copy: allocate a fresh 16-byte va_control block
+                // on the stack, copy gp_ptr and fp_ptr from the source
+                // block, and point dest at the new block.
+                //
+                // The 16 bytes are allocated by sub RSP, 16. Since the
+                // epilogue restores RSP from RBP, this is automatically
+                // reclaimed on function return.
+
+                // Step 1: Load source va_control pointer: RCX = *src_slot
                 out.push(va_load_from_slot(&src_slot, rcx.clone()));
-                // Store: *dest_slot = RCX
-                out.push(va_store_to_slot(&dest_slot, rcx));
+
+                // Step 2: Load gp_ptr and fp_ptr from source block
+                // RDX = [RCX+0] (gp_ptr), R10 = [RCX+8] (fp_ptr)
+                out.push(Self::mk_inst(
+                    X86Opcode::LoadInd,
+                    Some(rdx.clone()),
+                    std::slice::from_ref(&rcx),
+                ));
+                out.push(Self::mk_inst(
+                    X86Opcode::Add,
+                    Some(rcx.clone()),
+                    &[rcx.clone(), MachineOperand::Immediate(8)],
+                ));
+                out.push(Self::mk_inst(
+                    X86Opcode::LoadInd,
+                    Some(r10.clone()),
+                    std::slice::from_ref(&rcx),
+                ));
+
+                // Step 3: Allocate 16 bytes on stack: sub RSP, 16
+                out.push(Self::mk_inst(
+                    X86Opcode::Sub,
+                    Some(rsp_op.clone()),
+                    &[rsp_op.clone(), MachineOperand::Immediate(16)],
+                ));
+
+                // Step 4: Store gp_ptr and fp_ptr to new block
+                // [RSP] = RDX (gp_ptr), [RSP+8] = R10 (fp_ptr)
+                out.push(Self::mk_inst(
+                    X86Opcode::StoreInd,
+                    None,
+                    &[rsp_op.clone(), rdx],
+                ));
+                // Use RCX = RSP + 8 for the fp_ptr store
+                out.push(Self::mk_inst(
+                    X86Opcode::Mov,
+                    Some(rcx.clone()),
+                    std::slice::from_ref(&rsp_op),
+                ));
+                out.push(Self::mk_inst(
+                    X86Opcode::Add,
+                    Some(rcx.clone()),
+                    &[rcx.clone(), MachineOperand::Immediate(8)],
+                ));
+                out.push(Self::mk_inst(X86Opcode::StoreInd, None, &[rcx, r10]));
+
+                // Step 5: Store RSP (new block address) to dest
+                out.push(va_store_to_slot(&dest_slot, rsp_op));
+
                 let dst = self.new_vreg();
                 self.set_value(result, dst.clone());
                 out.push(Self::mk_inst(
@@ -3150,7 +3406,7 @@ impl X86_64CodeGen {
     ) -> Vec<MachineInstruction> {
         // Intercept __builtin_* intrinsic calls and emit inline code.
         if let Some(fname) = self.func_ref_names.get(&callee).cloned() {
-            if let Some(inlined) = self.try_inline_builtin(&fname, result, args) {
+            if let Some(inlined) = self.try_inline_builtin(&fname, result, args, return_type) {
                 return inlined;
             }
         }
@@ -3228,7 +3484,26 @@ impl X86_64CodeGen {
             out.push(push_inst);
         }
 
-        // 2. Set AL = number of SSE registers used for variadic calls.
+        // 2. Resolve callee operand.  For direct calls (known function
+        //    names), use a GlobalSymbol operand.  For indirect calls
+        //    (function pointers loaded from memory/registers), use the
+        //    virtual register holding the callee address.
+        //
+        //    NOTE: The `MOV RAX, <sse_count>` emitted below (step 3) may
+        //    clobber RAX.  If the register allocator assigns the callee
+        //    virtual register to RAX, this creates a conflict.  The
+        //    post-allocation pass `fix_indirect_call_rax_clobber` in
+        //    generation.rs detects this case and inserts a save to R11
+        //    (the reserved spill-scratch register) before the AL setup.
+        let is_direct_call = self.func_ref_names.contains_key(&callee);
+        let callee_op = if is_direct_call {
+            let fname = self.func_ref_names.get(&callee).unwrap();
+            MachineOperand::GlobalSymbol(fname.clone())
+        } else {
+            self.get_value(callee)
+        };
+
+        // 3. Set AL = number of SSE registers used for variadic calls.
         //    Per the System V AMD64 ABI, AL must contain the count of
         //    vector (XMM) registers used when calling a variadic function.
         //    We set AL unconditionally for ALL calls because:
@@ -3249,13 +3524,7 @@ impl X86_64CodeGen {
             out.push(al_inst);
         }
 
-        // 3. Emit CALL instruction.
-        // Resolve callee — check func_ref_names for direct call target.
-        let callee_op = if let Some(fname) = self.func_ref_names.get(&callee) {
-            MachineOperand::GlobalSymbol(fname.clone())
-        } else {
-            self.get_value(callee)
-        };
+        // 4. Emit CALL instruction.
         let mut call_inst = Self::mk_inst(X86Opcode::Call, None, &[callee_op]);
         call_inst.is_call = true;
         out.push(call_inst);

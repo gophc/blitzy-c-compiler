@@ -677,6 +677,12 @@ fn lookup_var_type(ctx: &ExprLoweringContext<'_>, name: &str) -> CType {
     if let Some(ct) = ctx.local_types.get(name) {
         return ct.clone();
     }
+    // Prefer the original C type recorded during global variable lowering —
+    // this preserves struct field names, function pointer signatures, and
+    // other information that the IR type system cannot represent.
+    if let Some(ct) = ctx.module.global_c_types.get(name) {
+        return ct.clone();
+    }
     // Fall back to global variable types from the module.
     if let Some(gv) = ctx.module.get_global(name) {
         return ir_type_to_approx_ctype(&gv.ty);
@@ -3836,15 +3842,41 @@ fn lower_va_builtin(
             arg_vals.push(tv.value);
         }
     }
+    // For va_arg, determine the requested type from the type-name carrier
+    // (the second argument, wrapped as SizeofType by the parser). This lets
+    // the backend distinguish integer vs. floating-point va_arg requests and
+    // select the correct register class / load instruction.
+    let va_arg_ctype: Option<CType> = if name == "va_arg" {
+        args.get(1).and_then(|e| {
+            if let ast::Expression::SizeofType { type_name, .. } = e {
+                Some(resolve_type_name(ctx, type_name))
+            } else {
+                None
+            }
+        })
+    } else {
+        None
+    };
+
+    let (ret_ir_type, ret_ctype) = if name == "va_arg" {
+        let cty = va_arg_ctype.unwrap_or(CType::LongLong);
+        let ir_ty = match &cty {
+            CType::Float => IrType::F32,
+            CType::Double | CType::LongDouble => IrType::F64,
+            _ => IrType::I64,
+        };
+        (ir_ty, cty)
+    } else {
+        (IrType::Void, CType::Void)
+    };
+
     let intrinsic_name = format!("__builtin_{}", name);
     let callee = emit_global_ref(ctx, &intrinsic_name, span);
-    let (result, ci) = ctx.builder.build_call(callee, arg_vals, IrType::Void, span);
+    let (result, ci) = ctx.builder.build_call(callee, arg_vals, ret_ir_type, span);
     emit_inst(ctx, ci);
 
-    // va_arg returns a value of the type argument; for lowering purposes
-    // we produce an I64 that the backend will handle via ABI-specific code.
     if name == "va_arg" {
-        TypedValue::new(result, CType::LongLong)
+        TypedValue::new(result, ret_ctype)
     } else {
         TypedValue::void()
     }

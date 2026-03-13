@@ -794,14 +794,26 @@ pub struct MachineFunction {
     /// (R11) and MOV instructions. Populated during instruction selection.
     pub sse_vregs: crate::common::fx_hash::FxHashSet<u32>,
 
-    /// RBP-relative offset of the variadic register save area (negative).
+    /// RBP-relative offset of the variadic GPR register save area (negative).
     /// Set only for variadic functions on x86-64.  The save area holds
     /// 6 GPR slots (RDI, RSI, RDX, RCX, R8, R9) at consecutive offsets.
     pub va_save_area_offset: Option<i32>,
 
+    /// RBP-relative offset of the variadic FP register save area (negative).
+    /// Holds 8 XMM slots (XMM0–XMM7, low 64-bit each) at 8-byte offsets.
+    pub va_fp_save_area_offset: Option<i32>,
+
+    /// RBP-relative offset of the 16-byte va_control block.
+    /// Layout: [gp_ptr (8 bytes), fp_ptr (8 bytes)].
+    pub va_control_offset: Option<i32>,
+
     /// Number of named (non-variadic) GPR parameters.  Used by va_start
     /// to compute the address of the first variadic argument in the save area.
     pub named_gpr_count: usize,
+
+    /// Number of named (non-variadic) FP parameters.  Used by va_start
+    /// to compute the address of the first variadic FP argument.
+    pub named_fp_count: usize,
 }
 
 impl MachineFunction {
@@ -824,7 +836,10 @@ impl MachineFunction {
             vreg_to_ir_value: FxHashMap::default(),
             sse_vregs: crate::common::fx_hash::FxHashSet::default(),
             va_save_area_offset: None,
+            va_fp_save_area_offset: None,
+            va_control_offset: None,
             named_gpr_count: 0,
+            named_fp_count: 0,
         }
     }
 

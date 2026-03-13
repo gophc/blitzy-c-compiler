@@ -638,6 +638,10 @@ fn generate_for_arch<A: ArchCodegen>(
     let mut rodata_section: Vec<u8> = Vec::new();
     let mut bss_size: u64 = 0;
     let mut global_symbols: Vec<GlobalSymbolInfo> = Vec::new();
+    // Data-section relocations: (offset_in_section, symbol_name, is_rodata).
+    // These are generated for GlobalRef entries in global variable
+    // initializers so that the linker can patch symbol addresses.
+    let mut data_relocs: Vec<(u64, String, bool)> = Vec::new();
 
     for global in module.globals() {
         // Skip non-definition globals (extern declarations with no storage
@@ -646,6 +650,10 @@ fn generate_for_arch<A: ArchCodegen>(
         if !global.is_definition {
             continue;
         }
+        // Record pre-emit offsets to compute relocation positions.
+        let data_offset_before = data_section.len() as u64;
+        let rodata_offset_before = rodata_section.len() as u64;
+
         let sym_info = emit_global_variable(
             global,
             &mut data_section,
@@ -653,6 +661,22 @@ fn generate_for_arch<A: ArchCodegen>(
             &mut bss_size,
             ctx,
         );
+
+        // Collect GlobalRef relocations within this global's initializer.
+        if let Some(ref init) = global.initializer {
+            let mut relocs: Vec<(u64, String)> = Vec::new();
+            collect_constant_relocs(init, 0, Some(&global.ty), &mut relocs);
+            let is_rodata = matches!(sym_info.section, SectionPlacement::Rodata);
+            let section_base = if is_rodata {
+                rodata_offset_before
+            } else {
+                data_offset_before
+            };
+            for (offset_in_init, sym_name) in relocs {
+                data_relocs.push((section_base + offset_in_init, sym_name, is_rodata));
+            }
+        }
+
         global_symbols.push(sym_info);
     }
 
@@ -720,6 +744,7 @@ fn generate_for_arch<A: ArchCodegen>(
         &compiled_functions,
         &global_symbols,
         &text_relocations,
+        &data_relocs,
         &dwarf_sections,
         module,
         ctx,
@@ -735,7 +760,13 @@ fn generate_for_arch<A: ArchCodegen>(
     // Phase F: Linking Orchestration
     // -----------------------------------------------------------------------
 
-    link_to_final_output(&object_bytes, &text_relocations, ctx, diagnostics)
+    link_to_final_output(
+        &object_bytes,
+        &text_relocations,
+        &data_relocs,
+        ctx,
+        diagnostics,
+    )
 }
 
 // ===========================================================================
@@ -2409,6 +2440,58 @@ fn constant_to_bytes_typed(
 }
 
 /// Computes the storage size for a global variable based on its IR type.
+/// Recursively collects `GlobalRef` entries within a constant initializer,
+/// recording their byte offset within the emitted data so that the caller
+/// can generate ELF relocation entries (e.g., `R_X86_64_64`) for the
+/// linker to patch at link time.
+///
+/// `base_offset` is the byte offset of the start of this constant within
+/// the containing section (`.data` or `.rodata`).
+fn collect_constant_relocs(
+    constant: &crate::ir::module::Constant,
+    base_offset: u64,
+    ir_ty: Option<&crate::ir::types::IrType>,
+    relocs: &mut Vec<(u64, String)>,
+) {
+    use crate::ir::module::Constant;
+    use crate::ir::types::IrType;
+
+    match constant {
+        Constant::GlobalRef(name) => {
+            relocs.push((base_offset, name.clone()));
+        }
+        Constant::Struct(fields) => {
+            let field_types = match ir_ty {
+                Some(IrType::Struct(st)) => Some(&st.fields),
+                _ => None,
+            };
+            let mut offset = base_offset;
+            for (i, field) in fields.iter().enumerate() {
+                let ft = field_types.and_then(|fts| fts.get(i));
+                collect_constant_relocs(field, offset, ft, relocs);
+                // Advance offset by the byte size of this field.
+                let field_bytes = constant_to_bytes_typed(field, ft);
+                offset += field_bytes.len() as u64;
+            }
+        }
+        Constant::Array(elements) => {
+            let elem_ty = match ir_ty {
+                Some(IrType::Array(et, _)) => Some(et.as_ref()),
+                _ => None,
+            };
+            let mut offset = base_offset;
+            for elem in elements {
+                collect_constant_relocs(elem, offset, elem_ty, relocs);
+                let elem_bytes = constant_to_bytes_typed(elem, elem_ty);
+                offset += elem_bytes.len() as u64;
+            }
+        }
+        // All other constant types (Integer, Float, String, ZeroInit, Null,
+        // Undefined, LongDouble) contain no symbol references.
+        _ => {}
+    }
+}
+
 fn global_variable_size(global: &crate::ir::module::GlobalVariable) -> u64 {
     // Use the IR type's size information.
     // For BSS globals without initializers, we need the type size.
@@ -2615,6 +2698,7 @@ fn write_relocatable_object(
     functions: &[CompiledFunction],
     globals: &[GlobalSymbolInfo],
     text_relocs: &[crate::backend::traits::FunctionRelocation],
+    data_relocs: &[(u64, String, bool)],
     dwarf: &Option<DwarfSections>,
     module: &IrModule,
     ctx: &CodegenContext,
@@ -2792,17 +2876,30 @@ fn write_relocatable_object(
     // Add external function declaration symbols (undefined).
     // Mark them as STT_FUNC so the dynamic linker creates PLT entries
     // for lazy binding of external function calls (e.g. printf, malloc).
-    for decl in module.declarations() {
-        let sym = ElfSymbol {
-            name: decl.name.clone(),
-            value: 0,
-            size: 0,
-            binding: STB_GLOBAL,
-            sym_type: STT_FUNC,
-            visibility: STV_DEFAULT,
-            section_index: 0, // SHN_UNDEF
-        };
-        writer.add_symbol(sym);
+    //
+    // IMPORTANT: Skip declarations for functions that already have a
+    // definition in this translation unit (i.e., already in `functions`).
+    // C programs commonly forward-declare static functions before defining
+    // them; emitting both a LOCAL defined symbol AND a GLOBAL undefined
+    // symbol for the same name confuses the system linker.
+    {
+        let defined_funcs: crate::common::fx_hash::FxHashSet<&str> =
+            functions.iter().map(|f| f.name.as_str()).collect();
+        for decl in module.declarations() {
+            if defined_funcs.contains(decl.name.as_str()) {
+                continue; // Already defined — skip the undefined entry.
+            }
+            let sym = ElfSymbol {
+                name: decl.name.clone(),
+                value: 0,
+                size: 0,
+                binding: STB_GLOBAL,
+                sym_type: STT_FUNC,
+                visibility: STV_DEFAULT,
+                section_index: 0, // SHN_UNDEF
+            };
+            writer.add_symbol(sym);
+        }
     }
 
     // Add external variable declaration symbols (undefined).
@@ -2877,10 +2974,15 @@ fn write_relocatable_object(
         // Build a name→ELF-symbol-index map that matches the writer's
         // internal ordering: locals first (index 1..), then globals.
         // This mirrors the partitioning in SymbolTable::build_bytes().
+        // IMPORTANT: Must use the same declaration filtering as the
+        // symbol-adding loop above (skip declarations already defined
+        // as functions).
         struct SymEntry {
             name: String,
             binding: u8,
         }
+        let rela_defined_funcs: crate::common::fx_hash::FxHashSet<&str> =
+            functions.iter().map(|f| f.name.as_str()).collect();
         let mut all_syms: Vec<SymEntry> = Vec::new();
         for func in functions.iter() {
             all_syms.push(SymEntry {
@@ -2900,6 +3002,9 @@ fn write_relocatable_object(
             });
         }
         for decl in module.declarations() {
+            if rela_defined_funcs.contains(decl.name.as_str()) {
+                continue; // Filtered — already defined as a function.
+            }
             all_syms.push(SymEntry {
                 name: decl.name.clone(),
                 binding: STB_GLOBAL,
@@ -2944,12 +3049,24 @@ fn write_relocatable_object(
         }
 
         if !rela_data.is_empty() {
-            // The .symtab section is generated automatically by ElfWriter::write()
-            // at index (num_user_sections + 1).  After adding .rela.text, the
-            // total user section count determines the .symtab index.
-            let num_user_after = writer.sections_count() + 1; // +1 for the section we're about to add
-            let symtab_section_idx = (num_user_after + 1) as u32;
-
+            // Pre-compute the .symtab section index.  ElfWriter::write()
+            // places .symtab right after all user sections at index
+            // (total_user + 1).  We must count ALL rela sections that will
+            // be added (not just the current one) so the sh_link value is
+            // correct for every .rela.* section.
+            let rela_count = {
+                let mut c = 1u32; // This .rela.text section
+                let has_rela_data = data_relocs.iter().any(|(_, _, is_ro)| !*is_ro);
+                let has_rela_rodata = data_relocs.iter().any(|(_, _, is_ro)| *is_ro);
+                if has_rela_data {
+                    c += 1;
+                }
+                if has_rela_rodata {
+                    c += 1;
+                }
+                c
+            };
+            let symtab_section_idx_val = (writer.sections_count() as u32) + rela_count + 1;
             let rela_section = Section {
                 name: if is_64 {
                     ".rela.text".to_string()
@@ -2961,8 +3078,230 @@ fn write_relocatable_object(
                 data: rela_data,
                 sh_addralign: if is_64 { 8 } else { 4 },
                 sh_entsize: if is_64 { 24 } else { 8 }, // sizeof(Elf64_Rela) or sizeof(Elf32_Rel)
-                sh_link: symtab_section_idx,            // Points to .symtab
+                sh_link: symtab_section_idx_val,        // Points to .symtab
                 sh_info: text_section_index as u32,     // Section being relocated (.text)
+                logical_size: 0,
+                virtual_address: 0,
+                file_offset_hint: 0,
+            };
+            writer.add_section(rela_section);
+        }
+    }
+
+    // --- .rela.data / .rela.rodata sections (relocations for data sections) ---
+    // GlobalRef constants in global variable initializers produce address
+    // entries that the linker must patch (e.g., a function pointer stored in
+    // a global struct).  Each entry generates an R_X86_64_64 (or
+    // R_AARCH64_ABS64, R_RISCV_64, R_386_32) relocation.
+    if !data_relocs.is_empty() {
+        let is_64 = ctx.target.is_64bit();
+
+        // Determine the absolute-address relocation type for this target.
+        let abs_reloc_type: u32 = match ctx.target {
+            Target::X86_64 => 1,    // R_X86_64_64
+            Target::I686 => 1,      // R_386_32
+            Target::AArch64 => 257, // R_AARCH64_ABS64
+            Target::RiscV64 => 2,   // R_RISCV_64
+        };
+
+        // Ensure all referenced symbols exist in the symbol table. Build a
+        // name→index map reusing the same partitioning logic as .rela.text
+        // (locals first, then globals, starting from index 1 after the null
+        // symbol at index 0).
+        //
+        // First, collect all existing symbol names.
+        let mut known_syms: crate::common::fx_hash::FxHashSet<String> =
+            crate::common::fx_hash::FxHashSet::default();
+        for func in functions.iter() {
+            known_syms.insert(func.name.clone());
+        }
+        for gsym in globals.iter() {
+            known_syms.insert(gsym.name.clone());
+        }
+        for decl in module.declarations() {
+            known_syms.insert(decl.name.clone());
+        }
+        // Add any symbols from text relocs that were already added.
+        for reloc in text_relocs {
+            known_syms.insert(reloc.symbol.clone());
+        }
+
+        // Add undefined symbols for any data reloc targets not yet known.
+        let mut data_extra_undefs: Vec<String> = Vec::new();
+        for (_, sym_name, _) in data_relocs {
+            if !known_syms.contains(sym_name) {
+                known_syms.insert(sym_name.clone());
+                data_extra_undefs.push(sym_name.clone());
+            }
+        }
+        for name in &data_extra_undefs {
+            let sym = ElfSymbol {
+                name: name.clone(),
+                value: 0,
+                size: 0,
+                binding: STB_GLOBAL,
+                sym_type: STT_NOTYPE,
+                visibility: STV_DEFAULT,
+                section_index: 0, // SHN_UNDEF
+            };
+            writer.add_symbol(sym);
+        }
+
+        // Build name→ELF-symbol-index map (same partitioning as .rela.text).
+        // IMPORTANT: Must mirror the EXACT same filtering as the main
+        // symbol-adding loop (declarations already defined as functions
+        // are skipped).
+        struct DataSymEntry {
+            name: String,
+            binding: u8,
+        }
+        let data_defined_funcs: crate::common::fx_hash::FxHashSet<&str> =
+            functions.iter().map(|f| f.name.as_str()).collect();
+        let mut all_syms: Vec<DataSymEntry> = Vec::new();
+        for func in functions.iter() {
+            all_syms.push(DataSymEntry {
+                name: func.name.clone(),
+                binding: func.elf_binding,
+            });
+        }
+        for gsym in globals.iter() {
+            let b = if gsym.is_global {
+                STB_GLOBAL
+            } else {
+                STB_LOCAL
+            };
+            all_syms.push(DataSymEntry {
+                name: gsym.name.clone(),
+                binding: b,
+            });
+        }
+        for decl in module.declarations() {
+            if data_defined_funcs.contains(decl.name.as_str()) {
+                continue; // Filtered — already defined as a function.
+            }
+            all_syms.push(DataSymEntry {
+                name: decl.name.clone(),
+                binding: STB_GLOBAL,
+            });
+        }
+        // Include extra undef symbols from text relocs (if any were added).
+        {
+            let mut text_extra: crate::common::fx_hash::FxHashSet<String> =
+                crate::common::fx_hash::FxHashSet::default();
+            for func in functions.iter() {
+                text_extra.insert(func.name.clone());
+            }
+            for gsym in globals.iter() {
+                text_extra.insert(gsym.name.clone());
+            }
+            for decl in module.declarations() {
+                if data_defined_funcs.contains(decl.name.as_str()) {
+                    continue; // Filtered — already defined as a function.
+                }
+                text_extra.insert(decl.name.clone());
+            }
+            for reloc in text_relocs {
+                if text_extra.insert(reloc.symbol.clone()) {
+                    all_syms.push(DataSymEntry {
+                        name: reloc.symbol.clone(),
+                        binding: STB_GLOBAL,
+                    });
+                }
+            }
+        }
+        for name in &data_extra_undefs {
+            all_syms.push(DataSymEntry {
+                name: name.clone(),
+                binding: STB_GLOBAL,
+            });
+        }
+
+        let locals: Vec<&DataSymEntry> =
+            all_syms.iter().filter(|s| s.binding == STB_LOCAL).collect();
+        let globals_list: Vec<&DataSymEntry> =
+            all_syms.iter().filter(|s| s.binding != STB_LOCAL).collect();
+        let mut sym_name_to_idx: FxHashMap<String, u32> = FxHashMap::default();
+        for (i, sym) in locals.iter().enumerate() {
+            sym_name_to_idx.insert(sym.name.clone(), (i as u32) + 1);
+        }
+        let global_base = (locals.len() as u32) + 1;
+        for (i, sym) in globals_list.iter().enumerate() {
+            sym_name_to_idx.insert(sym.name.clone(), global_base + (i as u32));
+        }
+
+        // Separate data relocs by target section (.data vs .rodata).
+        let mut rela_data_bytes: Vec<u8> = Vec::new();
+        let mut rela_rodata_bytes: Vec<u8> = Vec::new();
+
+        for (offset, sym_name, is_rodata) in data_relocs {
+            let sym_idx = sym_name_to_idx.get(sym_name).copied().unwrap_or(0);
+            let rela_buf = if *is_rodata {
+                &mut rela_rodata_bytes
+            } else {
+                &mut rela_data_bytes
+            };
+
+            if is_64 {
+                let rela = Elf64Rela::new(*offset, sym_idx, abs_reloc_type, 0);
+                rela_buf.extend_from_slice(&rela.to_bytes());
+            } else {
+                let rel = Elf32Rel::new(*offset as u32, sym_idx, abs_reloc_type as u8);
+                rela_buf.extend_from_slice(&rel.to_bytes());
+            }
+        }
+
+        // Pre-compute the .symtab section index for data/rodata relocs.
+        // .symtab is auto-generated at index (total_user_sections + 1).
+        // Count remaining rela sections to be added:
+        let data_rela_remaining = {
+            let mut c = 0u32;
+            if !rela_data_bytes.is_empty() && data_section_index > 0 {
+                c += 1;
+            }
+            if !rela_rodata_bytes.is_empty() && rodata_section_index > 0 {
+                c += 1;
+            }
+            c
+        };
+        let data_symtab_idx = (writer.sections_count() as u32) + data_rela_remaining + 1;
+
+        // Emit .rela.data section.
+        if !rela_data_bytes.is_empty() && data_section_index > 0 {
+            let rela_section = Section {
+                name: if is_64 {
+                    ".rela.data".to_string()
+                } else {
+                    ".rel.data".to_string()
+                },
+                sh_type: if is_64 { SHT_RELA } else { SHT_REL },
+                sh_flags: SHF_INFO_LINK,
+                data: rela_data_bytes,
+                sh_addralign: if is_64 { 8 } else { 4 },
+                sh_entsize: if is_64 { 24 } else { 8 },
+                sh_link: data_symtab_idx,
+                sh_info: data_section_index as u32,
+                logical_size: 0,
+                virtual_address: 0,
+                file_offset_hint: 0,
+            };
+            writer.add_section(rela_section);
+        }
+
+        // Emit .rela.rodata section.
+        if !rela_rodata_bytes.is_empty() && rodata_section_index > 0 {
+            let rela_section = Section {
+                name: if is_64 {
+                    ".rela.rodata".to_string()
+                } else {
+                    ".rel.rodata".to_string()
+                },
+                sh_type: if is_64 { SHT_RELA } else { SHT_REL },
+                sh_flags: SHF_INFO_LINK,
+                data: rela_rodata_bytes,
+                sh_addralign: if is_64 { 8 } else { 4 },
+                sh_entsize: if is_64 { 24 } else { 8 },
+                sh_link: data_symtab_idx,
+                sh_info: rodata_section_index as u32,
                 logical_size: 0,
                 virtual_address: 0,
                 file_offset_hint: 0,
@@ -3027,6 +3366,7 @@ fn add_dwarf_sections(writer: &mut ElfWriter, dwarf: &DwarfSections) {
 fn link_to_final_output(
     object_bytes: &[u8],
     text_relocations: &[crate::backend::traits::FunctionRelocation],
+    data_relocations: &[(u64, String, bool)],
     ctx: &CodegenContext,
     diagnostics: &mut DiagnosticEngine,
 ) -> Result<Vec<u8>, String> {
@@ -3093,6 +3433,57 @@ fn link_to_final_output(
                 section_index: 1, // .text section index in our .o files
                 output_section_name: Some(".text".to_string()),
             });
+    }
+
+    // Convert data-section relocations (GlobalRef entries in global
+    // initializers) into linker-format Relocation entries so the linker
+    // patches absolute addresses in .data/.rodata sections.
+    {
+        // Determine the absolute-address relocation type for this target.
+        let abs_reloc_type: u32 = match ctx.target {
+            Target::X86_64 => 1,    // R_X86_64_64
+            Target::I686 => 1,      // R_386_32
+            Target::AArch64 => 257, // R_AARCH64_ABS64
+            Target::RiscV64 => 2,   // R_RISCV_64
+        };
+
+        // Find the section indices for .data and .rodata in the parsed input.
+        let data_sec_idx = input
+            .sections
+            .iter()
+            .position(|s| s.name == ".data")
+            .map(|i| (i + 1) as u32) // +1 because section 0 is null
+            .unwrap_or(0);
+        let rodata_sec_idx = input
+            .sections
+            .iter()
+            .position(|s| s.name == ".rodata")
+            .map(|i| (i + 1) as u32)
+            .unwrap_or(0);
+
+        for (offset, sym_name, is_rodata) in data_relocations {
+            let sec_idx = if *is_rodata {
+                rodata_sec_idx
+            } else {
+                data_sec_idx
+            };
+            let sec_name = if *is_rodata { ".rodata" } else { ".data" };
+            if sec_idx == 0 {
+                continue; // Section not found — skip relocation.
+            }
+            input
+                .relocations
+                .push(crate::backend::linker_common::relocation::Relocation {
+                    offset: *offset,
+                    symbol_name: sym_name.clone(),
+                    sym_index: 0,
+                    rel_type: abs_reloc_type,
+                    addend: 0,
+                    object_id: 0,
+                    section_index: sec_idx,
+                    output_section_name: Some(sec_name.to_string()),
+                });
+        }
     }
 
     // For executables (not shared libs), inject a CRT `_start` stub that

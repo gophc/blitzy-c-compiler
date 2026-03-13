@@ -2797,6 +2797,67 @@ impl X86_64Encoder {
                 bytes.extend_from_slice(&mem_enc.displacement);
                 EncodedInstruction::new(bytes)
             }
+            // Movsd xmm, Immediate(0) — zero a floating-point register.
+            // Emitted by the register allocator's spill resolution when a
+            // float value maps to Immediate(0) (the get_value fallback for
+            // unmapped Values).  Encode as `xorps xmm, xmm` (0F 57 /r)
+            // which zeroes the entire 128-bit register.
+            (Some(MachineOperand::Register(xmm)), Some(MachineOperand::Immediate(0)))
+                if is_sse(*xmm) =>
+            {
+                let enc = hw_encoding(*xmm) & 0x7;
+                let mut bytes = Vec::with_capacity(5);
+                // REX prefix if xmm >= XMM8 (need both REX.R and REX.B
+                // since the same register appears in both reg and r/m).
+                if let Some(rex) = compute_rex(false, Some(*xmm), None, Some(*xmm)) {
+                    bytes.push(rex);
+                }
+                // xorps xmm, xmm: 0F 57 /r (mod=11, reg=xmm, r/m=xmm)
+                bytes.push(0x0F);
+                bytes.push(0x57);
+                bytes.push(modrm_byte(0b11, enc, enc));
+                EncodedInstruction::new(bytes)
+            }
+            // Movsd xmm, Immediate(non-zero) — materialize a float constant
+            // from its raw bit pattern.  This is unusual (float constants
+            // should normally come from the .rodata pool), but can arise
+            // when the constant cache misses.  We store the 64-bit
+            // immediate to a temporary stack slot and load it back via
+            // movsd.  We use [RSP-8] as scratch space (below the current
+            // RSP, inside the red zone on System V AMD64).
+            (Some(MachineOperand::Register(xmm)), Some(MachineOperand::Immediate(val)))
+                if is_sse(*xmm) =>
+            {
+                let mut bytes = Vec::with_capacity(32);
+                let imm_bytes = (*val).to_le_bytes();
+                // mov qword [rsp-8], imm32 (if fits) or mov rax, imm64 + mov [rsp-8], rax
+                // Use: sub rsp, 8; mov [rsp], low32; mov [rsp+4], high32; movsd xmm, [rsp]; add rsp, 8
+                // Simplest: push the 64-bit value via two 32-bit halves.
+                // Actually use MOV r64, imm64 via RAX then MOV [RSP-8], RAX then MOVSD xmm, [RSP-8].
+                let lo = i64::from_le_bytes(imm_bytes);
+                // REX.W MOV RAX, imm64: 48 B8 <8 bytes>
+                bytes.push(0x48);
+                bytes.push(0xB8);
+                bytes.extend_from_slice(&lo.to_le_bytes());
+                // MOV [RSP - 8], RAX: 48 89 44 24 F8
+                bytes.push(0x48);
+                bytes.push(0x89);
+                bytes.push(0x44); // ModRM: mod=01, reg=RAX(0), r/m=100 (SIB)
+                bytes.push(0x24); // SIB: scale=0, index=RSP(4), base=RSP(4)
+                bytes.push(0xF8u8); // disp8 = -8
+                                    // MOVSD xmm, [RSP - 8]: F2 [REX] 0F 10 /r
+                bytes.push(0xF2);
+                if let Some(rex) = compute_rex(false, Some(*xmm), None, Some(RSP)) {
+                    bytes.push(rex);
+                }
+                bytes.push(0x0F);
+                bytes.push(0x10);
+                let xmm_enc = hw_encoding(*xmm) & 0x7;
+                bytes.push(0x44 | (xmm_enc << 3)); // ModRM: mod=01, reg=xmm, r/m=100 (SIB)
+                bytes.push(0x24); // SIB: RSP-based
+                bytes.push(0xF8u8); // disp8 = -8
+                EncodedInstruction::new(bytes)
+            }
             _ => {
                 eprintln!(
                     "[UD2] opcode={} ops={:?} res={:?}",
@@ -2962,6 +3023,44 @@ impl X86_64Encoder {
                     bytes.push(s);
                 }
                 bytes.extend_from_slice(&mem_enc.displacement);
+                EncodedInstruction::new(bytes)
+            }
+            // Movss xmm, Immediate(0) — zero the register via xorps.
+            (Some(MachineOperand::Register(xmm)), Some(MachineOperand::Immediate(0)))
+                if is_sse(*xmm) =>
+            {
+                let enc = hw_encoding(*xmm) & 0x7;
+                let mut bytes = Vec::with_capacity(5);
+                if let Some(rex) = compute_rex(false, Some(*xmm), None, Some(*xmm)) {
+                    bytes.push(rex);
+                }
+                bytes.push(0x0F);
+                bytes.push(0x57);
+                bytes.push(modrm_byte(0b11, enc, enc));
+                EncodedInstruction::new(bytes)
+            }
+            // Movss xmm, Immediate(non-zero) — materialize via stack scratch.
+            (Some(MachineOperand::Register(xmm)), Some(MachineOperand::Immediate(val)))
+                if is_sse(*xmm) =>
+            {
+                let mut bytes = Vec::with_capacity(24);
+                // MOV dword [RSP-4], imm32: C7 44 24 FC <imm32>
+                bytes.push(0xC7);
+                bytes.push(0x44);
+                bytes.push(0x24);
+                bytes.push(0xFC_u8); // disp8 = -4
+                bytes.extend_from_slice(&(*val as i32).to_le_bytes());
+                // MOVSS xmm, [RSP-4]: F3 [REX] 0F 10 /r
+                bytes.push(0xF3);
+                if let Some(rex) = compute_rex(false, Some(*xmm), None, Some(RSP)) {
+                    bytes.push(rex);
+                }
+                bytes.push(0x0F);
+                bytes.push(0x10);
+                let xmm_enc = hw_encoding(*xmm) & 0x7;
+                bytes.push(0x44 | (xmm_enc << 3));
+                bytes.push(0x24);
+                bytes.push(0xFC_u8);
                 EncodedInstruction::new(bytes)
             }
             _ => {

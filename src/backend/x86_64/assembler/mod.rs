@@ -1554,7 +1554,10 @@ mod tests {
             vreg_to_ir_value: crate::common::fx_hash::FxHashMap::default(),
             sse_vregs: crate::common::fx_hash::FxHashSet::default(),
             va_save_area_offset: None,
+            va_fp_save_area_offset: None,
+            va_control_offset: None,
             named_gpr_count: 0,
+            named_fp_count: 0,
         }
     }
 

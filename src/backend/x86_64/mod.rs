@@ -439,8 +439,7 @@ impl ArchCodegen for X86_64Backend {
         }
 
         // For variadic functions: save the 6 integer parameter registers
-        // (RDI, RSI, RDX, RCX, R8, R9) to the register save area so that
-        // va_start / va_arg can locate all variadic arguments.
+        // (RDI, RSI, RDX, RCX, R8, R9) to the GPR save area.
         if let Some(va_offset) = mf.va_save_area_offset {
             let save_regs: [u16; 6] = [
                 registers::RDI,
@@ -462,6 +461,87 @@ impl ArchCodegen for X86_64Backend {
                 save.operands.push(MachineOperand::Register(reg));
                 prologue.push(save);
             }
+        }
+
+        // For variadic functions: save XMM0–XMM7 (low 64-bit each) to
+        // the FP save area using movsd.
+        if let Some(fp_offset) = mf.va_fp_save_area_offset {
+            let xmm_regs: [u16; 8] = [
+                registers::XMM0,
+                registers::XMM1,
+                registers::XMM2,
+                registers::XMM3,
+                registers::XMM4,
+                registers::XMM5,
+                registers::XMM6,
+                registers::XMM7,
+            ];
+            for (i, &reg) in xmm_regs.iter().enumerate() {
+                let disp = fp_offset as i64 + (i as i64) * 8;
+                let mut save = MachineInstruction::new(X86Opcode::Movsd.as_u32());
+                save.operands.push(MachineOperand::Memory {
+                    base: Some(RBP),
+                    index: None,
+                    scale: 1,
+                    displacement: disp,
+                });
+                save.operands.push(MachineOperand::Register(reg));
+                prologue.push(save);
+            }
+        }
+
+        // For variadic functions: initialize the 16-byte va_control block.
+        // [ctrl+0] = gp_ptr, [ctrl+8] = fp_ptr.
+        if let (Some(ctrl_offset), Some(gpr_offset), Some(fp_offset)) = (
+            mf.va_control_offset,
+            mf.va_save_area_offset,
+            mf.va_fp_save_area_offset,
+        ) {
+            // gp_ptr = RBP + gpr_save_offset + named_gpr_count * 8
+            let gp_ptr_disp = gpr_offset as i64 + (mf.named_gpr_count as i64) * 8;
+            let mut lea_gp = MachineInstruction::new(X86Opcode::Lea.as_u32());
+            lea_gp.result = Some(MachineOperand::Register(registers::RAX));
+            lea_gp.operands.push(MachineOperand::Memory {
+                base: Some(RBP),
+                index: None,
+                scale: 1,
+                displacement: gp_ptr_disp,
+            });
+            prologue.push(lea_gp);
+            let mut store_gp = MachineInstruction::new(X86Opcode::Mov.as_u32());
+            store_gp.operands.push(MachineOperand::Memory {
+                base: Some(RBP),
+                index: None,
+                scale: 1,
+                displacement: ctrl_offset as i64,
+            });
+            store_gp
+                .operands
+                .push(MachineOperand::Register(registers::RAX));
+            prologue.push(store_gp);
+
+            // fp_ptr = RBP + fp_save_offset + named_fp_count * 8
+            let fp_ptr_disp = fp_offset as i64 + (mf.named_fp_count as i64) * 8;
+            let mut lea_fp = MachineInstruction::new(X86Opcode::Lea.as_u32());
+            lea_fp.result = Some(MachineOperand::Register(registers::RAX));
+            lea_fp.operands.push(MachineOperand::Memory {
+                base: Some(RBP),
+                index: None,
+                scale: 1,
+                displacement: fp_ptr_disp,
+            });
+            prologue.push(lea_fp);
+            let mut store_fp = MachineInstruction::new(X86Opcode::Mov.as_u32());
+            store_fp.operands.push(MachineOperand::Memory {
+                base: Some(RBP),
+                index: None,
+                scale: 1,
+                displacement: ctrl_offset as i64 + 8,
+            });
+            store_fp
+                .operands
+                .push(MachineOperand::Register(registers::RAX));
+            prologue.push(store_fp);
         }
 
         prologue

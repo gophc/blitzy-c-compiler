@@ -723,6 +723,13 @@ pub struct IrModule {
     /// `lower_function_call` can recover the correct C return type even
     /// when the callee IR value is typed as an opaque `Pointer(Void)`.
     pub func_c_return_types: FxHashMap<String, crate::common::types::CType>,
+
+    /// Maps global variable name to its original C-level type.  Populated
+    /// during `lower_global_variable` so that expression lowering can recover
+    /// the full C type (including struct field names and function pointer
+    /// signatures) instead of relying on the lossy `ir_type_to_approx_ctype`
+    /// conversion from the stored `IrType`.
+    pub global_c_types: FxHashMap<String, crate::common::types::CType>,
 }
 
 // ===========================================================================
@@ -763,6 +770,7 @@ impl IrModule {
             func_ref_map: FxHashMap::default(),
             global_var_refs: FxHashMap::default(),
             func_c_return_types: FxHashMap::default(),
+            global_c_types: FxHashMap::default(),
         }
     }
 }
