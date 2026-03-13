@@ -495,6 +495,15 @@ impl<'a> SemanticAnalyzer<'a> {
             return self.handle_static_assert(decl);
         }
 
+        // Check if this is an __auto_type declaration (GCC extension).
+        // For __auto_type, we defer type resolution until the initializer
+        // expression is analyzed, then use its type.
+        let is_auto_type = decl
+            .specifiers
+            .type_specifiers
+            .iter()
+            .any(|s| matches!(s, TypeSpecifier::AutoType));
+
         // Resolve the base type from declaration specifiers.
         let base_type = self.resolve_type_from_specifiers(&decl.specifiers);
 
@@ -515,7 +524,20 @@ impl<'a> SemanticAnalyzer<'a> {
             let id_span = init_decl.span;
 
             // Build the fully-qualified type from the base type and declarator.
-            let full_type = self.apply_declarator_to_type(base_type.clone(), &init_decl.declarator);
+            let mut full_type =
+                self.apply_declarator_to_type(base_type.clone(), &init_decl.declarator);
+
+            // For __auto_type declarations, infer the actual type from the
+            // initializer expression. This GCC extension acts like C++ `auto`:
+            //   __auto_type __ptr = &(p);  // type = typeof(&(p))
+            //   __auto_type __val = *__ptr; // type = typeof(*__ptr)
+            if is_auto_type {
+                if let Some(Initializer::Expression(ref mut expr)) = init_decl.initializer {
+                    if let Ok(inferred) = self.analyze_expression(expr) {
+                        full_type = inferred;
+                    }
+                }
+            }
 
             // Extract the declared name.
             let name = self.extract_declarator_name(&init_decl.declarator);
