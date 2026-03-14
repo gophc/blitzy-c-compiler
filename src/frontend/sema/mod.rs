@@ -2054,7 +2054,10 @@ impl<'a> SemanticAnalyzer<'a> {
                     if let Expression::IntegerLiteral { value, .. } = s.as_ref() {
                         Some(*value as usize)
                     } else {
-                        None
+                        // Evaluate non-literal array size expressions
+                        // (e.g. sizeof-based expressions) for correct
+                        // type layout in abstract declarator contexts.
+                        self.try_eval_attr_const_expr(s).map(|v| v as usize)
                     }
                 });
                 let arr_ty = CType::Array(Box::new(base), arr_size);
@@ -2539,24 +2542,15 @@ impl<'a> SemanticAnalyzer<'a> {
                 // definition is looked up later only when field access or
                 // sizeof computation actually requires it.
                 if spec.members.is_none() {
-                    // This is a tag *reference* (e.g. `struct foo *p;`),
-                    // NOT a definition.  Return a minimal type object.
-                    let tag_str = self.interner.resolve(tag_name).to_string();
-                    return if is_struct {
-                        CType::Struct {
-                            name: Some(tag_str),
-                            fields: Vec::new(),
-                            packed: false,
-                            aligned: None,
-                        }
-                    } else {
-                        CType::Union {
-                            name: Some(tag_str),
-                            fields: Vec::new(),
-                            packed: false,
-                            aligned: None,
-                        }
-                    };
+                    // This is a tag *reference* (e.g. `struct foo var;`),
+                    // NOT a definition.  Return the full type from the tag
+                    // namespace so that sizeof computation on embedded
+                    // (by-value) struct fields works correctly.  The
+                    // previous "lightweight tag reference" optimisation
+                    // returned an empty-fields CType that caused
+                    // sizeof(Outer) to exclude embedded struct fields when
+                    // computing struct layout.
+                    return entry.ty.clone();
                 }
                 // This is a re-definition or has a body — clone fully.
                 return entry.ty.clone();
@@ -2714,19 +2708,29 @@ impl<'a> SemanticAnalyzer<'a> {
                     if let Expression::IntegerLiteral { value, .. } = s.as_ref() {
                         Some(*value as usize)
                     } else {
-                        None
+                        // Evaluate non-literal array size expressions
+                        // (e.g. sizeof(T)*8, (int)(sizeof(T)*N), BMS,
+                        // etc.) through the constant expression evaluator.
+                        // This is critical for correct struct layout when
+                        // array sizes involve sizeof, casts, or arithmetic.
+                        self.try_eval_attr_const_expr(s).map(|v| v as usize)
                     }
                 });
 
-                // When the inner DD is Parenthesized, the parenthesized
-                // declarator wraps the array type (e.g. `int (*arr)[5]`
-                // → `Pointer(Array(Int, 5))`).
+                // Build the array type with the CURRENT dimension applied
+                // to the base type first, then recurse outward.  This
+                // produces the correct nesting for multi-dimensional
+                // arrays.  E.g. `int a[3][4]` has AST
+                //   Array(size=4, inner=Array(size=3, inner=Ident))
+                // The outermost AST node's size (4) is the INNERMOST
+                // dimension in C: `a[i]` yields `int[4]`.  So we wrap
+                // `base` with the current size first, then let the
+                // recursive call wrap the result with the next dimension.
+                let arr_type = CType::Array(Box::new(base), array_size);
                 if let DirectDeclarator::Parenthesized(inner_decl) = inner_dd.as_ref() {
-                    let arr_type = CType::Array(Box::new(base), array_size);
                     self.apply_declarator_to_type(arr_type, inner_decl)
                 } else {
-                    let inner_type = self.apply_direct_declarator_to_type(base, inner_dd);
-                    CType::Array(Box::new(inner_type), array_size)
+                    self.apply_direct_declarator_to_type(arr_type, inner_dd)
                 }
             }
             DirectDeclarator::Function {

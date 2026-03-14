@@ -814,6 +814,15 @@ pub struct MachineFunction {
     /// Number of named (non-variadic) FP parameters.  Used by va_start
     /// to compute the address of the first variadic FP argument.
     pub named_fp_count: usize,
+
+    /// Number of parameter-loading MOV instructions injected at the start
+    /// of the entry block during instruction selection.
+    ///
+    /// Used by [`resolve_param_load_conflicts`] to limit its scan to only
+    /// the true parameter copies (ABI register → virtual register) and
+    /// avoid incorrectly including register-allocator-inserted copies that
+    /// happen to source from ABI registers.
+    pub num_param_moves: usize,
 }
 
 impl MachineFunction {
@@ -840,6 +849,7 @@ impl MachineFunction {
             va_control_offset: None,
             named_gpr_count: 0,
             named_fp_count: 0,
+            num_param_moves: 0,
         }
     }
 

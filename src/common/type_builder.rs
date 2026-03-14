@@ -41,6 +41,12 @@ pub struct FieldLayout {
     pub size: usize,
     /// Natural alignment of the field in bytes.
     pub alignment: usize,
+    /// For bitfield members, contains `Some((bit_offset_in_unit, bit_width))`
+    /// where `bit_offset_in_unit` is the bit position of this field within
+    /// its storage unit (starting from bit 0 = LSB on little-endian),
+    /// and `bit_width` is the number of bits in the bitfield.
+    /// `None` for regular (non-bitfield) fields.
+    pub bitfield_info: Option<(usize, usize)>,
 }
 
 // ===========================================================================
@@ -259,6 +265,7 @@ impl TypeBuilder {
                 offset,
                 size: field_size,
                 alignment: field_align,
+                bitfield_info: None,
             });
 
             // Advance past this field (flex contributes 0).
@@ -301,12 +308,15 @@ impl TypeBuilder {
         explicit_align: Option<usize>,
     ) -> StructLayout {
         let mut field_layouts = Vec::with_capacity(fields.len());
-        let mut offset: usize = 0;
-        let mut bit_offset: u32 = 0; // Bit offset within the current allocation unit.
+        // Track position as absolute bit offset from the struct start.
+        // This matches the algorithm in `compute_struct_size` (types.rs)
+        // which correctly handles bitfield packing per the System V ABI:
+        // bitfields are placed at the current bit position within a
+        // natural-alignment region of their storage unit type, without
+        // forcing alignment of the storage unit itself.
+        let mut abs_bit: usize = 0;
         let mut max_field_align: usize = 1;
         let mut has_flexible_array = false;
-        let mut in_bitfield = false; // Track whether we are inside a bitfield run.
-        let mut current_unit_size: usize = 0; // Size of the current bitfield allocation unit.
 
         for (i, field) in fields.iter().enumerate() {
             let is_last = i == fields.len() - 1;
@@ -316,82 +326,84 @@ impl TypeBuilder {
             }
 
             if let Some(bits) = field.bit_width {
+                let bits = bits as usize;
                 // ----- Bitfield handling -----
-                if bits == 0 {
-                    // Zero-width bitfield: force alignment to the next
-                    // allocation unit boundary.
-                    if in_bitfield {
-                        // Finish the current allocation unit.
-                        offset += current_unit_size;
-                        bit_offset = 0;
-                        in_bitfield = false;
-                        current_unit_size = 0;
-                    }
-                    let unit_align = if packed {
-                        1
-                    } else {
-                        alignof_ctype(&field.ty, &self.target)
-                    };
-                    offset = align_up(offset, unit_align);
-                    if unit_align > max_field_align {
-                        max_field_align = unit_align;
-                    }
-                    // Zero-width bitfields produce a field layout entry at
-                    // the aligned offset with zero size.
-                    field_layouts.push(FieldLayout {
-                        offset,
-                        size: 0,
-                        alignment: unit_align,
-                    });
-                    continue;
-                }
-
                 let unit_type_size = sizeof_ctype(&field.ty, &self.target);
                 let unit_type_align = if packed {
                     1
                 } else {
                     alignof_ctype(&field.ty, &self.target)
                 };
+                let unit_size_bits = unit_type_size * 8;
 
-                let total_bits_in_unit = (unit_type_size as u32) * 8;
-
-                if !in_bitfield {
-                    // Start a new bitfield allocation unit.
-                    offset = align_up(offset, unit_type_align);
-                    bit_offset = 0;
-                    current_unit_size = unit_type_size;
-                    in_bitfield = true;
+                if bits == 0 {
+                    // Zero-width bitfield: pad to next alignment boundary
+                    // of the underlying type, then close the current
+                    // storage unit.
+                    let align_bits = unit_type_align * 8;
+                    if align_bits > 0 {
+                        abs_bit = align_up(abs_bit, align_bits);
+                    }
+                    if unit_type_align > max_field_align {
+                        max_field_align = unit_type_align;
+                    }
+                    let byte_off = abs_bit / 8;
+                    field_layouts.push(FieldLayout {
+                        offset: byte_off,
+                        size: 0,
+                        alignment: unit_type_align,
+                        bitfield_info: Some((0, 0)),
+                    });
+                    continue;
                 }
 
-                // Check if the bitfield fits in the current allocation unit.
-                if bit_offset + bits > total_bits_in_unit {
-                    // Does not fit — close the current unit and start a new one.
-                    offset += current_unit_size;
-                    offset = align_up(offset, unit_type_align);
-                    bit_offset = 0;
-                    current_unit_size = unit_type_size;
+                // Determine the natural-alignment region that contains the
+                // current bit position.  Regions are sized to the storage
+                // unit type (e.g. 32 bits for `unsigned int`) and start at
+                // multiples of `unit_type_align * 8` bits from the struct
+                // start.
+                let unit_align_bits = if packed { 8 } else { unit_type_align * 8 };
+                let unit_start = if unit_align_bits > 0 {
+                    (abs_bit / unit_align_bits) * unit_align_bits
+                } else {
+                    abs_bit
+                };
+                let bits_used_in_unit = abs_bit - unit_start;
+
+                if bits_used_in_unit + bits > unit_size_bits {
+                    // Doesn't fit in the current storage unit — advance to
+                    // the next unit boundary.
+                    abs_bit = unit_start + unit_size_bits;
+                    // Re-align for the new unit.
+                    let byte_offset = (abs_bit + 7) / 8;
+                    let aligned_byte = align_up(byte_offset, unit_type_align);
+                    abs_bit = aligned_byte * 8;
                 }
+
+                // The byte offset of the storage unit containing this
+                // bitfield.  Compute as the aligned-down byte position.
+                let bf_byte = (abs_bit / 8) & !(unit_type_align - 1).max(0);
+
+                // Compute the bit offset within the storage unit.
+                let bit_offset_in_unit = abs_bit - bf_byte * 8;
 
                 field_layouts.push(FieldLayout {
-                    offset,
+                    offset: bf_byte,
                     size: unit_type_size,
                     alignment: unit_type_align,
+                    bitfield_info: Some((bit_offset_in_unit, bits)),
                 });
 
-                bit_offset += bits;
+                abs_bit += bits;
 
                 if unit_type_align > max_field_align {
                     max_field_align = unit_type_align;
                 }
             } else {
                 // ----- Regular (non-bitfield) field -----
-                // Close any open bitfield allocation unit.
-                if in_bitfield {
-                    offset += current_unit_size;
-                    bit_offset = 0;
-                    in_bitfield = false;
-                    current_unit_size = 0;
-                }
+                // Round up to byte boundary (close any partial bitfield
+                // byte).
+                let byte_offset = (abs_bit + 7) / 8;
 
                 let field_size = if is_flex {
                     0
@@ -405,15 +417,16 @@ impl TypeBuilder {
                     alignof_ctype(&field.ty, &self.target)
                 };
 
-                offset = align_up(offset, field_align);
+                let aligned_byte = align_up(byte_offset, field_align);
 
                 field_layouts.push(FieldLayout {
-                    offset,
+                    offset: aligned_byte,
                     size: field_size,
                     alignment: field_align,
+                    bitfield_info: None,
                 });
 
-                offset += field_size;
+                abs_bit = (aligned_byte + field_size) * 8;
 
                 if field_align > max_field_align {
                     max_field_align = field_align;
@@ -421,13 +434,11 @@ impl TypeBuilder {
             }
         }
 
-        // Close any trailing bitfield allocation unit.
-        if in_bitfield {
-            offset += current_unit_size;
-        }
+        // Convert final bit offset to bytes (round up).
+        let final_byte = (abs_bit + 7) / 8;
 
         let struct_align = compute_aggregate_alignment(max_field_align, packed, explicit_align);
-        let total_size = align_up(offset, struct_align);
+        let total_size = align_up(final_byte, struct_align);
 
         StructLayout {
             fields: field_layouts,
@@ -478,6 +489,7 @@ impl TypeBuilder {
                 offset: 0, // All union fields start at offset 0.
                 size: field_size,
                 alignment: field_align,
+                bitfield_info: None,
             });
 
             if field_size > max_size {

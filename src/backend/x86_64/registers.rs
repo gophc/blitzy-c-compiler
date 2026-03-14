@@ -210,6 +210,23 @@ pub fn needs_rex(reg: u16) -> bool {
     hw_encoding(reg) >= 8
 }
 
+/// Returns `true` when `reg` requires a mandatory REX prefix for byte-sized
+/// operand access on x86-64.
+///
+/// Registers RSP, RBP, RSI, and RDI (hardware encodings 4–7) map to the
+/// legacy high-byte registers %ah, %ch, %dh, %bh in byte context when no
+/// REX prefix is present. A REX prefix (even the bare 0x40) redirects the
+/// encoding to the low-byte forms %spl, %bpl, %sil, %dil. Without this
+/// prefix, byte operations on these registers silently access the wrong
+/// physical storage.
+#[inline]
+pub fn needs_rex_for_byte_reg(reg: u16) -> bool {
+    let enc = hw_encoding(reg);
+    // hw encodings 4-7 are RSP/RBP/RSI/RDI — they need REX for byte access
+    // hw encodings 8+ already need REX (R8-R15) — handled by needs_rex()
+    (4..8).contains(&enc)
+}
+
 /// Returns `true` if `reg` is callee-saved per the System V AMD64 ABI.
 ///
 /// Callee-saved: RBX, RBP, R12, R13, R14, R15.

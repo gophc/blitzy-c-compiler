@@ -105,13 +105,26 @@ pub fn lower_global_variable(
     let attributes = &specifiers.attributes;
 
     let is_thread_local = matches!(storage_class, Some(ast::StorageClass::ThreadLocal));
-    let is_const = specifiers
+    let spec_has_const = specifiers
         .type_qualifiers
         .iter()
         .any(|q| matches!(q, ast::TypeQualifier::Const));
 
     for init_decl in &decl.declarators {
         let declarator = &init_decl.declarator;
+
+        // Determine whether the *variable* itself is const.  When the
+        // declarator contains a pointer derivation (e.g. `const char *p`),
+        // the specifier-level `const` qualifies the pointee, not the
+        // pointer variable — so the variable is mutable and must go in
+        // `.data`, not `.rodata`.  Only when the declarator adds no pointer
+        // (e.g. `const int x`) does the specifier `const` apply to the
+        // variable itself.
+        let is_const = if declarator.pointer.is_some() {
+            false
+        } else {
+            spec_has_const
+        };
 
         let var_name = match extract_declarator_name(declarator, name_table) {
             Some(name) => name,
@@ -162,12 +175,35 @@ pub fn lower_global_variable(
             }
             _ => c_type,
         };
+
+        // Resolve forward-referenced struct/union types so the IR type
+        // carries the full field list (needed for correct initializer byte
+        // layout and struct size computation in the backend).
+        let c_type = {
+            let mut ct = c_type;
+            super::SIZEOF_STRUCT_DEFS.with(|defs| {
+                if let Some(ref sd) = *defs.borrow() {
+                    resolve_struct_forward_ref(&mut ct, sd);
+                }
+            });
+            ct
+        };
         let ir_type = IrType::from_ctype(&c_type, target);
 
         let linkage = determine_linkage(storage_class, attributes, name_table);
         let _visibility = determine_visibility(attributes, name_table);
         let section = extract_section_attribute(attributes, name_table);
         let alignment = extract_alignment_attribute(attributes, name_table);
+
+        // Post-process: convert any Constant::String values at
+        // pointer-typed positions into Constant::GlobalRef pointing to
+        // interned string literals in .rodata.  Without this, string
+        // literal initializers for `const char *` struct fields would be
+        // written inline (as raw bytes) rather than as a pointer +
+        // relocation to a .rodata entry.
+        let initializer = initializer.map(|init| {
+            fixup_string_ptrs_in_constant(init, &ir_type, module)
+        });
 
         let var_name_owned = var_name.clone();
         let mut global = GlobalVariable::new(var_name, ir_type, initializer);
@@ -184,6 +220,58 @@ pub fn lower_global_variable(
         module.global_c_types.insert(var_name_owned, c_type.clone());
 
         module.add_global(global);
+    }
+}
+
+// ===========================================================================
+// String-in-pointer fixup for static initializers
+// ===========================================================================
+
+/// Recursively walks a `Constant` initializer alongside its IR type tree
+/// and replaces `Constant::String` values that appear at `IrType::Ptr`
+/// positions with `Constant::GlobalRef` entries.  The raw string bytes
+/// are interned into the module's string pool (→ `.rodata`), and the
+/// resulting label (e.g. `.L.str.N`) is used for the `GlobalRef`.
+///
+/// This is necessary because `evaluate_initializer_constant` always
+/// produces `Constant::String(bytes)` for string literals — correct for
+/// `char arr[] = "hello"` (array) but wrong for `const char *p = "hello"`
+/// (pointer), where the struct field must hold an address, not inline data.
+fn fixup_string_ptrs_in_constant(
+    constant: Constant,
+    ir_ty: &IrType,
+    module: &mut IrModule,
+) -> Constant {
+    match (&constant, ir_ty) {
+        // Core case: a String constant at a Ptr-typed position.
+        // Intern the bytes and produce a GlobalRef.
+        (Constant::String(bytes), IrType::Ptr) => {
+            let id = module.intern_string(bytes.clone());
+            let label = format!(".L.str.{}", id);
+            Constant::GlobalRef(label)
+        }
+        // Recurse into struct fields.
+        (Constant::Struct(fields), IrType::Struct(st)) => {
+            let new_fields: Vec<Constant> = fields
+                .iter()
+                .enumerate()
+                .map(|(i, field)| {
+                    let ft = st.fields.get(i).unwrap_or(ir_ty);
+                    fixup_string_ptrs_in_constant(field.clone(), ft, module)
+                })
+                .collect();
+            Constant::Struct(new_fields)
+        }
+        // Recurse into array elements.
+        (Constant::Array(elements), IrType::Array(elem_ty, _)) => {
+            let new_elems: Vec<Constant> = elements
+                .iter()
+                .map(|e| fixup_string_ptrs_in_constant(e.clone(), elem_ty, module))
+                .collect();
+            Constant::Array(new_elems)
+        }
+        // Everything else passes through unchanged.
+        _ => constant,
     }
 }
 
@@ -257,7 +345,11 @@ pub fn lower_function_definition(
     let mut ir_params = Vec::with_capacity(param_declarations.len());
     for param_decl in &param_declarations {
         let param_name = extract_param_name(param_decl, name_table);
-        let param_c_type = resolve_param_type(param_decl, target, name_table);
+        let mut param_c_type = resolve_param_type(param_decl, target, name_table);
+        // Resolve struct forward references so the IR type has the full
+        // field layout — required for correct ABI classification (e.g.,
+        // 16-byte structs passed in register pairs).
+        resolve_struct_forward_ref(&mut param_c_type, struct_defs);
         let param_ir_type = IrType::from_ctype(&param_c_type, target);
         let param_value = builder.fresh_value();
         ir_params.push(FunctionParam::new(param_name, param_ir_type, param_value));
@@ -387,11 +479,14 @@ pub fn lower_function_definition(
     for local_info in &locals {
         local_types.insert(local_info.name.clone(), local_info.c_type.clone());
     }
-    // Add parameter types as well.
+    // Add parameter types as well — resolve struct forward references so
+    // that `struct Item *arr` parameter types carry the full struct layout,
+    // enabling correct sizeof computation for pointer arithmetic.
     for param_decl in &param_declarations {
         let pname = extract_param_name(param_decl, name_table);
         if !pname.is_empty() {
-            let ptype = resolve_param_type(param_decl, target, name_table);
+            let mut ptype = resolve_param_type(param_decl, target, name_table);
+            resolve_struct_forward_ref(&mut ptype, struct_defs);
             local_types.insert(pname, ptype);
         }
     }
@@ -457,6 +552,7 @@ pub fn lower_function_definition(
             struct_defs,
             current_function_name: Some(&func_name),
             scope_type_overrides: FxHashMap::default(),
+            return_ctype: Some(return_c_type.clone()),
         };
         stmt_lowering::lower_statement(&mut stmt_ctx, &body_stmt);
     }
@@ -544,7 +640,19 @@ pub fn lower_local_initializer(
 ) {
     match initializer {
         ast::Initializer::Expression(expr) => {
-            let init_val = expr_lowering::lower_expression(ctx, expr);
+            // Lower the expression and get its C type so we can insert
+            // an implicit conversion when the variable type differs.
+            // This is critical for cases like `char *p = 0;` where the
+            // literal 0 has type `int` (I32) but the variable needs a
+            // pointer-width (I64) store to initialize all 8 bytes.
+            let typed_val = expr_lowering::lower_expression_typed(ctx, expr);
+            let init_val = expr_lowering::insert_implicit_conversion(
+                ctx,
+                typed_val.value,
+                &typed_val.ty,
+                var_type,
+                Span::dummy(),
+            );
             let store_inst = ctx.builder.build_store(init_val, var_alloca, Span::dummy());
             emit_inst_to_ctx(ctx, store_inst);
         }
@@ -748,7 +856,7 @@ fn lower_single_init_element(
 // ===========================================================================
 
 /// Evaluate an AST initializer as a compile-time constant for global variables.
-fn evaluate_initializer_constant(
+pub(super) fn evaluate_initializer_constant(
     init: &ast::Initializer,
     expected_type: &CType,
     target: &Target,
@@ -1275,6 +1383,11 @@ fn allocate_parameters(
         }
 
         let param_c_type = resolve_param_type(param_decl, target, name_table);
+        // Resolve forward-referenced struct/union tag references to their
+        // full definitions so that the alloca gets the correct size.
+        // Without this, `union YYMINORTYPE minor` (tag reference without
+        // body) would produce a 0-byte alloca instead of the full union size.
+        let param_c_type = resolve_sizeof_struct_ref(param_c_type, target);
         let param_ir_type = IrType::from_ctype(&param_c_type, target);
 
         let (alloca_val, alloca_inst) = builder.build_alloca(param_ir_type, Span::dummy());
@@ -1534,7 +1647,10 @@ fn allocate_local_variables(
     local_vars: &mut FxHashMap<String, Value>,
 ) {
     for (idx, local) in locals.iter().enumerate() {
-        let ir_type = IrType::from_ctype(&local.c_type, target);
+        // Resolve forward-referenced struct/union tag references so the
+        // alloca size matches the full struct/union definition.
+        let resolved_type = resolve_sizeof_struct_ref(local.c_type.clone(), target);
+        let ir_type = IrType::from_ctype(&resolved_type, target);
         let (alloca_val, alloca_inst) = builder.build_alloca(ir_type.clone(), local.span);
         push_inst_to_entry(function, alloca_inst);
         local_vars.insert(local.name.clone(), alloca_val);
@@ -1569,38 +1685,28 @@ fn lower_static_local(
     init_expr: Option<&ast::Initializer>,
     module: &mut IrModule,
     target: &Target,
-    _type_builder: &TypeBuilder,
-    _diagnostics: &mut DiagnosticEngine,
+    type_builder: &TypeBuilder,
+    diagnostics: &mut DiagnosticEngine,
 ) {
     let mangled_name = format!("{}.{}", func_name, name);
 
     // Attempt to extract a compile-time constant from the initializer.
+    // Delegate to evaluate_initializer_constant so that function pointers,
+    // address-of expressions, designated initializers, and other non-trivial
+    // constant expressions are handled correctly — matching how global
+    // variable initializers are processed.
+    let name_table: Vec<String> =
+        super::INTERNER_SNAPSHOT.with(|snap| snap.borrow().as_ref().cloned().unwrap_or_default());
     let constant = if has_initializer {
-        if let Some(ast::Initializer::Expression(expr)) = init_expr {
-            eval_static_init_expr(expr, c_type)
-        } else if let Some(ast::Initializer::List {
-            designators_and_initializers,
-            ..
-        }) = init_expr
-        {
-            // Brace-init list for arrays/structs — lower each element.
-            let mut elems = Vec::new();
-            for di in designators_and_initializers {
-                if let ast::Initializer::Expression(expr) = &di.initializer {
-                    if let Some(c) = eval_static_init_expr(expr, c_type) {
-                        elems.push(c);
-                    } else {
-                        elems.push(Constant::ZeroInit);
-                    }
-                } else {
-                    elems.push(Constant::ZeroInit);
-                }
-            }
-            if elems.is_empty() {
-                Some(Constant::ZeroInit)
-            } else {
-                Some(Constant::Array(elems))
-            }
+        if let Some(init) = init_expr {
+            evaluate_initializer_constant(
+                init,
+                c_type,
+                target,
+                type_builder,
+                diagnostics,
+                &name_table,
+            )
         } else {
             Some(Constant::ZeroInit)
         }
@@ -1620,36 +1726,22 @@ fn lower_static_local(
     };
     let ir_type = IrType::from_ctype(&c_type, target);
 
+    // Post-process: convert Constant::String at Ptr-typed positions into
+    // Constant::GlobalRef (same fixup applied to global variables).
+    let constant = constant.map(|c| fixup_string_ptrs_in_constant(c, &ir_type, module));
+
+    // Store the original C type so that lookup_var_type can retrieve the
+    // accurate struct/union/typedef information instead of using the lossy
+    // ir_type_to_approx_ctype reverse mapping (which turns IrType::Struct
+    // into CType::Int).
+    module
+        .global_c_types
+        .insert(mangled_name.clone(), c_type.clone());
+
     let mut global = GlobalVariable::new(mangled_name, ir_type, constant);
     global.linkage = Linkage::Internal;
     global.is_definition = true;
     module.add_global(global);
-}
-
-/// Evaluate a simple constant expression for static variable initialization.
-fn eval_static_init_expr(expr: &ast::Expression, _c_type: &CType) -> Option<Constant> {
-    match expr {
-        ast::Expression::IntegerLiteral { value, .. } => Some(Constant::Integer(*value as i128)),
-        ast::Expression::FloatLiteral { value, .. } => Some(Constant::Float(*value)),
-        ast::Expression::CharLiteral { value, .. } => Some(Constant::Integer(*value as i128)),
-        ast::Expression::StringLiteral { segments, .. } => {
-            let mut bytes = Vec::new();
-            for seg in segments {
-                bytes.extend_from_slice(&seg.value);
-            }
-            bytes.push(0); // null terminator
-            Some(Constant::String(bytes))
-        }
-        ast::Expression::UnaryOp { op, operand, .. } => {
-            if matches!(op, ast::UnaryOp::Negate) {
-                if let ast::Expression::IntegerLiteral { value, .. } = operand.as_ref() {
-                    return Some(Constant::Integer(-(*value as i128)));
-                }
-            }
-            Some(Constant::ZeroInit)
-        }
-        _ => Some(Constant::ZeroInit),
-    }
 }
 
 // ===========================================================================
@@ -1907,11 +1999,25 @@ fn resolve_struct_forward_ref_inner(
                 resolve_struct_forward_ref_inner(&mut field.ty, struct_defs, visited);
             }
         }
-        // Do NOT recurse through pointers — pointer targets are opaque in IR (IrType::Ptr),
-        // and recursing into them causes infinite loops on self-referential types
-        // (e.g., struct list_head { struct list_head *next, *prev; }).
+        // Do NOT recurse through pointers — pointer targets are opaque in IR
+        // (IrType::Ptr), and recursing into them causes exponential type-tree
+        // cloning on large codebases (e.g. SQLite).  Instead, incomplete
+        // pointee types are resolved lazily via `sizeof_resolved` when
+        // array subscript element sizes are computed.
         CType::Pointer(_, _) => {}
         CType::Array(inner, _) => {
+            resolve_struct_forward_ref_inner(inner, struct_defs, visited);
+        }
+        // Recurse through typedef wrappers so that `typedef struct S T;`
+        // followed by `T arr[] = { ... }` correctly resolves the inner
+        // struct fields for constant initializer fixup and sizeof.
+        // Typedef cycles are impossible in C, so this is safe.
+        CType::Typedef {
+            ref mut underlying, ..
+        } => {
+            resolve_struct_forward_ref_inner(underlying, struct_defs, visited);
+        }
+        CType::Atomic(inner) | CType::Complex(inner) => {
             resolve_struct_forward_ref_inner(inner, struct_defs, visited);
         }
         _ => {}
@@ -2415,13 +2521,16 @@ fn apply_direct_declarator(
                     let array_type = CType::Array(Box::new(base), array_size);
                     apply_declarator_type(array_type, inner_decl, name_table)
                 }
-                // Non-parenthesized: `void *x[3]`
-                // The pointer was already applied to the base (in apply_declarator_type),
-                // so `base` here is already `Pointer(Void)`.
-                // Just wrap with array: Array(Pointer(Void), 3)
+                // Non-parenthesized: e.g. `int x[3]` or `int x[3][4]`
+                // Build Array(base, current_size) first, then recurse into
+                // inner_dd so that multi-dimensional arrays nest correctly:
+                //   `int a[3][4]` → Array(Array(int, 4), 3)
+                // The outermost AST node's size (4, parsed last) corresponds
+                // to the innermost C dimension, so we wrap base with it
+                // first and let the recursion wrap with the outer dimension.
                 _ => {
-                    let inner_type = apply_direct_declarator(base, inner_dd, name_table);
-                    CType::Array(Box::new(inner_type), array_size)
+                    let arr_type = CType::Array(Box::new(base), array_size);
+                    apply_direct_declarator(arr_type, inner_dd, name_table)
                 }
             }
         }
@@ -2564,6 +2673,19 @@ fn evaluate_const_int_expr(expr: &ast::Expression) -> Option<usize> {
             let inner = evaluate_const_int_expr(operand)?;
             Some((-(inner as i64)) as usize)
         }
+        ast::Expression::UnaryOp {
+            op: ast::UnaryOp::BitwiseNot,
+            operand,
+            ..
+        } => {
+            let inner = evaluate_const_int_expr(operand)?;
+            Some(!inner)
+        }
+        ast::Expression::UnaryOp {
+            op: ast::UnaryOp::Plus,
+            operand,
+            ..
+        } => evaluate_const_int_expr(operand),
         ast::Expression::Binary {
             op, left, right, ..
         } => {
@@ -2580,13 +2702,111 @@ fn evaluate_const_int_expr(expr: &ast::Expression) -> Option<usize> {
                 ast::BinaryOp::BitwiseAnd => Some(l & r),
                 ast::BinaryOp::BitwiseOr => Some(l | r),
                 ast::BinaryOp::BitwiseXor => Some(l ^ r),
+                ast::BinaryOp::Equal => {
+                    Some(if l == r { 1 } else { 0 })
+                }
+                ast::BinaryOp::NotEqual => {
+                    Some(if l != r { 1 } else { 0 })
+                }
+                ast::BinaryOp::Less => {
+                    Some(if (l as i64) < (r as i64) { 1 } else { 0 })
+                }
+                ast::BinaryOp::Greater => {
+                    Some(if (l as i64) > (r as i64) { 1 } else { 0 })
+                }
+                ast::BinaryOp::LessEqual => {
+                    Some(if (l as i64) <= (r as i64) { 1 } else { 0 })
+                }
+                ast::BinaryOp::GreaterEqual => {
+                    Some(if (l as i64) >= (r as i64) { 1 } else { 0 })
+                }
                 _ => None,
             }
         }
         ast::Expression::Cast { operand, .. } => evaluate_const_int_expr(operand),
         ast::Expression::Parenthesized { inner, .. } => evaluate_const_int_expr(inner),
+        ast::Expression::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+            ..
+        } => {
+            let c = evaluate_const_int_expr(condition)?;
+            if c != 0 {
+                then_expr
+                    .as_ref()
+                    .and_then(|e| evaluate_const_int_expr(e))
+            } else {
+                evaluate_const_int_expr(else_expr)
+            }
+        }
+        // Handle sizeof(type) — critical for correct struct layout when
+        // array dimensions use sizeof expressions (e.g. `int arr[sizeof(T)]`).
+        ast::Expression::SizeofType { type_name, .. } => {
+            // Access the target from the thread-local set during lowering.
+            super::LOWERING_TARGET.with(|tl| {
+                let target = tl.borrow();
+                let target = target.as_ref()?;
+                let cty = resolve_base_type_from_sqlist(&type_name.specifier_qualifiers);
+                let cty = if let Some(ref abs) = type_name.abstract_declarator {
+                    apply_abstract_declarator_to_type(cty, abs)
+                } else {
+                    cty
+                };
+                // Resolve forward-referenced struct types using the
+                // thread-local struct_defs registry.
+                let resolved = resolve_sizeof_struct_ref(cty, target);
+                Some(crate::common::types::sizeof_ctype(&resolved, target))
+            })
+        }
+        // Handle sizeof(expr) — infer the expression's type and compute size.
+        ast::Expression::SizeofExpr { operand, .. } => {
+            super::LOWERING_TARGET.with(|tl| {
+                let target = tl.borrow();
+                let target = target.as_ref()?;
+                // For sizeof applied to an expression, attempt to determine
+                // the expression's type from context.  Common patterns:
+                //   sizeof(*ptr) — dereference → pointee type
+                //   sizeof(literal) — integer literal → int
+                match operand.as_ref() {
+                    ast::Expression::IntegerLiteral { .. } => {
+                        Some(crate::common::types::sizeof_ctype(&CType::Int, target))
+                    }
+                    ast::Expression::StringLiteral { segments, .. } => {
+                        // sizeof("string") = total length of segments + 1 (null terminator)
+                        let total: usize = segments.iter().map(|s| s.value.len()).sum();
+                        Some(total + 1)
+                    }
+                    _ => {
+                        // Default: pointer width for unresolvable expressions.
+                        Some(target.pointer_width())
+                    }
+                }
+            })
+        }
+        // Handle _Alignof(type) / __alignof__(type)
+        ast::Expression::AlignofType { type_name, .. } => {
+            super::LOWERING_TARGET.with(|tl| {
+                let target = tl.borrow();
+                let target = target.as_ref()?;
+                let cty = resolve_base_type_from_sqlist(&type_name.specifier_qualifiers);
+                let cty = if let Some(ref abs) = type_name.abstract_declarator {
+                    apply_abstract_declarator_to_type(cty, abs)
+                } else {
+                    cty
+                };
+                let resolved = resolve_sizeof_struct_ref(cty, target);
+                Some(crate::common::types::alignof_ctype(&resolved, target))
+            })
+        }
         _ => None,
     }
+}
+
+/// Public wrapper for `evaluate_const_int_expr` so that other lowering
+/// modules (e.g. `expr_lowering`) can evaluate non-literal array sizes.
+pub fn evaluate_const_int_expr_pub(expr: &ast::Expression) -> Option<usize> {
+    evaluate_const_int_expr(expr)
 }
 
 /// Evaluate sizeof for a type expression (simplified heuristic).
@@ -2661,17 +2881,8 @@ fn apply_direct_abstract_decl_to_type(
             apply_abstract_declarator_to_type(base, inner)
         }
         ast::DirectAbstractDeclarator::Array { size, .. } => {
-            let len = size
-                .as_ref()
-                .and_then(|e| {
-                    if let ast::Expression::IntegerLiteral { value, .. } = e.as_ref() {
-                        Some(*value as usize)
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or(0);
-            CType::Array(Box::new(base), Some(len))
+            let len = size.as_ref().and_then(|e| evaluate_const_int_expr(e));
+            CType::Array(Box::new(base), len)
         }
         ast::DirectAbstractDeclarator::Function { .. } => CType::Pointer(
             Box::new(base),
@@ -2719,6 +2930,26 @@ fn resolve_sizeof_forward_ref(ctype: &mut CType, struct_defs: &FxHashMap<String,
         }
         CType::Pointer(inner, _) => resolve_sizeof_forward_ref(inner, struct_defs),
         CType::Array(inner, _) => resolve_sizeof_forward_ref(inner, struct_defs),
+        CType::Typedef { underlying, .. } => resolve_sizeof_forward_ref(underlying, struct_defs),
+        CType::Qualified(inner, _) => resolve_sizeof_forward_ref(inner, struct_defs),
+        CType::Atomic(inner) => resolve_sizeof_forward_ref(inner, struct_defs),
+        // Also resolve struct fields that contain forward-referenced types.
+        CType::Struct {
+            ref mut fields,
+            ..
+        } if !fields.is_empty() => {
+            for field in fields.iter_mut() {
+                resolve_sizeof_forward_ref(&mut field.ty, struct_defs);
+            }
+        }
+        CType::Union {
+            ref mut fields,
+            ..
+        } if !fields.is_empty() => {
+            for field in fields.iter_mut() {
+                resolve_sizeof_forward_ref(&mut field.ty, struct_defs);
+            }
+        }
         _ => {}
     }
 }

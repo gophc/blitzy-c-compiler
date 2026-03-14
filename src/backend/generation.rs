@@ -469,6 +469,14 @@ fn generate_for_arch<A: ArchCodegen>(
             resolve_div_conflicts(&mut mf);
         }
 
+        // Resolve shift-destination / RCX conflicts.
+        // After register allocation, the SHL/SHR/SAR destination virtual
+        // register may have been assigned to RCX.  Since the shift count
+        // is also loaded into RCX (CL), the value-to-shift is clobbered.
+        if matches!(ctx.target, Target::X86_64 | Target::I686) {
+            resolve_shift_conflicts(&mut mf);
+        }
+
         // Resolve call-argument register move conflicts.
         // After register allocation, argument setup moves like
         //   MOV RSI, <vreg_x>  ; MOV RDX, <vreg_y>
@@ -1452,8 +1460,22 @@ fn resolve_param_load_conflicts(mf: &mut MachineFunction) {
     // beginning of the entry block.  A parameter MOV is a MOV from a
     // physical ABI register to another physical register.  Float params
     // use MOVSD (opcode 86).
+    //
+    // CRITICAL: After register allocation, the allocator may insert
+    // additional register-to-register copies right after the true
+    // parameter MOVs.  These copies may source from ABI registers
+    // (because the allocator reuses them), making them
+    // indistinguishable from parameter MOVs by pattern alone.
+    // Including them in the parallel-move set corrupts the output.
+    //
+    // We use `mf.num_param_moves` (set during instruction selection)
+    // to cap the scan at the exact number of true parameter copies.
+    let max_param_moves = mf.num_param_moves;
     let mut seq_len: usize = 0;
     for inst in insts.iter() {
+        if seq_len >= max_param_moves {
+            break;
+        }
         if inst.opcode != MOV_OPCODE && inst.opcode != MOVSD_OPCODE {
             break;
         }
@@ -1830,6 +1852,218 @@ fn resolve_div_conflicts(mf: &mut MachineFunction) {
 }
 
 // ===========================================================================
+// resolve_shift_conflicts — fix shift-destination / RCX clobbering
+// ===========================================================================
+
+/// On x86(-64), variable-count shifts (SHL, SHR, SAR) require the shift
+/// amount in CL (the low byte of RCX).  The instruction-selection phase
+/// emits:
+///
+/// ```text
+///   MOV  dst, lhs        ; value to shift
+///   MOV  RCX, rhs        ; shift amount → CL
+///   SHL  dst, CL
+/// ```
+///
+/// If the register allocator assigns `dst` to RCX, the second MOV
+/// clobbers `lhs` before the shift executes, producing:
+///
+/// ```text
+///   MOV  RCX, lhs        ; RCX = lhs
+///   MOV  RCX, rhs        ; RCX = rhs  ← overwrites lhs!
+///   SHL  RCX, CL         ; rhs << rhs  ← WRONG
+/// ```
+///
+/// This pass detects the pattern and rewrites it to use a scratch register:
+///
+/// ```text
+///   MOV  scratch, lhs    ; scratch = lhs
+///   MOV  RCX, rhs        ; CL = rhs
+///   SHL  scratch, CL     ; scratch = lhs << rhs
+///   MOV  RCX, scratch    ; result back in RCX
+/// ```
+fn resolve_shift_conflicts(mf: &mut MachineFunction) {
+    const MOV_OP: u32 = 0; // X86Opcode::Mov
+    const SHL_OP: u32 = 19; // X86Opcode::Shl
+    const SHR_OP: u32 = 20; // X86Opcode::Shr
+    const SAR_OP: u32 = 21; // X86Opcode::Sar
+    const RCX: u16 = 1;
+    const R11: u16 = 11;
+    const R10: u16 = 10;
+
+    fn is_shift(opcode: u32) -> bool {
+        opcode == SHL_OP || opcode == SHR_OP || opcode == SAR_OP
+    }
+
+    /// Check if register `reg` is used by any instruction in `insts[start..]`
+    /// either as a source operand, result, or memory base.
+    fn rcx_used_after(insts: &[MachineInstruction], start: usize) -> bool {
+        for inst in insts.iter().skip(start) {
+            // Check operands for direct register use
+            for op in &inst.operands {
+                match op {
+                    MachineOperand::Register(RCX) => return true,
+                    MachineOperand::Memory { base, index, .. } => {
+                        if *base == Some(RCX) || *index == Some(RCX) {
+                            return true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // Check result — if RCX is being redefined (as dst of a MOV
+            // etc.), the old value is dead past here → no conflict.
+            if matches!(inst.result, Some(MachineOperand::Register(RCX))) {
+                return false;
+            }
+            if let Some(MachineOperand::Memory { base, index, .. }) = &inst.result {
+                if *base == Some(RCX) || *index == Some(RCX) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    for block in &mut mf.blocks {
+        let mut new_insts: Vec<MachineInstruction> =
+            Vec::with_capacity(block.instructions.len() + 8);
+        let old_insts = std::mem::take(&mut block.instructions);
+        let len = old_insts.len();
+
+        let mut i = 0;
+        while i < len {
+            if !is_shift(old_insts[i].opcode) {
+                new_insts.push(old_insts[i].clone());
+                i += 1;
+                continue;
+            }
+
+            let shift_dst_is_rcx = matches!(
+                old_insts[i].result,
+                Some(MachineOperand::Register(RCX))
+            );
+
+            if shift_dst_is_rcx {
+                // ── CASE 1: SHL/SHR/SAR RCX, CL ──
+                // The destination is RCX.  The codegen setup is:
+                //   MOV RCX, <lhs>    (value to shift)
+                //   MOV RCX, <rhs>    (shift amount → CL)
+                //   SHL RCX, CL       <-- we're here
+                // The first MOV is clobbered by the second.  Fix by
+                // redirecting lhs and the shift to a scratch register.
+
+                let ni_len = new_insts.len();
+                if ni_len < 2 {
+                    new_insts.push(old_insts[i].clone());
+                    i += 1;
+                    continue;
+                }
+
+                let mov_rhs_idx = ni_len - 1;
+                let mov_lhs_idx = ni_len - 2;
+
+                let rhs_is_mov_rcx = new_insts[mov_rhs_idx].opcode == MOV_OP
+                    && matches!(
+                        new_insts[mov_rhs_idx].result,
+                        Some(MachineOperand::Register(RCX))
+                    );
+                let lhs_is_mov_rcx = new_insts[mov_lhs_idx].opcode == MOV_OP
+                    && matches!(
+                        new_insts[mov_lhs_idx].result,
+                        Some(MachineOperand::Register(RCX))
+                    );
+
+                if !(rhs_is_mov_rcx && lhs_is_mov_rcx) {
+                    new_insts.push(old_insts[i].clone());
+                    i += 1;
+                    continue;
+                }
+
+                let rhs_src = new_insts[mov_rhs_idx].operands.first().cloned();
+                let rhs_reg = match &rhs_src {
+                    Some(MachineOperand::Register(r)) => Some(*r),
+                    _ => None,
+                };
+                let scratch = if rhs_reg != Some(R11) { R11 } else { R10 };
+
+                new_insts[mov_lhs_idx].result =
+                    Some(MachineOperand::Register(scratch));
+
+                let mut shift_inst = old_insts[i].clone();
+                shift_inst.result = Some(MachineOperand::Register(scratch));
+                new_insts.push(shift_inst);
+
+                let mut restore = MachineInstruction::new(MOV_OP);
+                restore.result = Some(MachineOperand::Register(RCX));
+                restore.operands.push(MachineOperand::Register(scratch));
+                new_insts.push(restore);
+            } else {
+                // ── CASE 2: SHL/SHR/SAR <dst>, CL  where dst ≠ RCX ──
+                // The codegen loads the shift count into RCX, which
+                // clobbers whatever the register allocator placed there.
+                // We save/restore RCX via PUSH/POP (stack-safe, no
+                // scratch register clobbering) around the MOV+SHL.
+                //
+                // Rewrite:
+                //   ... MOV RCX, <shift_count> ...
+                //   SHL <dst>, CL
+                // Into:
+                //   PUSH RCX                   (save previous RCX)
+                //   MOV RCX, <shift_count>     (load shift count)
+                //   SHL <dst>, CL              (shift)
+                //   POP RCX                    (restore previous RCX)
+
+                const PUSH_OP: u32 = 4; // X86Opcode::Push
+                const POP_OP: u32 = 5; // X86Opcode::Pop
+
+                // Find the MOV RCX, <shift_count> in the preceding
+                // new_insts that sets up CL.
+                let mut mov_rcx_idx = None;
+                for j in (0..new_insts.len()).rev() {
+                    if new_insts[j].opcode == MOV_OP
+                        && matches!(
+                            new_insts[j].result,
+                            Some(MachineOperand::Register(RCX))
+                        )
+                    {
+                        mov_rcx_idx = Some(j);
+                        break;
+                    }
+                    if is_shift(new_insts[j].opcode) {
+                        break;
+                    }
+                }
+
+                if let Some(mcx_idx) = mov_rcx_idx {
+                    // Insert: PUSH RCX (save) BEFORE the MOV RCX
+                    let mut save_inst = MachineInstruction::new(PUSH_OP);
+                    save_inst
+                        .operands
+                        .push(MachineOperand::Register(RCX));
+                    new_insts.insert(mcx_idx, save_inst);
+
+                    // Push the shift instruction
+                    new_insts.push(old_insts[i].clone());
+
+                    // Insert: POP RCX (restore) AFTER the shift
+                    let mut restore_inst = MachineInstruction::new(POP_OP);
+                    restore_inst.result =
+                        Some(MachineOperand::Register(RCX));
+                    new_insts.push(restore_inst);
+                } else {
+                    new_insts.push(old_insts[i].clone());
+                }
+            }
+
+            i += 1;
+        }
+
+        block.instructions = new_insts;
+    }
+}
+
+// ===========================================================================
 // resolve_call_arg_conflicts — fix register clobbering in call setup
 // ===========================================================================
 
@@ -1926,13 +2160,26 @@ fn resolve_call_arg_conflicts(mf: &mut MachineFunction, target: &Target) {
             // For indirect calls (CALL *reg), the target register may be
             // clobbered by the argument-setup sequence (e.g., MOV RAX,0
             // for AL=0 clobbers RAX if the function pointer is in RAX).
-            // We detect this and will insert a save to R11 at the start
-            // of the resolved move sequence.
+            // We detect this and will insert a save to a safe register
+            // at the start of the resolved move sequence.
+            //
+            // IMPORTANT: We use R10 (not R11) for saving the indirect
+            // call target on x86-64.  R11 is the spill-scratch register
+            // and spill reloads within the arg-setup window may clobber
+            // it.  R10 is caller-saved (safe to clobber at a call site)
+            // and is NOT an argument register, NOT the spill scratch,
+            // so it will not be overwritten by arg-setup or spill code.
+            let indirect_call_save_reg: u16 = match target {
+                Target::X86_64 => 10, // R10
+                Target::I686 => scratch_reg,
+                Target::AArch64 => 17, // X17 (IP1 — second intra-procedure scratch)
+                Target::RiscV64 => 6,  // T1 (x6 — temporary, not arg)
+            };
             let indirect_save_needed: Option<u16> = {
                 let call_inst_ref = &new_insts[call_pos];
                 if let Some(MachineOperand::Register(target_reg)) = call_inst_ref.operands.first() {
                     let tr = *target_reg;
-                    if tr != scratch_reg {
+                    if tr != indirect_call_save_reg {
                         let clobbered = (seq_start..call_pos).any(|idx| {
                             matches!(&new_insts[idx].result,
                                 Some(MachineOperand::Register(dst)) if *dst == tr)
@@ -1949,9 +2196,9 @@ fn resolve_call_arg_conflicts(mf: &mut MachineFunction, target: &Target) {
                     None
                 }
             };
-            // If save needed, update CALL to use R11 now.
+            // If save needed, update CALL to use the safe register.
             if indirect_save_needed.is_some() {
-                new_insts[call_pos].operands[0] = MachineOperand::Register(scratch_reg);
+                new_insts[call_pos].operands[0] = MachineOperand::Register(indirect_call_save_reg);
             }
 
             // Partition instructions into:
@@ -1997,7 +2244,7 @@ fn resolve_call_arg_conflicts(mf: &mut MachineFunction, target: &Target) {
                     // memory operand, spill load).
                     //
                     // Check if this instruction loads into a scratch
-                    // register that the NEXT instruction immediately moves
+                    // register that a LATER instruction immediately moves
                     // to an arg register.  If so, they form a compound
                     // pair that must be emitted atomically to prevent the
                     // scratch register from being clobbered in between.
@@ -2006,26 +2253,89 @@ fn resolve_call_arg_conflicts(mf: &mut MachineFunction, target: &Target) {
                         .iter()
                         .any(|op| matches!(op, MachineOperand::Memory { .. }));
                     if has_mem_src {
-                        if let Some(d_scratch) = dst_reg {
-                            // Look at next instruction(s) for a MV from d_scratch
-                            if let Some(next_si) = setup_insts.get(idx + 1) {
+                        // Determine the effective destination register of this
+                        // spill load. On RISC-V/AArch64/i686, it's in `result`.
+                        // On x86-64, MOV instructions encode the destination as
+                        // operands[0] and the memory source as operands[1], with
+                        // result = None. We must check both.
+                        let eff_load_dst = dst_reg.or_else(|| {
+                            if si.operands.len() >= 2 {
+                                if let MachineOperand::Register(r) = &si.operands[0] {
+                                    Some(*r)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some(d_scratch) = eff_load_dst {
+                            // Search forward through remaining setup instructions
+                            // for an instruction that reads d_scratch — either as
+                            // a register source (MV arg, scratch) or as a memory
+                            // base (MOV arg, (scratch) for derefs). This handles
+                            // cases where the paired move is not at idx+1 (e.g.,
+                            // when multiple spill reloads are adjacent).
+                            let mut found_pair = false;
+                            for j in (idx + 1)..setup_insts.len() {
+                                if consumed.contains(&j) {
+                                    continue;
+                                }
+                                let next_si = &setup_insts[j];
                                 let next_dst = match &next_si.result {
                                     Some(MachineOperand::Register(r)) => Some(*r),
                                     _ => None,
                                 };
-                                let next_src = match next_si.operands.first() {
-                                    Some(MachineOperand::Register(r)) => Some(*r),
-                                    _ => None,
-                                };
-                                if next_src == Some(d_scratch) {
+                                // Check if next_si reads from d_scratch:
+                                // 1. Register source: operands[0] == Register(d_scratch)
+                                // 2. Memory base: operands has Memory{base=d_scratch}
+                                let next_reads_scratch = next_si.operands.iter().any(|op| {
+                                    match op {
+                                        MachineOperand::Register(r) => *r == d_scratch,
+                                        MachineOperand::Memory { base: Some(r), .. } => {
+                                            *r == d_scratch
+                                        }
+                                        _ => false,
+                                    }
+                                });
+                                if next_reads_scratch {
                                     if let Some(eff_dst) = next_dst {
-                                        // Compound pair found: load-then-move
-                                        compound_moves
-                                            .push((vec![si.clone(), next_si.clone()], eff_dst));
-                                        consumed.insert(idx + 1);
-                                        continue;
+                                        // Compound pair (or chain) found. Collect
+                                        // all instructions from idx to j inclusive.
+                                        let mut chain = vec![si.clone()];
+                                        // Include any intermediate instructions
+                                        // between idx and j that use d_scratch
+                                        // (e.g., a deref through the scratch).
+                                        for k in (idx + 1)..j {
+                                            if !consumed.contains(&k) {
+                                                chain.push(setup_insts[k].clone());
+                                                consumed.insert(k);
+                                            }
+                                        }
+                                        chain.push(next_si.clone());
+                                        consumed.insert(j);
+                                        compound_moves.push((chain, eff_dst));
+                                        found_pair = true;
+                                        break;
                                     }
                                 }
+                                // If next_si also writes to d_scratch, stop
+                                // searching — the original load is dead.
+                                let next_writes_scratch = match &next_si.result {
+                                    Some(MachineOperand::Register(r)) => *r == d_scratch,
+                                    _ => false,
+                                } || (next_si.operands.len() >= 2
+                                    && matches!(&next_si.operands[0],
+                                               MachineOperand::Register(r) if *r == d_scratch)
+                                    && next_si.operands.iter().any(|op| {
+                                        matches!(op, MachineOperand::Memory { .. })
+                                    }));
+                                if next_writes_scratch {
+                                    break;
+                                }
+                            }
+                            if found_pair {
+                                continue;
                             }
                         }
                     }
@@ -2034,10 +2344,30 @@ fn resolve_call_arg_conflicts(mf: &mut MachineFunction, target: &Target) {
             }
 
             // Check if there are actually any register conflicts.
+            // A conflict exists if:
+            //   (a) A reg-to-reg move writes to a register that is a
+            //       source for another reg-to-reg move, OR
+            //   (b) A compound move (memory load → arg reg) writes to a
+            //       register that is a source for a reg-to-reg move, OR
+            //   (c) A non-reg move (immediate/LEA → reg) writes to a
+            //       register that is a source for a reg-to-reg move.
+            // Without (b)/(c), the early exit restores original ordering
+            // which can clobber a source register before it is read.
             let has_conflict = {
                 let dsts: crate::common::fx_hash::FxHashSet<u16> =
                     reg_moves.iter().map(|m| m.0).collect();
-                reg_moves.iter().any(|m| dsts.contains(&m.1))
+                let reg_vs_reg = reg_moves.iter().any(|m| dsts.contains(&m.1));
+                let reg_srcs: crate::common::fx_hash::FxHashSet<u16> =
+                    reg_moves.iter().map(|m| m.1).collect();
+                let compound_vs_reg =
+                    compound_moves.iter().any(|cm| reg_srcs.contains(&cm.1));
+                let non_reg_vs_reg = non_reg_move_insts.iter().any(|nrm| {
+                    match &nrm.result {
+                        Some(MachineOperand::Register(r)) => reg_srcs.contains(r),
+                        _ => false,
+                    }
+                });
+                reg_vs_reg || compound_vs_reg || non_reg_vs_reg
             };
 
             if !has_conflict && indirect_save_needed.is_none() {
@@ -2054,7 +2384,7 @@ fn resolve_call_arg_conflicts(mf: &mut MachineFunction, target: &Target) {
                 // the indirect call target. Insert save before setup.
                 let call_inst = new_insts.remove(seq_start);
                 let mut save_inst = MachineInstruction::new(mov_opcode_val);
-                save_inst.result = Some(MachineOperand::Register(scratch_reg));
+                save_inst.result = Some(MachineOperand::Register(indirect_call_save_reg));
                 save_inst
                     .operands
                     .push(MachineOperand::Register(target_reg));
@@ -2078,11 +2408,13 @@ fn resolve_call_arg_conflicts(mf: &mut MachineFunction, target: &Target) {
             let mut resolved: Vec<MachineInstruction> = Vec::new();
 
             // If we need to protect an indirect call target register,
-            // insert MOV R11, target_reg as the VERY FIRST instruction
-            // before any arg-setup moves can clobber the target.
+            // insert MOV <safe_reg>, target_reg as the VERY FIRST
+            // instruction before any arg-setup moves can clobber the
+            // target.  Uses indirect_call_save_reg (R10 on x86-64)
+            // instead of R11 to avoid conflicts with spill reloads.
             if let Some(target_reg) = indirect_save_needed {
                 let mut save_inst = MachineInstruction::new(mov_opcode_val);
-                save_inst.result = Some(MachineOperand::Register(scratch_reg));
+                save_inst.result = Some(MachineOperand::Register(indirect_call_save_reg));
                 save_inst
                     .operands
                     .push(MachineOperand::Register(target_reg));
@@ -2404,13 +2736,35 @@ fn constant_to_bytes_typed(
         }
         Constant::Struct(fields) => {
             let mut result = Vec::new();
-            let field_types = match ir_ty {
-                Some(IrType::Struct(st)) => Some(&st.fields),
-                _ => None,
+            let (field_types, packed) = match ir_ty {
+                Some(IrType::Struct(st)) => (Some(&st.fields), st.packed),
+                _ => (None, false),
             };
+            let mut offset: usize = 0;
             for (i, field) in fields.iter().enumerate() {
                 let ft = field_types.and_then(|fts| fts.get(i));
-                result.extend_from_slice(&constant_to_bytes_typed(field, ft));
+                // Insert alignment padding before this field (unless packed).
+                if !packed {
+                    if let Some(fty) = ft {
+                        let fa = ir_type_align(fty) as usize;
+                        let rem = offset % fa;
+                        if rem != 0 {
+                            let pad = fa - rem;
+                            result.extend(std::iter::repeat(0u8).take(pad));
+                            offset += pad;
+                        }
+                    }
+                }
+                let field_bytes = constant_to_bytes_typed(field, ft);
+                offset += field_bytes.len();
+                result.extend_from_slice(&field_bytes);
+            }
+            // Add tail padding to reach the full struct ABI size.
+            if let Some(sty) = ir_ty {
+                let total = ir_type_size(sty) as usize;
+                if result.len() < total {
+                    result.resize(total, 0);
+                }
             }
             result
         }
@@ -2461,15 +2815,25 @@ fn collect_constant_relocs(
             relocs.push((base_offset, name.clone()));
         }
         Constant::Struct(fields) => {
-            let field_types = match ir_ty {
-                Some(IrType::Struct(st)) => Some(&st.fields),
-                _ => None,
+            let (field_types, packed) = match ir_ty {
+                Some(IrType::Struct(st)) => (Some(&st.fields), st.packed),
+                _ => (None, false),
             };
             let mut offset = base_offset;
             for (i, field) in fields.iter().enumerate() {
                 let ft = field_types.and_then(|fts| fts.get(i));
+                // Account for inter-field alignment padding (mirrors
+                // constant_to_bytes_typed).
+                if !packed {
+                    if let Some(fty) = ft {
+                        let fa = ir_type_align(fty);
+                        let rem = offset % fa;
+                        if rem != 0 {
+                            offset += fa - rem;
+                        }
+                    }
+                }
                 collect_constant_relocs(field, offset, ft, relocs);
-                // Advance offset by the byte size of this field.
                 let field_bytes = constant_to_bytes_typed(field, ft);
                 offset += field_bytes.len() as u64;
             }
@@ -2493,43 +2857,77 @@ fn collect_constant_relocs(
 }
 
 fn global_variable_size(global: &crate::ir::module::GlobalVariable) -> u64 {
-    // Use the IR type's size information.
-    // For BSS globals without initializers, we need the type size.
-    // Default to 8 bytes (pointer size on 64-bit targets).
-    match &global.ty {
-        crate::ir::types::IrType::I1 => 1,
-        crate::ir::types::IrType::I8 => 1,
-        crate::ir::types::IrType::I16 => 2,
-        crate::ir::types::IrType::I32 => 4,
-        crate::ir::types::IrType::I64 | crate::ir::types::IrType::Ptr => 8,
-        crate::ir::types::IrType::I128 => 16,
-        crate::ir::types::IrType::F32 => 4,
-        crate::ir::types::IrType::F64 => 8,
-        crate::ir::types::IrType::F80 => 16,
-        crate::ir::types::IrType::Void => 0,
-        crate::ir::types::IrType::Array(elem_ty, count) => {
-            let elem_size = ir_type_size(elem_ty);
-            elem_size * (*count as u64)
+    // Use the padding-aware ir_type_size to compute the correct ABI size
+    // for structs (including inter-field and tail padding).
+    ir_type_size(&global.ty)
+}
+
+/// Returns the ABI alignment (in bytes) for an IR type.
+///
+/// For structs, the alignment is the maximum alignment of any field (or 1
+/// for packed structs).  For arrays, the alignment equals the element
+/// alignment.
+fn ir_type_align(ty: &crate::ir::types::IrType) -> u64 {
+    use crate::ir::types::IrType;
+    match ty {
+        IrType::Void | IrType::I1 | IrType::I8 => 1,
+        IrType::I16 => 2,
+        IrType::I32 | IrType::F32 => 4,
+        IrType::I64 | IrType::F64 | IrType::Ptr => 8,
+        IrType::I128 | IrType::F80 => 16,
+        IrType::Array(elem, _) => ir_type_align(elem),
+        IrType::Struct(st) => {
+            if st.packed {
+                1
+            } else {
+                st.fields.iter().map(ir_type_align).max().unwrap_or(1)
+            }
         }
-        crate::ir::types::IrType::Struct(st) => st.fields.iter().map(ir_type_size).sum(),
-        crate::ir::types::IrType::Function(_, _) => 0,
+        IrType::Function(_, _) => 1,
     }
 }
 
-/// Estimates the size of an IR type in bytes.
+/// Computes the ABI size of an IR type in bytes, accounting for struct
+/// field alignment padding and tail padding.
 fn ir_type_size(ty: &crate::ir::types::IrType) -> u64 {
+    use crate::ir::types::IrType;
     match ty {
-        crate::ir::types::IrType::Void => 0,
-        crate::ir::types::IrType::I1 | crate::ir::types::IrType::I8 => 1,
-        crate::ir::types::IrType::I16 => 2,
-        crate::ir::types::IrType::I32 | crate::ir::types::IrType::F32 => 4,
-        crate::ir::types::IrType::I64
-        | crate::ir::types::IrType::F64
-        | crate::ir::types::IrType::Ptr => 8,
-        crate::ir::types::IrType::I128 | crate::ir::types::IrType::F80 => 16,
-        crate::ir::types::IrType::Array(elem, count) => ir_type_size(elem) * (*count as u64),
-        crate::ir::types::IrType::Struct(st) => st.fields.iter().map(ir_type_size).sum(),
-        crate::ir::types::IrType::Function(_, _) => 0,
+        IrType::Void => 0,
+        IrType::I1 | IrType::I8 => 1,
+        IrType::I16 => 2,
+        IrType::I32 | IrType::F32 => 4,
+        IrType::I64 | IrType::F64 | IrType::Ptr => 8,
+        IrType::I128 | IrType::F80 => 16,
+        IrType::Array(elem, count) => ir_type_size(elem) * (*count as u64),
+        IrType::Struct(st) => {
+            if st.packed {
+                // Packed structs: no padding, just sum field sizes.
+                return st.fields.iter().map(ir_type_size).sum();
+            }
+            // Compute size with inter-field alignment padding.
+            let mut offset: u64 = 0;
+            let mut max_align: u64 = 1;
+            for f in &st.fields {
+                let fa = ir_type_align(f);
+                if fa > max_align {
+                    max_align = fa;
+                }
+                // Align the current offset to this field's requirement.
+                let rem = offset % fa;
+                if rem != 0 {
+                    offset += fa - rem;
+                }
+                offset += ir_type_size(f);
+            }
+            // Add tail padding so the struct size is a multiple of its
+            // overall alignment (required for arrays of structs).
+            let rem = offset % max_align;
+            if rem != 0 {
+                offset += max_align - rem;
+            }
+            offset
+        }
+        IrType::Function(_, _) => 0,
     }
 }
 

@@ -44,7 +44,7 @@
 use std::fmt;
 
 use crate::common::target::Target;
-use crate::common::types::{sizeof_ctype, CType};
+use crate::common::types::{alignof_ctype, sizeof_ctype, CType};
 
 // ===========================================================================
 // StructType — Aggregate field layout
@@ -504,13 +504,25 @@ impl IrType {
                 })
             }
 
-            // ----- Union: represented as byte array of the union's total size -----
+            // ----- Union: represented as array of properly-aligned elements -----
             CType::Union { .. } => {
                 // Compute the union's total size (including alignment padding)
                 // from the C type system for accuracy with bitfields and
                 // packed/aligned attributes.
                 let union_size = sizeof_ctype(ctype, target);
-                IrType::Array(Box::new(IrType::I8), union_size)
+                // Use the union's natural alignment to choose the IR base
+                // element type.  `Array(I8, N)` would lose alignment info,
+                // causing enclosing structs to lay out fields at wrong offsets.
+                let union_align = alignof_ctype(ctype, target);
+                if union_align >= 8 && union_size % 8 == 0 {
+                    IrType::Array(Box::new(IrType::I64), union_size / 8)
+                } else if union_align >= 4 && union_size % 4 == 0 {
+                    IrType::Array(Box::new(IrType::I32), union_size / 4)
+                } else if union_align >= 2 && union_size % 2 == 0 {
+                    IrType::Array(Box::new(IrType::I16), union_size / 2)
+                } else {
+                    IrType::Array(Box::new(IrType::I8), union_size)
+                }
             }
 
             // ----- Enum: resolve to underlying integer type -----
@@ -1038,8 +1050,10 @@ mod tests {
             aligned: None,
         };
         let ir = IrType::from_ctype(&cunion, &Target::X86_64);
-        // Union size = max(sizeof(int)=4, sizeof(double)=8) = 8, aligned to 8
-        assert_eq!(ir, IrType::Array(Box::new(IrType::I8), 8));
+        // Union size = max(sizeof(int)=4, sizeof(double)=8) = 8, aligned to 8.
+        // On 64-bit targets, the union has 8-byte alignment, so it becomes
+        // Array(I64, 1) to preserve that alignment in enclosing struct layouts.
+        assert_eq!(ir, IrType::Array(Box::new(IrType::I64), 1));
     }
 
     #[test]

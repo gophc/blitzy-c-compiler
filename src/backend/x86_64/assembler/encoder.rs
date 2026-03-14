@@ -31,8 +31,8 @@ use super::relocations::{RelocationEntry, X86_64RelocationType};
 use crate::backend::traits::{MachineInstruction, MachineOperand};
 use crate::backend::x86_64::codegen::X86Opcode;
 use crate::backend::x86_64::registers::{
-    hw_encoding, is_gpr, is_sse, needs_rex, OPERAND_SIZE_PREFIX, R10, R11, R12, R13, R14, R15, R8,
-    R9, RAX, RBP, RBX, RCX, RDI, RDX, RSI, RSP, XMM0, XMM8,
+    hw_encoding, is_gpr, is_sse, needs_rex, needs_rex_for_byte_reg, OPERAND_SIZE_PREFIX, R10, R11,
+    R12, R13, R14, R15, R8, R9, RAX, RBP, RBX, RCX, RDI, RDX, RSI, RSP, XMM0, XMM8,
 };
 use crate::common::fx_hash::FxHashMap;
 
@@ -178,6 +178,32 @@ fn compute_rex(
     let x = index.map_or(false, needs_rex);
     let b = rm_or_base.map_or(false, needs_rex);
     if w || r || x || b {
+        Some(rex_byte(w, r, x, b))
+    } else {
+        None
+    }
+}
+
+/// Determine if a REX prefix is needed, forcing one for byte-sized operand
+/// access on registers RSP/RBP/RSI/RDI (hw encodings 4–7).
+///
+/// On x86-64, byte-sized register operand encodings 4–7 without REX select
+/// the legacy high-byte registers %ah/%ch/%dh/%bh. With any REX prefix they
+/// select the low-byte forms %spl/%bpl/%sil/%dil. Callers pass the register
+/// operands that participate in the byte operation via `byte_regs`.
+fn compute_rex_byte_aware(
+    operand_size_64: bool,
+    reg: Option<u16>,
+    index: Option<u16>,
+    rm_or_base: Option<u16>,
+    byte_regs: &[u16],
+) -> Option<u8> {
+    let force = byte_regs.iter().any(|r| needs_rex_for_byte_reg(*r));
+    let w = operand_size_64;
+    let r = reg.map_or(false, needs_rex);
+    let x = index.map_or(false, needs_rex);
+    let b = rm_or_base.map_or(false, needs_rex);
+    if w || r || x || b || force {
         Some(rex_byte(w, r, x, b))
     } else {
         None
@@ -774,7 +800,11 @@ impl X86_64Encoder {
             X86Opcode::Divsd => self.encode_sse_op(inst, 0xF2, 0x5E),
             X86Opcode::Ucomisd => self.encode_ucomisd(inst),
             X86Opcode::Cvtsi2sd => self.encode_cvtsi2sd(inst),
+            X86Opcode::Cvtsi2ss => self.encode_cvtsi2ss(inst),
             X86Opcode::Cvtsd2si => self.encode_cvtsd2si(inst),
+            X86Opcode::Cvtss2si => self.encode_cvtss2si(inst),
+            X86Opcode::Cvtsd2ss => self.encode_cvtsd2ss(inst),
+            X86Opcode::Cvtss2sd => self.encode_cvtss2sd(inst),
             // Fixed-encoding instructions (fallback if not caught above)
             X86Opcode::Ret
             | X86Opcode::Nop
@@ -1181,7 +1211,7 @@ impl X86_64Encoder {
                         EncodedInstruction::new(bytes)
                     }
                     // Spill case: ptr in register, value spilled to stack.
-                    // Save R11, load value, store, restore R11.
+                    // Use a scratch register that does NOT collide with ptr.
                     (
                         Some(MachineOperand::Register(ptr)),
                         Some(MachineOperand::Memory {
@@ -1191,14 +1221,16 @@ impl X86_64Encoder {
                             displacement,
                         }),
                     ) => {
+                        // Choose scratch != ptr. Default to R11; if ptr IS R11, use R10.
+                        let scratch: u16 = if *ptr == 11 { 10 } else { 11 };
                         let mut bytes = Vec::new();
-                        // PUSH R11 — save scratch
-                        let save = self.encode_push_pop(0x50, 11);
+                        // PUSH scratch — save scratch register
+                        let save = self.encode_push_pop(0x50, scratch);
                         bytes.extend_from_slice(&save.bytes);
-                        // MOV R11d, [base+disp] — load 32-bit spilled value
+                        // MOV scratch_32, [base+disp] — load 32-bit spilled value
                         let load = self.encode_reg_mem_op(
                             &[0x8B],
-                            11,
+                            scratch,
                             *base,
                             *index,
                             *scale,
@@ -1206,11 +1238,12 @@ impl X86_64Encoder {
                             4,
                         );
                         bytes.extend_from_slice(&load.bytes);
-                        // MOV dword [ptr], R11d
-                        let store = self.encode_mem_reg_op(&[0x89], Some(*ptr), None, 1, 0, 11, 4);
+                        // MOV dword [ptr], scratch_32
+                        let store =
+                            self.encode_mem_reg_op(&[0x89], Some(*ptr), None, 1, 0, scratch, 4);
                         bytes.extend_from_slice(&store.bytes);
-                        // POP R11 — restore scratch
-                        let restore = self.encode_push_pop(0x58, 11);
+                        // POP scratch — restore scratch register
+                        let restore = self.encode_push_pop(0x58, scratch);
                         bytes.extend_from_slice(&restore.bytes);
                         EncodedInstruction::new(bytes)
                     }
@@ -1241,12 +1274,13 @@ impl X86_64Encoder {
                             displacement,
                         }),
                     ) => {
+                        let scratch: u16 = if *ptr == 11 { 10 } else { 11 };
                         let mut bytes = Vec::new();
-                        let save = self.encode_push_pop(0x50, 11);
+                        let save = self.encode_push_pop(0x50, scratch);
                         bytes.extend_from_slice(&save.bytes);
                         let load = self.encode_reg_mem_op(
                             &[0x8B],
-                            11,
+                            scratch,
                             *base,
                             *index,
                             *scale,
@@ -1254,9 +1288,10 @@ impl X86_64Encoder {
                             4,
                         );
                         bytes.extend_from_slice(&load.bytes);
-                        let store = self.encode_mem_reg_op(&[0x89], Some(*ptr), None, 1, 0, 11, 2);
+                        let store =
+                            self.encode_mem_reg_op(&[0x89], Some(*ptr), None, 1, 0, scratch, 2);
                         bytes.extend_from_slice(&store.bytes);
-                        let restore = self.encode_push_pop(0x58, 11);
+                        let restore = self.encode_push_pop(0x58, scratch);
                         bytes.extend_from_slice(&restore.bytes);
                         EncodedInstruction::new(bytes)
                     }
@@ -1303,12 +1338,13 @@ impl X86_64Encoder {
                             displacement,
                         }),
                     ) => {
+                        let scratch: u16 = if *ptr == 11 { 10 } else { 11 };
                         let mut bytes = Vec::new();
-                        let save = self.encode_push_pop(0x50, 11);
+                        let save = self.encode_push_pop(0x50, scratch);
                         bytes.extend_from_slice(&save.bytes);
                         let load = self.encode_reg_mem_op(
                             &[0x8B],
-                            11,
+                            scratch,
                             *base,
                             *index,
                             *scale,
@@ -1316,9 +1352,10 @@ impl X86_64Encoder {
                             4,
                         );
                         bytes.extend_from_slice(&load.bytes);
-                        let store = self.encode_mem_reg_op(&[0x88], Some(*ptr), None, 1, 0, 11, 1);
+                        let store =
+                            self.encode_mem_reg_op(&[0x88], Some(*ptr), None, 1, 0, scratch, 1);
                         bytes.extend_from_slice(&store.bytes);
-                        let restore = self.encode_push_pop(0x58, 11);
+                        let restore = self.encode_push_pop(0x58, scratch);
                         bytes.extend_from_slice(&restore.bytes);
                         EncodedInstruction::new(bytes)
                     }
@@ -1372,7 +1409,15 @@ impl X86_64Encoder {
             bytes.push(OPERAND_SIZE_PREFIX);
         }
         let need_64 = operand_size == 8;
-        if let Some(rex) = compute_rex(need_64, Some(src), None, Some(dst)) {
+        // For byte-sized operands, ensure REX prefix for registers RSP/RBP/RSI/RDI
+        // whose hw encodings 4-7 would otherwise select %ah/%ch/%dh/%bh.
+        if operand_size == 1 {
+            if let Some(rex) =
+                compute_rex_byte_aware(need_64, Some(src), None, Some(dst), &[src, dst])
+            {
+                bytes.push(rex);
+            }
+        } else if let Some(rex) = compute_rex(need_64, Some(src), None, Some(dst)) {
             bytes.push(rex);
         }
         bytes.extend_from_slice(opcode);
@@ -1398,7 +1443,12 @@ impl X86_64Encoder {
             bytes.push(OPERAND_SIZE_PREFIX);
         }
         let need_64 = operand_size == 8;
-        if let Some(rex) = compute_rex(need_64, None, None, Some(dst)) {
+        // For byte-sized operands, ensure REX prefix for registers with hw encoding 4-7
+        if operand_size == 1 {
+            if let Some(rex) = compute_rex_byte_aware(need_64, None, None, Some(dst), &[dst]) {
+                bytes.push(rex);
+            }
+        } else if let Some(rex) = compute_rex(need_64, None, None, Some(dst)) {
             bytes.push(rex);
         }
         bytes.extend_from_slice(opcode);
@@ -1432,7 +1482,12 @@ impl X86_64Encoder {
         let reg_enc = hw_encoding(reg);
         let mem_enc = encode_memory_operand(reg_enc & 0x7, base, index, scale, displacement);
         let need_64 = operand_size == 8;
-        if let Some(rex) = compute_rex(need_64, Some(reg), index, base) {
+        // For byte-sized operands, ensure REX prefix for registers with hw encoding 4-7
+        if operand_size == 1 {
+            if let Some(rex) = compute_rex_byte_aware(need_64, Some(reg), index, base, &[reg]) {
+                bytes.push(rex);
+            }
+        } else if let Some(rex) = compute_rex(need_64, Some(reg), index, base) {
             bytes.push(rex);
         }
         bytes.extend_from_slice(opcode);
@@ -1462,7 +1517,13 @@ impl X86_64Encoder {
         let reg_enc = hw_encoding(reg);
         let mem_enc = encode_memory_operand(reg_enc & 0x7, base, index, scale, displacement);
         let need_64 = operand_size == 8;
-        if let Some(rex) = compute_rex(need_64, Some(reg), index, base) {
+        // For byte-sized operands, ensure REX prefix for registers with hw encoding 4-7
+        // (RSP/RBP/RSI/RDI) so the CPU selects %spl/%bpl/%sil/%dil instead of %ah/%ch/%dh/%bh.
+        if operand_size == 1 {
+            if let Some(rex) = compute_rex_byte_aware(need_64, Some(reg), index, base, &[reg]) {
+                bytes.push(rex);
+            }
+        } else if let Some(rex) = compute_rex(need_64, Some(reg), index, base) {
             bytes.push(rex);
         }
         bytes.extend_from_slice(opcode);
@@ -1798,16 +1859,18 @@ impl X86_64Encoder {
 
     /// Encode MOV instruction — handles multiple forms.
     fn encode_mov(&mut self, inst: &MachineInstruction) -> EncodedInstruction {
+        let opsz = Self::infer_operand_size(inst);
         let ops = &inst.operands;
         match (ops.first(), ops.get(1)) {
             (Some(MachineOperand::Register(dst)), Some(MachineOperand::Register(src))) => {
-                self.encode_reg_reg_op(&[0x89], *dst, *src, 8)
+                self.encode_reg_reg_op(&[0x89], *dst, *src, opsz)
             }
             (Some(MachineOperand::Register(dst)), Some(MachineOperand::Immediate(imm))) => {
                 let imm = *imm;
                 let dst = *dst;
-                if (i32::MIN as i64..=i32::MAX as i64).contains(&imm) {
-                    self.encode_reg_imm_op(&[0xC7], 0, dst, imm, 8)
+                // For 32-bit MOV, use the 32-bit encoding path.
+                if opsz <= 4 || (i32::MIN as i64..=i32::MAX as i64).contains(&imm) {
+                    self.encode_reg_imm_op(&[0xC7], 0, dst, imm, opsz)
                 } else {
                     // MOV r64, imm64: REX.W + 0xB8+rd + imm64
                     let mut bytes = Vec::with_capacity(10);
@@ -1827,9 +1890,9 @@ impl X86_64Encoder {
                     scale,
                     displacement,
                 }),
-            ) => self.encode_reg_mem_op(&[0x8B], *reg, *base, *index, *scale, *displacement, 8),
+            ) => self.encode_reg_mem_op(&[0x8B], *reg, *base, *index, *scale, *displacement, opsz),
             (Some(MachineOperand::Register(reg)), Some(MachineOperand::FrameSlot(offset))) => {
-                self.encode_reg_mem_op(&[0x8B], *reg, Some(RBP), None, 1, *offset as i64, 8)
+                self.encode_reg_mem_op(&[0x8B], *reg, Some(RBP), None, 1, *offset as i64, opsz)
             }
             (
                 Some(MachineOperand::Memory {
@@ -1839,9 +1902,9 @@ impl X86_64Encoder {
                     displacement,
                 }),
                 Some(MachineOperand::Register(reg)),
-            ) => self.encode_mem_reg_op(&[0x89], *base, *index, *scale, *displacement, *reg, 8),
+            ) => self.encode_mem_reg_op(&[0x89], *base, *index, *scale, *displacement, *reg, opsz),
             (Some(MachineOperand::FrameSlot(offset)), Some(MachineOperand::Register(reg))) => {
-                self.encode_mem_reg_op(&[0x89], Some(RBP), None, 1, *offset as i64, *reg, 8)
+                self.encode_mem_reg_op(&[0x89], Some(RBP), None, 1, *offset as i64, *reg, opsz)
             }
             (
                 Some(MachineOperand::Memory {
@@ -1853,9 +1916,13 @@ impl X86_64Encoder {
                 Some(MachineOperand::Immediate(imm)),
             ) => {
                 let (base, index, scale, displacement) = (*base, *index, *scale, *displacement);
+                let need_64 = opsz == 8;
                 let mut bytes = Vec::with_capacity(16);
                 let mem_enc = encode_memory_operand(0, base, index, scale, displacement);
-                if let Some(rex) = compute_rex(true, None, index, base) {
+                if opsz == 2 {
+                    bytes.push(OPERAND_SIZE_PREFIX);
+                }
+                if let Some(rex) = compute_rex(need_64, None, index, base) {
                     bytes.push(rex);
                 }
                 bytes.push(0xC7);
@@ -1944,6 +2011,8 @@ impl X86_64Encoder {
         opcode: &X86Opcode,
     ) -> EncodedInstruction {
         let opext = shift_opext(opcode);
+        let opsz = Self::infer_operand_size(inst);
+        let need_64 = opsz == 8;
         // Handle normalization: 3-operand form [dst, dst, count] → strip dup
         let ops = &inst.operands;
         let (dst_op, count_op) = if ops.len() == 3 {
@@ -1959,7 +2028,10 @@ impl X86_64Encoder {
         match (dst_op, count_op) {
             (MachineOperand::Register(dst), MachineOperand::Register(cl)) if *cl == RCX => {
                 let mut bytes = Vec::with_capacity(4);
-                if let Some(rex) = compute_rex(true, None, None, Some(*dst)) {
+                if opsz == 2 {
+                    bytes.push(OPERAND_SIZE_PREFIX);
+                }
+                if let Some(rex) = compute_rex(need_64, None, None, Some(*dst)) {
                     bytes.push(rex);
                 }
                 bytes.push(0xD3);
@@ -1968,7 +2040,10 @@ impl X86_64Encoder {
             }
             (MachineOperand::Register(dst), MachineOperand::Immediate(imm)) => {
                 let mut bytes = Vec::with_capacity(5);
-                if let Some(rex) = compute_rex(true, None, None, Some(*dst)) {
+                if opsz == 2 {
+                    bytes.push(OPERAND_SIZE_PREFIX);
+                }
+                if let Some(rex) = compute_rex(need_64, None, None, Some(*dst)) {
                     bytes.push(rex);
                 }
                 if *imm == 1 {
@@ -2002,11 +2077,16 @@ impl X86_64Encoder {
             Some(e) => (e.opcode[0], e.reg_opext.unwrap_or(0)),
             None => (0xF7, 0),
         };
+        let opsz = Self::infer_operand_size(inst);
+        let need_64 = opsz == 8;
         let ops = &inst.operands;
         match ops.first() {
             Some(MachineOperand::Register(reg)) => {
                 let mut bytes = Vec::with_capacity(4);
-                if let Some(rex) = compute_rex(true, None, None, Some(*reg)) {
+                if opsz == 2 {
+                    bytes.push(OPERAND_SIZE_PREFIX);
+                }
+                if let Some(rex) = compute_rex(need_64, None, None, Some(*reg)) {
                     bytes.push(rex);
                 }
                 bytes.push(opc_byte);
@@ -2021,7 +2101,10 @@ impl X86_64Encoder {
             }) => {
                 let mut bytes = Vec::with_capacity(12);
                 let mem_enc = encode_memory_operand(opext, *base, *index, *scale, *displacement);
-                if let Some(rex) = compute_rex(true, None, *index, *base) {
+                if opsz == 2 {
+                    bytes.push(OPERAND_SIZE_PREFIX);
+                }
+                if let Some(rex) = compute_rex(need_64, None, *index, *base) {
                     bytes.push(rex);
                 }
                 bytes.push(opc_byte);
@@ -2044,6 +2127,8 @@ impl X86_64Encoder {
 
     /// Encode IMUL instruction.
     fn encode_imul(&mut self, inst: &MachineInstruction) -> EncodedInstruction {
+        let opsz = Self::infer_operand_size(inst);
+        let need_64 = opsz == 8;
         // Handle 3-operand normalised form: [dst, dst_dup, src] → [dst, src]
         // (same pattern as encode_alu_op)
         let ops_vec: Vec<MachineOperand>;
@@ -2068,7 +2153,10 @@ impl X86_64Encoder {
         match (ops.first(), ops.get(1), ops.get(2)) {
             (Some(MachineOperand::Register(dst)), Some(MachineOperand::Register(src)), None) => {
                 let mut bytes = Vec::with_capacity(5);
-                if let Some(rex) = compute_rex(true, Some(*dst), None, Some(*src)) {
+                if opsz == 2 {
+                    bytes.push(OPERAND_SIZE_PREFIX);
+                }
+                if let Some(rex) = compute_rex(need_64, Some(*dst), None, Some(*src)) {
                     bytes.push(rex);
                 }
                 bytes.push(0x0F);
@@ -2087,7 +2175,10 @@ impl X86_64Encoder {
             ) => {
                 let imm = *imm;
                 let mut bytes = Vec::with_capacity(8);
-                if let Some(rex) = compute_rex(true, Some(*dst), None, Some(*src)) {
+                if opsz == 2 {
+                    bytes.push(OPERAND_SIZE_PREFIX);
+                }
+                if let Some(rex) = compute_rex(need_64, Some(*dst), None, Some(*src)) {
                     bytes.push(rex);
                 }
                 if (-128..=127).contains(&imm) {
@@ -2127,7 +2218,10 @@ impl X86_64Encoder {
                     *scale,
                     *displacement,
                 );
-                if let Some(rex) = compute_rex(true, Some(*dst), *index, *base) {
+                if opsz == 2 {
+                    bytes.push(OPERAND_SIZE_PREFIX);
+                }
+                if let Some(rex) = compute_rex(need_64, Some(*dst), *index, *base) {
                     bytes.push(rex);
                 }
                 bytes.push(0x0F);
@@ -2153,7 +2247,10 @@ impl X86_64Encoder {
                     1,
                     *offset as i64,
                 );
-                if let Some(rex) = compute_rex(true, Some(*dst), None, Some(RBP)) {
+                if opsz == 2 {
+                    bytes.push(OPERAND_SIZE_PREFIX);
+                }
+                if let Some(rex) = compute_rex(need_64, Some(*dst), None, Some(RBP)) {
                     bytes.push(rex);
                 }
                 bytes.push(0x0F);
@@ -2180,7 +2277,10 @@ impl X86_64Encoder {
                     1,
                     *offset as i64,
                 );
-                if let Some(rex) = compute_rex(true, Some(*dst), None, Some(RBP)) {
+                if opsz == 2 {
+                    bytes.push(OPERAND_SIZE_PREFIX);
+                }
+                if let Some(rex) = compute_rex(need_64, Some(*dst), None, Some(RBP)) {
                     bytes.push(rex);
                 }
                 if (-128..=127).contains(&imm) {
@@ -2283,19 +2383,67 @@ impl X86_64Encoder {
 
     /// Encode MOVSX / MOVSXD.
     fn encode_movsx(&mut self, inst: &MachineInstruction) -> EncodedInstruction {
+        // Dispatch based on operand_size which encodes the SOURCE width:
+        //   1 → MOVSX r64, r/m8  (0x0F 0xBE with REX.W)
+        //   2 → MOVSX r64, r/m16 (0x0F 0xBF with REX.W)
+        //   4 → MOVSXD r64, r/m32 (0x63 with REX.W)
+        let src_bytes = inst.operand_size;
         let ops = &inst.operands;
         match (ops.first(), ops.get(1)) {
             (Some(MachineOperand::Register(dst)), Some(MachineOperand::Register(src))) => {
                 let mut bytes = Vec::with_capacity(5);
-                if let Some(rex) = compute_rex(true, Some(*dst), None, Some(*src)) {
-                    bytes.push(rex);
+                match src_bytes {
+                    1 => {
+                        // MOVSX r64, r/m8: REX.W 0x0F 0xBE /r
+                        // Need REX.W for 64-bit destination, plus REX.B if
+                        // src uses r8-r15, REX.R if dst uses r8-r15.
+                        let mut rex = 0x48u8; // REX.W
+                        if hw_encoding(*dst) >= 8 {
+                            rex |= 0x04; // REX.R
+                        }
+                        if hw_encoding(*src) >= 8 {
+                            rex |= 0x01; // REX.B
+                        }
+                        bytes.push(rex);
+                        bytes.push(0x0F);
+                        bytes.push(0xBE);
+                        bytes.push(modrm_byte(
+                            0b11,
+                            hw_encoding(*dst) & 0x7,
+                            hw_encoding(*src) & 0x7,
+                        ));
+                    }
+                    2 => {
+                        // MOVSX r64, r/m16: REX.W 0x0F 0xBF /r
+                        let mut rex = 0x48u8; // REX.W
+                        if hw_encoding(*dst) >= 8 {
+                            rex |= 0x04; // REX.R
+                        }
+                        if hw_encoding(*src) >= 8 {
+                            rex |= 0x01; // REX.B
+                        }
+                        bytes.push(rex);
+                        bytes.push(0x0F);
+                        bytes.push(0xBF);
+                        bytes.push(modrm_byte(
+                            0b11,
+                            hw_encoding(*dst) & 0x7,
+                            hw_encoding(*src) & 0x7,
+                        ));
+                    }
+                    _ => {
+                        // MOVSXD r64, r/m32: REX.W 0x63 /r (default for 4 bytes or unset)
+                        if let Some(rex) = compute_rex(true, Some(*dst), None, Some(*src)) {
+                            bytes.push(rex);
+                        }
+                        bytes.push(0x63);
+                        bytes.push(modrm_byte(
+                            0b11,
+                            hw_encoding(*dst) & 0x7,
+                            hw_encoding(*src) & 0x7,
+                        ));
+                    }
                 }
-                bytes.push(0x63); // MOVSXD
-                bytes.push(modrm_byte(
-                    0b11,
-                    hw_encoding(*dst) & 0x7,
-                    hw_encoding(*src) & 0x7,
-                ));
                 EncodedInstruction::new(bytes)
             }
             (
@@ -2315,10 +2463,55 @@ impl X86_64Encoder {
                     *displacement,
                 );
                 let mut bytes = Vec::with_capacity(10);
-                if let Some(rex) = compute_rex(true, Some(*dst), *index, *base) {
-                    bytes.push(rex);
+                match src_bytes {
+                    1 => {
+                        // MOVSX r64, m8: REX.W 0x0F 0xBE /r
+                        let mut rex = 0x48u8; // REX.W
+                        if hw_encoding(*dst) >= 8 {
+                            rex |= 0x04; // REX.R
+                        }
+                        if let Some(b) = base {
+                            if hw_encoding(*b) >= 8 {
+                                rex |= 0x01; // REX.B
+                            }
+                        }
+                        if let Some(x) = index {
+                            if hw_encoding(*x) >= 8 {
+                                rex |= 0x02; // REX.X
+                            }
+                        }
+                        bytes.push(rex);
+                        bytes.push(0x0F);
+                        bytes.push(0xBE);
+                    }
+                    2 => {
+                        // MOVSX r64, m16: REX.W 0x0F 0xBF /r
+                        let mut rex = 0x48u8; // REX.W
+                        if hw_encoding(*dst) >= 8 {
+                            rex |= 0x04; // REX.R
+                        }
+                        if let Some(b) = base {
+                            if hw_encoding(*b) >= 8 {
+                                rex |= 0x01; // REX.B
+                            }
+                        }
+                        if let Some(x) = index {
+                            if hw_encoding(*x) >= 8 {
+                                rex |= 0x02; // REX.X
+                            }
+                        }
+                        bytes.push(rex);
+                        bytes.push(0x0F);
+                        bytes.push(0xBF);
+                    }
+                    _ => {
+                        // MOVSXD r64, m32: REX.W 0x63 /r
+                        if let Some(rex) = compute_rex(true, Some(*dst), *index, *base) {
+                            bytes.push(rex);
+                        }
+                        bytes.push(0x63);
+                    }
                 }
-                bytes.push(0x63);
                 bytes.push(mem_enc.modrm);
                 if let Some(s) = mem_enc.sib {
                     bytes.push(s);
@@ -3219,7 +3412,12 @@ impl X86_64Encoder {
         }
     }
 
-    /// Encode CVTSD2SI (double to integer).
+    /// Encode CVTTSD2SI — truncating double-to-signed-integer conversion.
+    ///
+    /// Uses opcode `0x2C` (truncate toward zero) rather than `0x2D`
+    /// (round per MXCSR) to match C cast semantics `(int)d`.
+    /// Format: `F2 [REX.W] 0F 2C /r` — GPR ← truncate(XMM).
+    /// `operand_size` controls REX.W: 8 → 64-bit dest, else 32-bit.
     fn encode_cvtsd2si(&mut self, inst: &MachineInstruction) -> EncodedInstruction {
         let ops = &inst.operands;
         match (ops.first(), ops.get(1)) {
@@ -3228,11 +3426,12 @@ impl X86_64Encoder {
             {
                 let mut bytes = Vec::with_capacity(6);
                 bytes.push(0xF2);
-                if let Some(rex) = compute_rex(true, Some(*gpr), None, Some(*xmm)) {
+                let want_rexw = inst.operand_size == 0 || inst.operand_size == 8;
+                if let Some(rex) = compute_rex(want_rexw, Some(*gpr), None, Some(*xmm)) {
                     bytes.push(rex);
                 }
                 bytes.push(0x0F);
-                bytes.push(0x2D);
+                bytes.push(0x2C); // CVTTSD2SI — truncation
                 bytes.push(modrm_byte(
                     0b11,
                     hw_encoding(*gpr) & 0x7,
@@ -3248,6 +3447,87 @@ impl X86_64Encoder {
                 EncodedInstruction::new(vec![0x0F, 0x0B])
             }
         }
+    }
+
+    /// Encode CVTSI2SS — signed-integer-to-float conversion.
+    ///
+    /// Format: `F3 [REX.W] 0F 2A /r` — XMM ← convert(GPR).
+    fn encode_cvtsi2ss(&mut self, inst: &MachineInstruction) -> EncodedInstruction {
+        let ops = &inst.operands;
+        match (ops.first(), ops.get(1)) {
+            (Some(MachineOperand::Register(xmm)), Some(MachineOperand::Register(gpr)))
+                if is_sse(*xmm) =>
+            {
+                let mut bytes = Vec::with_capacity(6);
+                bytes.push(0xF3);
+                if let Some(rex) = compute_rex(true, Some(*xmm), None, Some(*gpr)) {
+                    bytes.push(rex);
+                }
+                bytes.push(0x0F);
+                bytes.push(0x2A);
+                bytes.push(modrm_byte(
+                    0b11,
+                    hw_encoding(*xmm) & 0x7,
+                    hw_encoding(*gpr) & 0x7,
+                ));
+                EncodedInstruction::new(bytes)
+            }
+            _ => {
+                eprintln!(
+                    "[UD2] opcode={} ops={:?} res={:?}",
+                    inst.opcode, inst.operands, inst.result
+                );
+                EncodedInstruction::new(vec![0x0F, 0x0B])
+            }
+        }
+    }
+
+    /// Encode CVTTSS2SI — truncating float-to-signed-integer conversion.
+    ///
+    /// Format: `F3 [REX.W] 0F 2C /r` — GPR ← truncate(XMM).
+    fn encode_cvtss2si(&mut self, inst: &MachineInstruction) -> EncodedInstruction {
+        let ops = &inst.operands;
+        match (ops.first(), ops.get(1)) {
+            (Some(MachineOperand::Register(gpr)), Some(MachineOperand::Register(xmm)))
+                if is_sse(*xmm) =>
+            {
+                let mut bytes = Vec::with_capacity(6);
+                bytes.push(0xF3);
+                let want_rexw = inst.operand_size == 0 || inst.operand_size == 8;
+                if let Some(rex) = compute_rex(want_rexw, Some(*gpr), None, Some(*xmm)) {
+                    bytes.push(rex);
+                }
+                bytes.push(0x0F);
+                bytes.push(0x2C); // CVTTSS2SI — truncation
+                bytes.push(modrm_byte(
+                    0b11,
+                    hw_encoding(*gpr) & 0x7,
+                    hw_encoding(*xmm) & 0x7,
+                ));
+                EncodedInstruction::new(bytes)
+            }
+            _ => {
+                eprintln!(
+                    "[UD2] opcode={} ops={:?} res={:?}",
+                    inst.opcode, inst.operands, inst.result
+                );
+                EncodedInstruction::new(vec![0x0F, 0x0B])
+            }
+        }
+    }
+
+    /// Encode CVTSD2SS — double-to-float conversion.
+    ///
+    /// Format: `F2 0F 5A /r` — XMM(float) ← convert(XMM(double)).
+    fn encode_cvtsd2ss(&mut self, inst: &MachineInstruction) -> EncodedInstruction {
+        self.encode_sse_op(inst, 0xF2, 0x5A)
+    }
+
+    /// Encode CVTSS2SD — float-to-double conversion.
+    ///
+    /// Format: `F3 0F 5A /r` — XMM(double) ← convert(XMM(float)).
+    fn encode_cvtss2sd(&mut self, inst: &MachineInstruction) -> EncodedInstruction {
+        self.encode_sse_op(inst, 0xF3, 0x5A)
     }
 } // end impl X86_64Encoder
 

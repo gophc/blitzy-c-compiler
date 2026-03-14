@@ -36,7 +36,10 @@ use crate::ir::basic_block::BasicBlock;
 use crate::ir::builder::IrBuilder;
 use crate::ir::function::IrFunction;
 use crate::ir::instructions::{BlockId, Instruction, Value};
-use crate::ir::lowering::expr_lowering::{lower_expression, lower_lvalue, ExprLoweringContext};
+use crate::ir::lowering::expr_lowering::{
+    insert_implicit_conversion, lower_expression, lower_expression_typed, lower_lvalue,
+    ExprLoweringContext, TypedValue,
+};
 use crate::ir::module::IrModule;
 use crate::ir::types::IrType;
 
@@ -149,6 +152,13 @@ pub struct StmtLoweringContext<'a> {
     /// one in an outer scope but with a different type, this map holds the
     /// CURRENT scope's type, overriding `local_types`.
     pub scope_type_overrides: FxHashMap<String, CType>,
+    /// C-level return type of the enclosing function.  Used by `lower_return`
+    /// to insert an implicit conversion (SExt/ZExt/Trunc) when the return
+    /// expression's C type differs from the function's declared return type.
+    /// Without this, returning a `signed char` from an `int`-returning
+    /// function would omit the sign-extension, producing incorrect values
+    /// for negative numbers.
+    pub return_ctype: Option<CType>,
 }
 
 // ===========================================================================
@@ -455,6 +465,11 @@ fn string_literal_length(expr: &ast::Expression) -> Option<usize> {
 /// IR-type comparison that ignores minor CType representation differences
 /// (e.g. `int` vs `typedef int my_int`).
 fn ctypes_compatible_for_scope_shadowing(a: &CType, b: &CType, target: &Target) -> bool {
+    // Unwrap typedefs before comparison so that a resolved typedef
+    // (with full struct fields) matches an unresolved one (empty fields)
+    // when they share the same typedef name or underlying struct tag.
+    let a = unwrap_typedef_for_compat(a);
+    let b = unwrap_typedef_for_compat(b);
     match (a, b) {
         // Named struct — same tag means same type regardless of field resolution.
         (CType::Struct { name: Some(na), .. }, CType::Struct { name: Some(nb), .. }) => na == nb,
@@ -471,6 +486,18 @@ fn ctypes_compatible_for_scope_shadowing(a: &CType, b: &CType, target: &Target) 
         // For all other types, compare via IR types which normalises
         // typedefs and minor representation differences.
         _ => IrType::from_ctype(a, target) == IrType::from_ctype(b, target),
+    }
+}
+
+/// Unwrap typedef layers to reach the underlying concrete type.
+/// This ensures that `typedef struct S S;` comparisons look through
+/// the typedef wrapper and compare the underlying struct tags,
+/// preventing false "scope shadowing" when the pre-scan resolved
+/// the struct fields but the AST-level type still has empty fields.
+fn unwrap_typedef_for_compat(ty: &CType) -> &CType {
+    match ty {
+        CType::Typedef { underlying, .. } => unwrap_typedef_for_compat(underlying),
+        other => other,
     }
 }
 
@@ -540,59 +567,20 @@ pub fn ensure_allocas_for_declaration(ctx: &mut StmtLoweringContext<'_>, decl: &
             let func_name = &ctx.function.name;
             let mangled_name = format!("{}.{}", func_name, var_name);
 
-            // Evaluate constant initializer if present.
-            let constant = if let Some(ast::Initializer::Expression(expr)) =
-                init_decl.initializer.as_ref()
-            {
-                match &**expr {
-                    ast::Expression::IntegerLiteral { value, .. } => {
-                        Some(crate::ir::module::Constant::Integer(*value as i128))
-                    }
-                    ast::Expression::FloatLiteral { value, .. } => {
-                        Some(crate::ir::module::Constant::Float(*value))
-                    }
-                    ast::Expression::CharLiteral { value, .. } => {
-                        Some(crate::ir::module::Constant::Integer(*value as i128))
-                    }
-                    ast::Expression::StringLiteral { segments, .. } => {
-                        let mut bytes = Vec::new();
-                        for seg in segments {
-                            bytes.extend_from_slice(&seg.value);
-                        }
-                        bytes.push(0); // null terminator
-                        Some(crate::ir::module::Constant::String(bytes))
-                    }
-                    _ => Some(crate::ir::module::Constant::ZeroInit),
-                }
-            } else if let Some(ast::Initializer::List {
-                designators_and_initializers,
-                ..
-            }) = init_decl.initializer.as_ref()
-            {
-                // Brace-init list for static local arrays.
-                let mut elems = Vec::new();
-                for di in designators_and_initializers {
-                    if let ast::Initializer::Expression(expr) = &di.initializer {
-                        match expr.as_ref() {
-                            ast::Expression::IntegerLiteral { value, .. } => {
-                                elems.push(crate::ir::module::Constant::Integer(*value as i128));
-                            }
-                            ast::Expression::CharLiteral { value, .. } => {
-                                elems.push(crate::ir::module::Constant::Integer(*value as i128));
-                            }
-                            _ => {
-                                elems.push(crate::ir::module::Constant::ZeroInit);
-                            }
-                        }
-                    } else {
-                        elems.push(crate::ir::module::Constant::ZeroInit);
-                    }
-                }
-                if elems.is_empty() {
-                    Some(crate::ir::module::Constant::ZeroInit)
-                } else {
-                    Some(crate::ir::module::Constant::Array(elems))
-                }
+            // Evaluate constant initializer if present.  Delegate to the
+            // full evaluate_initializer_constant from decl_lowering so that
+            // function pointers, address-of expressions, designated initializers,
+            // and other non-trivial constant expressions are handled correctly
+            // — matching how global variable initializers are processed.
+            let constant = if let Some(ref init) = init_decl.initializer {
+                super::decl_lowering::evaluate_initializer_constant(
+                    init,
+                    &c_type,
+                    ctx.target,
+                    ctx.type_builder,
+                    ctx.diagnostics,
+                    ctx.name_table,
+                )
             } else {
                 Some(crate::ir::module::Constant::ZeroInit)
             };
@@ -753,6 +741,7 @@ pub fn lower_declaration_initializers(ctx: &mut StmtLoweringContext<'_>, decl: &
             current_function_name: ctx.current_function_name,
             enclosing_loop_stack: ctx.loop_stack.clone(),
             scope_type_overrides: &ctx.scope_type_overrides,
+            last_bitfield_info: None,
         };
         decl_lowering::lower_local_initializer(alloca_val, initializer, &var_type, &mut expr_ctx);
     }
@@ -923,8 +912,15 @@ fn lower_while_loop(
         .builder
         .build_cond_branch(cond_val, body_block, exit_block, span);
     emit_instruction_to_current_block(ctx, cond_br);
-    add_cfg_edge(ctx, header_block.index(), body_block.index());
-    add_cfg_edge(ctx, header_block.index(), exit_block.index());
+    // Use actual current block (may differ from header_block when the
+    // condition contains `&&`/`||` that create short-circuit blocks).
+    let actual_header_end = ctx
+        .builder
+        .get_insert_block()
+        .map(|b| b.index())
+        .unwrap_or(header_block.index());
+    add_cfg_edge(ctx, actual_header_end, body_block.index());
+    add_cfg_edge(ctx, actual_header_end, exit_block.index());
 
     // --- Body block ---
     ctx.builder.set_insert_point(body_block);
@@ -1065,8 +1061,22 @@ fn lower_do_while_loop(
             .builder
             .build_cond_branch(cond_val, body_block, exit_block, span);
         emit_instruction_to_current_block(ctx, cond_br);
-        add_cfg_edge(ctx, cond_block.index(), body_block.index());
-        add_cfg_edge(ctx, cond_block.index(), exit_block.index());
+        // CRITICAL: `lower_expr_to_i1` may create intermediate blocks for
+        // short-circuit `&&` / `||` operators. The conditional branch above
+        // is emitted in the *actual* current block (which may be a merge
+        // block created by `&&`/`||`), NOT necessarily `cond_block`. We
+        // must record CFG edges from the actual block that holds the branch,
+        // otherwise phi-node predecessors at `body_block` (the do-while
+        // header) will reference the wrong block, causing phi-elimination
+        // to place back-edge copies in a block that doesn't directly
+        // branch to the loop header — making loop variables stale.
+        let actual_cond_end = ctx
+            .builder
+            .get_insert_block()
+            .map(|b| b.index())
+            .unwrap_or(cond_block.index());
+        add_cfg_edge(ctx, actual_cond_end, body_block.index());
+        add_cfg_edge(ctx, actual_cond_end, exit_block.index());
     }
 
     // Continue at exit block.
@@ -1134,8 +1144,15 @@ fn lower_for_loop(
             .builder
             .build_cond_branch(cond_val, body_block, exit_block, span);
         emit_instruction_to_current_block(ctx, cond_br);
-        add_cfg_edge(ctx, cond_block.index(), body_block.index());
-        add_cfg_edge(ctx, cond_block.index(), exit_block.index());
+        // Use actual current block — `lower_expr_to_i1` may create
+        // short-circuit blocks for `&&`/`||` in the condition.
+        let actual_cond_end = ctx
+            .builder
+            .get_insert_block()
+            .map(|b| b.index())
+            .unwrap_or(cond_block.index());
+        add_cfg_edge(ctx, actual_cond_end, body_block.index());
+        add_cfg_edge(ctx, actual_cond_end, exit_block.index());
     } else {
         // Infinite loop (no condition): always branch to body.
         let br = ctx.builder.build_branch(body_block, span);
@@ -1503,7 +1520,41 @@ fn lower_return(
                 "returning a value from a void function",
             ));
         }
-        Some(lower_expr_via_context(ctx, expr))
+        // Use typed lowering to get both the Value and the C type of
+        // the expression.  This enables correct implicit conversion to
+        // the function's return type (e.g., `signed char` → `int`
+        // needs SExt, not zero-extension).
+        let tv = lower_expr_typed_via_context(ctx, expr);
+        let mut val = tv.value;
+
+        // Insert implicit conversion if the function has a known C
+        // return type and the expression's C type differs.
+        if let Some(ref ret_cty) = ctx.return_ctype {
+            let mut expr_ctx = ExprLoweringContext {
+                builder: ctx.builder,
+                function: ctx.function,
+                module: ctx.module,
+                target: ctx.target,
+                type_builder: ctx.type_builder,
+                diagnostics: ctx.diagnostics,
+                local_vars: ctx.local_vars,
+                param_values: ctx.param_values,
+                name_table: ctx.name_table,
+                local_types: ctx.local_types,
+                enum_constants: ctx.enum_constants,
+                static_locals: ctx.static_locals,
+                struct_defs: ctx.struct_defs,
+                label_blocks: ctx.label_blocks,
+                current_function_name: ctx.current_function_name,
+                enclosing_loop_stack: ctx.loop_stack.clone(),
+                scope_type_overrides: &ctx.scope_type_overrides,
+                last_bitfield_info: None,
+            };
+            val = insert_implicit_conversion(
+                &mut expr_ctx, val, &tv.ty, ret_cty, span,
+            );
+        }
+        Some(val)
     } else {
         // Verify function has a void return type when no value is returned.
         if ctx.function.return_type != IrType::Void {
@@ -1845,13 +1896,49 @@ fn statement_span(stmt: &ast::Statement) -> Span {
 fn eval_case_constant(expr: &ast::Expression) -> i64 {
     match expr {
         ast::Expression::IntegerLiteral { value, .. } => *value as i64,
+        ast::Expression::CharLiteral { value, .. } => *value as i64,
         ast::Expression::UnaryOp {
             op: ast::UnaryOp::Negate,
             operand,
             ..
         } => -eval_case_constant(operand),
+        ast::Expression::UnaryOp {
+            op: ast::UnaryOp::BitwiseNot,
+            operand,
+            ..
+        } => !eval_case_constant(operand),
         ast::Expression::Parenthesized { inner, .. } => eval_case_constant(inner),
         ast::Expression::Cast { operand: inner, .. } => eval_case_constant(inner),
+        ast::Expression::Binary {
+            op,
+            left,
+            right,
+            ..
+        } => {
+            let l = eval_case_constant(left);
+            let r = eval_case_constant(right);
+            match op {
+                ast::BinaryOp::Add => l.wrapping_add(r),
+                ast::BinaryOp::Sub => l.wrapping_sub(r),
+                ast::BinaryOp::Mul => l.wrapping_mul(r),
+                ast::BinaryOp::Div if r != 0 => l.wrapping_div(r),
+                ast::BinaryOp::Mod if r != 0 => l.wrapping_rem(r),
+                ast::BinaryOp::BitwiseAnd => l & r,
+                ast::BinaryOp::BitwiseOr => l | r,
+                ast::BinaryOp::BitwiseXor => l ^ r,
+                ast::BinaryOp::ShiftLeft => l.wrapping_shl(r as u32),
+                ast::BinaryOp::ShiftRight => l.wrapping_shr(r as u32),
+                _ => 0,
+            }
+        }
+        ast::Expression::Identifier { name, .. } => {
+            // Enum constants — look up in enum_constants if available.
+            // Since we don't have direct access to enum_constants here,
+            // this case should have been folded by the semantic analyzer.
+            // Return 0 as fallback.
+            let _ = name;
+            0
+        }
         _ => {
             // For non-trivial constant expressions the semantic analyzer
             // should have folded them before they reach IR lowering.
@@ -1893,8 +1980,40 @@ fn lower_expr_via_context(ctx: &mut StmtLoweringContext<'_>, expr: &ast::Express
         current_function_name: ctx.current_function_name,
         enclosing_loop_stack: ctx.loop_stack.clone(),
         scope_type_overrides: &ctx.scope_type_overrides,
+        last_bitfield_info: None,
     };
     lower_expression(&mut expr_ctx, expr)
+}
+
+/// Lower an expression via a `StmtLoweringContext`, returning both the
+/// IR `Value` and the expression's C-level type.  Used by `lower_return`
+/// so that the caller can insert a correct implicit conversion (SExt for
+/// signed types, ZExt for unsigned) to the function's return type.
+fn lower_expr_typed_via_context(
+    ctx: &mut StmtLoweringContext<'_>,
+    expr: &ast::Expression,
+) -> TypedValue {
+    let mut expr_ctx = ExprLoweringContext {
+        builder: ctx.builder,
+        function: ctx.function,
+        module: ctx.module,
+        target: ctx.target,
+        type_builder: ctx.type_builder,
+        diagnostics: ctx.diagnostics,
+        local_vars: ctx.local_vars,
+        param_values: ctx.param_values,
+        name_table: ctx.name_table,
+        local_types: ctx.local_types,
+        enum_constants: ctx.enum_constants,
+        static_locals: ctx.static_locals,
+        struct_defs: ctx.struct_defs,
+        label_blocks: ctx.label_blocks,
+        current_function_name: ctx.current_function_name,
+        enclosing_loop_stack: ctx.loop_stack.clone(),
+        scope_type_overrides: &ctx.scope_type_overrides,
+        last_bitfield_info: None,
+    };
+    lower_expression_typed(&mut expr_ctx, expr)
 }
 
 /// Lower an expression as an **lvalue** via a `StmtLoweringContext`.
@@ -1921,6 +2040,7 @@ fn lower_lvalue_via_context(ctx: &mut StmtLoweringContext<'_>, expr: &ast::Expre
         current_function_name: ctx.current_function_name,
         enclosing_loop_stack: ctx.loop_stack.clone(),
         scope_type_overrides: &ctx.scope_type_overrides,
+        last_bitfield_info: None,
     };
     lower_lvalue(&mut expr_ctx, expr)
 }
@@ -1988,6 +2108,11 @@ fn lower_expr_to_i1(
         span,
     };
     emit_instruction_to_current_block(ctx, zero_inst);
+    // Register the zero constant in the function's constant_values map so
+    // the backend resolves it correctly (Bug 35: without this, the backend
+    // falls through to select_binop which produces garbage values instead
+    // of immediate 0).
+    ctx.function.constant_values.insert(zero, 0);
 
     let cmp_result = ctx.builder.fresh_value();
     let cmp_inst = Instruction::ICmp {

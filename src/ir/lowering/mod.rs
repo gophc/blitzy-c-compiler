@@ -86,6 +86,11 @@ thread_local! {
     // constant expressions can resolve forward-referenced struct types.
     static SIZEOF_STRUCT_DEFS: RefCell<Option<FxHashMap<String, CType>>> = const { RefCell::new(None) };
 
+    // Target architecture, populated at the start of `lower_translation_unit`
+    // so that `evaluate_const_int_expr` can resolve sizeof/alignof in array
+    // dimension expressions without threading the target through every call.
+    static LOWERING_TARGET: RefCell<Option<crate::common::target::Target>> = const { RefCell::new(None) };
+
     // typeof resolution context — maps variable names to their resolved CTypes.
     // Populated incrementally during `collect_locals_from_declaration` so that
     // `typeof(var)` can look up a previously declared variable's type.  Also
@@ -723,51 +728,13 @@ pub fn lower_translation_unit(
         INTERNER_SNAPSHOT.with(|snap| snap.borrow().as_ref().cloned().unwrap_or_default());
 
     // ====================================================================
-    // Pass 0 — Collect struct/union/enum definitions before global lowering
-    // ====================================================================
-    let _t0 = std::time::Instant::now();
-    // Struct/union definitions at file scope (or embedded in declarations)
-    // populate a registry mapping tag name → CType.  This MUST run before
-    // global variable lowering so that constant expressions like
-    // `sizeof(struct S)` in global initializers can resolve the full type.
-    let struct_defs: FxHashMap<String, CType> = {
-        let mut map = FxHashMap::default();
-        for ext_decl in &translation_unit.declarations {
-            match ext_decl {
-                ast::ExternalDeclaration::Declaration(decl) => {
-                    collect_struct_defs_from_specifiers(
-                        &decl.specifiers.type_specifiers,
-                        &name_table,
-                        &mut map,
-                    );
-                }
-                ast::ExternalDeclaration::FunctionDefinition(func_def) => {
-                    collect_struct_defs_from_specifiers(
-                        &func_def.specifiers.type_specifiers,
-                        &name_table,
-                        &mut map,
-                    );
-                }
-                _ => {}
-            }
-        }
-        map
-    };
-
-    eprintln!(
-        "[BCC-TIMING] ir-pass0-struct-collect: {:.3}s",
-        _t0.elapsed().as_secs_f64()
-    );
-    // Populate the thread-local struct definitions registry so that
-    // sizeof/alignof evaluation in global constant expressions can
-    // resolve forward-referenced struct/union types.
-    SIZEOF_STRUCT_DEFS.with(|defs| {
-        *defs.borrow_mut() = Some(struct_defs.clone());
-    });
-
-    // ====================================================================
     // Pass 0.5 — Collect typedef definitions for type resolution
     // ====================================================================
+    // MUST run BEFORE struct/union collection (Pass 0), because struct
+    // field extraction resolves typedef names from TYPEDEF_MAP.  Without
+    // this, fields with typedef'd types (e.g., `u8` → `unsigned char`)
+    // would fall back to `CType::Int`, corrupting struct layouts.
+    //
     // Initialize the typedef map with builtin typedefs BEFORE scanning
     // user code, so that typedef chains (e.g., typedef __builtin_va_list
     // va_list) can resolve through the map incrementally.
@@ -819,6 +786,71 @@ pub fn lower_translation_unit(
             }
         }
     }
+
+    // Populate the thread-local target BEFORE pass 0 so that
+    // `evaluate_const_int_expr` can resolve sizeof/alignof in array
+    // dimension expressions during struct field collection.
+    LOWERING_TARGET.with(|t| {
+        *t.borrow_mut() = Some(target.clone());
+    });
+
+    // ====================================================================
+    // Pass 0 — Collect struct/union/enum definitions before global lowering
+    // ====================================================================
+    let _t0 = std::time::Instant::now();
+    // Struct/union definitions at file scope (or embedded in declarations)
+    // populate a registry mapping tag name → CType.  This MUST run after
+    // typedef collection (Pass 0.5) so that struct field types can resolve
+    // typedef names, and MUST run before global variable lowering so that
+    // constant expressions like `sizeof(struct S)` can resolve the full type.
+    let mut struct_defs: FxHashMap<String, CType> = {
+        let mut map = FxHashMap::default();
+        for ext_decl in &translation_unit.declarations {
+            match ext_decl {
+                ast::ExternalDeclaration::Declaration(decl) => {
+                    collect_struct_defs_from_specifiers(
+                        &decl.specifiers.type_specifiers,
+                        &name_table,
+                        &mut map,
+                    );
+                }
+                ast::ExternalDeclaration::FunctionDefinition(func_def) => {
+                    collect_struct_defs_from_specifiers(
+                        &func_def.specifiers.type_specifiers,
+                        &name_table,
+                        &mut map,
+                    );
+                }
+                _ => {}
+            }
+        }
+        map
+    };
+
+    // After collecting all struct definitions, resolve forward-referenced
+    // typedef field types.  Without this pass, a typedef that was created
+    // before its underlying struct was defined (common C pattern:
+    //   typedef struct Foo Foo; struct Foo { ... };
+    // ) retains an empty field list inside the typedef's `underlying`,
+    // causing sizeof_ctype to return 0 for those fields and corrupting
+    // all subsequent field offsets in any enclosing struct.
+    {
+        let tags_snapshot: FxHashMap<String, CType> = struct_defs.clone();
+        for (_tag, def) in struct_defs.iter_mut() {
+            resolve_struct_field_forward_refs(def, &tags_snapshot);
+        }
+    }
+
+    eprintln!(
+        "[BCC-TIMING] ir-pass0-struct-collect: {:.3}s",
+        _t0.elapsed().as_secs_f64()
+    );
+    // Populate the thread-local struct definitions registry so that
+    // sizeof/alignof evaluation in global constant expressions can
+    // resolve forward-referenced struct/union types.
+    SIZEOF_STRUCT_DEFS.with(|defs| {
+        *defs.borrow_mut() = Some(struct_defs.clone());
+    });
 
     // ====================================================================
     // Pass 1 — Global declarations, function prototypes, file-scope asm
@@ -1141,8 +1173,13 @@ fn collect_enum_constants_from_specifiers(
                     let mut next_val: i128 = 0;
                     for enumerator in enumerators {
                         // Try to evaluate the explicit value expression.
+                        // Pass name_table and the partially-built map so that
+                        // enum aliases like `E = A` can resolve `A` from the
+                        // map of already-processed enumerators (Bug 36 fix).
                         if let Some(ref val_expr) = enumerator.value {
-                            if let Some(v) = try_eval_const_int_expr(val_expr) {
+                            if let Some(v) =
+                                try_eval_const_int_expr_ctx(val_expr, name_table, out)
+                            {
                                 next_val = v;
                             }
                         }
@@ -1262,6 +1299,87 @@ fn collect_enum_constants_from_statement(
 /// the full `CType` (with populated fields) in the output map, keyed
 /// by tag name. This allows forward references like `struct S s;` in
 /// function bodies to resolve the full struct layout.
+/// Recursively resolve forward-referenced struct/union types inside the
+/// field types of a struct or union definition.  This ensures that
+/// `sizeof_ctype` returns the correct size for typedef fields whose
+/// underlying struct was forward-declared at typedef creation time.
+fn resolve_struct_field_forward_refs(ty: &mut CType, tags: &FxHashMap<String, CType>) {
+    match ty {
+        CType::Struct {
+            ref mut fields, ..
+        }
+        | CType::Union {
+            ref mut fields, ..
+        } => {
+            for field in fields.iter_mut() {
+                resolve_type_forward_refs_deep(&mut field.ty, tags);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Recursively resolve forward-referenced struct/union types within a type
+/// tree.  Handles typedefs, pointers, arrays, qualifiers, etc.
+fn resolve_type_forward_refs_deep(ty: &mut CType, tags: &FxHashMap<String, CType>) {
+    match ty {
+        CType::Struct {
+            name: Some(ref tag),
+            ref fields,
+            ..
+        } if fields.is_empty() => {
+            let tag_owned = tag.clone();
+            if let Some(full_def) = tags.get(&tag_owned) {
+                *ty = full_def.clone();
+                // Recurse into the newly resolved type — it may itself
+                // contain empty-field tag references that need resolution.
+                resolve_type_forward_refs_deep(ty, tags);
+            }
+        }
+        CType::Union {
+            name: Some(ref tag),
+            ref fields,
+            ..
+        } if fields.is_empty() => {
+            let tag_owned = tag.clone();
+            if let Some(full_def) = tags.get(&tag_owned) {
+                *ty = full_def.clone();
+                // Recurse into the newly resolved type — it may itself
+                // contain empty-field tag references that need resolution.
+                resolve_type_forward_refs_deep(ty, tags);
+            }
+        }
+        CType::Struct {
+            ref mut fields, ..
+        }
+        | CType::Union {
+            ref mut fields, ..
+        } => {
+            for field in fields.iter_mut() {
+                resolve_type_forward_refs_deep(&mut field.ty, tags);
+            }
+        }
+        CType::Typedef {
+            ref mut underlying, ..
+        } => {
+            resolve_type_forward_refs_deep(underlying, tags);
+        }
+        CType::Pointer(_, _) => {
+            // Don't recurse into pointers — they don't affect layout size
+        }
+        CType::Array(ref mut inner, _) => {
+            resolve_type_forward_refs_deep(inner, tags);
+        }
+        CType::Qualified(ref mut inner, _) => {
+            resolve_type_forward_refs_deep(inner, tags);
+        }
+        CType::Atomic(ref mut inner) => {
+            resolve_type_forward_refs_deep(inner, tags);
+        }
+        _ => {}
+    }
+}
+
 fn collect_struct_defs_from_specifiers(
     specs: &[ast::TypeSpecifier],
     name_table: &[String],
@@ -1270,7 +1388,7 @@ fn collect_struct_defs_from_specifiers(
     for spec in specs {
         match spec {
             ast::TypeSpecifier::Struct(s) => {
-                if let (Some(ref tag), Some(ref _members)) = (&s.tag, &s.members) {
+                if let (Some(ref tag), Some(ref members)) = (&s.tag, &s.members) {
                     let tag_name_idx = tag.as_u32() as usize;
                     if tag_name_idx < name_table.len() {
                         let tag_name = name_table[tag_name_idx].clone();
@@ -1283,10 +1401,29 @@ fn collect_struct_defs_from_specifiers(
                         };
                         out.insert(tag_name, ctype);
                     }
+                    // Recurse into member declarations to collect nested
+                    // struct/union definitions (e.g. `struct _ht { ... }` defined
+                    // inside a member of `struct Hash`).
+                    for member in members {
+                        collect_struct_defs_from_specifiers(
+                            &member.specifiers.type_specifiers,
+                            name_table,
+                            out,
+                        );
+                    }
+                } else if let Some(ref members) = s.members {
+                    // Anonymous struct with members — still recurse.
+                    for member in members {
+                        collect_struct_defs_from_specifiers(
+                            &member.specifiers.type_specifiers,
+                            name_table,
+                            out,
+                        );
+                    }
                 }
             }
             ast::TypeSpecifier::Union(u) => {
-                if let (Some(ref tag), Some(ref _members)) = (&u.tag, &u.members) {
+                if let (Some(ref tag), Some(ref members)) = (&u.tag, &u.members) {
                     let tag_name_idx = tag.as_u32() as usize;
                     if tag_name_idx < name_table.len() {
                         let tag_name = name_table[tag_name_idx].clone();
@@ -1299,6 +1436,22 @@ fn collect_struct_defs_from_specifiers(
                         };
                         out.insert(tag_name, ctype);
                     }
+                    // Recurse into member declarations.
+                    for member in members {
+                        collect_struct_defs_from_specifiers(
+                            &member.specifiers.type_specifiers,
+                            name_table,
+                            out,
+                        );
+                    }
+                } else if let Some(ref members) = u.members {
+                    for member in members {
+                        collect_struct_defs_from_specifiers(
+                            &member.specifiers.type_specifiers,
+                            name_table,
+                            out,
+                        );
+                    }
                 }
             }
             _ => {}
@@ -1307,19 +1460,46 @@ fn collect_struct_defs_from_specifiers(
 }
 
 fn try_eval_const_int_expr(expr: &ast::Expression) -> Option<i128> {
+    try_eval_const_int_expr_ctx(expr, &[], &FxHashMap::default())
+}
+
+/// Evaluate a compile-time integer constant expression, with access to
+/// a name table and an existing enum constant map for resolving
+/// identifiers that reference previously-defined enum constants.
+/// This is essential for enum aliases like:
+///   `PTHREAD_MUTEX_RECURSIVE = PTHREAD_MUTEX_RECURSIVE_NP`
+/// where the value expression is an identifier.
+fn try_eval_const_int_expr_ctx(
+    expr: &ast::Expression,
+    name_table: &[String],
+    enum_map: &FxHashMap<String, i128>,
+) -> Option<i128> {
     match expr {
         ast::Expression::IntegerLiteral { value, .. } => Some(*value as i128),
+        // Resolve identifier references to previously-defined enum constants.
+        ast::Expression::Identifier { name, .. } => {
+            let idx = name.as_u32() as usize;
+            if idx < name_table.len() {
+                enum_map.get(&name_table[idx]).copied()
+            } else {
+                None
+            }
+        }
         ast::Expression::UnaryOp { op, operand, .. } => match op {
-            ast::UnaryOp::Negate => try_eval_const_int_expr(operand).map(|v| -v),
-            ast::UnaryOp::Plus => try_eval_const_int_expr(operand),
-            ast::UnaryOp::BitwiseNot => try_eval_const_int_expr(operand).map(|v| !v),
+            ast::UnaryOp::Negate => {
+                try_eval_const_int_expr_ctx(operand, name_table, enum_map).map(|v| -v)
+            }
+            ast::UnaryOp::Plus => try_eval_const_int_expr_ctx(operand, name_table, enum_map),
+            ast::UnaryOp::BitwiseNot => {
+                try_eval_const_int_expr_ctx(operand, name_table, enum_map).map(|v| !v)
+            }
             _ => None,
         },
         ast::Expression::Binary {
             op, left, right, ..
         } => {
-            let l = try_eval_const_int_expr(left)?;
-            let r = try_eval_const_int_expr(right)?;
+            let l = try_eval_const_int_expr_ctx(left, name_table, enum_map)?;
+            let r = try_eval_const_int_expr_ctx(right, name_table, enum_map)?;
             match op {
                 ast::BinaryOp::Add => Some(l + r),
                 ast::BinaryOp::Sub => Some(l - r),
@@ -1343,11 +1523,24 @@ fn try_eval_const_int_expr(expr: &ast::Expression) -> Option<i128> {
                 ast::BinaryOp::BitwiseAnd => Some(l & r),
                 ast::BinaryOp::BitwiseOr => Some(l | r),
                 ast::BinaryOp::BitwiseXor => Some(l ^ r),
+                ast::BinaryOp::Equal => Some(if l == r { 1 } else { 0 }),
+                ast::BinaryOp::NotEqual => Some(if l != r { 1 } else { 0 }),
+                ast::BinaryOp::Less => Some(if l < r { 1 } else { 0 }),
+                ast::BinaryOp::LessEqual => Some(if l <= r { 1 } else { 0 }),
+                ast::BinaryOp::Greater => Some(if l > r { 1 } else { 0 }),
+                ast::BinaryOp::GreaterEqual => Some(if l >= r { 1 } else { 0 }),
+                ast::BinaryOp::LogicalAnd => Some(if l != 0 && r != 0 { 1 } else { 0 }),
+                ast::BinaryOp::LogicalOr => Some(if l != 0 || r != 0 { 1 } else { 0 }),
                 _ => None,
             }
         }
+        ast::Expression::Cast { operand, .. } => {
+            try_eval_const_int_expr_ctx(operand, name_table, enum_map)
+        }
         // Parenthesized expression — just unwrap.
-        ast::Expression::Parenthesized { inner, .. } => try_eval_const_int_expr(inner),
+        ast::Expression::Parenthesized { inner, .. } => {
+            try_eval_const_int_expr_ctx(inner, name_table, enum_map)
+        }
         _ => None,
     }
 }

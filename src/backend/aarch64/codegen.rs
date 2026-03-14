@@ -1983,14 +1983,27 @@ impl AArch64InstructionSelector {
                 insts.push(inst);
             }
             BinOp::Xor => {
-                let mut inst = A64Instruction::new(A64Opcode::EOR_reg)
-                    .with_rd(rd)
-                    .with_rn(rn)
-                    .with_rm(rm);
-                if is_32 {
-                    inst = inst.set_32bit();
+                // Detect bitwise NOT: XOR with Value::UNDEF represents
+                // `~operand` (XOR with all-ones). Emit MVN (bitwise NOT)
+                // instead of EOR with the UNDEF-resolved zero register.
+                if *rhs == Value::UNDEF {
+                    let mut inst = A64Instruction::new(A64Opcode::MVN_reg)
+                        .with_rd(rd)
+                        .with_rm(rn);
+                    if is_32 {
+                        inst = inst.set_32bit();
+                    }
+                    insts.push(inst);
+                } else {
+                    let mut inst = A64Instruction::new(A64Opcode::EOR_reg)
+                        .with_rd(rd)
+                        .with_rn(rn)
+                        .with_rm(rm);
+                    if is_32 {
+                        inst = inst.set_32bit();
+                    }
+                    insts.push(inst);
                 }
-                insts.push(inst);
             }
             BinOp::Shl => {
                 let mut inst = A64Instruction::new(A64Opcode::LSL_reg)

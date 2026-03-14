@@ -47,7 +47,7 @@ use crate::common::target::Target;
 use crate::ir::basic_block::BasicBlock;
 use crate::ir::function::IrFunction;
 #[allow(unused_imports)]
-use crate::ir::instructions::{BlockId, Instruction, Value};
+use crate::ir::instructions::{BinOp, BlockId, Instruction, Value};
 use crate::ir::types::IrType;
 
 // ===========================================================================
@@ -379,6 +379,19 @@ pub fn compute_live_intervals(func: &IrFunction) -> Vec<LiveInterval> {
             }
             // Detect call instructions.
             if matches!(inst, Instruction::Call { .. }) {
+                call_positions.push(idx);
+            }
+            // x86-64 DIV/IDIV implicitly clobber RAX and RDX (both are
+            // caller-saved).  Treat division instructions as pseudo-calls
+            // so the allocator avoids placing live values in caller-saved
+            // registers across them.
+            if matches!(
+                inst,
+                Instruction::BinOp { op: BinOp::SDiv, .. }
+                    | Instruction::BinOp { op: BinOp::UDiv, .. }
+                    | Instruction::BinOp { op: BinOp::SRem, .. }
+                    | Instruction::BinOp { op: BinOp::URem, .. }
+            ) {
                 call_positions.push(idx);
             }
 

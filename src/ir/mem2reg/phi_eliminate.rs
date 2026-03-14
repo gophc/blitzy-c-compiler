@@ -238,7 +238,12 @@ pub fn eliminate_trivial_phis(func: &mut IrFunction) -> bool {
     let mut trivial: Vec<(Value, Value)> = Vec::new(); // (phi_result, replacement_value)
 
     for block in func.blocks() {
-        for inst in block.phi_instructions() {
+        // Scan ALL instructions in the block — not just the phi prefix —
+        // because IR lowering may place non-phi instructions (e.g. casts
+        // for ternary operand type unification) before phi nodes in merge
+        // blocks.  Using `phi_instructions()` (which uses `take_while`)
+        // would miss phis that follow a non-phi instruction.
+        for inst in block.instructions.iter() {
             if let Instruction::Phi {
                 result, incoming, ..
             } = inst
@@ -316,7 +321,10 @@ fn collect_phi_nodes(func: &IrFunction) -> FxHashMap<usize, Vec<PhiInfo>> {
     for (block_idx, block) in func.blocks().iter().enumerate() {
         let mut phis_in_block: Vec<PhiInfo> = Vec::new();
 
-        for inst in block.phi_instructions() {
+        // Scan ALL instructions — not just the phi prefix — because IR
+        // lowering may place non-phi instructions (e.g. type casts for
+        // ternary operand unification) before phi nodes in merge blocks.
+        for inst in block.instructions.iter() {
             if let Instruction::Phi {
                 result: phi_result,
                 ty,

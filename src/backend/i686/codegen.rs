@@ -1893,17 +1893,33 @@ impl I686Codegen {
                 );
             }
             BinOp::Xor => {
-                insts.push(
-                    MachineInstruction::new(I686_MOV)
-                        .with_operand(lhs_op)
-                        .with_result(MachineOperand::VirtualRegister(result_vreg)),
-                );
-                insts.push(
-                    MachineInstruction::new(I686_XOR)
-                        .with_operand(MachineOperand::VirtualRegister(result_vreg))
-                        .with_operand(rhs_op)
-                        .with_result(MachineOperand::VirtualRegister(result_vreg)),
-                );
+                // Detect bitwise NOT: XOR with Value::UNDEF represents
+                // `~operand` (XOR with all-ones). Emit NOT instruction
+                // instead of XOR with UNDEF-resolved Immediate(0).
+                if *rhs == Value::UNDEF {
+                    insts.push(
+                        MachineInstruction::new(I686_MOV)
+                            .with_operand(lhs_op)
+                            .with_result(MachineOperand::VirtualRegister(result_vreg)),
+                    );
+                    insts.push(
+                        MachineInstruction::new(I686_NOT)
+                            .with_operand(MachineOperand::VirtualRegister(result_vreg))
+                            .with_result(MachineOperand::VirtualRegister(result_vreg)),
+                    );
+                } else {
+                    insts.push(
+                        MachineInstruction::new(I686_MOV)
+                            .with_operand(lhs_op)
+                            .with_result(MachineOperand::VirtualRegister(result_vreg)),
+                    );
+                    insts.push(
+                        MachineInstruction::new(I686_XOR)
+                            .with_operand(MachineOperand::VirtualRegister(result_vreg))
+                            .with_operand(rhs_op)
+                            .with_result(MachineOperand::VirtualRegister(result_vreg)),
+                    );
+                }
             }
             BinOp::Shl => {
                 // Shift amount must go into CL register.
@@ -2356,17 +2372,32 @@ impl I686Codegen {
                 );
             }
             BinOp::Xor => {
-                insts.push(
-                    MachineInstruction::new(I686_MOV)
-                        .with_operand(lhs_op)
-                        .with_result(MachineOperand::Register(registers::EAX)),
-                );
-                insts.push(
-                    MachineInstruction::new(I686_XOR)
-                        .with_operand(MachineOperand::Register(registers::EAX))
-                        .with_operand(rhs_op)
-                        .with_result(MachineOperand::Register(registers::EAX)),
-                );
+                // Detect bitwise NOT: XOR with Value::UNDEF represents
+                // `~operand` (XOR with all-ones).
+                if *rhs == Value::UNDEF {
+                    insts.push(
+                        MachineInstruction::new(I686_MOV)
+                            .with_operand(lhs_op)
+                            .with_result(MachineOperand::Register(registers::EAX)),
+                    );
+                    insts.push(
+                        MachineInstruction::new(I686_NOT)
+                            .with_operand(MachineOperand::Register(registers::EAX))
+                            .with_result(MachineOperand::Register(registers::EAX)),
+                    );
+                } else {
+                    insts.push(
+                        MachineInstruction::new(I686_MOV)
+                            .with_operand(lhs_op)
+                            .with_result(MachineOperand::Register(registers::EAX)),
+                    );
+                    insts.push(
+                        MachineInstruction::new(I686_XOR)
+                            .with_operand(MachineOperand::Register(registers::EAX))
+                            .with_operand(rhs_op)
+                            .with_result(MachineOperand::Register(registers::EAX)),
+                    );
+                }
             }
             _ => {
                 // For 64-bit mul/div/shift: emit the lhs → EAX as a baseline.

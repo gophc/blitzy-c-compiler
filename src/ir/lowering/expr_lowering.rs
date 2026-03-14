@@ -113,6 +113,12 @@ pub struct ExprLoweringContext<'a> {
     /// case block and `void *t` in another), this map holds the CURRENT
     /// scope's type for that variable, overriding `local_types`.
     pub scope_type_overrides: &'a FxHashMap<String, CType>,
+    /// Bitfield information from the most recent `lower_member_access_lvalue`
+    /// call.  Set to `Some((bit_offset_in_unit, bit_width))` when the
+    /// accessed member is a bitfield, `None` for regular fields.  Consumed
+    /// by `lower_member_access` (read) and `lower_assignment` (write) to
+    /// emit proper bit-manipulation instead of full-width load/store.
+    pub last_bitfield_info: Option<(usize, usize)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -121,9 +127,17 @@ pub struct ExprLoweringContext<'a> {
 
 /// Combined `Value` + C type returned by internal lowering helpers so that
 /// callers can propagate signedness / pointee information.
-struct TypedValue {
-    value: Value,
-    ty: CType,
+/// A pair of an IR [`Value`] and its C-level type.
+///
+/// Used internally during expression lowering to propagate type information
+/// alongside the generated value, and exposed publicly for callers that need
+/// the expression's C type for implicit conversion insertion (e.g. local
+/// variable initializer lowering).
+pub struct TypedValue {
+    /// The IR value handle.
+    pub value: Value,
+    /// The C-level type of this value.
+    pub ty: CType,
 }
 
 impl TypedValue {
@@ -155,6 +169,10 @@ fn emit_inst(ctx: &mut ExprLoweringContext<'_>, inst: Instruction) {
     }
 }
 
+/// Emit an alloca instruction into the **entry block** (block 0).
+///
+/// This is needed for temporary allocas created during expression
+/// lowering (e.g. struct-to-alloca copies for ABI correctness).
 /// Create a new basic block in the current function and return its `BlockId`.
 fn new_block(ctx: &mut ExprLoweringContext<'_>) -> BlockId {
     let block_id = ctx.builder.create_block();
@@ -579,12 +597,82 @@ fn pointee_of(ctype: &CType) -> CType {
 }
 
 /// Compute the byte size of the pointee for pointer arithmetic scaling.
+#[allow(dead_code)]
 fn pointee_size(ctype: &CType, tb: &TypeBuilder) -> usize {
     let pt = pointee_of(ctype);
     if matches!(pt, CType::Void) {
         1
     } else {
         tb.sizeof_type(&pt)
+    }
+}
+
+/// Like [`pointee_size`] but falls back to `sizeof_resolved` so that
+/// pointer arithmetic on `T *p` correctly scales by `sizeof(T)` even
+/// when `T` is a forward-declared/incomplete struct behind a typedef.
+fn pointee_size_resolved(
+    ctype: &CType,
+    tb: &TypeBuilder,
+    struct_defs: &FxHashMap<String, CType>,
+    target: &Target,
+) -> usize {
+    let pt = pointee_of(ctype);
+    if matches!(pt, CType::Void) {
+        1
+    } else {
+        sizeof_resolved(&pt, tb, struct_defs, target)
+    }
+}
+
+/// Compute `sizeof(ty)`, resolving incomplete struct/union types through
+/// typedefs and the `struct_defs` registry.  Falls back to the plain
+/// `TypeBuilder::sizeof_type` when no resolution is needed.
+fn sizeof_resolved(
+    ty: &CType,
+    tb: &TypeBuilder,
+    struct_defs: &FxHashMap<String, CType>,
+    target: &Target,
+) -> usize {
+    // Fast path — normal sizeof.
+    let sz = tb.sizeof_type(ty);
+    if sz > 0 {
+        return sz;
+    }
+    // Slow path — strip typedefs and resolve empty structs/unions from the
+    // global tag registry.
+    sizeof_resolved_inner(ty, struct_defs, target)
+}
+
+fn sizeof_resolved_inner(
+    ty: &CType,
+    struct_defs: &FxHashMap<String, CType>,
+    target: &Target,
+) -> usize {
+    match ty {
+        CType::Typedef { underlying, .. } => sizeof_resolved_inner(underlying, struct_defs, target),
+        CType::Struct {
+            name: Some(ref tag),
+            fields,
+            ..
+        } if fields.is_empty() => {
+            if let Some(full) = struct_defs.get(tag) {
+                types::sizeof_ctype(full, target)
+            } else {
+                0
+            }
+        }
+        CType::Union {
+            name: Some(ref tag),
+            fields,
+            ..
+        } if fields.is_empty() => {
+            if let Some(full) = struct_defs.get(tag) {
+                types::sizeof_ctype(full, target)
+            } else {
+                0
+            }
+        }
+        _ => types::sizeof_ctype(ty, target),
     }
 }
 
@@ -659,10 +747,14 @@ fn lookup_var(ctx: &ExprLoweringContext<'_>, name: &str) -> Option<(Value, bool)
 
 /// Look up the declared C type of a variable.
 fn lookup_var_type(ctx: &ExprLoweringContext<'_>, name: &str) -> CType {
-    // For static local variables, prefer the module global (which has the
-    // correct inferred array size from the initializer) over the local_types
-    // entry (which may have None size from the declaration syntax).
+    // For static local variables, prefer the original C type stored during
+    // lower_static_local (which preserves struct/union/typedef information)
+    // over the lossy ir_type_to_approx_ctype reverse mapping (which turns
+    // IrType::Struct into CType::Int, producing wrong sizeof/field offsets).
     if let Some(mangled) = ctx.static_locals.get(name) {
+        if let Some(ct) = ctx.module.global_c_types.get(mangled.as_str()) {
+            return ct.clone();
+        }
         if let Some(gv) = ctx.module.get_global(mangled.as_str()) {
             return ir_type_to_approx_ctype(&gv.ty);
         }
@@ -702,6 +794,18 @@ fn lookup_var_type(ctx: &ExprLoweringContext<'_>, name: &str) -> CType {
 /// implicit load.
 pub fn lower_expression(ctx: &mut ExprLoweringContext<'_>, expr: &ast::Expression) -> Value {
     lower_expr_inner(ctx, expr).value
+}
+
+/// Lower an AST expression, returning both the IR `Value` and the C type.
+///
+/// Used by callers that need the expression's C-level type for implicit
+/// conversion (e.g. local variable initializers where `char *p = 0` must
+/// convert the `int` literal to a pointer).
+pub fn lower_expression_typed(
+    ctx: &mut ExprLoweringContext<'_>,
+    expr: &ast::Expression,
+) -> TypedValue {
+    lower_expr_inner(ctx, expr)
 }
 
 /// Lower an AST expression as an **lvalue**, returning a pointer `Value`.
@@ -881,6 +985,9 @@ fn lower_expr_inner(ctx: &mut ExprLoweringContext<'_>, expr: &ast::Expression) -
 
 /// Internal lvalue dispatch returning `TypedValue` (pointer + pointee type).
 fn lower_lvalue_inner(ctx: &mut ExprLoweringContext<'_>, expr: &ast::Expression) -> TypedValue {
+    // Clear bitfield info — it will be set by lower_member_access_lvalue
+    // if the resulting lvalue is a bitfield member.
+    ctx.last_bitfield_info = None;
     match expr {
         ast::Expression::Identifier { name, span } => {
             lower_identifier_lvalue(ctx, name.as_u32(), *span)
@@ -1228,8 +1335,13 @@ fn lower_identifier(ctx: &mut ExprLoweringContext<'_>, sym_idx: u32, span: Span)
             // arrays should return the pointer directly (no load).
             let global_is_array = matches!(&gt, IrType::Array(_, _));
             if is_array_decay || global_is_array {
-                // Build the decayed pointer type for the return.
-                let ret_ty = if let IrType::Array(elem, _) = &gt {
+                // Use the accurately-computed decayed type from
+                // lookup_var_type (which reads global_c_types) when
+                // available; this preserves Typedef/Struct element types
+                // that ir_elem_to_approx_ctype would lose.
+                let ret_ty = if is_array_decay {
+                    decayed_ty
+                } else if let IrType::Array(elem, _) = &gt {
                     let elem_cty = ir_elem_to_approx_ctype(elem);
                     CType::Pointer(Box::new(elem_cty), TypeQualifiers::default())
                 } else {
@@ -1919,7 +2031,7 @@ fn lower_ptr_arith(
     idx: &TypedValue,
     span: Span,
 ) -> TypedValue {
-    let es = pointee_size(&ptr.ty, ctx.type_builder) as i128;
+    let es = pointee_size_resolved(&ptr.ty, ctx.type_builder, ctx.struct_defs, ctx.target) as i128;
     let si = size_ir_type(ctx.target);
     let sc = emit_int_const(ctx, es, si.clone(), span);
     let iv = insert_implicit_conversion(ctx, idx.value, &idx.ty, &size_ctype(ctx.target), span);
@@ -1961,7 +2073,7 @@ fn lower_ptr_diff(
     emit_inst(ctx, ric);
     let (d, di) = ctx.builder.build_sub(li, ri, pi.clone(), span);
     emit_inst(ctx, di);
-    let es = pointee_size(&l.ty, ctx.type_builder) as i128;
+    let es = pointee_size_resolved(&l.ty, ctx.type_builder, ctx.struct_defs, ctx.target) as i128;
     let dv = emit_int_const(ctx, es, pi.clone(), span);
     let (res, rdi) = ctx.builder.build_div(d, dv, pi, true, span);
     emit_inst(ctx, rdi);
@@ -2049,10 +2161,121 @@ fn lower_assignment(
 ) -> TypedValue {
     match op {
         ast::AssignOp::Assign => {
-            // Simple assignment:  lhs = rhs
-            let rhs = lower_expr_inner(ctx, value);
+            // Determine the LHS type first to decide assignment strategy.
             let lhs = lower_lvalue_inner(ctx, target);
+            let assign_bf_info = ctx.last_bitfield_info.take();
+
+            // For aggregate types (struct/union), the x86-64 codegen cannot
+            // load/store an entire struct through a single register.  Instead,
+            // expand into individual 8-byte (or smaller) load/store pairs that
+            // copy the aggregate field by field at the IR level.
+            // Resolve forward-declared struct/union types so that
+            // sizeof_ctype returns the actual size rather than 0.
+            let mut resolved_lhs_ty = lhs.ty.clone();
+            resolve_forward_ref_type(&mut resolved_lhs_ty, ctx.struct_defs);
+            let is_agg = crate::common::types::is_struct_or_union(&resolved_lhs_ty);
+            let struct_size = if is_agg {
+                crate::common::types::sizeof_ctype(&resolved_lhs_ty, ctx.target)
+            } else {
+                0
+            };
+            if is_agg && struct_size > 8 {
+                    // Get the RHS as an lvalue (pointer) — do NOT dereference.
+                    let rhs_ptr = lower_lvalue_inner(ctx, value);
+
+                    // Emit individual 8-byte load/store pairs to copy the
+                    // struct from source to destination.  Process in 8-byte
+                    // chunks (matching pointer/qword width on 64-bit targets),
+                    // with a smaller final chunk for any remainder.
+                    let mut offset: usize = 0;
+                    while offset < struct_size {
+                        let remaining = struct_size - offset;
+                        let (chunk_ty, chunk_ir) = if remaining >= 8 {
+                            (8, IrType::I64)
+                        } else if remaining >= 4 {
+                            (4, IrType::I32)
+                        } else if remaining >= 2 {
+                            (2, IrType::I16)
+                        } else {
+                            (1, IrType::I8)
+                        };
+
+                        // Compute source address: rhs_ptr + offset
+                        let src_addr = if offset == 0 {
+                            rhs_ptr.value
+                        } else {
+                            let off_val = emit_int_const(
+                                ctx,
+                                offset as i128,
+                                IrType::I64,
+                                span,
+                            );
+                            let (gep_val, gep_inst) = ctx.builder.build_gep(
+                                rhs_ptr.value,
+                                vec![off_val],
+                                chunk_ir.clone(),
+                                span,
+                            );
+                            emit_inst(ctx, gep_inst);
+                            gep_val
+                        };
+
+                        // Load chunk from source.
+                        let (loaded, li) =
+                            ctx.builder.build_load(src_addr, chunk_ir.clone(), span);
+                        emit_inst(ctx, li);
+
+                        // Compute destination address: lhs + offset
+                        let dst_addr = if offset == 0 {
+                            lhs.value
+                        } else {
+                            let off_val2 = emit_int_const(
+                                ctx,
+                                offset as i128,
+                                IrType::I64,
+                                span,
+                            );
+                            let (gep_val2, gep_inst2) = ctx.builder.build_gep(
+                                lhs.value,
+                                vec![off_val2],
+                                chunk_ir.clone(),
+                                span,
+                            );
+                            emit_inst(ctx, gep_inst2);
+                            gep_val2
+                        };
+
+                        // Store chunk to destination.
+                        let si = ctx.builder.build_store(loaded, dst_addr, span);
+                        emit_inst(ctx, si);
+
+                        offset += chunk_ty;
+                    }
+
+                    return TypedValue::new(lhs.value, lhs.ty);
+            }
+
+            // Scalar / small-aggregate assignment: load + store.
+            let rhs = lower_expr_inner(ctx, value);
             let rhs_val = insert_implicit_conversion(ctx, rhs.value, &rhs.ty, &lhs.ty, span);
+
+            // Bitfield store: read-modify-write the storage unit to
+            // preserve adjacent fields packed in the same unit.
+            if let Some((bit_offset, bit_width)) = assign_bf_info {
+                if bit_width > 0 {
+                    lower_bitfield_store(
+                        ctx,
+                        lhs.value,
+                        rhs_val,
+                        &lhs.ty,
+                        bit_offset,
+                        bit_width,
+                        span,
+                    );
+                    return TypedValue::new(rhs_val, lhs.ty);
+                }
+            }
+
             let si = ctx.builder.build_store(rhs_val, lhs.value, span);
             emit_inst(ctx, si);
             TypedValue::new(rhs_val, lhs.ty)
@@ -2060,16 +2283,41 @@ fn lower_assignment(
         _ => {
             // Compound assignment:  lhs <op>= rhs
             let lhs_ptr = lower_lvalue_inner(ctx, target);
+            let compound_bf_info = ctx.last_bitfield_info.take();
             let lhs_ir = ctype_to_ir(&lhs_ptr.ty, ctx.target);
-            let (cur_val, li) = ctx.builder.build_load(lhs_ptr.value, lhs_ir.clone(), span);
-            emit_inst(ctx, li);
+
+            // For bitfields, read the current value using bitfield-aware
+            // extraction (shift + mask) rather than a raw full-width load.
+            let cur_val = if let Some((bit_offset, bit_width)) = compound_bf_info {
+                if bit_width > 0 {
+                    let tv = lower_bitfield_read(
+                        ctx,
+                        lhs_ptr.value,
+                        &lhs_ptr.ty,
+                        bit_offset,
+                        bit_width,
+                        span,
+                    );
+                    tv.value
+                } else {
+                    let (v, li) =
+                        ctx.builder.build_load(lhs_ptr.value, lhs_ir.clone(), span);
+                    emit_inst(ctx, li);
+                    v
+                }
+            } else {
+                let (v, li) =
+                    ctx.builder.build_load(lhs_ptr.value, lhs_ir.clone(), span);
+                emit_inst(ctx, li);
+                v
+            };
             let rhs = lower_expr_inner(ctx, value);
             let rhs_conv = insert_implicit_conversion(ctx, rhs.value, &rhs.ty, &lhs_ptr.ty, span);
             let uns = is_unsigned(&lhs_ptr.ty);
             let new_val = match op {
                 ast::AssignOp::AddAssign => {
                     if is_pointer_type(&lhs_ptr.ty) {
-                        let es = pointee_size(&lhs_ptr.ty, ctx.type_builder) as i128;
+                        let es = pointee_size_resolved(&lhs_ptr.ty, ctx.type_builder, ctx.struct_defs, ctx.target) as i128;
                         let si = size_ir_type(ctx.target);
                         let sc = emit_int_const(ctx, es, si.clone(), span);
                         let iv = insert_implicit_conversion(
@@ -2157,6 +2405,24 @@ fn lower_assignment(
                 }
                 ast::AssignOp::Assign => unreachable!(),
             };
+
+            // For bitfields, use read-modify-write to store the computed
+            // value back without clobbering adjacent fields.
+            if let Some((bit_offset, bit_width)) = compound_bf_info {
+                if bit_width > 0 {
+                    lower_bitfield_store(
+                        ctx,
+                        lhs_ptr.value,
+                        new_val,
+                        &lhs_ptr.ty,
+                        bit_offset,
+                        bit_width,
+                        span,
+                    );
+                    return TypedValue::new(new_val, lhs_ptr.ty);
+                }
+            }
+
             let si = ctx.builder.build_store(new_val, lhs_ptr.value, span);
             emit_inst(ctx, si);
             TypedValue::new(new_val, lhs_ptr.ty)
@@ -2193,7 +2459,9 @@ fn lower_conditional(
     add_cfg_edge(ctx, cond_blk.index(), then_blk.index());
     add_cfg_edge(ctx, cond_blk.index(), else_blk.index());
 
-    // Then branch.
+    // Then branch — lower the value but don't emit the branch yet.
+    // We need to know the result type first to insert implicit conversions
+    // in the correct branch block before branching to the merge block.
     ctx.builder.set_insert_point(then_blk);
     let then_tv = if let Some(te) = then_expr {
         lower_expr_inner(ctx, te)
@@ -2201,6 +2469,25 @@ fn lower_conditional(
         // GCC extension: x ?: y — condition value IS the then-value.
         TypedValue::new(cond_tv.value, cond_tv.ty.clone())
     };
+    // Save the current block (may differ from then_blk due to sub-expressions
+    // creating new blocks, e.g. nested ternaries).
+    let then_value_end = ctx.builder.get_insert_block().unwrap();
+
+    // Else branch — lower the value but don't emit the branch yet.
+    ctx.builder.set_insert_point(else_blk);
+    let else_tv = lower_expr_inner(ctx, else_expr);
+    let else_value_end = ctx.builder.get_insert_block().unwrap();
+
+    // Compute the unified result type for both branches.
+    let result_ty = type_builder::usual_arithmetic_conversion(&then_tv.ty, &else_tv.ty);
+    let result_ir = ctype_to_ir(&result_ty, ctx.target);
+
+    // Insert implicit conversions in the THEN block (before the branch).
+    // This ensures conversion instructions (e.g. ptrtoint, sext) are
+    // placed in the branch that produces the value, not in the merge block
+    // where they would violate the phi-at-block-start invariant.
+    ctx.builder.set_insert_point(then_value_end);
+    let tv = insert_implicit_conversion(ctx, then_tv.value, &then_tv.ty, &result_ty, span);
     let bi_then = ctx.builder.build_branch(merge_blk, span);
     emit_inst(ctx, bi_then);
     let then_end = ctx.builder.get_insert_block().unwrap();
@@ -2208,9 +2495,9 @@ fn lower_conditional(
     // Establish CFG edge: then_end → merge_blk
     add_cfg_edge(ctx, then_end.index(), merge_blk.index());
 
-    // Else branch.
-    ctx.builder.set_insert_point(else_blk);
-    let else_tv = lower_expr_inner(ctx, else_expr);
+    // Insert implicit conversions in the ELSE block (before the branch).
+    ctx.builder.set_insert_point(else_value_end);
+    let ev = insert_implicit_conversion(ctx, else_tv.value, &else_tv.ty, &result_ty, span);
     let bi_else = ctx.builder.build_branch(merge_blk, span);
     emit_inst(ctx, bi_else);
     let else_end = ctx.builder.get_insert_block().unwrap();
@@ -2218,12 +2505,8 @@ fn lower_conditional(
     // Establish CFG edge: else_end → merge_blk
     add_cfg_edge(ctx, else_end.index(), merge_blk.index());
 
-    // Merge — determine result type via usual-arithmetic-conversion.
+    // Merge — phi uses the already-converted values from each branch.
     ctx.builder.set_insert_point(merge_blk);
-    let result_ty = type_builder::usual_arithmetic_conversion(&then_tv.ty, &else_tv.ty);
-    let result_ir = ctype_to_ir(&result_ty, ctx.target);
-    let tv = insert_implicit_conversion(ctx, then_tv.value, &then_tv.ty, &result_ty, span);
-    let ev = insert_implicit_conversion(ctx, else_tv.value, &else_tv.ty, &result_ty, span);
     let (pv, pi) = ctx
         .builder
         .build_phi(result_ir, vec![(tv, then_end), (ev, else_end)], span);
@@ -2674,6 +2957,7 @@ fn lower_function_call(
     let mut arg_vals = Vec::with_capacity(args.len());
     for arg in args {
         let atv = lower_expr_inner(ctx, arg);
+
         // Apply default argument promotions for variadic calls.
         let promoted = types::integer_promotion(&atv.ty);
         let v = insert_implicit_conversion(ctx, atv.value, &atv.ty, &promoted, span);
@@ -2867,6 +3151,11 @@ fn resolve_forward_ref_type(ctype: &mut CType, struct_defs: &FxHashMap<String, C
         } if fields.is_empty() => {
             let tag_owned = tag.clone();
             if let Some(full_def) = struct_defs.get(&tag_owned) {
+                // struct_defs entries are already fully resolved by the
+                // recursive pass0 fixup loop, so no further recursion
+                // into the replacement is needed.  Recursing would loop
+                // infinitely on self-referential pointer fields like
+                // `struct PgHdr1 *pNext` inside PgHdr1.
                 *ctype = full_def.clone();
             }
         }
@@ -2878,6 +3167,19 @@ fn resolve_forward_ref_type(ctype: &mut CType, struct_defs: &FxHashMap<String, C
             let tag_owned = tag.clone();
             if let Some(full_def) = struct_defs.get(&tag_owned) {
                 *ctype = full_def.clone();
+            }
+        }
+        CType::Struct {
+            ref mut fields, ..
+        }
+        | CType::Union {
+            ref mut fields, ..
+        } => {
+            // Recurse into field types of non-empty structs/unions
+            // built locally from AST (not from struct_defs) to resolve
+            // any nested empty-field tag references.
+            for field in fields.iter_mut() {
+                resolve_forward_ref_type(&mut field.ty, struct_defs);
             }
         }
         CType::Pointer(inner, _) => resolve_forward_ref_type(inner, struct_defs),
@@ -2926,15 +3228,8 @@ fn apply_direct_abstract_declarator(base: CType, direct: &ast::DirectAbstractDec
         ast::DirectAbstractDeclarator::Array { size, .. } => {
             let len = size
                 .as_ref()
-                .and_then(|e| {
-                    if let ast::Expression::IntegerLiteral { value, .. } = e.as_ref() {
-                        Some(*value as usize)
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or(0);
-            CType::Array(Box::new(base), Some(len))
+                .and_then(|e| super::decl_lowering::evaluate_const_int_expr_pub(e));
+            CType::Array(Box::new(base), len)
         }
         ast::DirectAbstractDeclarator::Function { .. } => {
             // Function pointer type name — simplify to a function pointer.
@@ -2960,34 +3255,116 @@ fn lower_sizeof_expr(
     // that preserves array types: sizeof(arr) returns the total array
     // size, not the pointer size.
     //
-    // Try to determine the original (non-decayed) type for identifiers.
-    // Unwrap parenthesized expressions to find the actual operand.
-    // sizeof(arr) parses as sizeof(Parenthesized(Identifier("arr"))).
-    let unwrapped = {
-        let mut e = operand;
-        while let ast::Expression::Parenthesized { inner, .. } = e {
-            e = inner.as_ref();
-        }
-        e
-    };
-    let expr_ty = if let ast::Expression::Identifier { name, .. } = unwrapped {
-        let sym_name = resolve_sym(ctx, name.as_u32());
-        let vty = lookup_var_type(ctx, sym_name);
-        if types::is_array(&vty) {
-            // Use the original array type (not decayed pointer).
-            vty
-        } else {
-            // For non-arrays, fall back to normal lowering.
-            lower_expr_inner(ctx, operand).ty
-        }
-    } else {
-        // For complex expressions, evaluate normally.
-        lower_expr_inner(ctx, operand).ty
-    };
-    let size = ctx.type_builder.sizeof_type(&expr_ty);
+    // Strategy: use `sizeof_infer_type` which recursively determines the
+    // undecayed C type for any expression, including member access chains
+    // like `s.arr`, `p->arr`, `*p`, casts, dereferences, and subscripts.
+    // This avoids calling `lower_expr_inner` which performs array-to-pointer
+    // decay on array-typed sub-expressions.
+    let expr_ty = sizeof_infer_type(ctx, operand);
+    // Use sizeof_resolved to handle incomplete/forward-declared struct types
+    // that appear when dereferencing pointers (e.g. sizeof(*pColl) where
+    // pColl's pointee type is a forward-declared struct with empty fields).
+    let size = sizeof_resolved(&expr_ty, ctx.type_builder, ctx.struct_defs, ctx.target);
     let ir_ty = size_ir_type(ctx.target);
     let val = emit_int_const(ctx, size as i128, ir_ty, span);
     TypedValue::new(val, size_ctype(ctx.target))
+}
+
+/// Infer the C type of an expression for `sizeof` purposes WITHOUT
+/// triggering array-to-pointer decay. In C11 §6.5.3.4, the `sizeof`
+/// operator yields the size of the operand's type, where array types
+/// are NOT converted to pointer types (unlike most other expression
+/// contexts).
+///
+/// This function recursively determines the undecayed type for
+/// identifiers, member accesses (`s.arr`, `p->arr`), dereferences,
+/// subscripts, casts, and parenthesized expressions.
+fn sizeof_infer_type(
+    ctx: &mut ExprLoweringContext<'_>,
+    expr: &ast::Expression,
+) -> CType {
+    match expr {
+        // Parenthesized: recurse through
+        ast::Expression::Parenthesized { inner, .. } => sizeof_infer_type(ctx, inner),
+
+        // Identifier: look up the variable's declared type (preserving array types)
+        ast::Expression::Identifier { name, .. } => {
+            let sym_name = resolve_sym(ctx, name.as_u32());
+            lookup_var_type(ctx, sym_name)
+        }
+
+        // Member access (s.member): get member type from struct definition
+        ast::Expression::MemberAccess {
+            object, member, ..
+        } => {
+            let obj_ty = sizeof_infer_type(ctx, object);
+            sizeof_resolve_member(&obj_ty, *member, ctx)
+        }
+
+        // Arrow access (p->member): dereference pointer, get member type
+        ast::Expression::PointerMemberAccess {
+            object, member, ..
+        } => {
+            let ptr_ty = sizeof_infer_type(ctx, object);
+            let obj_ty = match types::resolve_typedef(&ptr_ty) {
+                CType::Pointer(inner, _) => (**inner).clone(),
+                CType::Array(inner, _) => (**inner).clone(),
+                other => other.clone(),
+            };
+            sizeof_resolve_member(&obj_ty, *member, ctx)
+        }
+
+        // Dereference (*p): get pointee type
+        ast::Expression::UnaryOp {
+            op: ast::UnaryOp::Deref,
+            operand,
+            ..
+        } => {
+            let inner_ty = sizeof_infer_type(ctx, operand);
+            match types::resolve_typedef(&inner_ty) {
+                CType::Pointer(pointee, _) => (**pointee).clone(),
+                CType::Array(elem, _) => (**elem).clone(),
+                other => other.clone(),
+            }
+        }
+
+        // Array subscript (a[i]): get element type
+        ast::Expression::ArraySubscript { base, .. } => {
+            let arr_ty = sizeof_infer_type(ctx, base);
+            match types::resolve_typedef(&arr_ty) {
+                CType::Array(elem, _) => (**elem).clone(),
+                CType::Pointer(pointee, _) => (**pointee).clone(),
+                other => other.clone(),
+            }
+        }
+
+        // Cast: use the target type
+        ast::Expression::Cast { type_name, .. } => resolve_type_name(ctx, type_name),
+
+        // For all other expressions, fall back to normal lowering.
+        // This handles arithmetic, function calls, etc. where array
+        // decay is the correct behavior (e.g. sizeof(a + b)).
+        _ => lower_expr_inner(ctx, expr).ty,
+    }
+}
+
+/// Resolve a struct/union member type for sizeof purposes.
+/// Returns the member's declared type WITHOUT array-to-pointer decay.
+fn sizeof_resolve_member(
+    obj_ty: &CType,
+    member_sym: crate::common::string_interner::Symbol,
+    ctx: &mut ExprLoweringContext<'_>,
+) -> CType {
+    let member_name = resolve_sym(ctx, member_sym.as_u32()).to_string();
+    let mut resolved = obj_ty.clone();
+    resolve_forward_ref_type(&mut resolved, ctx.struct_defs);
+    let (_offset, member_ty, _bf_info) = find_struct_member(
+        &resolved,
+        &member_name,
+        ctx.type_builder,
+        ctx.struct_defs,
+    );
+    member_ty
 }
 
 fn lower_sizeof_type(
@@ -3045,6 +3422,7 @@ fn lower_member_access(
     span: Span,
 ) -> TypedValue {
     let lv = lower_member_access_lvalue(ctx, object, member_sym, is_arrow, span);
+    let bitfield_info = ctx.last_bitfield_info.take();
 
     // Array-typed members decay to a pointer to the first element.
     // The GEP address IS the pointer value — do not load from it.
@@ -3060,10 +3438,174 @@ fn lower_member_access(
         return TypedValue::new(lv.value, ptr_ty);
     }
 
+    // Bitfield read: load the storage unit, shift right, and mask to
+    // extract the bitfield value.
+    if let Some((bit_offset, bit_width)) = bitfield_info {
+        if bit_width > 0 {
+            return lower_bitfield_read(ctx, lv.value, &lv.ty, bit_offset, bit_width, span);
+        }
+    }
+
     let ir_ty = ctype_to_ir(&lv.ty, ctx.target);
     let (loaded, li) = ctx.builder.build_load(lv.value, ir_ty, span);
     emit_inst(ctx, li);
     TypedValue::new(loaded, lv.ty)
+}
+
+/// Emit IR for reading a bitfield: load the storage unit, shift right by
+/// `bit_offset`, then mask to `bit_width` bits.  Returns the extracted
+/// value with the declared C type.
+fn lower_bitfield_read(
+    ctx: &mut ExprLoweringContext<'_>,
+    storage_ptr: Value,
+    field_ty: &CType,
+    bit_offset: usize,
+    bit_width: usize,
+    span: Span,
+) -> TypedValue {
+    // Determine the storage unit IR type from the field's declared C type.
+    let storage_size = crate::common::types::sizeof_ctype(field_ty, ctx.target);
+    let storage_ir = match storage_size {
+        1 => IrType::I8,
+        2 => IrType::I16,
+        4 => IrType::I32,
+        _ => IrType::I64,
+    };
+
+    // Load the full storage unit.
+    let (loaded, li) = ctx.builder.build_load(storage_ptr, storage_ir.clone(), span);
+    emit_inst(ctx, li);
+
+    // Shift right by bit_offset to bring the field to bit 0.
+    let shifted = if bit_offset > 0 {
+        let shift_amt = emit_int_const(ctx, bit_offset as i128, storage_ir.clone(), span);
+        let (s, si) = ctx
+            .builder
+            .build_shr(loaded, shift_amt, storage_ir.clone(), false, span);
+        emit_inst(ctx, si);
+        s
+    } else {
+        loaded
+    };
+
+    // Mask to extract only the bitfield bits.
+    let mask_val = (1u64 << bit_width).wrapping_sub(1);
+    let mask = emit_int_const(ctx, mask_val as i128, storage_ir.clone(), span);
+    let (masked, mi) = ctx
+        .builder
+        .build_and(shifted, mask, storage_ir.clone(), span);
+    emit_inst(ctx, mi);
+
+    // For signed bitfields, sign-extend from bit_width to the storage type.
+    let is_signed = !is_unsigned(field_ty);
+    let result = if is_signed && bit_width < storage_size * 8 {
+        // Sign extension: shift left to put the sign bit at the MSB of
+        // the storage type, then arithmetic shift right to propagate it.
+        let shift_up = (storage_size * 8 - bit_width) as i128;
+        let shift_up_val = emit_int_const(ctx, shift_up, storage_ir.clone(), span);
+        let (shl_val, shl_i) = ctx
+            .builder
+            .build_shl(masked, shift_up_val, storage_ir.clone(), span);
+        emit_inst(ctx, shl_i);
+        let shift_down_val = emit_int_const(ctx, shift_up, storage_ir.clone(), span);
+        let (sar_val, sar_i) = ctx
+            .builder
+            .build_shr(shl_val, shift_down_val, storage_ir.clone(), true, span);
+        emit_inst(ctx, sar_i);
+        sar_val
+    } else {
+        masked
+    };
+
+    // If the C type is smaller/larger than the storage IR type, cast.
+    let target_ir = ctype_to_ir(field_ty, ctx.target);
+    let final_val = if target_ir != storage_ir {
+        let (cast_val, cast_inst) = ctx.builder.build_bitcast(result, target_ir, span);
+        emit_inst(ctx, cast_inst);
+        cast_val
+    } else {
+        result
+    };
+
+    TypedValue::new(final_val, field_ty.clone())
+}
+
+/// Emit IR for writing a bitfield: load the storage unit, clear the
+/// target bits, OR in the new value, and store back.  This preserves
+/// adjacent fields packed in the same storage unit.
+fn lower_bitfield_store(
+    ctx: &mut ExprLoweringContext<'_>,
+    storage_ptr: Value,
+    new_value: Value,
+    field_ty: &CType,
+    bit_offset: usize,
+    bit_width: usize,
+    span: Span,
+) {
+    let storage_size = crate::common::types::sizeof_ctype(field_ty, ctx.target);
+    let storage_ir = match storage_size {
+        1 => IrType::I8,
+        2 => IrType::I16,
+        4 => IrType::I32,
+        _ => IrType::I64,
+    };
+
+    // Load the full storage unit.
+    let (old_val, li) = ctx
+        .builder
+        .build_load(storage_ptr, storage_ir.clone(), span);
+    emit_inst(ctx, li);
+
+    // Build the mask for the bitfield bits: ((1 << bit_width) - 1) << bit_offset
+    let field_mask = ((1u64 << bit_width).wrapping_sub(1)) << bit_offset;
+    let inv_mask = emit_int_const(ctx, !field_mask as i64 as i128, storage_ir.clone(), span);
+
+    // Clear the bitfield bits in the old value: old & ~mask
+    let (cleared, ci) = ctx
+        .builder
+        .build_and(old_val, inv_mask, storage_ir.clone(), span);
+    emit_inst(ctx, ci);
+
+    // Prepare the new value: (new_value & ((1 << bit_width) - 1)) << bit_offset
+    // First, ensure the new value is the same IR type as the storage unit.
+    let new_val_cast = if ctype_to_ir(field_ty, ctx.target) != storage_ir {
+        // Truncate or zero-extend to match storage unit width.
+        let (cv, ci2) = ctx.builder.build_bitcast(new_value, storage_ir.clone(), span);
+        emit_inst(ctx, ci2);
+        cv
+    } else {
+        new_value
+    };
+
+    // Mask the new value to bit_width bits.
+    let val_mask_int = (1u64 << bit_width).wrapping_sub(1);
+    let val_mask = emit_int_const(ctx, val_mask_int as i128, storage_ir.clone(), span);
+    let (masked_new, mi) = ctx
+        .builder
+        .build_and(new_val_cast, val_mask, storage_ir.clone(), span);
+    emit_inst(ctx, mi);
+
+    // Shift the masked value into position.
+    let shifted_new = if bit_offset > 0 {
+        let shift_amt = emit_int_const(ctx, bit_offset as i128, storage_ir.clone(), span);
+        let (s, si) = ctx
+            .builder
+            .build_shl(masked_new, shift_amt, storage_ir.clone(), span);
+        emit_inst(ctx, si);
+        s
+    } else {
+        masked_new
+    };
+
+    // OR the shifted new value into the cleared storage unit.
+    let (combined, oi) = ctx
+        .builder
+        .build_or(cleared, shifted_new, storage_ir.clone(), span);
+    emit_inst(ctx, oi);
+
+    // Store back the modified storage unit.
+    let si = ctx.builder.build_store(combined, storage_ptr, span);
+    emit_inst(ctx, si);
 }
 
 fn lower_member_access_lvalue(
@@ -3093,14 +3635,19 @@ fn lower_member_access_lvalue(
     resolve_forward_ref_type(&mut resolved_obj_ty, ctx.struct_defs);
 
     // Look up the member in the struct fields.
-    let (member_offset, member_ty) = find_struct_member(
+    let (member_offset, member_ty, bitfield_info) = find_struct_member(
         &resolved_obj_ty,
         &member_name_owned,
         ctx.type_builder,
         ctx.struct_defs,
     );
 
-    // Compute GEP to the member.
+    // Store bitfield information for the caller to use.
+    // `lower_member_access` (reads) and `lower_assignment` (writes)
+    // will check this to emit proper bit-manipulation.
+    ctx.last_bitfield_info = bitfield_info;
+
+    // Compute GEP to the member (or storage unit for bitfields).
     let offset_val = emit_int_const(ctx, member_offset as i128, size_ir_type(ctx.target), span);
     let (gep_val, gep_inst) = ctx
         .builder
@@ -3110,7 +3657,11 @@ fn lower_member_access_lvalue(
     TypedValue::new(gep_val, member_ty)
 }
 
-/// Find a struct member by name. Returns (byte_offset, member_type).
+/// Find a struct member by name. Returns (byte_offset, member_type, bitfield_info).
+///
+/// For bitfield members, `bitfield_info` is `Some((bit_offset_in_unit, bit_width))`
+/// where `bit_offset_in_unit` is the bit position within the storage unit starting
+/// from bit 0 (LSB on little-endian).
 ///
 /// When the type is a lightweight tag reference (empty fields with a tag
 /// name), the full definition is resolved from `struct_defs` before
@@ -3120,7 +3671,7 @@ fn find_struct_member(
     name: &str,
     tb: &TypeBuilder,
     struct_defs: &FxHashMap<String, CType>,
-) -> (usize, CType) {
+) -> (usize, CType, Option<(usize, usize)>) {
     let resolved = types::resolve_typedef(ctype);
     // Resolve lightweight tag references (empty fields with a tag name)
     // by looking up the full definition from the struct_defs registry.
@@ -3156,28 +3707,51 @@ fn find_struct_member(
             aligned,
             ..
         } => {
-            let layout = tb.compute_struct_layout_with_fields(fields, *packed, *aligned);
+            // Resolve forward-referenced typedef field types so that
+            // sizeof_ctype returns the correct sizes during layout
+            // computation.  Without this, typedefs that were created
+            // before their underlying struct was defined retain empty
+            // field lists and compute as size 0, corrupting all
+            // subsequent field offsets in the parent struct.
+            let resolved_fields: Vec<crate::common::types::StructField> = fields
+                .iter()
+                .map(|f| {
+                    let mut resolved_ty = f.ty.clone();
+                    resolve_forward_ref_type(&mut resolved_ty, struct_defs);
+                    crate::common::types::StructField {
+                        name: f.name.clone(),
+                        ty: resolved_ty,
+                        bit_width: f.bit_width,
+                    }
+                })
+                .collect();
+            let layout =
+                tb.compute_struct_layout_with_fields(&resolved_fields, *packed, *aligned);
 
             for (i, field) in fields.iter().enumerate() {
                 if field.name.as_deref() == Some(name) {
                     let fl = &layout.fields[i];
-                    return (fl.offset, field.ty.clone());
+                    let mut result_ty = field.ty.clone();
+                    resolve_forward_ref_type(&mut result_ty, struct_defs);
+                    return (fl.offset, result_ty, fl.bitfield_info);
                 }
             }
             // Anonymous struct/union members — search recursively.
             for (i, field) in fields.iter().enumerate() {
                 if field.name.is_none() {
-                    let inner = types::resolve_typedef(&field.ty);
+                    let mut inner_ty = field.ty.clone();
+                    resolve_forward_ref_type(&mut inner_ty, struct_defs);
+                    let inner = types::resolve_typedef(&inner_ty);
                     if matches!(inner, CType::Struct { .. } | CType::Union { .. }) {
-                        let (inner_off, inner_ty) =
+                        let (inner_off, found_ty, bf_info) =
                             find_struct_member(inner, name, tb, struct_defs);
-                        if !matches!(inner_ty, CType::Void) {
-                            return (layout.fields[i].offset + inner_off, inner_ty);
+                        if !matches!(found_ty, CType::Void) {
+                            return (layout.fields[i].offset + inner_off, found_ty, bf_info);
                         }
                     }
                 }
             }
-            (0, CType::Void)
+            (0, CType::Void, None)
         }
         CType::Union {
             fields,
@@ -3185,26 +3759,39 @@ fn find_struct_member(
             aligned,
             ..
         } => {
-            let field_types: Vec<CType> = fields.iter().map(|f| f.ty.clone()).collect();
-            let _union_layout = tb.compute_union_layout(&field_types, *packed, *aligned);
+            let resolved_field_types: Vec<CType> = fields
+                .iter()
+                .map(|f| {
+                    let mut ty = f.ty.clone();
+                    resolve_forward_ref_type(&mut ty, struct_defs);
+                    ty
+                })
+                .collect();
+            let _union_layout =
+                tb.compute_union_layout(&resolved_field_types, *packed, *aligned);
             for field in fields {
                 if field.name.as_deref() == Some(name) {
-                    return (0, field.ty.clone());
+                    let mut result_ty = field.ty.clone();
+                    resolve_forward_ref_type(&mut result_ty, struct_defs);
+                    return (0, result_ty, None);
                 }
                 // Anonymous nested.
                 if field.name.is_none() {
-                    let inner = types::resolve_typedef(&field.ty);
+                    let mut inner_ty = field.ty.clone();
+                    resolve_forward_ref_type(&mut inner_ty, struct_defs);
+                    let inner = types::resolve_typedef(&inner_ty);
                     if matches!(inner, CType::Struct { .. } | CType::Union { .. }) {
-                        let (off, ty) = find_struct_member(inner, name, tb, struct_defs);
+                        let (off, ty, bf_info) =
+                            find_struct_member(inner, name, tb, struct_defs);
                         if !matches!(ty, CType::Void) {
-                            return (off, ty);
+                            return (off, ty, bf_info);
                         }
                     }
                 }
             }
-            (0, CType::Void)
+            (0, CType::Void, None)
         }
-        _ => (0, CType::Void),
+        _ => (0, CType::Void, None),
     }
 }
 
@@ -3219,10 +3806,32 @@ fn lower_array_subscript(
     span: Span,
 ) -> TypedValue {
     let lv = lower_array_subscript_lvalue(ctx, base, index, span);
-    let ir_ty = ctype_to_ir(&lv.ty, ctx.target);
-    let (loaded, li) = ctx.builder.build_load(lv.value, ir_ty, span);
-    emit_inst(ctx, li);
-    TypedValue::new(loaded, lv.ty)
+    // If the element type is an array, the subscript yields an array lvalue
+    // which decays to a pointer.  We must NOT load from the address because
+    // the address itself IS the decayed pointer value (a `T (*)[N]` →
+    // `T *` implicit conversion).  E.g., for `int a[3][4]; a[i]` — the
+    // result is a pointer to the first element of the i-th inner array,
+    // NOT a load of 4 integers from memory.
+    if matches!(&lv.ty, CType::Array(_, _)) {
+        // Return the pointer (address) directly, with the type set to a
+        // pointer-to-element-type so that subsequent subscripting
+        // (e.g., `a[i][j]`) indexes individual elements.
+        // This implements C array-to-pointer decay: `T a[N][M]; a[i]`
+        // yields a `T*` pointing at the first element of row i.
+        let inner_elem = match &lv.ty {
+            CType::Array(elem, _) => elem.as_ref().clone(),
+            _ => unreachable!(),
+        };
+        TypedValue::new(
+            lv.value,
+            CType::Pointer(Box::new(inner_elem), TypeQualifiers::default()),
+        )
+    } else {
+        let ir_ty = ctype_to_ir(&lv.ty, ctx.target);
+        let (loaded, li) = ctx.builder.build_load(lv.value, ir_ty, span);
+        emit_inst(ctx, li);
+        TypedValue::new(loaded, lv.ty)
+    }
 }
 
 fn lower_array_subscript_lvalue(
@@ -3235,7 +3844,8 @@ fn lower_array_subscript_lvalue(
     let idx_tv = lower_expr_inner(ctx, index);
 
     let elem_ty = pointee_of(&base_tv.ty);
-    let elem_size = ctx.type_builder.sizeof_type(&elem_ty) as i128;
+    let elem_size =
+        sizeof_resolved(&elem_ty, ctx.type_builder, ctx.struct_defs, ctx.target) as i128;
     let si = size_ir_type(ctx.target);
 
     // Scale index by element size.
@@ -3264,12 +3874,26 @@ fn lower_post_inc_dec(
     span: Span,
 ) -> TypedValue {
     let lv = lower_lvalue_inner(ctx, operand);
+    let bf_info = ctx.last_bitfield_info.take();
     let ir_ty = ctype_to_ir(&lv.ty, ctx.target);
-    let (old_val, li) = ctx.builder.build_load(lv.value, ir_ty.clone(), span);
-    emit_inst(ctx, li);
+
+    // For bitfields, use bitfield-aware read/write.
+    let old_val = if let Some((bo, bw)) = bf_info {
+        if bw > 0 {
+            lower_bitfield_read(ctx, lv.value, &lv.ty, bo, bw, span).value
+        } else {
+            let (v, li) = ctx.builder.build_load(lv.value, ir_ty.clone(), span);
+            emit_inst(ctx, li);
+            v
+        }
+    } else {
+        let (v, li) = ctx.builder.build_load(lv.value, ir_ty.clone(), span);
+        emit_inst(ctx, li);
+        v
+    };
 
     let new_val = if is_pointer_type(&lv.ty) {
-        let es = pointee_size(&lv.ty, ctx.type_builder) as i128;
+        let es = pointee_size_resolved(&lv.ty, ctx.type_builder, ctx.struct_defs, ctx.target) as i128;
         let step = emit_int_const(
             ctx,
             if is_inc { es } else { -(es as i128) },
@@ -3293,6 +3917,13 @@ fn lower_post_inc_dec(
             v
         }
     };
+
+    if let Some((bo, bw)) = bf_info {
+        if bw > 0 {
+            lower_bitfield_store(ctx, lv.value, new_val, &lv.ty, bo, bw, span);
+            return TypedValue::new(old_val, lv.ty);
+        }
+    }
     let si = ctx.builder.build_store(new_val, lv.value, span);
     emit_inst(ctx, si);
     // Post-: return the OLD value.
@@ -3306,12 +3937,25 @@ fn lower_pre_inc_dec(
     span: Span,
 ) -> TypedValue {
     let lv = lower_lvalue_inner(ctx, operand);
+    let bf_info = ctx.last_bitfield_info.take();
     let ir_ty = ctype_to_ir(&lv.ty, ctx.target);
-    let (old_val, li) = ctx.builder.build_load(lv.value, ir_ty.clone(), span);
-    emit_inst(ctx, li);
+
+    let old_val = if let Some((bo, bw)) = bf_info {
+        if bw > 0 {
+            lower_bitfield_read(ctx, lv.value, &lv.ty, bo, bw, span).value
+        } else {
+            let (v, li) = ctx.builder.build_load(lv.value, ir_ty.clone(), span);
+            emit_inst(ctx, li);
+            v
+        }
+    } else {
+        let (v, li) = ctx.builder.build_load(lv.value, ir_ty.clone(), span);
+        emit_inst(ctx, li);
+        v
+    };
 
     let new_val = if is_pointer_type(&lv.ty) {
-        let es = pointee_size(&lv.ty, ctx.type_builder) as i128;
+        let es = pointee_size_resolved(&lv.ty, ctx.type_builder, ctx.struct_defs, ctx.target) as i128;
         let step = emit_int_const(
             ctx,
             if is_inc { es } else { -(es as i128) },
@@ -3335,6 +3979,13 @@ fn lower_pre_inc_dec(
             v
         }
     };
+
+    if let Some((bo, bw)) = bf_info {
+        if bw > 0 {
+            lower_bitfield_store(ctx, lv.value, new_val, &lv.ty, bo, bw, span);
+            return TypedValue::new(new_val, lv.ty);
+        }
+    }
     let si = ctx.builder.build_store(new_val, lv.value, span);
     emit_inst(ctx, si);
     // Pre-: return the NEW value.
@@ -3476,6 +4127,7 @@ fn lower_statement_expression(
         struct_defs: ctx.struct_defs,
         current_function_name: ctx.current_function_name,
         scope_type_overrides: ctx.scope_type_overrides.clone(),
+        return_ctype: None,
     };
 
     // Second pass: lower each block item. Track the value of the last
@@ -3514,6 +4166,7 @@ fn lower_statement_expression(
                         current_function_name: stmt_ctx.current_function_name,
                         enclosing_loop_stack: stmt_ctx.loop_stack.clone(),
                         scope_type_overrides: &stmt_ctx.scope_type_overrides,
+                        last_bitfield_info: None,
                     };
                     let tv = lower_expr_inner(&mut inner_expr_ctx, expr);
                     last_val = tv.value;
@@ -4172,7 +4825,14 @@ fn lower_address_of_label(
 /// - Pointer ↔ integer conversions.
 /// - Float ↔ integer conversions.
 /// - Identity (same type → no-op).
-fn insert_implicit_conversion(
+/// Insert an implicit type conversion from `from_cty` to `to_cty`.
+///
+/// Handles integer ↔ integer (trunc/zext/sext), integer ↔ pointer (inttoptr/
+/// ptrtoint), pointer ↔ pointer (bitcast), integer ↔ float, float ↔ float,
+/// enum → integer, array/function decay, and bool conversions.
+///
+/// Returns `value` unchanged if no conversion is necessary.
+pub fn insert_implicit_conversion(
     ctx: &mut ExprLoweringContext<'_>,
     value: Value,
     from_cty: &CType,
@@ -4588,12 +5248,24 @@ fn compute_builtin_offsetof(
     compute_offset_in_type(&ctype, &member_chain, ctx.type_builder)
 }
 
-/// Extract a chain of member names from a member-designator expression.
+/// A single step in an `offsetof` member-designator chain.
+///
+/// Represents either a struct/union field name or an array index,
+/// allowing `offsetof(type, field.subfield[3])` to be properly computed.
+enum OffsetofDesignator {
+    /// A struct/union field access: `.field_name`
+    Field(String),
+    /// An array subscript: `[index]`
+    ArrayIndex(usize),
+}
+
+/// Extract a chain of member designators from a member-designator expression.
 ///
 /// Handles:
-///   - `Identifier { name }` → `["name"]`
-///   - `MemberAccess { object, member }` → recursively: object chain + ["member"]
-fn extract_member_chain(expr: &ast::Expression, name_table: &[String]) -> Vec<String> {
+///   - `Identifier { name }` → `[Field("name")]`
+///   - `MemberAccess { object, member }` → recursively: object chain + `[Field("member")]`
+///   - `ArraySubscript { base, index }` → recursively: base chain + `[ArrayIndex(n)]`
+fn extract_member_chain(expr: &ast::Expression, name_table: &[String]) -> Vec<OffsetofDesignator> {
     match expr {
         ast::Expression::Identifier { name, .. } => {
             let idx = name.as_u32() as usize;
@@ -4602,7 +5274,7 @@ fn extract_member_chain(expr: &ast::Expression, name_table: &[String]) -> Vec<St
             } else {
                 format!("sym_{}", idx)
             };
-            vec![s]
+            vec![OffsetofDesignator::Field(s)]
         }
         ast::Expression::MemberAccess { object, member, .. } => {
             let mut chain = extract_member_chain(object, name_table);
@@ -4612,56 +5284,104 @@ fn extract_member_chain(expr: &ast::Expression, name_table: &[String]) -> Vec<St
             } else {
                 format!("sym_{}", idx)
             };
-            chain.push(s);
+            chain.push(OffsetofDesignator::Field(s));
+            chain
+        }
+        ast::Expression::ArraySubscript { base, index, .. } => {
+            let mut chain = extract_member_chain(base, name_table);
+            // Evaluate the index as a constant integer.
+            let idx_val = extract_constant_index(index);
+            chain.push(OffsetofDesignator::ArrayIndex(idx_val));
             chain
         }
         _ => Vec::new(),
     }
 }
 
-/// Compute byte offset of a member chain within a CType.
+/// Extract a constant integer value from an expression (for offsetof array indices).
+fn extract_constant_index(expr: &ast::Expression) -> usize {
+    match expr {
+        ast::Expression::IntegerLiteral { value, .. } => *value as usize,
+        ast::Expression::Parenthesized { inner, .. } => extract_constant_index(inner),
+        _ => 0,
+    }
+}
+
+/// Compute byte offset of a member designator chain within a CType.
+///
+/// Walks through struct field accesses and array subscripts to compute
+/// the cumulative byte offset for `__builtin_offsetof(type, chain)`.
 fn compute_offset_in_type(
     ctype: &CType,
-    member_chain: &[String],
+    member_chain: &[OffsetofDesignator],
     type_builder: &TypeBuilder,
 ) -> usize {
     if member_chain.is_empty() {
         return 0;
     }
 
-    let fields = match ctype {
-        CType::Struct { fields, .. } => fields,
-        CType::Union { fields, .. } => fields,
-        _ => return 0,
-    };
-
-    let target_name = &member_chain[0];
-
-    // Compute field offsets using the same logic as decl_lowering.
-    let mut current_offset: usize = 0;
-    for field in fields {
-        let field_align = type_builder.alignof_type(&field.ty);
-        let align = if field_align == 0 { 1 } else { field_align };
-        current_offset = (current_offset + align - 1) & !(align - 1);
-
-        let field_name = field.name.as_deref().unwrap_or("");
-        if field_name == target_name {
-            // Found the field.
-            if member_chain.len() == 1 {
-                // Final field — return the offset.
-                return current_offset;
-            }
-            // Recurse into nested struct/union for remaining chain.
-            return current_offset
-                + compute_offset_in_type(&field.ty, &member_chain[1..], type_builder);
+    match &member_chain[0] {
+        OffsetofDesignator::ArrayIndex(idx) => {
+            // Array subscript: compute element_size * index, then continue
+            // with the element type for the remaining chain.
+            let (elem_ty, _elem_count) = match unwrap_type(ctype) {
+                CType::Array(elem, count) => ((**elem).clone(), count.unwrap_or(0)),
+                _ => return 0, // Not an array — can't subscript
+            };
+            let elem_size = type_builder.sizeof_type(&elem_ty);
+            idx * elem_size + compute_offset_in_type(&elem_ty, &member_chain[1..], type_builder)
         }
+        OffsetofDesignator::Field(target_name) => {
+            // Struct/union field access: find the field and its offset.
+            let unwrapped = unwrap_type(ctype);
+            let fields = match unwrapped {
+                CType::Struct { fields, .. } => fields,
+                CType::Union { fields, .. } => fields,
+                _ => return 0,
+            };
 
-        // For unions, all fields start at offset 0.
-        if !matches!(ctype, CType::Union { .. }) {
-            current_offset += type_builder.sizeof_type(&field.ty);
+            let is_union = matches!(unwrapped, CType::Union { .. });
+            let mut current_offset: usize = 0;
+            for field in fields {
+                let field_align = type_builder.alignof_type(&field.ty);
+                let align = if field_align == 0 { 1 } else { field_align };
+                current_offset = (current_offset + align - 1) & !(align - 1);
+
+                let field_name = field.name.as_deref().unwrap_or("");
+                if field_name == target_name {
+                    // Found the field.
+                    if member_chain.len() == 1 {
+                        return current_offset;
+                    }
+                    // Recurse for remaining chain (may be nested field or array subscript).
+                    return current_offset
+                        + compute_offset_in_type(
+                            &field.ty,
+                            &member_chain[1..],
+                            type_builder,
+                        );
+                }
+
+                // For unions, all fields start at offset 0.
+                if !is_union {
+                    current_offset += type_builder.sizeof_type(&field.ty);
+                }
+            }
+
+            // Field not found — return 0.
+            0
         }
     }
+}
 
-    // Field not found — return 0.
-    0
+/// Unwrap Typedef / Qualified wrappers to reach the underlying type.
+fn unwrap_type(ctype: &CType) -> &CType {
+    let mut t = ctype;
+    loop {
+        match t {
+            CType::Typedef { underlying, .. } => t = underlying.as_ref(),
+            CType::Qualified(inner, _) => t = inner.as_ref(),
+            _ => return t,
+        }
+    }
 }

@@ -1558,6 +1558,7 @@ mod tests {
             va_control_offset: None,
             named_gpr_count: 0,
             named_fp_count: 0,
+            num_param_moves: 0,
         }
     }
 

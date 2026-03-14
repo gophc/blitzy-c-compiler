@@ -2733,6 +2733,12 @@ impl RiscV64InstructionSelector {
                             self.emit(RvInstruction::i_type(RvOpcode::ADDI, rd, ZERO, 0));
                         }
                     }
+                } else if *op == BinOp::Xor && *rhs == Value::UNDEF {
+                    // Bitwise NOT: XOR with UNDEF sentinel = ~operand.
+                    // RISC-V encodes this as XORI rd, rs, -1.
+                    let lhs_reg = self.src_reg(*lhs);
+                    let rd = self.dest_reg(*result, ty);
+                    self.emit_i(RvOpcode::XORI, rd, lhs_reg, -1i64 as i32 as i64);
                 } else {
                     let lhs_reg = self.src_reg(*lhs);
                     let rhs_reg = self.src_reg(*rhs);
