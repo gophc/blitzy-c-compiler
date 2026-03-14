@@ -234,6 +234,12 @@ pub enum Constant {
     /// function. Used for initializers like `int *p = &global_var;`.
     GlobalRef(String),
 
+    /// Reference to a global symbol with a byte offset (address constant
+    /// with addend).  Used for initializers like
+    /// `const char *p = &array[42];` where the result is the symbol
+    /// address plus a compile-time byte offset.
+    GlobalRefOffset(String, i64),
+
     /// Null pointer constant — `(void *)0` or any integer constant
     /// expression with value 0 cast to a pointer type.
     Null,
@@ -290,6 +296,7 @@ impl std::fmt::Display for Constant {
                 write!(f, " ]")
             }
             Constant::GlobalRef(name) => write!(f, "@{}", name),
+            Constant::GlobalRefOffset(name, off) => write!(f, "@{}+{}", name, off),
             Constant::Null => write!(f, "null"),
             Constant::Undefined => write!(f, "undef"),
         }

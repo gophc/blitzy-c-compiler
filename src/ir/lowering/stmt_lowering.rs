@@ -1550,9 +1550,7 @@ fn lower_return(
                 scope_type_overrides: &ctx.scope_type_overrides,
                 last_bitfield_info: None,
             };
-            val = insert_implicit_conversion(
-                &mut expr_ctx, val, &tv.ty, ret_cty, span,
-            );
+            val = insert_implicit_conversion(&mut expr_ctx, val, &tv.ty, ret_cty, span);
         }
         Some(val)
     } else {
@@ -1910,10 +1908,7 @@ fn eval_case_constant(expr: &ast::Expression) -> i64 {
         ast::Expression::Parenthesized { inner, .. } => eval_case_constant(inner),
         ast::Expression::Cast { operand: inner, .. } => eval_case_constant(inner),
         ast::Expression::Binary {
-            op,
-            left,
-            right,
-            ..
+            op, left, right, ..
         } => {
             let l = eval_case_constant(left);
             let r = eval_case_constant(right);

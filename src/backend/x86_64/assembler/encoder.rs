@@ -798,7 +798,12 @@ impl X86_64Encoder {
             X86Opcode::Subsd => self.encode_sse_op(inst, 0xF2, 0x5C),
             X86Opcode::Mulsd => self.encode_sse_op(inst, 0xF2, 0x59),
             X86Opcode::Divsd => self.encode_sse_op(inst, 0xF2, 0x5E),
+            X86Opcode::Addss => self.encode_sse_op(inst, 0xF3, 0x58),
+            X86Opcode::Subss => self.encode_sse_op(inst, 0xF3, 0x5C),
+            X86Opcode::Mulss => self.encode_sse_op(inst, 0xF3, 0x59),
+            X86Opcode::Divss => self.encode_sse_op(inst, 0xF3, 0x5E),
             X86Opcode::Ucomisd => self.encode_ucomisd(inst),
+            X86Opcode::Ucomiss => self.encode_ucomiss(inst),
             X86Opcode::Cvtsi2sd => self.encode_cvtsi2sd(inst),
             X86Opcode::Cvtsi2ss => self.encode_cvtsi2ss(inst),
             X86Opcode::Cvtsd2si => self.encode_cvtsd2si(inst),
@@ -1986,9 +1991,6 @@ impl X86_64Encoder {
             }
             (Some(MachineOperand::Register(reg)), Some(MachineOperand::GlobalSymbol(sym))) => {
                 if self.pic_enabled {
-                    // PIC mode: use MOV (opcode 0x8B) to LOAD the address
-                    // from the GOT entry instead of LEA (0x8D) which would
-                    // only compute the GOT entry's own address.
                     self.encode_rip_relative(&[0x8B], *reg, sym, 0)
                 } else {
                     self.encode_rip_relative(&[0x8D], *reg, sym, 0)
@@ -2300,6 +2302,49 @@ impl X86_64Encoder {
                 }
                 EncodedInstruction::new(bytes)
             }
+            // Two-operand IMUL with immediate: IMUL reg, imm → IMUL reg, reg, imm.
+            // x86 has no direct 2-operand reg,imm form; we encode as the
+            // 3-operand variant where dst and src are the same register.
+            (Some(MachineOperand::Register(dst)), Some(MachineOperand::Immediate(imm)), None) => {
+                let imm = *imm;
+                let dst = *dst;
+                // Optimisation: multiply by 0 → zero the register.
+                if imm == 0 {
+                    let mut xor_inst = inst.clone();
+                    xor_inst.opcode = X86Opcode::Xor.as_u32();
+                    xor_inst.operands =
+                        vec![MachineOperand::Register(dst), MachineOperand::Register(dst)];
+                    // encode_alu_op(inst, opext, rm_reg_opc, reg_rm_opc)
+                    // XOR: opext=6, rm_reg=0x31, reg_rm=0x33
+                    return self.encode_alu_op(&xor_inst, 6, 0x31, 0x33);
+                }
+                // General case: IMUL dst, dst, imm.
+                let mut bytes = Vec::with_capacity(8);
+                if opsz == 2 {
+                    bytes.push(OPERAND_SIZE_PREFIX);
+                }
+                if let Some(rex) = compute_rex(need_64, Some(dst), None, Some(dst)) {
+                    bytes.push(rex);
+                }
+                if (-128..=127).contains(&imm) {
+                    bytes.push(0x6B);
+                    bytes.push(modrm_byte(
+                        0b11,
+                        hw_encoding(dst) & 0x7,
+                        hw_encoding(dst) & 0x7,
+                    ));
+                    bytes.push(imm as u8);
+                } else {
+                    bytes.push(0x69);
+                    bytes.push(modrm_byte(
+                        0b11,
+                        hw_encoding(dst) & 0x7,
+                        hw_encoding(dst) & 0x7,
+                    ));
+                    bytes.extend_from_slice(&(imm as i32).to_le_bytes());
+                }
+                EncodedInstruction::new(bytes)
+            }
             _ => {
                 eprintln!(
                     "[UD2] opcode={} ops={:?} res={:?}",
@@ -2324,6 +2369,21 @@ impl X86_64Encoder {
         let opc = if use_word { word_opc } else { byte_opc };
         let ops = &inst.operands;
         match (ops.first(), ops.get(1)) {
+            // MOVZX reg, immediate → emit MOV reg, zero-extended-immediate.
+            // x86 has no MOVZX from immediate; the extension is a no-op on
+            // an already-known constant — just materialize it.
+            (Some(MachineOperand::Register(dst)), Some(MachineOperand::Immediate(imm))) => {
+                let val = if use_word { *imm & 0xFFFF } else { *imm & 0xFF };
+                // Reuse the Mov encoder with the zero-extended value.
+                let mut mov_inst = inst.clone();
+                mov_inst.opcode = X86Opcode::Mov.as_u32();
+                mov_inst.operands = vec![
+                    MachineOperand::Register(*dst),
+                    MachineOperand::Immediate(val),
+                ];
+                mov_inst.operand_size = 4; // 32-bit MOV zero-extends to 64 bits on x86-64
+                self.encode_mov(&mov_inst)
+            }
             (Some(MachineOperand::Register(dst)), Some(MachineOperand::Register(src))) => {
                 let mut bytes = Vec::with_capacity(5);
                 // MOVZBL/MOVSBL read a byte register in the r/m field.
@@ -2390,6 +2450,27 @@ impl X86_64Encoder {
         let src_bytes = inst.operand_size;
         let ops = &inst.operands;
         match (ops.first(), ops.get(1)) {
+            // MOVSX reg, immediate → sign-extend at compile time, emit MOV.
+            // x86 has no MOVSX from an immediate; the extension is trivial
+            // on a known constant — just materialize the sign-extended value.
+            (Some(MachineOperand::Register(dst)), Some(MachineOperand::Immediate(imm))) => {
+                let val = match src_bytes {
+                    1 => *imm as i8 as i64,
+                    2 => *imm as i16 as i64,
+                    4 => *imm as i32 as i64,
+                    _ => *imm,
+                };
+                let mut mov_inst = inst.clone();
+                mov_inst.opcode = X86Opcode::Mov.as_u32();
+                mov_inst.operands = vec![
+                    MachineOperand::Register(*dst),
+                    MachineOperand::Immediate(val),
+                ];
+                // Use 8-byte operand size for potentially negative values;
+                // 4-byte is fine when val fits in i32 (encode_mov handles this).
+                mov_inst.operand_size = 8;
+                self.encode_mov(&mov_inst)
+            }
             (Some(MachineOperand::Register(dst)), Some(MachineOperand::Register(src))) => {
                 let mut bytes = Vec::with_capacity(5);
                 match src_bytes {
@@ -3359,6 +3440,67 @@ impl X86_64Encoder {
                 );
                 let mut bytes = Vec::with_capacity(12);
                 bytes.push(0x66);
+                if let Some(rex) = compute_rex(false, Some(*xmm), *index, *base) {
+                    bytes.push(rex);
+                }
+                bytes.push(0x0F);
+                bytes.push(0x2E);
+                bytes.push(mem_enc.modrm);
+                if let Some(s) = mem_enc.sib {
+                    bytes.push(s);
+                }
+                bytes.extend_from_slice(&mem_enc.displacement);
+                EncodedInstruction::new(bytes)
+            }
+            _ => {
+                eprintln!(
+                    "[UD2] opcode={} ops={:?} res={:?}",
+                    inst.opcode, inst.operands, inst.result
+                );
+                EncodedInstruction::new(vec![0x0F, 0x0B])
+            }
+        }
+    }
+
+    /// Encode UCOMISS — unordered compare scalar single-precision.
+    /// Encoding: `0F 2E /r` (no mandatory prefix, unlike UCOMISD which uses 0x66).
+    fn encode_ucomiss(&mut self, inst: &MachineInstruction) -> EncodedInstruction {
+        let ops = &inst.operands;
+        match (ops.first(), ops.get(1)) {
+            (Some(MachineOperand::Register(dst)), Some(MachineOperand::Register(src)))
+                if is_sse(*dst) && is_sse(*src) =>
+            {
+                let mut bytes = Vec::with_capacity(5);
+                // No mandatory prefix for UCOMISS (unlike UCOMISD's 0x66).
+                if let Some(rex) = compute_rex(false, Some(*dst), None, Some(*src)) {
+                    bytes.push(rex);
+                }
+                bytes.push(0x0F);
+                bytes.push(0x2E);
+                bytes.push(modrm_byte(
+                    0b11,
+                    hw_encoding(*dst) & 0x7,
+                    hw_encoding(*src) & 0x7,
+                ));
+                EncodedInstruction::new(bytes)
+            }
+            (
+                Some(MachineOperand::Register(xmm)),
+                Some(MachineOperand::Memory {
+                    base,
+                    index,
+                    scale,
+                    displacement,
+                }),
+            ) if is_sse(*xmm) => {
+                let mem_enc = encode_memory_operand(
+                    hw_encoding(*xmm) & 0x7,
+                    *base,
+                    *index,
+                    *scale,
+                    *displacement,
+                );
+                let mut bytes = Vec::with_capacity(10);
                 if let Some(rex) = compute_rex(false, Some(*xmm), *index, *base) {
                     bytes.push(rex);
                 }

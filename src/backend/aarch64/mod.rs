@@ -504,7 +504,7 @@ impl AArch64Codegen {
                 }
                 data
             }
-            Constant::GlobalRef(_name) => {
+            Constant::GlobalRef(_name) | Constant::GlobalRefOffset(_name, _) => {
                 // Emit a placeholder 8-byte address; a relocation will patch it.
                 vec![0u8; 8]
             }

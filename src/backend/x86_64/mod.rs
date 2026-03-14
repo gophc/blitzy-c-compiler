@@ -490,14 +490,18 @@ impl ArchCodegen for X86_64Backend {
             }
         }
 
-        // For variadic functions: initialize the 16-byte va_control block.
-        // [ctrl+0] = gp_ptr, [ctrl+8] = fp_ptr.
+        // For variadic functions: initialize the 32-byte va_control block.
+        // Layout:
+        //   [ctrl+0]  gp_ptr       — &gpr_save_area[named_gpr_count]
+        //   [ctrl+8]  fp_ptr       — &fp_save_area[named_fp_count]
+        //   [ctrl+16] gp_end       — &gpr_save_area[6] (one past last register slot)
+        //   [ctrl+24] overflow_ptr — RBP + 16 (stack args above return address)
         if let (Some(ctrl_offset), Some(gpr_offset), Some(fp_offset)) = (
             mf.va_control_offset,
             mf.va_save_area_offset,
             mf.va_fp_save_area_offset,
         ) {
-            // gp_ptr = RBP + gpr_save_offset + named_gpr_count * 8
+            // [+0] gp_ptr = RBP + gpr_save_offset + named_gpr_count * 8
             let gp_ptr_disp = gpr_offset as i64 + (mf.named_gpr_count as i64) * 8;
             let mut lea_gp = MachineInstruction::new(X86Opcode::Lea.as_u32());
             lea_gp.result = Some(MachineOperand::Register(registers::RAX));
@@ -520,7 +524,7 @@ impl ArchCodegen for X86_64Backend {
                 .push(MachineOperand::Register(registers::RAX));
             prologue.push(store_gp);
 
-            // fp_ptr = RBP + fp_save_offset + named_fp_count * 8
+            // [+8] fp_ptr = RBP + fp_save_offset + named_fp_count * 8
             let fp_ptr_disp = fp_offset as i64 + (mf.named_fp_count as i64) * 8;
             let mut lea_fp = MachineInstruction::new(X86Opcode::Lea.as_u32());
             lea_fp.result = Some(MachineOperand::Register(registers::RAX));
@@ -542,6 +546,53 @@ impl ArchCodegen for X86_64Backend {
                 .operands
                 .push(MachineOperand::Register(registers::RAX));
             prologue.push(store_fp);
+
+            // [+16] gp_end = RBP + gpr_save_offset + 6 * 8
+            //        (one past the last GPR register save slot)
+            let gp_end_disp = gpr_offset as i64 + 6 * 8;
+            let mut lea_ge = MachineInstruction::new(X86Opcode::Lea.as_u32());
+            lea_ge.result = Some(MachineOperand::Register(registers::RAX));
+            lea_ge.operands.push(MachineOperand::Memory {
+                base: Some(RBP),
+                index: None,
+                scale: 1,
+                displacement: gp_end_disp,
+            });
+            prologue.push(lea_ge);
+            let mut store_ge = MachineInstruction::new(X86Opcode::Mov.as_u32());
+            store_ge.operands.push(MachineOperand::Memory {
+                base: Some(RBP),
+                index: None,
+                scale: 1,
+                displacement: ctrl_offset as i64 + 16,
+            });
+            store_ge
+                .operands
+                .push(MachineOperand::Register(registers::RAX));
+            prologue.push(store_ge);
+
+            // [+24] overflow_ptr = RBP + 16
+            //        (first stack argument above saved RBP and return address)
+            let mut lea_ov = MachineInstruction::new(X86Opcode::Lea.as_u32());
+            lea_ov.result = Some(MachineOperand::Register(registers::RAX));
+            lea_ov.operands.push(MachineOperand::Memory {
+                base: Some(RBP),
+                index: None,
+                scale: 1,
+                displacement: 16,
+            });
+            prologue.push(lea_ov);
+            let mut store_ov = MachineInstruction::new(X86Opcode::Mov.as_u32());
+            store_ov.operands.push(MachineOperand::Memory {
+                base: Some(RBP),
+                index: None,
+                scale: 1,
+                displacement: ctrl_offset as i64 + 24,
+            });
+            store_ov
+                .operands
+                .push(MachineOperand::Register(registers::RAX));
+            prologue.push(store_ov);
         }
 
         prologue

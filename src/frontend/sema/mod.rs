@@ -160,6 +160,15 @@ pub struct SemanticAnalyzer<'a> {
     tag_types_by_name: std::collections::HashMap<String, CType>,
 }
 
+/// A single step in an `__builtin_offsetof` member-designator chain,
+/// used during compile-time evaluation of offsetof expressions.
+enum OffsetofStep {
+    /// Struct/union field access by name.
+    Field(String),
+    /// Array subscript by constant index.
+    Index(usize),
+}
+
 impl<'a> SemanticAnalyzer<'a> {
     // ====================================================================
     // Constructor
@@ -2057,7 +2066,8 @@ impl<'a> SemanticAnalyzer<'a> {
                         // Evaluate non-literal array size expressions
                         // (e.g. sizeof-based expressions) for correct
                         // type layout in abstract declarator contexts.
-                        self.try_eval_attr_const_expr(s).map(|v| v as usize)
+                        let result2 = self.try_eval_attr_const_expr(s);
+                        result2.map(|v| v as usize)
                     }
                 });
                 let arr_ty = CType::Array(Box::new(base), arr_size);
@@ -2713,7 +2723,8 @@ impl<'a> SemanticAnalyzer<'a> {
                         // etc.) through the constant expression evaluator.
                         // This is critical for correct struct layout when
                         // array sizes involve sizeof, casts, or arithmetic.
-                        self.try_eval_attr_const_expr(s).map(|v| v as usize)
+                        let result = self.try_eval_attr_const_expr(s);
+                        result.map(|v| v as usize)
                     }
                 });
 
@@ -2995,6 +3006,15 @@ impl<'a> SemanticAnalyzer<'a> {
                 self.try_eval_attr_const_expr(operand)
             }
             Expression::UnaryOp { op, operand, .. } => {
+                // Classic offsetof pattern:
+                //   &((TYPE*)0)->MEMBER
+                // i.e. AddressOf(PointerMemberAccess(Cast(TYPE*, 0), member))
+                // Evaluates to the byte offset of MEMBER within TYPE.
+                if matches!(op, UnaryOp::AddressOf) {
+                    if let Some(off) = self.try_eval_offsetof_pattern(operand) {
+                        return Some(off);
+                    }
+                }
                 let v = self.try_eval_attr_const_expr(operand)?;
                 match op {
                     UnaryOp::Negate => Some((-(v as i64)) as u64),
@@ -3018,7 +3038,303 @@ impl<'a> SemanticAnalyzer<'a> {
                     self.try_eval_attr_const_expr(else_expr)
                 }
             }
+            // __builtin_offsetof(type, member) — compile-time byte offset
+            // of a struct/union member.  Required for array dimensions that
+            // involve offsetof, e.g. `char buf[sizeof(S) - offsetof(S, m)]`.
+            Expression::BuiltinCall {
+                builtin: BuiltinKind::Offsetof,
+                args,
+                ..
+            } => {
+                // args[0] is a SizeofType carrier wrapping the TypeName;
+                // args[1] is the member designator expression.
+                if let Some(Expression::SizeofType { type_name, .. }) = args.first() {
+                    let ctype = self.resolve_type_name(type_name);
+                    if let Some(member_expr) = args.get(1) {
+                        return self.compute_offsetof_for_const_eval(&ctype, member_expr);
+                    }
+                }
+                None
+            }
             _ => None,
+        }
+    }
+
+    /// Compute the byte offset of a struct/union member for compile-time
+    /// `__builtin_offsetof` evaluation.
+    ///
+    /// Walks the struct type's field list, accumulating byte offsets with
+    /// alignment padding, to find the target member.  Handles nested
+    /// member chains (`field.subfield`), anonymous structs/unions, and
+    /// array subscripts in the designator.
+    fn compute_offsetof_for_const_eval(
+        &self,
+        ctype: &CType,
+        member_expr: &Expression,
+    ) -> Option<u64> {
+        // Extract the member designator chain.
+        let chain = self.extract_offsetof_chain(member_expr);
+        if chain.is_empty() {
+            return None;
+        }
+        self.compute_field_offset_in_type(ctype, &chain)
+    }
+
+    /// Extract a chain of field names / array indices from the member
+    /// designator expression of `__builtin_offsetof`.
+    fn extract_offsetof_chain(&self, expr: &Expression) -> Vec<OffsetofStep> {
+        match expr {
+            Expression::Identifier { name, .. } => {
+                let s = self.interner.resolve(*name).to_owned();
+                vec![OffsetofStep::Field(s)]
+            }
+            Expression::MemberAccess { object, member, .. } => {
+                let mut chain = self.extract_offsetof_chain(object);
+                let s = self.interner.resolve(*member).to_owned();
+                chain.push(OffsetofStep::Field(s));
+                chain
+            }
+            Expression::ArraySubscript { base, index, .. } => {
+                let mut chain = self.extract_offsetof_chain(base);
+                if let Some(idx_val) = self.try_eval_attr_const_expr(index) {
+                    chain.push(OffsetofStep::Index(idx_val as usize));
+                }
+                chain
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Walk a struct/union type following a member-designator chain and
+    /// return the cumulative byte offset.
+    fn compute_field_offset_in_type(&self, ctype: &CType, chain: &[OffsetofStep]) -> Option<u64> {
+        use crate::common::types::{alignof_ctype_resolved, sizeof_ctype_resolved};
+        if chain.is_empty() {
+            return Some(0);
+        }
+        let unwrapped = Self::unwrap_typedef_quals(ctype);
+
+        // Resolve lightweight tag references (forward-declared structs
+        // with empty field lists) via tag_types_by_name, just like
+        // sizeof_ctype_resolved does.
+        let resolved: &CType;
+        let owned_resolved: CType;
+        match unwrapped {
+            CType::Struct {
+                name: Some(ref n),
+                fields,
+                ..
+            } if fields.is_empty() => {
+                if let Some(complete) = self.tag_types_by_name.get(n) {
+                    owned_resolved = complete.clone();
+                    resolved = &owned_resolved;
+                } else {
+                    return None; // incomplete struct
+                }
+            }
+            CType::Union {
+                name: Some(ref n),
+                fields,
+                ..
+            } if fields.is_empty() => {
+                if let Some(complete) = self.tag_types_by_name.get(n) {
+                    owned_resolved = complete.clone();
+                    resolved = &owned_resolved;
+                } else {
+                    return None; // incomplete union
+                }
+            }
+            other => {
+                resolved = other;
+            }
+        }
+        let unwrapped = Self::unwrap_typedef_quals(resolved);
+
+        match &chain[0] {
+            OffsetofStep::Index(idx) => {
+                // Array subscript — element_size * index then recurse.
+                if let CType::Array(elem, _) = unwrapped {
+                    let elem_sz =
+                        sizeof_ctype_resolved(elem, &self.target, &self.tag_types_by_name) as u64;
+                    let rest = self.compute_field_offset_in_type(elem, &chain[1..])?;
+                    Some((*idx as u64) * elem_sz + rest)
+                } else {
+                    None
+                }
+            }
+            OffsetofStep::Field(target_name) => {
+                let (fields, is_union, packed) = match unwrapped {
+                    CType::Struct { fields, packed, .. } => (fields, false, *packed),
+                    CType::Union { fields, packed, .. } => (fields, true, *packed),
+                    _ => return None,
+                };
+
+                let mut bit_offset: usize = 0;
+                for field in fields {
+                    // Handle bitfield alignment.
+                    if let Some(bits) = field.bit_width {
+                        let bits = bits as usize;
+                        let unit_bytes =
+                            sizeof_ctype_resolved(&field.ty, &self.target, &self.tag_types_by_name);
+                        let unit_bits = unit_bytes * 8;
+                        let fa = if packed {
+                            1
+                        } else {
+                            alignof_ctype_resolved(&field.ty, &self.target, &self.tag_types_by_name)
+                        };
+                        if bits == 0 {
+                            let align_bits = fa * 8;
+                            if align_bits > 0 {
+                                bit_offset =
+                                    (bit_offset + align_bits - 1) / align_bits * align_bits;
+                            }
+                            continue;
+                        }
+                        let unit_align_bits = if packed { 8 } else { fa * 8 };
+                        let aligned_start =
+                            (bit_offset + unit_align_bits - 1) / unit_align_bits * unit_align_bits;
+                        let unit_end = aligned_start + unit_bits;
+                        let start = if bit_offset + bits <= unit_end {
+                            bit_offset
+                        } else {
+                            aligned_start
+                        };
+                        let field_name = field.name.as_deref().unwrap_or("");
+                        if field_name == target_name.as_str() {
+                            // Bitfield: return byte offset of containing unit.
+                            return Some((start / 8) as u64);
+                        }
+                        if !is_union {
+                            bit_offset = start + bits;
+                        }
+                        continue;
+                    }
+                    // Non-bitfield: round up to byte boundary first.
+                    if bit_offset % 8 != 0 {
+                        bit_offset = (bit_offset + 7) / 8 * 8;
+                    }
+                    let byte_offset = bit_offset / 8;
+                    let fa = if packed {
+                        1
+                    } else {
+                        alignof_ctype_resolved(&field.ty, &self.target, &self.tag_types_by_name)
+                    };
+                    let aligned = if fa > 1 {
+                        (byte_offset + fa - 1) & !(fa - 1)
+                    } else {
+                        byte_offset
+                    };
+
+                    let field_name = field.name.as_deref().unwrap_or("");
+                    if field_name == target_name.as_str() {
+                        if chain.len() == 1 {
+                            return Some(aligned as u64);
+                        }
+                        return self
+                            .compute_field_offset_in_type(&field.ty, &chain[1..])
+                            .map(|rest| aligned as u64 + rest);
+                    }
+
+                    // Check for anonymous struct/union — recurse into it
+                    // to find the target field.
+                    if field_name.is_empty() {
+                        if let Some(inner_offset) =
+                            self.compute_field_offset_in_type(&field.ty, chain)
+                        {
+                            return Some(aligned as u64 + inner_offset);
+                        }
+                    }
+
+                    if !is_union {
+                        let field_sz =
+                            sizeof_ctype_resolved(&field.ty, &self.target, &self.tag_types_by_name);
+                        bit_offset = aligned * 8 + field_sz * 8;
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    /// Strip Typedef / Qualified wrappers.
+    fn unwrap_typedef_quals(ctype: &CType) -> &CType {
+        let mut t = ctype;
+        loop {
+            match t {
+                CType::Typedef { underlying, .. } => t = underlying.as_ref(),
+                CType::Qualified(inner, _) => t = inner.as_ref(),
+                _ => return t,
+            }
+        }
+    }
+
+    /// Detect the classic C offsetof pattern:
+    ///   `((TYPE*)0)->MEMBER` — a PointerMemberAccess whose object
+    ///   is a cast of 0 to a struct pointer.
+    ///
+    /// Given the operand of `&`, this function checks if it matches
+    /// `((TYPE*)0)->member` (possibly with chained `.sub` and `[idx]`).
+    /// If so, it resolves the struct type and computes the byte offset.
+    fn try_eval_offsetof_pattern(&self, expr: &Expression) -> Option<u64> {
+        // Peel through pointer-member accesses and dot-member accesses
+        // to build a chain and find the root, which should be
+        // (TYPE*)0 or (TYPE*)NULL.
+        let mut chain: Vec<OffsetofStep> = Vec::new();
+        let mut current = expr;
+
+        loop {
+            match current {
+                // ptr->field
+                Expression::PointerMemberAccess { object, member, .. } => {
+                    let name = self.interner.resolve(*member).to_owned();
+                    chain.push(OffsetofStep::Field(name));
+                    current = object.as_ref();
+                }
+                // val.field
+                Expression::MemberAccess { object, member, .. } => {
+                    let name = self.interner.resolve(*member).to_owned();
+                    chain.push(OffsetofStep::Field(name));
+                    current = object.as_ref();
+                }
+                // base[index]
+                Expression::ArraySubscript { base, index, .. } => {
+                    let idx = self.try_eval_attr_const_expr(index)?;
+                    chain.push(OffsetofStep::Index(idx as usize));
+                    current = base.as_ref();
+                }
+                // Parenthesized
+                Expression::Parenthesized { inner, .. } => {
+                    current = inner.as_ref();
+                }
+                // UnaryOp(Deref, inner) — explicit dereference  `*(TYPE*)0`
+                Expression::UnaryOp {
+                    op: UnaryOp::Deref,
+                    operand,
+                    ..
+                } => {
+                    current = operand.as_ref();
+                }
+                // Cast(TYPE*, 0) — the null pointer base
+                Expression::Cast {
+                    type_name, operand, ..
+                } => {
+                    // Check if the inner value is 0 (null pointer constant).
+                    if self.try_eval_attr_const_expr(operand) == Some(0) {
+                        // Extract the pointed-to type from the cast.
+                        let cast_ty = self.resolve_type_name(type_name);
+                        let pointee = match cast_ty {
+                            CType::Pointer(inner, _) => *inner,
+                            _ => return None,
+                        };
+                        // The chain was built bottom-up (innermost field first),
+                        // but compute_field_offset_in_type expects outermost first.
+                        chain.reverse();
+                        return self.compute_field_offset_in_type(&pointee, &chain);
+                    }
+                    return None;
+                }
+                _ => return None,
+            }
         }
     }
 

@@ -791,7 +791,7 @@ pub fn lower_translation_unit(
     // `evaluate_const_int_expr` can resolve sizeof/alignof in array
     // dimension expressions during struct field collection.
     LOWERING_TARGET.with(|t| {
-        *t.borrow_mut() = Some(target.clone());
+        *t.borrow_mut() = Some(*target);
     });
 
     // ====================================================================
@@ -1177,8 +1177,7 @@ fn collect_enum_constants_from_specifiers(
                         // enum aliases like `E = A` can resolve `A` from the
                         // map of already-processed enumerators (Bug 36 fix).
                         if let Some(ref val_expr) = enumerator.value {
-                            if let Some(v) =
-                                try_eval_const_int_expr_ctx(val_expr, name_table, out)
+                            if let Some(v) = try_eval_const_int_expr_ctx(val_expr, name_table, out)
                             {
                                 next_val = v;
                             }
@@ -1305,12 +1304,7 @@ fn collect_enum_constants_from_statement(
 /// underlying struct was forward-declared at typedef creation time.
 fn resolve_struct_field_forward_refs(ty: &mut CType, tags: &FxHashMap<String, CType>) {
     match ty {
-        CType::Struct {
-            ref mut fields, ..
-        }
-        | CType::Union {
-            ref mut fields, ..
-        } => {
+        CType::Struct { ref mut fields, .. } | CType::Union { ref mut fields, .. } => {
             for field in fields.iter_mut() {
                 resolve_type_forward_refs_deep(&mut field.ty, tags);
             }
@@ -1349,12 +1343,7 @@ fn resolve_type_forward_refs_deep(ty: &mut CType, tags: &FxHashMap<String, CType
                 resolve_type_forward_refs_deep(ty, tags);
             }
         }
-        CType::Struct {
-            ref mut fields, ..
-        }
-        | CType::Union {
-            ref mut fields, ..
-        } => {
+        CType::Struct { ref mut fields, .. } | CType::Union { ref mut fields, .. } => {
             for field in fields.iter_mut() {
                 resolve_type_forward_refs_deep(&mut field.ty, tags);
             }
@@ -1459,10 +1448,6 @@ fn collect_struct_defs_from_specifiers(
     }
 }
 
-fn try_eval_const_int_expr(expr: &ast::Expression) -> Option<i128> {
-    try_eval_const_int_expr_ctx(expr, &[], &FxHashMap::default())
-}
-
 /// Evaluate a compile-time integer constant expression, with access to
 /// a name table and an existing enum constant map for resolving
 /// identifiers that reference previously-defined enum constants.
@@ -1531,7 +1516,6 @@ fn try_eval_const_int_expr_ctx(
                 ast::BinaryOp::GreaterEqual => Some(if l >= r { 1 } else { 0 }),
                 ast::BinaryOp::LogicalAnd => Some(if l != 0 && r != 0 { 1 } else { 0 }),
                 ast::BinaryOp::LogicalOr => Some(if l != 0 || r != 0 { 1 } else { 0 }),
-                _ => None,
             }
         }
         ast::Expression::Cast { operand, .. } => {

@@ -387,10 +387,19 @@ pub fn compute_live_intervals(func: &IrFunction) -> Vec<LiveInterval> {
             // registers across them.
             if matches!(
                 inst,
-                Instruction::BinOp { op: BinOp::SDiv, .. }
-                    | Instruction::BinOp { op: BinOp::UDiv, .. }
-                    | Instruction::BinOp { op: BinOp::SRem, .. }
-                    | Instruction::BinOp { op: BinOp::URem, .. }
+                Instruction::BinOp {
+                    op: BinOp::SDiv,
+                    ..
+                } | Instruction::BinOp {
+                    op: BinOp::UDiv,
+                    ..
+                } | Instruction::BinOp {
+                    op: BinOp::SRem,
+                    ..
+                } | Instruction::BinOp {
+                    op: BinOp::URem,
+                    ..
+                }
             ) {
                 call_positions.push(idx);
             }

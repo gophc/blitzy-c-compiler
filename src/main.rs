@@ -158,6 +158,8 @@ struct CliArgs {
     depfile_phony: bool,
     /// `-nostdinc`: suppress default system include paths.
     nostdinc: bool,
+    /// `--verbose`: enable verbose compilation debugging output.
+    verbose: bool,
 }
 
 impl Default for CliArgs {
@@ -186,6 +188,7 @@ impl Default for CliArgs {
             depfile_target: None,
             depfile_phony: false,
             nostdinc: false,
+            verbose: false,
         }
     }
 }
@@ -237,6 +240,8 @@ struct CompilationContext {
     max_recursion_depth: usize,
     /// Whether to suppress default system include paths (`-nostdinc`).
     nostdinc: bool,
+    /// Whether verbose compilation debugging output is enabled (`--verbose`).
+    verbose: bool,
 }
 
 impl CompilationContext {
@@ -260,6 +265,7 @@ impl CompilationContext {
             forced_includes: args.forced_includes.clone(),
             max_recursion_depth: MAX_RECURSION_DEPTH,
             nostdinc: args.nostdinc,
+            verbose: args.verbose,
         }
     }
 }
@@ -594,6 +600,13 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
 
         // -pipe — accepted silently (GCC compat)
         if arg == "-pipe" {
+            i += 1;
+            continue;
+        }
+
+        // --verbose — enable verbose compilation debugging output
+        if arg == "--verbose" {
+            cli.verbose = true;
             i += 1;
             continue;
         }
@@ -963,6 +976,29 @@ fn run_compilation(args: CliArgs) -> Result<(), String> {
 
     let ctx = CompilationContext::from_cli_args(&args);
     let output_path = resolve_output_path(&args);
+
+    // Verbose mode: print compilation parameters for debugging
+    if ctx.verbose {
+        eprintln!(
+            "{}: verbose: target={:?} opt={} pic={} shared={} debug={}",
+            PROGRAM_NAME, ctx.target, ctx.optimization_level, ctx.pic, ctx.shared, ctx.debug_info
+        );
+        for input in &args.input_files {
+            eprintln!("{}: verbose: input file: {}", PROGRAM_NAME, input);
+        }
+        if let Some(ref out) = output_path {
+            eprintln!("{}: verbose: output file: {}", PROGRAM_NAME, out);
+        }
+        for path in &ctx.include_paths {
+            eprintln!("{}: verbose: include path: {}", PROGRAM_NAME, path);
+        }
+        for (name, val) in &ctx.defines {
+            match val {
+                Some(v) => eprintln!("{}: verbose: define: {}={}", PROGRAM_NAME, name, v),
+                None => eprintln!("{}: verbose: define: {}", PROGRAM_NAME, name),
+            }
+        }
+    }
 
     // -E mode: preprocess only
     if args.preprocess_only {

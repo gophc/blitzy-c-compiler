@@ -649,7 +649,8 @@ fn generate_for_arch<A: ArchCodegen>(
     // Data-section relocations: (offset_in_section, symbol_name, is_rodata).
     // These are generated for GlobalRef entries in global variable
     // initializers so that the linker can patch symbol addresses.
-    let mut data_relocs: Vec<(u64, String, bool)> = Vec::new();
+    // Tuple: (offset_in_section, symbol_name, is_rodata, addend)
+    let mut data_relocs: Vec<(u64, String, bool, i64)> = Vec::new();
 
     for global in module.globals() {
         // Skip non-definition globals (extern declarations with no storage
@@ -672,7 +673,7 @@ fn generate_for_arch<A: ArchCodegen>(
 
         // Collect GlobalRef relocations within this global's initializer.
         if let Some(ref init) = global.initializer {
-            let mut relocs: Vec<(u64, String)> = Vec::new();
+            let mut relocs: Vec<(u64, String, i64)> = Vec::new();
             collect_constant_relocs(init, 0, Some(&global.ty), &mut relocs);
             let is_rodata = matches!(sym_info.section, SectionPlacement::Rodata);
             let section_base = if is_rodata {
@@ -680,8 +681,8 @@ fn generate_for_arch<A: ArchCodegen>(
             } else {
                 data_offset_before
             };
-            for (offset_in_init, sym_name) in relocs {
-                data_relocs.push((section_base + offset_in_init, sym_name, is_rodata));
+            for (offset_in_init, sym_name, addend) in relocs {
+                data_relocs.push((section_base + offset_in_init, sym_name, is_rodata, addend));
             }
         }
 
@@ -1895,36 +1896,6 @@ fn resolve_shift_conflicts(mf: &mut MachineFunction) {
         opcode == SHL_OP || opcode == SHR_OP || opcode == SAR_OP
     }
 
-    /// Check if register `reg` is used by any instruction in `insts[start..]`
-    /// either as a source operand, result, or memory base.
-    fn rcx_used_after(insts: &[MachineInstruction], start: usize) -> bool {
-        for inst in insts.iter().skip(start) {
-            // Check operands for direct register use
-            for op in &inst.operands {
-                match op {
-                    MachineOperand::Register(RCX) => return true,
-                    MachineOperand::Memory { base, index, .. } => {
-                        if *base == Some(RCX) || *index == Some(RCX) {
-                            return true;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            // Check result — if RCX is being redefined (as dst of a MOV
-            // etc.), the old value is dead past here → no conflict.
-            if matches!(inst.result, Some(MachineOperand::Register(RCX))) {
-                return false;
-            }
-            if let Some(MachineOperand::Memory { base, index, .. }) = &inst.result {
-                if *base == Some(RCX) || *index == Some(RCX) {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
     for block in &mut mf.blocks {
         let mut new_insts: Vec<MachineInstruction> =
             Vec::with_capacity(block.instructions.len() + 8);
@@ -1939,10 +1910,8 @@ fn resolve_shift_conflicts(mf: &mut MachineFunction) {
                 continue;
             }
 
-            let shift_dst_is_rcx = matches!(
-                old_insts[i].result,
-                Some(MachineOperand::Register(RCX))
-            );
+            let shift_dst_is_rcx =
+                matches!(old_insts[i].result, Some(MachineOperand::Register(RCX)));
 
             if shift_dst_is_rcx {
                 // ── CASE 1: SHL/SHR/SAR RCX, CL ──
@@ -1987,8 +1956,7 @@ fn resolve_shift_conflicts(mf: &mut MachineFunction) {
                 };
                 let scratch = if rhs_reg != Some(R11) { R11 } else { R10 };
 
-                new_insts[mov_lhs_idx].result =
-                    Some(MachineOperand::Register(scratch));
+                new_insts[mov_lhs_idx].result = Some(MachineOperand::Register(scratch));
 
                 let mut shift_inst = old_insts[i].clone();
                 shift_inst.result = Some(MachineOperand::Register(scratch));
@@ -2022,10 +1990,7 @@ fn resolve_shift_conflicts(mf: &mut MachineFunction) {
                 let mut mov_rcx_idx = None;
                 for j in (0..new_insts.len()).rev() {
                     if new_insts[j].opcode == MOV_OP
-                        && matches!(
-                            new_insts[j].result,
-                            Some(MachineOperand::Register(RCX))
-                        )
+                        && matches!(new_insts[j].result, Some(MachineOperand::Register(RCX)))
                     {
                         mov_rcx_idx = Some(j);
                         break;
@@ -2038,9 +2003,7 @@ fn resolve_shift_conflicts(mf: &mut MachineFunction) {
                 if let Some(mcx_idx) = mov_rcx_idx {
                     // Insert: PUSH RCX (save) BEFORE the MOV RCX
                     let mut save_inst = MachineInstruction::new(PUSH_OP);
-                    save_inst
-                        .operands
-                        .push(MachineOperand::Register(RCX));
+                    save_inst.operands.push(MachineOperand::Register(RCX));
                     new_insts.insert(mcx_idx, save_inst);
 
                     // Push the shift instruction
@@ -2048,8 +2011,7 @@ fn resolve_shift_conflicts(mf: &mut MachineFunction) {
 
                     // Insert: POP RCX (restore) AFTER the shift
                     let mut restore_inst = MachineInstruction::new(POP_OP);
-                    restore_inst.result =
-                        Some(MachineOperand::Register(RCX));
+                    restore_inst.result = Some(MachineOperand::Register(RCX));
                     new_insts.push(restore_inst);
                 } else {
                     new_insts.push(old_insts[i].clone());
@@ -2289,15 +2251,14 @@ fn resolve_call_arg_conflicts(mf: &mut MachineFunction, target: &Target) {
                                 // Check if next_si reads from d_scratch:
                                 // 1. Register source: operands[0] == Register(d_scratch)
                                 // 2. Memory base: operands has Memory{base=d_scratch}
-                                let next_reads_scratch = next_si.operands.iter().any(|op| {
-                                    match op {
+                                let next_reads_scratch =
+                                    next_si.operands.iter().any(|op| match op {
                                         MachineOperand::Register(r) => *r == d_scratch,
                                         MachineOperand::Memory { base: Some(r), .. } => {
                                             *r == d_scratch
                                         }
                                         _ => false,
-                                    }
-                                });
+                                    });
                                 if next_reads_scratch {
                                     if let Some(eff_dst) = next_dst {
                                         // Compound pair (or chain) found. Collect
@@ -2306,9 +2267,11 @@ fn resolve_call_arg_conflicts(mf: &mut MachineFunction, target: &Target) {
                                         // Include any intermediate instructions
                                         // between idx and j that use d_scratch
                                         // (e.g., a deref through the scratch).
-                                        for k in (idx + 1)..j {
+                                        for (k, setup_inst) in
+                                            setup_insts.iter().enumerate().take(j).skip(idx + 1)
+                                        {
                                             if !consumed.contains(&k) {
-                                                chain.push(setup_insts[k].clone());
+                                                chain.push(setup_inst.clone());
                                                 consumed.insert(k);
                                             }
                                         }
@@ -2327,9 +2290,10 @@ fn resolve_call_arg_conflicts(mf: &mut MachineFunction, target: &Target) {
                                 } || (next_si.operands.len() >= 2
                                     && matches!(&next_si.operands[0],
                                                MachineOperand::Register(r) if *r == d_scratch)
-                                    && next_si.operands.iter().any(|op| {
-                                        matches!(op, MachineOperand::Memory { .. })
-                                    }));
+                                    && next_si
+                                        .operands
+                                        .iter()
+                                        .any(|op| matches!(op, MachineOperand::Memory { .. })));
                                 if next_writes_scratch {
                                     break;
                                 }
@@ -2359,13 +2323,10 @@ fn resolve_call_arg_conflicts(mf: &mut MachineFunction, target: &Target) {
                 let reg_vs_reg = reg_moves.iter().any(|m| dsts.contains(&m.1));
                 let reg_srcs: crate::common::fx_hash::FxHashSet<u16> =
                     reg_moves.iter().map(|m| m.1).collect();
-                let compound_vs_reg =
-                    compound_moves.iter().any(|cm| reg_srcs.contains(&cm.1));
-                let non_reg_vs_reg = non_reg_move_insts.iter().any(|nrm| {
-                    match &nrm.result {
-                        Some(MachineOperand::Register(r)) => reg_srcs.contains(r),
-                        _ => false,
-                    }
+                let compound_vs_reg = compound_moves.iter().any(|cm| reg_srcs.contains(&cm.1));
+                let non_reg_vs_reg = non_reg_move_insts.iter().any(|nrm| match &nrm.result {
+                    Some(MachineOperand::Register(r)) => reg_srcs.contains(r),
+                    _ => false,
                 });
                 reg_vs_reg || compound_vs_reg || non_reg_vs_reg
             };
@@ -2788,6 +2749,16 @@ fn constant_to_bytes_typed(
             };
             vec![0u8; ptr_size]
         }
+        Constant::GlobalRefOffset(_name, _addend) => {
+            // Same as GlobalRef — the actual addend is carried in the
+            // relocation entry's r_addend field. The data section holds
+            // placeholder zeros (or the addend for REL, but we use RELA).
+            let ptr_size = match ir_ty {
+                Some(IrType::Ptr) => 8,
+                _ => 8,
+            };
+            vec![0u8; ptr_size]
+        }
         Constant::Null => vec![0u8; 8],
         Constant::Undefined => vec![0u8; 8],
     }
@@ -2805,14 +2776,17 @@ fn collect_constant_relocs(
     constant: &crate::ir::module::Constant,
     base_offset: u64,
     ir_ty: Option<&crate::ir::types::IrType>,
-    relocs: &mut Vec<(u64, String)>,
+    relocs: &mut Vec<(u64, String, i64)>,
 ) {
     use crate::ir::module::Constant;
     use crate::ir::types::IrType;
 
     match constant {
         Constant::GlobalRef(name) => {
-            relocs.push((base_offset, name.clone()));
+            relocs.push((base_offset, name.clone(), 0));
+        }
+        Constant::GlobalRefOffset(name, addend) => {
+            relocs.push((base_offset, name.clone(), *addend));
         }
         Constant::Struct(fields) => {
             let (field_types, packed) = match ir_ty {
@@ -3096,7 +3070,7 @@ fn write_relocatable_object(
     functions: &[CompiledFunction],
     globals: &[GlobalSymbolInfo],
     text_relocs: &[crate::backend::traits::FunctionRelocation],
-    data_relocs: &[(u64, String, bool)],
+    data_relocs: &[(u64, String, bool, i64)],
     dwarf: &Option<DwarfSections>,
     module: &IrModule,
     ctx: &CodegenContext,
@@ -3454,8 +3428,8 @@ fn write_relocatable_object(
             // correct for every .rela.* section.
             let rela_count = {
                 let mut c = 1u32; // This .rela.text section
-                let has_rela_data = data_relocs.iter().any(|(_, _, is_ro)| !*is_ro);
-                let has_rela_rodata = data_relocs.iter().any(|(_, _, is_ro)| *is_ro);
+                let has_rela_data = data_relocs.iter().any(|(_, _, is_ro, _)| !*is_ro);
+                let has_rela_rodata = data_relocs.iter().any(|(_, _, is_ro, _)| *is_ro);
                 if has_rela_data {
                     c += 1;
                 }
@@ -3526,7 +3500,7 @@ fn write_relocatable_object(
 
         // Add undefined symbols for any data reloc targets not yet known.
         let mut data_extra_undefs: Vec<String> = Vec::new();
-        for (_, sym_name, _) in data_relocs {
+        for (_, sym_name, _, _) in data_relocs {
             if !known_syms.contains(sym_name) {
                 known_syms.insert(sym_name.clone());
                 data_extra_undefs.push(sym_name.clone());
@@ -3631,7 +3605,7 @@ fn write_relocatable_object(
         let mut rela_data_bytes: Vec<u8> = Vec::new();
         let mut rela_rodata_bytes: Vec<u8> = Vec::new();
 
-        for (offset, sym_name, is_rodata) in data_relocs {
+        for (offset, sym_name, is_rodata, addend) in data_relocs {
             let sym_idx = sym_name_to_idx.get(sym_name).copied().unwrap_or(0);
             let rela_buf = if *is_rodata {
                 &mut rela_rodata_bytes
@@ -3640,7 +3614,7 @@ fn write_relocatable_object(
             };
 
             if is_64 {
-                let rela = Elf64Rela::new(*offset, sym_idx, abs_reloc_type, 0);
+                let rela = Elf64Rela::new(*offset, sym_idx, abs_reloc_type, *addend);
                 rela_buf.extend_from_slice(&rela.to_bytes());
             } else {
                 let rel = Elf32Rel::new(*offset as u32, sym_idx, abs_reloc_type as u8);
@@ -3764,7 +3738,7 @@ fn add_dwarf_sections(writer: &mut ElfWriter, dwarf: &DwarfSections) {
 fn link_to_final_output(
     object_bytes: &[u8],
     text_relocations: &[crate::backend::traits::FunctionRelocation],
-    data_relocations: &[(u64, String, bool)],
+    data_relocations: &[(u64, String, bool, i64)],
     ctx: &CodegenContext,
     diagnostics: &mut DiagnosticEngine,
 ) -> Result<Vec<u8>, String> {
@@ -3859,7 +3833,7 @@ fn link_to_final_output(
             .map(|i| (i + 1) as u32)
             .unwrap_or(0);
 
-        for (offset, sym_name, is_rodata) in data_relocations {
+        for (offset, sym_name, is_rodata, addend) in data_relocations {
             let sec_idx = if *is_rodata {
                 rodata_sec_idx
             } else {
@@ -3876,7 +3850,7 @@ fn link_to_final_output(
                     symbol_name: sym_name.clone(),
                     sym_index: 0,
                     rel_type: abs_reloc_type,
-                    addend: 0,
+                    addend: *addend,
                     object_id: 0,
                     section_index: sec_idx,
                     output_section_name: Some(sec_name.to_string()),
@@ -4860,6 +4834,13 @@ fn emit_constant_as_asm(constant: &crate::ir::module::Constant, output: &mut Str
         }
         Constant::GlobalRef(name) => {
             output.push_str(&format!("\t.quad\t{}\n", name));
+        }
+        Constant::GlobalRefOffset(name, addend) => {
+            if *addend >= 0 {
+                output.push_str(&format!("\t.quad\t{}+{}\n", name, addend));
+            } else {
+                output.push_str(&format!("\t.quad\t{}{}\n", name, addend));
+            }
         }
         Constant::Null => {
             output.push_str("\t.quad\t0\n");

@@ -201,9 +201,8 @@ pub fn lower_global_variable(
         // literal initializers for `const char *` struct fields would be
         // written inline (as raw bytes) rather than as a pointer +
         // relocation to a .rodata entry.
-        let initializer = initializer.map(|init| {
-            fixup_string_ptrs_in_constant(init, &ir_type, module)
-        });
+        let initializer =
+            initializer.map(|init| fixup_string_ptrs_in_constant(init, &ir_type, module));
 
         let var_name_owned = var_name.clone();
         let mut global = GlobalVariable::new(var_name, ir_type, initializer);
@@ -917,12 +916,32 @@ fn evaluate_constant_expr(
         }
         ast::Expression::UnaryOp { op, operand, .. } => match op {
             ast::UnaryOp::AddressOf => {
+                // &identifier
                 if let ast::Expression::Identifier { name, .. } = operand.as_ref() {
                     let name_str = resolve_sym(name_table, name).to_string();
-                    Some(Constant::GlobalRef(name_str))
-                } else {
-                    Some(Constant::Undefined)
+                    return Some(Constant::GlobalRef(name_str));
                 }
+                // &array[index] — address of array element
+                if let ast::Expression::ArraySubscript { base, index, .. } = operand.as_ref() {
+                    if let Some((sym, byte_off)) =
+                        evaluate_address_of_subscript(base, index, target, name_table)
+                    {
+                        if byte_off == 0 {
+                            return Some(Constant::GlobalRef(sym));
+                        }
+                        return Some(Constant::GlobalRefOffset(sym, byte_off));
+                    }
+                }
+                // &struct->member or &ptr[N] chains
+                if let Some((sym, byte_off)) =
+                    evaluate_address_of_member_chain(operand, target, name_table)
+                {
+                    if byte_off == 0 {
+                        return Some(Constant::GlobalRef(sym));
+                    }
+                    return Some(Constant::GlobalRefOffset(sym, byte_off));
+                }
+                Some(Constant::Undefined)
             }
             ast::UnaryOp::Negate => {
                 let inner = evaluate_constant_expr(
@@ -2702,24 +2721,12 @@ fn evaluate_const_int_expr(expr: &ast::Expression) -> Option<usize> {
                 ast::BinaryOp::BitwiseAnd => Some(l & r),
                 ast::BinaryOp::BitwiseOr => Some(l | r),
                 ast::BinaryOp::BitwiseXor => Some(l ^ r),
-                ast::BinaryOp::Equal => {
-                    Some(if l == r { 1 } else { 0 })
-                }
-                ast::BinaryOp::NotEqual => {
-                    Some(if l != r { 1 } else { 0 })
-                }
-                ast::BinaryOp::Less => {
-                    Some(if (l as i64) < (r as i64) { 1 } else { 0 })
-                }
-                ast::BinaryOp::Greater => {
-                    Some(if (l as i64) > (r as i64) { 1 } else { 0 })
-                }
-                ast::BinaryOp::LessEqual => {
-                    Some(if (l as i64) <= (r as i64) { 1 } else { 0 })
-                }
-                ast::BinaryOp::GreaterEqual => {
-                    Some(if (l as i64) >= (r as i64) { 1 } else { 0 })
-                }
+                ast::BinaryOp::Equal => Some(if l == r { 1 } else { 0 }),
+                ast::BinaryOp::NotEqual => Some(if l != r { 1 } else { 0 }),
+                ast::BinaryOp::Less => Some(if (l as i64) < (r as i64) { 1 } else { 0 }),
+                ast::BinaryOp::Greater => Some(if (l as i64) > (r as i64) { 1 } else { 0 }),
+                ast::BinaryOp::LessEqual => Some(if (l as i64) <= (r as i64) { 1 } else { 0 }),
+                ast::BinaryOp::GreaterEqual => Some(if (l as i64) >= (r as i64) { 1 } else { 0 }),
                 _ => None,
             }
         }
@@ -2733,9 +2740,7 @@ fn evaluate_const_int_expr(expr: &ast::Expression) -> Option<usize> {
         } => {
             let c = evaluate_const_int_expr(condition)?;
             if c != 0 {
-                then_expr
-                    .as_ref()
-                    .and_then(|e| evaluate_const_int_expr(e))
+                then_expr.as_ref().and_then(|e| evaluate_const_int_expr(e))
             } else {
                 evaluate_const_int_expr(else_expr)
             }
@@ -2785,7 +2790,32 @@ fn evaluate_const_int_expr(expr: &ast::Expression) -> Option<usize> {
             })
         }
         // Handle _Alignof(type) / __alignof__(type)
-        ast::Expression::AlignofType { type_name, .. } => {
+        ast::Expression::AlignofType { type_name, .. } => super::LOWERING_TARGET.with(|tl| {
+            let target = tl.borrow();
+            let target = target.as_ref()?;
+            let cty = resolve_base_type_from_sqlist(&type_name.specifier_qualifiers);
+            let cty = if let Some(ref abs) = type_name.abstract_declarator {
+                apply_abstract_declarator_to_type(cty, abs)
+            } else {
+                cty
+            };
+            let resolved = resolve_sizeof_struct_ref(cty, target);
+            Some(crate::common::types::alignof_ctype(&resolved, target))
+        }),
+        // Handle __builtin_offsetof(type, member)
+        ast::Expression::BuiltinCall {
+            builtin: ast::BuiltinKind::Offsetof,
+            args,
+            ..
+        } => {
+            // args[0] is SizeofType wrapping the type name, args[1] is the member expr
+            if args.len() < 2 {
+                return None;
+            }
+            let type_name = match &args[0] {
+                ast::Expression::SizeofType { type_name, .. } => type_name,
+                _ => return None,
+            };
             super::LOWERING_TARGET.with(|tl| {
                 let target = tl.borrow();
                 let target = target.as_ref()?;
@@ -2796,10 +2826,201 @@ fn evaluate_const_int_expr(expr: &ast::Expression) -> Option<usize> {
                     cty
                 };
                 let resolved = resolve_sizeof_struct_ref(cty, target);
-                Some(crate::common::types::alignof_ctype(&resolved, target))
+                // Extract the chain of member designators from args[1]
+                let chain = extract_offsetof_member_chain(&args[1]);
+                compute_struct_field_offset(&resolved, &chain, target)
             })
         }
         _ => None,
+    }
+}
+
+/// A step in an offsetof member-designator chain.
+enum OffsetofMemberStep {
+    /// `.field_name`
+    Field(String),
+    /// `[index]`
+    Index(usize),
+}
+
+/// Extract the member designator chain from an offsetof member expression.
+///
+/// Walks the AST expression tree to build a flat list of field accesses and
+/// array subscripts.  For example, `a.b[0].c` produces
+/// `[Field("a"), Field("b"), Index(0), Field("c")]`.
+fn extract_offsetof_member_chain(expr: &ast::Expression) -> Vec<OffsetofMemberStep> {
+    let mut chain = Vec::new();
+    extract_offsetof_chain_recursive(expr, &mut chain);
+    chain
+}
+
+fn extract_offsetof_chain_recursive(expr: &ast::Expression, chain: &mut Vec<OffsetofMemberStep>) {
+    let name_table: Vec<String> =
+        super::INTERNER_SNAPSHOT.with(|snap| snap.borrow().as_ref().cloned().unwrap_or_default());
+    match expr {
+        ast::Expression::Identifier { name, .. } => {
+            let field_name = if (name.as_u32() as usize) < name_table.len() {
+                name_table[name.as_u32() as usize].clone()
+            } else {
+                format!("sym_{}", name.as_u32())
+            };
+            chain.push(OffsetofMemberStep::Field(field_name));
+        }
+        ast::Expression::MemberAccess { object, member, .. }
+        | ast::Expression::PointerMemberAccess { object, member, .. } => {
+            extract_offsetof_chain_recursive(object, chain);
+            let member_name = if (member.as_u32() as usize) < name_table.len() {
+                name_table[member.as_u32() as usize].clone()
+            } else {
+                format!("sym_{}", member.as_u32())
+            };
+            chain.push(OffsetofMemberStep::Field(member_name));
+        }
+        ast::Expression::ArraySubscript { base, index, .. } => {
+            extract_offsetof_chain_recursive(base, chain);
+            if let Some(idx) = evaluate_const_int_expr(index) {
+                chain.push(OffsetofMemberStep::Index(idx));
+            }
+        }
+        ast::Expression::Parenthesized { inner, .. } => {
+            extract_offsetof_chain_recursive(inner, chain);
+        }
+        _ => {}
+    }
+}
+
+/// Compute the byte offset of a member within a struct/union type,
+/// following a chain of field accesses and array subscripts.
+///
+/// This mirrors the layout computation in `compute_struct_size` from
+/// `src/common/types.rs`, including bitfield packing, alignment, and
+/// anonymous struct/union member lookup.
+fn compute_struct_field_offset(
+    ctype: &CType,
+    chain: &[OffsetofMemberStep],
+    target: &Target,
+) -> Option<usize> {
+    if chain.is_empty() {
+        return Some(0);
+    }
+
+    // Unwrap typedef/qualified wrappers
+    let unwrapped = unwrap_ctype_for_offsetof(ctype);
+
+    // Resolve forward-declared structs via thread-local struct_defs
+    let resolved = resolve_sizeof_struct_ref(unwrapped.clone(), target);
+    let unwrapped = unwrap_ctype_for_offsetof(&resolved);
+
+    match &chain[0] {
+        OffsetofMemberStep::Index(idx) => {
+            if let CType::Array(elem, _) = unwrapped {
+                let elem_sz = crate::common::types::sizeof_ctype(elem, target);
+                let rest = compute_struct_field_offset(elem, &chain[1..], target)?;
+                Some(idx * elem_sz + rest)
+            } else {
+                None
+            }
+        }
+        OffsetofMemberStep::Field(target_name) => {
+            let (fields, is_union, packed) = match unwrapped {
+                CType::Struct { fields, packed, .. } => (fields, false, *packed),
+                CType::Union { fields, packed, .. } => (fields, true, *packed),
+                _ => return None,
+            };
+
+            let mut bit_offset: usize = 0;
+            for field in fields {
+                // Handle bitfield alignment
+                if let Some(bits) = field.bit_width {
+                    let bits = bits as usize;
+                    let unit_bytes = crate::common::types::sizeof_ctype(&field.ty, target);
+                    let unit_bits = unit_bytes * 8;
+                    let fa = if packed {
+                        1
+                    } else {
+                        crate::common::types::alignof_ctype(&field.ty, target)
+                    };
+
+                    if bits == 0 {
+                        let align_bits = fa * 8;
+                        if align_bits > 0 {
+                            bit_offset = (bit_offset + align_bits - 1) / align_bits * align_bits;
+                        }
+                        continue;
+                    }
+
+                    let unit_align_bits = if packed { 8 } else { fa * 8 };
+                    let unit_start = if unit_align_bits > 0 {
+                        (bit_offset / unit_align_bits) * unit_align_bits
+                    } else {
+                        bit_offset
+                    };
+                    let bits_used = bit_offset - unit_start;
+                    let start = if bits_used + bits <= unit_bits {
+                        bit_offset
+                    } else {
+                        unit_start + unit_bits
+                    };
+
+                    let field_name = field.name.as_deref().unwrap_or("");
+                    if field_name == target_name.as_str() {
+                        return Some(start / 8);
+                    }
+                    if !is_union {
+                        bit_offset = start + bits;
+                    }
+                    continue;
+                }
+
+                // Non-bitfield: round up to byte boundary
+                if bit_offset % 8 != 0 {
+                    bit_offset = (bit_offset + 7) / 8 * 8;
+                }
+                let byte_offset = bit_offset / 8;
+                let fa = if packed {
+                    1
+                } else {
+                    crate::common::types::alignof_ctype(&field.ty, target)
+                };
+                let aligned = if fa > 1 {
+                    (byte_offset + fa - 1) & !(fa - 1)
+                } else {
+                    byte_offset
+                };
+
+                let field_name = field.name.as_deref().unwrap_or("");
+                if field_name == target_name.as_str() {
+                    if chain.len() == 1 {
+                        return Some(aligned);
+                    }
+                    return compute_struct_field_offset(&field.ty, &chain[1..], target)
+                        .map(|rest| aligned + rest);
+                }
+
+                // Check anonymous struct/union — recurse into it
+                if field_name.is_empty() {
+                    if let Some(inner_off) = compute_struct_field_offset(&field.ty, chain, target) {
+                        return Some(aligned + inner_off);
+                    }
+                }
+
+                if !is_union {
+                    let field_sz = crate::common::types::sizeof_ctype(&field.ty, target);
+                    bit_offset = aligned * 8 + field_sz * 8;
+                }
+            }
+            None
+        }
+    }
+}
+
+/// Strip Typedef, Qualified, and Atomic wrappers to get the underlying type.
+fn unwrap_ctype_for_offsetof(ctype: &CType) -> &CType {
+    match ctype {
+        CType::Typedef { underlying, .. } => unwrap_ctype_for_offsetof(underlying),
+        CType::Qualified(inner, _) => unwrap_ctype_for_offsetof(inner),
+        CType::Atomic(inner) => unwrap_ctype_for_offsetof(inner),
+        other => other,
     }
 }
 
@@ -2807,6 +3028,71 @@ fn evaluate_const_int_expr(expr: &ast::Expression) -> Option<usize> {
 /// modules (e.g. `expr_lowering`) can evaluate non-literal array sizes.
 pub fn evaluate_const_int_expr_pub(expr: &ast::Expression) -> Option<usize> {
     evaluate_const_int_expr(expr)
+}
+
+/// Evaluate `&array[index]` to a (symbol_name, byte_offset) pair.
+///
+/// Handles patterns like `&sqlite3UpperToLower[210]` which produce a
+/// GlobalRefOffset relocation.  Recursively handles nested subscripts
+/// for multi-dimensional arrays.
+fn evaluate_address_of_subscript(
+    base: &ast::Expression,
+    index: &ast::Expression,
+    target: &Target,
+    name_table: &[String],
+) -> Option<(String, i64)> {
+    let idx_val = evaluate_const_int_expr(index)? as i64;
+
+    match base {
+        ast::Expression::Identifier { name, .. } => {
+            let name_str = resolve_sym(name_table, name).to_string();
+            // Determine element size.  For a bare identifier used as an
+            // array base, look up its type from the TYPEOF_CONTEXT.
+            let elem_size = super::TYPEOF_CONTEXT.with(|ctx| {
+                let borrow = ctx.borrow();
+                if let Some(ref map) = *borrow {
+                    if let Some(CType::Array(elem, _)) = map.get(&name_str) {
+                        return Some(crate::common::types::sizeof_ctype(elem, target) as i64);
+                    }
+                }
+                // Default: try sizeof_ctype on the type itself.
+                // For `const unsigned char arr[]`, element size is 1.
+                None
+            });
+            let elem_sz = elem_size.unwrap_or(1);
+            Some((name_str, idx_val * elem_sz))
+        }
+        ast::Expression::ArraySubscript {
+            base: inner_base,
+            index: inner_index,
+            ..
+        } => {
+            // Nested subscript: &arr[i][j] — compute inner offset first.
+            let (sym, inner_off) =
+                evaluate_address_of_subscript(inner_base, inner_index, target, name_table)?;
+            // For nested subscripts, element size is harder to determine.
+            // Default to 1 for byte arrays.
+            Some((sym, inner_off + idx_val))
+        }
+        _ => None,
+    }
+}
+
+/// Evaluate address-of-member chains like `&((struct T *)0)->field` or
+/// `&ptr->field`.  Returns `(symbol_name, byte_offset)` if the expression
+/// is a compile-time address constant.
+fn evaluate_address_of_member_chain(
+    expr: &ast::Expression,
+    _target: &Target,
+    name_table: &[String],
+) -> Option<(String, i64)> {
+    // Handle &identifier (base case — already handled above, but defensive)
+    if let ast::Expression::Identifier { name, .. } = expr {
+        let name_str = resolve_sym(name_table, name).to_string();
+        return Some((name_str, 0));
+    }
+    // For more complex expressions, bail out for now.
+    None
 }
 
 /// Evaluate sizeof for a type expression (simplified heuristic).
@@ -2934,18 +3220,12 @@ fn resolve_sizeof_forward_ref(ctype: &mut CType, struct_defs: &FxHashMap<String,
         CType::Qualified(inner, _) => resolve_sizeof_forward_ref(inner, struct_defs),
         CType::Atomic(inner) => resolve_sizeof_forward_ref(inner, struct_defs),
         // Also resolve struct fields that contain forward-referenced types.
-        CType::Struct {
-            ref mut fields,
-            ..
-        } if !fields.is_empty() => {
+        CType::Struct { ref mut fields, .. } if !fields.is_empty() => {
             for field in fields.iter_mut() {
                 resolve_sizeof_forward_ref(&mut field.ty, struct_defs);
             }
         }
-        CType::Union {
-            ref mut fields,
-            ..
-        } if !fields.is_empty() => {
+        CType::Union { ref mut fields, .. } if !fields.is_empty() => {
             for field in fields.iter_mut() {
                 resolve_sizeof_forward_ref(&mut field.ty, struct_defs);
             }

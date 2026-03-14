@@ -4,6 +4,8 @@
 toolchain implemented in Rust (2021 Edition) that cross-compiles C source code into native Linux
 ELF executables and shared objects for four target architectures.
 
+[![BCC CI](https://github.com/blitzy-public-samples/blitzy-c-compiler/actions/workflows/ci.yml/badge.svg)](https://github.com/blitzy-public-samples/blitzy-c-compiler/actions/workflows/ci.yml)
+[![Checkpoints](https://github.com/blitzy-public-samples/blitzy-c-compiler/actions/workflows/checkpoints.yml/badge.svg)](https://github.com/blitzy-public-samples/blitzy-c-compiler/actions/workflows/checkpoints.yml)
 ![Rust Edition](https://img.shields.io/badge/Rust-2021_Edition-orange)
 ![Dependencies](https://img.shields.io/badge/Dependencies-Zero-brightgreen)
 ![Platform](https://img.shields.io/badge/Platform-Linux_ELF-blue)
