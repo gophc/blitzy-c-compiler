@@ -159,6 +159,10 @@ pub struct StmtLoweringContext<'a> {
     /// function would omit the sign-extension, producing incorrect values
     /// for negative numbers.
     pub return_ctype: Option<CType>,
+    /// Cache for computed struct/union layouts, keyed by struct tag name.
+    /// Shared with `ExprLoweringContext` to avoid recomputing full layout
+    /// for every member access on large structs.
+    pub layout_cache: FxHashMap<String, crate::common::type_builder::StructLayout>,
 }
 
 // ===========================================================================
@@ -742,6 +746,7 @@ pub fn lower_declaration_initializers(ctx: &mut StmtLoweringContext<'_>, decl: &
             enclosing_loop_stack: ctx.loop_stack.clone(),
             scope_type_overrides: &ctx.scope_type_overrides,
             last_bitfield_info: None,
+            layout_cache: &mut ctx.layout_cache,
         };
         decl_lowering::lower_local_initializer(alloca_val, initializer, &var_type, &mut expr_ctx);
     }
@@ -1549,6 +1554,7 @@ fn lower_return(
                 enclosing_loop_stack: ctx.loop_stack.clone(),
                 scope_type_overrides: &ctx.scope_type_overrides,
                 last_bitfield_info: None,
+                layout_cache: &mut ctx.layout_cache,
             };
             val = insert_implicit_conversion(&mut expr_ctx, val, &tv.ty, ret_cty, span);
         }
@@ -1976,6 +1982,7 @@ fn lower_expr_via_context(ctx: &mut StmtLoweringContext<'_>, expr: &ast::Express
         enclosing_loop_stack: ctx.loop_stack.clone(),
         scope_type_overrides: &ctx.scope_type_overrides,
         last_bitfield_info: None,
+        layout_cache: &mut ctx.layout_cache,
     };
     lower_expression(&mut expr_ctx, expr)
 }
@@ -2007,6 +2014,7 @@ fn lower_expr_typed_via_context(
         enclosing_loop_stack: ctx.loop_stack.clone(),
         scope_type_overrides: &ctx.scope_type_overrides,
         last_bitfield_info: None,
+        layout_cache: &mut ctx.layout_cache,
     };
     lower_expression_typed(&mut expr_ctx, expr)
 }
@@ -2036,6 +2044,7 @@ fn lower_lvalue_via_context(ctx: &mut StmtLoweringContext<'_>, expr: &ast::Expre
         enclosing_loop_stack: ctx.loop_stack.clone(),
         scope_type_overrides: &ctx.scope_type_overrides,
         last_bitfield_info: None,
+        layout_cache: &mut ctx.layout_cache,
     };
     lower_lvalue(&mut expr_ctx, expr)
 }

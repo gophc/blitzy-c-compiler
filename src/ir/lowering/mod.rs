@@ -79,7 +79,10 @@ thread_local! {
     // `lower_translation_unit` so that all name extraction helpers can resolve
     // Symbol handles to real C identifier strings without threading a borrow of
     // the interner through deeply nested call chains.
-    static INTERNER_SNAPSHOT: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+    //
+    // Wrapped in Rc so that callers can cheaply clone a reference-counted
+    // handle instead of deep-copying the entire Vec<String> every time.
+    static INTERNER_SNAPSHOT: RefCell<Option<std::rc::Rc<Vec<String>>>> = const { RefCell::new(None) };
 
     // Struct/union definitions registry, populated once at the start of
     // `lower_translation_unit` so that sizeof/alignof evaluation in global
@@ -701,7 +704,7 @@ pub fn lower_translation_unit(
         })
         .collect();
     INTERNER_SNAPSHOT.with(|snap| {
-        *snap.borrow_mut() = Some(snapshot);
+        *snap.borrow_mut() = Some(std::rc::Rc::new(snapshot));
     });
 
     // The symbol table from semantic analysis (Phase 5) provides type
@@ -724,8 +727,11 @@ pub fn lower_translation_unit(
     // top-level declaration names.  This ensures function parameters,
     // local variables, and all other identifiers are resolvable during
     // expression and statement lowering.
-    let name_table: Vec<String> =
-        INTERNER_SNAPSHOT.with(|snap| snap.borrow().as_ref().cloned().unwrap_or_default());
+    let name_table_rc: std::rc::Rc<Vec<String>> =
+        INTERNER_SNAPSHOT.with(|snap| {
+            snap.borrow().as_ref().cloned().unwrap_or_else(|| std::rc::Rc::new(Vec::new()))
+        });
+    let name_table: &[String] = &name_table_rc;
 
     // ====================================================================
     // Pass 0.5 — Collect typedef definitions for type resolution
@@ -826,24 +832,24 @@ pub fn lower_translation_unit(
         }
         map
     };
+    let _t0a = _t0.elapsed().as_secs_f64();
 
     // After collecting all struct definitions, resolve forward-referenced
-    // typedef field types.  Without this pass, a typedef that was created
-    // before its underlying struct was defined (common C pattern:
-    //   typedef struct Foo Foo; struct Foo { ... };
-    // ) retains an empty field list inside the typedef's `underlying`,
-    // causing sizeof_ctype to return 0 for those fields and corrupting
-    // all subsequent field offsets in any enclosing struct.
+    // typedef field types so that sizeof_ctype returns correct sizes.
     {
-        let tags_snapshot: FxHashMap<String, CType> = struct_defs.clone();
-        for (_tag, def) in struct_defs.iter_mut() {
-            resolve_struct_field_forward_refs(def, &tags_snapshot);
+        let tags_to_resolve: Vec<String> = struct_defs.keys().cloned().collect();
+        for tag in tags_to_resolve {
+            if let Some(mut def) = struct_defs.remove(&tag) {
+                resolve_struct_field_forward_refs(&mut def, &struct_defs);
+                struct_defs.insert(tag, def);
+            }
         }
     }
+    let _t0b = _t0.elapsed().as_secs_f64();
 
     eprintln!(
-        "[BCC-TIMING] ir-pass0-struct-collect: {:.3}s",
-        _t0.elapsed().as_secs_f64()
+        "[BCC-TIMING] ir-pass0-struct-collect: {:.3}s (gather={:.3}s, resolve={:.3}s, {} tags)",
+        _t0b, _t0a, _t0b - _t0a, struct_defs.len()
     );
     // Populate the thread-local struct definitions registry so that
     // sizeof/alignof evaluation in global constant expressions can
@@ -964,8 +970,12 @@ pub fn lower_translation_unit(
     // ====================================================================
     // Pass 2 — Function definitions (alloca-first pattern)
     // ====================================================================
+    let _t2 = std::time::Instant::now();
+    let mut _fn_count = 0u32;
+    let mut _fn_slow_count = 0u32;
     for ext_decl in &translation_unit.declarations {
         if let ast::ExternalDeclaration::FunctionDefinition(func_def) = ext_decl {
+            let _tfn = std::time::Instant::now();
             // Lowering function definitions to IR follows the alloca-first
             // pattern: local variables are allocated in the entry block, then
             // the function body is lowered as statement/expression IR.
@@ -979,12 +989,40 @@ pub fn lower_translation_unit(
                 &enum_constants,
                 &struct_defs,
             );
+            _fn_count += 1;
+            let _fn_elapsed = _tfn.elapsed().as_secs_f64();
+            if _fn_elapsed > 0.5 {
+                // Report slow function lowering
+                let fname = {
+                    fn extract_name_dd(dd: &ast::DirectDeclarator, nt: &[String]) -> Option<String> {
+                        match dd {
+                            ast::DirectDeclarator::Identifier(sym, _) => {
+                                let idx = sym.as_u32() as usize;
+                                if idx < nt.len() { Some(nt[idx].clone()) } else { None }
+                            }
+                            ast::DirectDeclarator::Function { base, .. } => extract_name_dd(base, nt),
+                            ast::DirectDeclarator::Array { base, .. } => extract_name_dd(base, nt),
+                            ast::DirectDeclarator::Parenthesized(inner) => {
+                                extract_name_dd(&inner.direct, nt)
+                            }
+                        }
+                    }
+                    extract_name_dd(&func_def.declarator.direct, &name_table)
+                        .unwrap_or_else(|| "<anon>".to_string())
+                };
+                eprintln!("[BCC-TIMING] slow fn: {} = {:.3}s", fname, _fn_elapsed);
+                _fn_slow_count += 1;
+            }
 
             // Check if a fatal error was emitted during function lowering.
             // We continue lowering other functions to collect more diagnostics,
             // but the final result will reflect the error state.
         }
     }
+    eprintln!(
+        "[BCC-TIMING] ir-pass2-functions: {} fns in {:.3}s ({} slow)",
+        _fn_count, _t2.elapsed().as_secs_f64(), _fn_slow_count
+    );
 
     // If any fatal errors were emitted during lowering, report the failure
     // but still return the partially-constructed module (the diagnostic
@@ -1306,28 +1344,40 @@ fn resolve_struct_field_forward_refs(ty: &mut CType, tags: &FxHashMap<String, CT
     match ty {
         CType::Struct { ref mut fields, .. } | CType::Union { ref mut fields, .. } => {
             for field in fields.iter_mut() {
-                resolve_type_forward_refs_deep(&mut field.ty, tags);
+                // Resolve only the immediate field type (depth 1).
+                // Don't recursively expand nested struct fields — they
+                // will be resolved on-demand during function lowering
+                // via resolve_struct_forward_ref or sizeof_resolved.
+                // This prevents quadratic type-tree expansion on large
+                // codebases like the Linux kernel.
+                resolve_type_forward_refs_shallow(&mut field.ty, tags);
             }
         }
         _ => {}
     }
 }
 
-/// Recursively resolve forward-referenced struct/union types within a type
-/// tree.  Handles typedefs, pointers, arrays, qualifiers, etc.
-fn resolve_type_forward_refs_deep(ty: &mut CType, tags: &FxHashMap<String, CType>) {
+/// Shallow forward-reference resolution: resolve only the outermost
+/// lightweight tag reference without recursing into the resolved
+/// definition's fields.  Nested lightweight references are resolved
+/// lazily by the function lowering code.
+fn resolve_type_forward_refs_shallow(ty: &mut CType, tags: &FxHashMap<String, CType>) {
     match ty {
         CType::Struct {
             name: Some(ref tag),
             ref fields,
             ..
         } if fields.is_empty() => {
-            let tag_owned = tag.clone();
-            if let Some(full_def) = tags.get(&tag_owned) {
-                *ty = full_def.clone();
-                // Recurse into the newly resolved type — it may itself
-                // contain empty-field tag references that need resolution.
-                resolve_type_forward_refs_deep(ty, tags);
+            if let Some(full_def) = tags.get(tag) {
+                let has_fields = match full_def {
+                    CType::Struct { fields: f, .. } | CType::Union { fields: f, .. } => {
+                        !f.is_empty()
+                    }
+                    _ => true,
+                };
+                if has_fields {
+                    *ty = full_def.clone();
+                }
             }
         }
         CType::Union {
@@ -1335,37 +1385,33 @@ fn resolve_type_forward_refs_deep(ty: &mut CType, tags: &FxHashMap<String, CType
             ref fields,
             ..
         } if fields.is_empty() => {
-            let tag_owned = tag.clone();
-            if let Some(full_def) = tags.get(&tag_owned) {
-                *ty = full_def.clone();
-                // Recurse into the newly resolved type — it may itself
-                // contain empty-field tag references that need resolution.
-                resolve_type_forward_refs_deep(ty, tags);
-            }
-        }
-        CType::Struct { ref mut fields, .. } | CType::Union { ref mut fields, .. } => {
-            for field in fields.iter_mut() {
-                resolve_type_forward_refs_deep(&mut field.ty, tags);
+            if let Some(full_def) = tags.get(tag) {
+                let has_fields = match full_def {
+                    CType::Struct { fields: f, .. } | CType::Union { fields: f, .. } => {
+                        !f.is_empty()
+                    }
+                    _ => true,
+                };
+                if has_fields {
+                    *ty = full_def.clone();
+                }
             }
         }
         CType::Typedef {
             ref mut underlying, ..
         } => {
-            resolve_type_forward_refs_deep(underlying, tags);
-        }
-        CType::Pointer(_, _) => {
-            // Don't recurse into pointers — they don't affect layout size
+            resolve_type_forward_refs_shallow(underlying, tags);
         }
         CType::Array(ref mut inner, _) => {
-            resolve_type_forward_refs_deep(inner, tags);
+            resolve_type_forward_refs_shallow(inner, tags);
         }
         CType::Qualified(ref mut inner, _) => {
-            resolve_type_forward_refs_deep(inner, tags);
+            resolve_type_forward_refs_shallow(inner, tags);
         }
         CType::Atomic(ref mut inner) => {
-            resolve_type_forward_refs_deep(inner, tags);
+            resolve_type_forward_refs_shallow(inner, tags);
         }
-        _ => {}
+        _ => {} // Don't recurse into Pointer, Function, etc.
     }
 }
 

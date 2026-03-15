@@ -131,8 +131,8 @@ pub fn parse_declaration(parser: &mut Parser<'_>) -> Result<Declaration, ()> {
         register_declarator_name(parser, &first_declarator);
     }
 
-    // Skip optional GCC asm label: `__asm__("symbol_name")`
-    skip_asm_label(parser);
+    // Parse optional GCC asm label / register binding: `__asm__("symbol_name")`
+    let first_asm_reg = skip_asm_label(parser);
 
     // Parse optional initializer for the first declarator.
     let first_init = if parser.match_token(&TokenKind::Equal) {
@@ -148,7 +148,7 @@ pub fn parse_declaration(parser: &mut Parser<'_>) -> Result<Declaration, ()> {
     init_declarators.push(InitDeclarator {
         declarator: first_declarator,
         initializer: first_init,
-        asm_register: None,
+        asm_register: first_asm_reg,
         span: first_span,
     });
 
@@ -162,8 +162,8 @@ pub fn parse_declaration(parser: &mut Parser<'_>) -> Result<Declaration, ()> {
             register_declarator_name(parser, &decl);
         }
 
-        // Skip optional GCC asm label
-        skip_asm_label(parser);
+        // Parse optional GCC asm label / register binding
+        let extra_asm_reg = skip_asm_label(parser);
 
         let init = if parser.match_token(&TokenKind::Equal) {
             Some(parse_initializer(parser)?)
@@ -178,7 +178,7 @@ pub fn parse_declaration(parser: &mut Parser<'_>) -> Result<Declaration, ()> {
         init_declarators.push(InitDeclarator {
             declarator: decl,
             initializer: init,
-            asm_register: None,
+            asm_register: extra_asm_reg,
             span: decl_span,
         });
     }
@@ -2144,11 +2144,12 @@ fn parse_string_literal_value(parser: &mut Parser<'_>) -> Option<Vec<u8>> {
 /// initializer or trailing `__attribute__`.
 ///
 /// Grammar: `asm-label: '__asm__' '(' string-literal ')'`
-pub(crate) fn skip_asm_label(parser: &mut Parser<'_>) {
+pub(crate) fn skip_asm_label(parser: &mut Parser<'_>) -> Option<String> {
     if parser.check(&TokenKind::Asm) {
         parser.advance(); // consume `__asm__` / `asm`
         if parser.match_token(&TokenKind::LeftParen) {
-            // Skip the string literal contents and any concatenated strings.
+            // Capture the string literal content (register name or asm label).
+            let mut label = String::new();
             let mut depth: u32 = 1;
             while depth > 0 && !parser.check(&TokenKind::Eof) {
                 if parser.check(&TokenKind::LeftParen) {
@@ -2159,11 +2160,20 @@ pub(crate) fn skip_asm_label(parser: &mut Parser<'_>) {
                         parser.advance(); // consume closing ')'
                         break;
                     }
+                } else if depth == 1 {
+                    // Extract register/label name from string literal token
+                    if let TokenKind::StringLiteral { ref value, .. } = parser.current.kind {
+                        label.push_str(value);
+                    }
                 }
                 parser.advance();
             }
+            if !label.is_empty() {
+                return Some(label);
+            }
         }
     }
+    None
 }
 
 /// Skip optional trailing `__attribute__((...))` lists that appear after a

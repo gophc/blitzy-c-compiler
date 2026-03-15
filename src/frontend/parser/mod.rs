@@ -566,10 +566,11 @@ impl<'src> Parser<'src> {
     /// This construct appears after a declarator to specify the assembly-level
     /// symbol name.  It is used extensively in glibc headers (e.g. to redirect
     /// `fscanf` to `__isoc99_fscanf`).
-    pub fn skip_asm_label(&mut self) {
+    pub fn skip_asm_label(&mut self) -> Option<String> {
         if self.check(&TokenKind::Asm) {
             self.advance(); // consume `__asm__` / `asm`
             if self.match_token(&TokenKind::LeftParen) {
+                let mut label = String::new();
                 let mut depth: u32 = 1;
                 while depth > 0 && !self.check(&TokenKind::Eof) {
                     if self.check(&TokenKind::LeftParen) {
@@ -580,11 +581,20 @@ impl<'src> Parser<'src> {
                             self.advance(); // consume closing ')'
                             break;
                         }
+                    } else if depth == 1 {
+                        // Extract register/label name from string literal
+                        if let TokenKind::StringLiteral { ref value, .. } = self.current.kind {
+                            label.push_str(value);
+                        }
                     }
                     self.advance();
                 }
+                if !label.is_empty() {
+                    return Some(label);
+                }
             }
         }
+        None
     }
 
     /// Skip optional trailing `__attribute__((...))` lists that appear after
@@ -870,8 +880,8 @@ impl<'src> Parser<'src> {
             declarations::register_declarator_name_pub(self, &first_declarator);
         }
 
-        // Skip optional GCC asm label: `__asm__("symbol_name")`
-        self.skip_asm_label();
+        // Parse optional GCC asm label / register binding: `__asm__("name")`
+        let first_asm_reg = self.skip_asm_label();
 
         // Parse optional initializer for the first declarator.
         let first_init = if self.match_token(&TokenKind::Equal) {
@@ -887,7 +897,7 @@ impl<'src> Parser<'src> {
         init_declarators.push(InitDeclarator {
             declarator: first_declarator,
             initializer: first_init,
-            asm_register: None,
+            asm_register: first_asm_reg,
             span: first_span,
         });
 
@@ -896,8 +906,8 @@ impl<'src> Parser<'src> {
             let decl_start = self.current_span();
             let decl = declarations::parse_declarator(self)?;
 
-            // Skip optional GCC asm label
-            self.skip_asm_label();
+            // Parse optional GCC asm label / register binding
+            let extra_asm_reg = self.skip_asm_label();
 
             let init = if self.match_token(&TokenKind::Equal) {
                 Some(self.parse_initializer()?)
@@ -912,7 +922,7 @@ impl<'src> Parser<'src> {
             init_declarators.push(InitDeclarator {
                 declarator: decl,
                 initializer: init,
-                asm_register: None,
+                asm_register: extra_asm_reg,
                 span: decl_span,
             });
         }

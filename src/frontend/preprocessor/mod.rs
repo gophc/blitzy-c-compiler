@@ -1103,8 +1103,55 @@ impl<'a> Preprocessor<'a> {
                 let in_macro_args = !macro_arg_depths.is_empty();
 
                 // If we hit a newline and we're NOT inside macro arguments,
-                // the line ends here.
+                // the line ends here — UNLESS the last non-whitespace token
+                // is a function-like macro name and the next non-whitespace
+                // token on the following line is `(`.  C11 §6.10.3 requires
+                // that whitespace (including newlines) between a function-like
+                // macro name and its opening `(` be ignored.
                 if tok.kind == PPTokenKind::Newline && !in_macro_args {
+                    // Peek: is the last non-whitespace token a function-like
+                    // macro name?
+                    let last_nws = line_tokens
+                        .iter()
+                        .rev()
+                        .find(|t| t.kind != PPTokenKind::Whitespace);
+                    let ends_with_func_macro = if let Some(lt) = last_nws {
+                        if lt.kind == PPTokenKind::Identifier {
+                            self.macro_defs
+                                .get(&lt.text)
+                                .map(|md| matches!(md.kind, MacroKind::FunctionLike { .. }))
+                                .unwrap_or(false)
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if ends_with_func_macro {
+                        // Peek ahead past whitespace and newlines in the
+                        // remaining token stream to find `(`.
+                        let mut peek = pos + 1; // skip the current newline
+                        while peek < len
+                            && matches!(
+                                tokens[peek].kind,
+                                PPTokenKind::Whitespace | PPTokenKind::Newline
+                            )
+                        {
+                            peek += 1;
+                        }
+                        if peek < len
+                            && tokens[peek].kind == PPTokenKind::Punctuator
+                            && tokens[peek].text == "("
+                        {
+                            // The `(` follows — skip the newline (and any
+                            // whitespace/newlines before the paren) and
+                            // continue collecting tokens on this logical
+                            // line so `expand_tokens` sees the full
+                            // function-like macro invocation.
+                            pos += 1; // skip newline token
+                            continue;
+                        }
+                    }
                     break;
                 }
 
@@ -2050,15 +2097,38 @@ impl<'a> Preprocessor<'a> {
                 .emit_error(directive_token.span, "#elif without matching #if");
             return;
         }
-        let top = self.conditional_stack.last_mut().unwrap();
-        if top.seen_else {
+        let stack_len = self.conditional_stack.len();
+
+        // Check structural errors first (seen_else).
+        if self.conditional_stack[stack_len - 1].seen_else {
             self.diagnostics
                 .emit_error(directive_token.span, "#elif after #else");
             return;
         }
-        if top.seen_active {
+
+        // Check if the parent context is active.  If any enclosing
+        // conditional block is inactive, this `#elif` branch is
+        // unconditionally inactive — we must NOT evaluate the
+        // expression (it may contain tokens that are invalid in
+        // preprocessor expressions, such as `__alignof__`).
+        let parent_active = if stack_len > 1 {
+            self.conditional_stack[..stack_len - 1]
+                .iter()
+                .all(|cs| cs.active)
+        } else {
+            true
+        };
+
+        if !parent_active {
+            // Parent is inactive — unconditionally deactivate this branch
+            // without evaluating the expression.
+            self.conditional_stack[stack_len - 1].active = false;
+            return;
+        }
+
+        if self.conditional_stack[stack_len - 1].seen_active {
             // A previous branch was taken — deactivate.
-            top.active = false;
+            self.conditional_stack[stack_len - 1].active = false;
         } else {
             // No branch taken yet — evaluate condition using full evaluator.
             let value = self.evaluate_condition(tokens);

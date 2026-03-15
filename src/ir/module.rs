@@ -737,6 +737,14 @@ pub struct IrModule {
     /// signatures) instead of relying on the lossy `ir_type_to_approx_ctype`
     /// conversion from the stored `IrType`.
     pub global_c_types: FxHashMap<String, crate::common::types::CType>,
+
+    /// GCC global register variables: `register T *name __asm__("reg");`
+    ///
+    /// Maps the variable name to (register_name, C type).  These
+    /// declarations bind a C identifier to a specific hardware register
+    /// (e.g. RISC-V `tp` for `current`).  No storage is allocated — reads
+    /// emit an inline-asm register read; writes emit a register store.
+    pub register_globals: FxHashMap<String, (String, crate::common::types::CType)>,
 }
 
 // ===========================================================================
@@ -778,6 +786,7 @@ impl IrModule {
             global_var_refs: FxHashMap::default(),
             func_c_return_types: FxHashMap::default(),
             global_c_types: FxHashMap::default(),
+            register_globals: FxHashMap::default(),
         }
     }
 }

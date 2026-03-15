@@ -1357,6 +1357,105 @@ impl<'a> ConstantEvaluator<'a> {
                     Err(())
                 }
             }
+            // Bit-manipulation builtins — constant-evaluable when the
+            // argument is itself a compile-time constant.
+            BuiltinKind::Clz | BuiltinKind::ClzL | BuiltinKind::ClzLL => {
+                if args.is_empty() {
+                    return Err(());
+                }
+                let val = self.evaluate_constant_expr(&args[0])?;
+                let v: u64 = match val {
+                    ConstValue::SignedInt(v) => v as u64,
+                    ConstValue::UnsignedInt(v) => v as u64,
+                    _ => return Err(()),
+                };
+                if v == 0 {
+                    // __builtin_clz(0) is undefined, but return 0
+                    Ok(ConstValue::SignedInt(0))
+                } else {
+                    Ok(ConstValue::SignedInt(v.leading_zeros() as i128))
+                }
+            }
+            BuiltinKind::Ctz | BuiltinKind::CtzL | BuiltinKind::CtzLL => {
+                if args.is_empty() {
+                    return Err(());
+                }
+                let val = self.evaluate_constant_expr(&args[0])?;
+                let v: u64 = match val {
+                    ConstValue::SignedInt(v) => v as u64,
+                    ConstValue::UnsignedInt(v) => v as u64,
+                    _ => return Err(()),
+                };
+                if v == 0 {
+                    Ok(ConstValue::SignedInt(0))
+                } else {
+                    Ok(ConstValue::SignedInt(v.trailing_zeros() as i128))
+                }
+            }
+            BuiltinKind::Popcount | BuiltinKind::PopcountL | BuiltinKind::PopcountLL => {
+                if args.is_empty() {
+                    return Err(());
+                }
+                let val = self.evaluate_constant_expr(&args[0])?;
+                let v: u64 = match val {
+                    ConstValue::SignedInt(v) => v as u64,
+                    ConstValue::UnsignedInt(v) => v as u64,
+                    _ => return Err(()),
+                };
+                Ok(ConstValue::SignedInt(v.count_ones() as i128))
+            }
+            BuiltinKind::Bswap16 => {
+                if args.is_empty() {
+                    return Err(());
+                }
+                let val = self.evaluate_constant_expr(&args[0])?;
+                let v: u16 = match val {
+                    ConstValue::SignedInt(v) => v as u16,
+                    ConstValue::UnsignedInt(v) => v as u16,
+                    _ => return Err(()),
+                };
+                Ok(ConstValue::UnsignedInt(v.swap_bytes() as u128))
+            }
+            BuiltinKind::Bswap32 => {
+                if args.is_empty() {
+                    return Err(());
+                }
+                let val = self.evaluate_constant_expr(&args[0])?;
+                let v: u32 = match val {
+                    ConstValue::SignedInt(v) => v as u32,
+                    ConstValue::UnsignedInt(v) => v as u32,
+                    _ => return Err(()),
+                };
+                Ok(ConstValue::UnsignedInt(v.swap_bytes() as u128))
+            }
+            BuiltinKind::Bswap64 => {
+                if args.is_empty() {
+                    return Err(());
+                }
+                let val = self.evaluate_constant_expr(&args[0])?;
+                let v: u64 = match val {
+                    ConstValue::SignedInt(v) => v as u64,
+                    ConstValue::UnsignedInt(v) => v as u64,
+                    _ => return Err(()),
+                };
+                Ok(ConstValue::UnsignedInt(v.swap_bytes() as u128))
+            }
+            BuiltinKind::Ffs | BuiltinKind::Ffsll => {
+                if args.is_empty() {
+                    return Err(());
+                }
+                let val = self.evaluate_constant_expr(&args[0])?;
+                let v: u64 = match val {
+                    ConstValue::SignedInt(v) => v as u64,
+                    ConstValue::UnsignedInt(v) => v as u64,
+                    _ => return Err(()),
+                };
+                if v == 0 {
+                    Ok(ConstValue::SignedInt(0))
+                } else {
+                    Ok(ConstValue::SignedInt((v.trailing_zeros() + 1) as i128))
+                }
+            }
             _ => {
                 // Other builtins are not compile-time constants
                 self.diagnostics.emit_error(
@@ -1403,6 +1502,48 @@ impl<'a> ConstantEvaluator<'a> {
         } else {
             format!("<sym_{}>", idx)
         }
+    }
+
+    /// Find the type of a named member within a struct or union type.
+    ///
+    /// Resolves typedef wrappers and looks up the member by name in the
+    /// struct/union field list. For forward-declared tags, also checks
+    /// the `tag_types` and `tag_types_by_name` registries. Recursively
+    /// searches anonymous struct/union fields.
+    fn find_member_type(&self, ty: &CType, member_name: &str) -> Option<CType> {
+        let resolved = Self::resolve_typedef(ty);
+        // Directly check struct/union fields
+        let fields = match resolved {
+            CType::Struct { fields, .. } | CType::Union { fields, .. } => {
+                if fields.is_empty() {
+                    // Forward reference — try tag registries
+                    if let CType::Struct { name: Some(tag), .. }
+                    | CType::Union { name: Some(tag), .. } = resolved
+                    {
+                        if let Some(full) = self.tag_types_by_name.get(tag) {
+                            return self.find_member_type(full, member_name);
+                        }
+                    }
+                    return None;
+                }
+                fields
+            }
+            _ => return None,
+        };
+
+        for field in fields {
+            if let Some(ref name) = field.name {
+                if name == member_name {
+                    return Some(field.ty.clone());
+                }
+            } else {
+                // Anonymous struct/union — recurse into it
+                if let Some(found) = self.find_member_type(&field.ty, member_name) {
+                    return Some(found);
+                }
+            }
+        }
+        None
     }
 
     // ===================================================================
@@ -1896,6 +2037,37 @@ impl<'a> ConstantEvaluator<'a> {
                             Ok(CType::UInt)
                         }
                     }
+                    _ => Ok(CType::Int),
+                }
+            }
+            Expression::MemberAccess { object, member, .. } => {
+                // sizeof(obj.member) — infer type of object, then find
+                // the named field within the struct/union type.
+                let obj_type = self.infer_expr_type(object, span)?;
+                let member_name = self.resolve_symbol_name(*member);
+                self.find_member_type(&obj_type, &member_name)
+                    .ok_or(())
+                    .or_else(|_| Ok(CType::Int))
+            }
+            Expression::PointerMemberAccess { object, member, .. } => {
+                // sizeof(ptr->member) — infer type of pointer, dereference
+                // to get the struct/union type, then find the named field.
+                let obj_type = self.infer_expr_type(object, span)?;
+                let pointee = match obj_type {
+                    CType::Pointer(inner, _) => *inner,
+                    _ => obj_type, // fallback: treat as the type itself
+                };
+                let member_name = self.resolve_symbol_name(*member);
+                self.find_member_type(&pointee, &member_name)
+                    .ok_or(())
+                    .or_else(|_| Ok(CType::Int))
+            }
+            Expression::ArraySubscript { base, .. } => {
+                // sizeof(arr[i]) — the element type of the array/pointer
+                let arr_type = self.infer_expr_type(base, span)?;
+                match arr_type {
+                    CType::Array(elem, _) => Ok(*elem),
+                    CType::Pointer(elem, _) => Ok(*elem),
                     _ => Ok(CType::Int),
                 }
             }

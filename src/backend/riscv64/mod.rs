@@ -1100,7 +1100,25 @@ impl ArchCodegen for RiscV64Codegen {
                     Ok(encoded) => {
                         let primary_offset = output.len();
 
+                        // Track whether the primary relocation is a
+                        // PCREL_HI20 or GOT_HI20.  If so, the continuation
+                        // relocation (PCREL_LO12_I/S) must reference a
+                        // local label at the AUIPC offset instead of the
+                        // original symbol — the RISC-V ELF ABI mandates
+                        // this pairing convention.
+                        let mut pcrel_hi_label: Option<String> = None;
                         if let Some(ref reloc) = encoded.relocation {
+                            let is_hi20 = reloc.reloc_type
+                                == crate::backend::riscv64::assembler::R_RISCV_PCREL_HI20
+                                || reloc.reloc_type
+                                    == crate::backend::riscv64::assembler::R_RISCV_GOT_HI20;
+                            if is_hi20 {
+                                let label = format!(
+                                    ".Lpcrel_hi{}",
+                                    primary_offset + reloc.offset as usize
+                                );
+                                pcrel_hi_label = Some(label);
+                            }
                             relocations.push(FunctionRelocation {
                                 offset: (primary_offset + reloc.offset as usize) as u64,
                                 symbol: sym_name.clone(),
@@ -1113,9 +1131,21 @@ impl ArchCodegen for RiscV64Codegen {
 
                         if let Some(ref cont) = encoded.continuation {
                             if let Some(ref cont_reloc) = cont.relocation {
+                                // For PCREL_LO12_I/S, reference the
+                                // local label at the AUIPC instruction.
+                                let cont_sym = if pcrel_hi_label.is_some()
+                                    && (cont_reloc.reloc_type
+                                        == crate::backend::riscv64::assembler::R_RISCV_PCREL_LO12_I
+                                        || cont_reloc.reloc_type
+                                            == crate::backend::riscv64::assembler::R_RISCV_PCREL_LO12_S)
+                                {
+                                    pcrel_hi_label.as_ref().unwrap().clone()
+                                } else {
+                                    sym_name.clone()
+                                };
                                 relocations.push(FunctionRelocation {
                                     offset: (output.len() + cont_reloc.offset as usize) as u64,
-                                    symbol: sym_name.clone(),
+                                    symbol: cont_sym,
                                     rel_type_id: cont_reloc.reloc_type,
                                     addend: cont_reloc.addend,
                                     section: ".text".to_string(),

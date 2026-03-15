@@ -1252,10 +1252,10 @@ fn parse_block_declaration(parser: &mut Parser<'_>) -> Result<Declaration, ()> {
         let decl_start = parser.current_span();
         let declarator = declarations::parse_declarator(parser)?;
 
-        // Skip optional GCC asm register binding or asm label:
+        // Parse optional GCC asm register binding or asm label:
         //   register int x asm("a0") = val;
         //   void foo(void) asm("_foo");
-        declarations::skip_asm_label(parser);
+        let local_asm_reg = declarations::skip_asm_label(parser);
 
         // Skip optional trailing __attribute__
         declarations::skip_trailing_attributes(parser);
@@ -1271,7 +1271,7 @@ fn parse_block_declaration(parser: &mut Parser<'_>) -> Result<Declaration, ()> {
         init_declarators.push(InitDeclarator {
             declarator,
             initializer,
-            asm_register: None,
+            asm_register: local_asm_reg,
             span: decl_span,
         });
 

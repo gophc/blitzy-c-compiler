@@ -676,17 +676,215 @@ impl<'a> SemanticAnalyzer<'a> {
                 self.scopes.declare_ordinary(sym_name, id);
 
                 // Analyze initializer if present.
-                if let Some(ref mut _init) = init_decl.initializer {
-                    // The initializer is validated structurally. Full
-                    // InitializerAnalyzer integration would analyze the
-                    // initializer against the target type. We mark the
-                    // symbol as defined.
+                if let Some(ref _init) = init_decl.initializer {
+                    // Complete incomplete array types from the initializer.
+                    // For declarations like `int arr[] = {1,2,3};`, the
+                    // parsed type is Array(Int, None). We deduce the
+                    // element count from the initializer list length and
+                    // update the symbol's type to Array(Int, Some(3)).
+                    {
+                        let sym_entry = self.symbols.get(id);
+                        let needs_completion = match &sym_entry.ty {
+                            CType::Array(_, None) => true,
+                            CType::Qualified(inner, _) => {
+                                matches!(inner.as_ref(), CType::Array(_, None))
+                            }
+                            _ => false,
+                        };
+                        if needs_completion {
+                            let count = Self::count_initializer_elements(
+                                _init,
+                                &self.enum_constant_values,
+                                &self.interner,
+                            );
+                            if count > 0 {
+                                let sym_mut = self.symbols.get_mut(id);
+                                sym_mut.ty = Self::complete_array_type(&sym_mut.ty, count);
+                            }
+                        }
+                    }
                     self.symbols.define(id);
                 }
             }
         }
 
         Ok(())
+    }
+
+    // ====================================================================
+    // Incomplete Array Type Completion
+    // ====================================================================
+
+    /// Count the number of top-level elements in an initializer list to
+    /// deduce the array size for declarations like `int arr[] = {1,2,3};`.
+    ///
+    /// For a brace-enclosed initializer list, returns the number of entries.
+    /// For designated initializers with explicit array indices, tracks the
+    /// maximum index to handle sparse initialization like `[5] = 42`.
+    /// For a single expression initializer (e.g., string literal), counts
+    /// string length + 1 for the NUL terminator if it's a string; otherwise
+    /// returns 1 (shouldn't normally be used for arrays).
+    fn count_initializer_elements(
+        init: &crate::frontend::parser::ast::Initializer,
+        enum_values: &FxHashMap<String, i128>,
+        interner: &crate::common::string_interner::Interner,
+    ) -> usize {
+        use crate::frontend::parser::ast::{Designator, Initializer};
+        match init {
+            Initializer::List {
+                designators_and_initializers,
+                ..
+            } => {
+                let mut max_index: usize = 0;
+                let mut positional: usize = 0;
+                let mut unresolved_indices = false;
+                for di in designators_and_initializers {
+                    if di.designators.is_empty() {
+                        // Positional initializer — increments the index
+                        positional += 1;
+                    } else {
+                        // Check for array index designators [N] or [lo...hi]
+                        let mut has_array_index = false;
+                        for d in &di.designators {
+                            match d {
+                                Designator::Index(expr, _) => {
+                                    has_array_index = true;
+                                    if let Some(idx) = Self::try_eval_index_expr(
+                                        expr, enum_values, interner,
+                                    ) {
+                                        let idx_usize = idx as usize;
+                                        if idx_usize + 1 > max_index {
+                                            max_index = idx_usize + 1;
+                                        }
+                                    } else {
+                                        unresolved_indices = true;
+                                    }
+                                }
+                                Designator::IndexRange(_lo, hi, _) => {
+                                    has_array_index = true;
+                                    if let Some(idx) = Self::try_eval_index_expr(
+                                        hi, enum_values, interner,
+                                    ) {
+                                        let idx_usize = idx as usize;
+                                        if idx_usize + 1 > max_index {
+                                            max_index = idx_usize + 1;
+                                        }
+                                    } else {
+                                        unresolved_indices = true;
+                                    }
+                                }
+                                Designator::Field(_, _) => {
+                                    // Struct field designator — not an array index
+                                }
+                            }
+                        }
+                        if !has_array_index {
+                            // Pure field designators (.field = val) count as
+                            // one positional element for the top-level array
+                            positional += 1;
+                        }
+                    }
+                }
+                // If we couldn't resolve some index designators,
+                // fall back to using the total number of initializer
+                // entries as the array size.
+                if unresolved_indices && max_index == 0 {
+                    designators_and_initializers.len()
+                } else {
+                    std::cmp::max(
+                        std::cmp::max(positional, max_index),
+                        designators_and_initializers.len(),
+                    )
+                }
+            }
+            Initializer::Expression(expr) => {
+                // String literal initializer for char arrays:
+                // `char s[] = "hello"` → 6 elements (5 chars + NUL)
+                use crate::frontend::parser::ast::Expression;
+                match expr.as_ref() {
+                    Expression::StringLiteral { segments, .. } => {
+                        // Count total bytes across all segments + NUL
+                        let total: usize = segments.iter().map(|s| s.value.len()).sum();
+                        total + 1
+                    }
+                    _ => 1,
+                }
+            }
+        }
+    }
+
+    /// Try to evaluate an index expression to a compile-time integer.
+    /// Handles: integer literals, enum constant identifiers, casts wrapping
+    /// any of the above, and simple arithmetic on them.
+    fn try_eval_index_expr(
+        expr: &crate::frontend::parser::ast::Expression,
+        enum_values: &FxHashMap<String, i128>,
+        interner: &crate::common::string_interner::Interner,
+    ) -> Option<i128> {
+        use crate::frontend::parser::ast::{BinaryOp, Expression, UnaryOp};
+        match expr {
+            Expression::IntegerLiteral { value, .. } => Some(*value as i128),
+            Expression::Cast { operand, .. } => {
+                Self::try_eval_index_expr(operand, enum_values, interner)
+            }
+            Expression::Identifier { name, .. } => {
+                // Try looking up as an enum constant
+                let name_str = interner.resolve(*name);
+                enum_values.get(name_str).copied()
+            }
+            Expression::UnaryOp { op, operand, .. } => {
+                let val = Self::try_eval_index_expr(operand, enum_values, interner)?;
+                match op {
+                    UnaryOp::Negate => Some(-val),
+                    UnaryOp::BitwiseNot => Some(!val),
+                    UnaryOp::LogicalNot => Some(if val == 0 { 1 } else { 0 }),
+                    UnaryOp::Plus => Some(val),
+                    _ => None,
+                }
+            }
+            Expression::Binary {
+                op, left, right, ..
+            } => {
+                let lv = Self::try_eval_index_expr(left, enum_values, interner)?;
+                let rv = Self::try_eval_index_expr(right, enum_values, interner)?;
+                match op {
+                    BinaryOp::Add => Some(lv.wrapping_add(rv)),
+                    BinaryOp::Sub => Some(lv.wrapping_sub(rv)),
+                    BinaryOp::Mul => Some(lv.wrapping_mul(rv)),
+                    BinaryOp::Div if rv != 0 => Some(lv / rv),
+                    BinaryOp::Mod if rv != 0 => Some(lv % rv),
+                    BinaryOp::ShiftLeft => Some(lv.wrapping_shl(rv as u32)),
+                    BinaryOp::ShiftRight => Some(lv.wrapping_shr(rv as u32)),
+                    BinaryOp::BitwiseAnd => Some(lv & rv),
+                    BinaryOp::BitwiseOr => Some(lv | rv),
+                    BinaryOp::BitwiseXor => Some(lv ^ rv),
+                    _ => None,
+                }
+            }
+            Expression::Parenthesized { inner, .. } => {
+                Self::try_eval_index_expr(inner, enum_values, interner)
+            }
+            _ => None,
+        }
+    }
+
+    /// Complete an incomplete array type `Array(base, None)` by filling in
+    /// the element count. Handles both plain `Array` and `Qualified(Array)`.
+    fn complete_array_type(ty: &CType, count: usize) -> CType {
+        match ty {
+            CType::Array(base, None) => CType::Array(base.clone(), Some(count)),
+            CType::Qualified(inner, quals) => {
+                if let CType::Array(base, None) = inner.as_ref() {
+                    CType::Qualified(
+                        Box::new(CType::Array(base.clone(), Some(count))),
+                        *quals,
+                    )
+                } else {
+                    ty.clone()
+                }
+            }
+            _ => ty.clone(),
+        }
     }
 
     // ====================================================================
@@ -1288,6 +1486,15 @@ impl<'a> SemanticAnalyzer<'a> {
                         "use of tag with wrong kind (struct vs union vs enum)",
                     );
                     return Err(());
+                }
+                // Performance: if the tag is already complete and this
+                // specifier also has members, we have a duplicate
+                // definition (e.g. from process_embedded_tag_definitions
+                // calling us twice, or from resolve_type_from_type_specifiers
+                // already having processed the definition).  Short-circuit
+                // to avoid re-resolving all member types.
+                if existing_entry.is_complete && spec.members.is_some() {
+                    return Ok(existing_entry.ty.clone());
                 }
             }
         }
@@ -2545,25 +2752,41 @@ impl<'a> SemanticAnalyzer<'a> {
     fn resolve_struct_union_type(&self, spec: &StructOrUnionSpecifier, is_struct: bool) -> CType {
         if let Some(tag_name) = spec.tag {
             if let Some(entry) = self.scopes.lookup_tag(tag_name) {
-                // Performance optimisation: instead of deep-cloning the entire
-                // field list of a potentially enormous struct (task_struct has
-                // ~200 fields, each with nested types), return a lightweight
-                // "tag reference" that carries just the tag name.  The full
-                // definition is looked up later only when field access or
-                // sizeof computation actually requires it.
                 if spec.members.is_none() {
                     // This is a tag *reference* (e.g. `struct foo var;`),
-                    // NOT a definition.  Return the full type from the tag
-                    // namespace so that sizeof computation on embedded
-                    // (by-value) struct fields works correctly.  The
-                    // previous "lightweight tag reference" optimisation
-                    // returned an empty-fields CType that caused
-                    // sizeof(Outer) to exclude embedded struct fields when
-                    // computing struct layout.
+                    // NOT a definition.  Return a lightweight "tag
+                    // reference" carrying only the tag name with empty
+                    // fields.  All consumers that need the full field
+                    // list — sizeof_ctype_resolved, lookup_member_type,
+                    // and the IR lowering's resolve_forward_ref_type —
+                    // already resolve lightweight references via the
+                    // tag namespace or tag_types_by_name map.  This
+                    // avoids deep-cloning enormous kernel structs
+                    // (task_struct ~200 fields) on every reference,
+                    // turning an O(n) clone into O(1) construction.
+                    let tag_str = self.interner.resolve(tag_name).to_string();
+                    return if is_struct {
+                        CType::Struct {
+                            name: Some(tag_str),
+                            fields: Vec::new(),
+                            packed: false,
+                            aligned: None,
+                        }
+                    } else {
+                        CType::Union {
+                            name: Some(tag_str),
+                            fields: Vec::new(),
+                            packed: false,
+                            aligned: None,
+                        }
+                    };
+                }
+                // This is a re-definition or has a body.  If the tag is
+                // already complete, return the registered type to avoid
+                // re-resolving all members below.
+                if entry.is_complete {
                     return entry.ty.clone();
                 }
-                // This is a re-definition or has a body — clone fully.
-                return entry.ty.clone();
             }
         }
         // If the struct/union has member declarations (i.e. a definition body),

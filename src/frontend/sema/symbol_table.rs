@@ -961,6 +961,15 @@ impl SymbolTable {
                 self.types_are_compatible(elem_a, elem_b)
             }
 
+            // Array ↔ Pointer compatibility: In C, function parameters
+            // declared as `T name[]` are adjusted to `T *name` (C11 §6.7.6.3p7).
+            // A forward declaration may use `T[]` while the definition uses
+            // `T *` (or vice versa).  Treat these as compatible.
+            (CType::Array(elem, _), CType::Pointer(inner, _))
+            | (CType::Pointer(inner, _), CType::Array(elem, _)) => {
+                self.types_are_compatible(elem, inner)
+            }
+
             // Function type vs pointer-to-function type: C99 §6.7.6.3/8
             // states that a parameter declared as "function returning type"
             // is adjusted to "pointer to function returning type".  This

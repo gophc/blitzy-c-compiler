@@ -529,8 +529,20 @@ fn generate_for_arch<A: ArchCodegen>(
 
         // Collect relocations, adjusting offsets to be relative to the
         // combined .text section rather than this individual function.
+        // For RISC-V PCREL local labels (.Lpcrel_hi<N>), also update the
+        // label name to use the absolute .text offset so that the symbol
+        // table entry created later has the correct value.
         for mut reloc in asm_result.relocations {
             reloc.offset += func_offset;
+            // Update PCREL local label references to use absolute offsets
+            if reloc.symbol.starts_with(".Lpcrel_hi") {
+                if let Some(per_func_str) = reloc.symbol.strip_prefix(".Lpcrel_hi") {
+                    if let Ok(per_func_off) = per_func_str.parse::<u64>() {
+                        let abs_off = per_func_off + func_offset;
+                        reloc.symbol = format!(".Lpcrel_hi{}", abs_off);
+                    }
+                }
+            }
             text_relocations.push(reloc);
         }
         text_section_offsets.push((func.name.clone(), func_offset, func_size));
@@ -3309,8 +3321,42 @@ fn write_relocatable_object(
 
         // For any symbol referenced by a relocation that isn't already in the
         // symbol table (functions, globals, declarations), add it as an
-        // undefined (SHN_UNDEF) global symbol.
+        // undefined (SHN_UNDEF) global symbol — EXCEPT for RISC-V local
+        // PCREL labels (.Lpcrel_hi<offset>) which must be LOCAL symbols
+        // pointing to the corresponding AUIPC instruction offset in .text.
+        //
+        // RISC-V PCREL_LO12 relocations reference a local label at the
+        // AUIPC instruction. The label name encodes the per-function offset
+        // (.Lpcrel_hi{N}), but we need to find the matching PCREL_HI20
+        // relocation to determine the absolute .text offset for the symbol.
+        //
+        // Step 1: Build a map from label name → absolute .text offset by
+        //         scanning PCREL_HI20 relocations (type 23 for RISCV).
+        let mut pcrel_label_to_abs_offset: FxHashMap<String, u64> = FxHashMap::default();
+        {
+            // R_RISCV_PCREL_HI20 = 23, R_RISCV_GOT_HI20 = 20
+            for reloc in text_relocs {
+                if reloc.rel_type_id == 23 || reloc.rel_type_id == 20 {
+                    // This HI20 relocation is at absolute offset reloc.offset.
+                    // The corresponding local label is ".Lpcrel_hi{reloc.offset}".
+                    // BUT: the label name was computed from per-function offsets
+                    // before adjustment. We need to check what label name was
+                    // generated. The LO12 referencing this HI20 uses a label
+                    // with the per-function offset. However, after offset
+                    // adjustment (reloc.offset += func_offset), the HI20 has
+                    // the absolute offset.
+                    //
+                    // Strategy: we don't know which label name maps to this
+                    // HI20 directly. Instead, record the absolute offset of
+                    // every HI20 relocation and match by scanning LO12s.
+                    let label = format!(".Lpcrel_hi{}", reloc.offset);
+                    pcrel_label_to_abs_offset.insert(label, reloc.offset);
+                }
+            }
+        }
+
         let mut extra_undef_symbols: Vec<String> = Vec::new();
+        let mut pcrel_local_labels: Vec<(String, u64)> = Vec::new();
         {
             let mut known: crate::common::fx_hash::FxHashSet<String> =
                 crate::common::fx_hash::FxHashSet::default();
@@ -3326,9 +3372,41 @@ fn write_relocatable_object(
             for reloc in text_relocs {
                 if !known.contains(&reloc.symbol) {
                     known.insert(reloc.symbol.clone());
-                    extra_undef_symbols.push(reloc.symbol.clone());
+                    // Check if this is a RISC-V PCREL local label
+                    if reloc.symbol.starts_with(".Lpcrel_hi") {
+                        if let Some(&abs_offset) = pcrel_label_to_abs_offset.get(&reloc.symbol) {
+                            pcrel_local_labels.push((reloc.symbol.clone(), abs_offset));
+                        } else {
+                            // Label not found in HI20 map — might be a naming
+                            // mismatch. Try parsing the offset from the name.
+                            if let Some(offset_str) = reloc.symbol.strip_prefix(".Lpcrel_hi") {
+                                if let Ok(offset) = offset_str.parse::<u64>() {
+                                    pcrel_local_labels.push((reloc.symbol.clone(), offset));
+                                } else {
+                                    extra_undef_symbols.push(reloc.symbol.clone());
+                                }
+                            } else {
+                                extra_undef_symbols.push(reloc.symbol.clone());
+                            }
+                        }
+                    } else {
+                        extra_undef_symbols.push(reloc.symbol.clone());
+                    }
                 }
             }
+        }
+        // Add PCREL local labels as STB_LOCAL symbols in .text section
+        for (name, offset) in &pcrel_local_labels {
+            let sym = ElfSymbol {
+                name: name.clone(),
+                value: *offset,
+                size: 0,
+                binding: STB_LOCAL,
+                sym_type: STT_NOTYPE,
+                visibility: STV_DEFAULT,
+                section_index: text_section_index,
+            };
+            writer.add_symbol(sym);
         }
         for name in &extra_undef_symbols {
             let sym = ElfSymbol {
@@ -3380,6 +3458,13 @@ fn write_relocatable_object(
             all_syms.push(SymEntry {
                 name: decl.name.clone(),
                 binding: STB_GLOBAL,
+            });
+        }
+        // RISC-V PCREL local labels are LOCAL symbols
+        for (name, _offset) in &pcrel_local_labels {
+            all_syms.push(SymEntry {
+                name: name.clone(),
+                binding: STB_LOCAL,
             });
         }
         for name in &extra_undef_symbols {

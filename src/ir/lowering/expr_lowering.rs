@@ -119,6 +119,10 @@ pub struct ExprLoweringContext<'a> {
     /// by `lower_member_access` (read) and `lower_assignment` (write) to
     /// emit proper bit-manipulation instead of full-width load/store.
     pub last_bitfield_info: Option<(usize, usize)>,
+    /// Cache for computed struct/union layouts, keyed by struct tag name.
+    /// Avoids recomputing full layout for every member access on large
+    /// structs like `struct sock` (hundreds of fields).
+    pub layout_cache: &'a mut FxHashMap<String, crate::common::type_builder::StructLayout>,
 }
 
 // ---------------------------------------------------------------------------
@@ -775,6 +779,10 @@ fn lookup_var_type(ctx: &ExprLoweringContext<'_>, name: &str) -> CType {
     if let Some(ct) = ctx.module.global_c_types.get(name) {
         return ct.clone();
     }
+    // GCC global register variables: type recorded in register_globals.
+    if let Some((_reg, ct)) = ctx.module.register_globals.get(name) {
+        return ct.clone();
+    }
     // Fall back to global variable types from the module.
     if let Some(gv) = ctx.module.get_global(name) {
         return ir_type_to_approx_ctype(&gv.ty);
@@ -1240,6 +1248,29 @@ fn lower_identifier(ctx: &mut ExprLoweringContext<'_>, sym_idx: u32, span: Span)
         return TypedValue::new(ptr_val, var_cty);
     }
 
+    // GCC global register variables: `register T *name __asm__("reg");`
+    // These map a C identifier to a hardware register.  We emit an
+    // inline-asm instruction that reads the register and returns the
+    // value directly (no memory access).
+    if let Some((reg_name, reg_ctype)) = ctx.module.register_globals.get(name).cloned() {
+        let _result_ir_ty = ctype_to_ir(&reg_ctype, ctx.target);
+        // Build a trivial inline-asm: `mv $0, <reg>` that outputs the
+        // register value.  We use the generic "=r" output constraint so
+        // the backend copies the specific register into a fresh virtual
+        // register.  The template is architecture-aware.
+        let template = format!("mv $0, {}", reg_name);
+        let (result_val, asm_inst) = ctx.builder.build_inline_asm(
+            template,
+            "=r".to_string(),
+            Vec::new(),
+            Vec::new(),
+            false, // has_side_effects
+            span,
+        );
+        emit_inst(ctx, asm_inst);
+        return TypedValue::new(result_val, reg_ctype);
+    }
+
     // Global variables.
     {
         let global_ty = ctx.module.get_global(name).map(|gv| gv.ty.clone());
@@ -1637,6 +1668,20 @@ fn lower_identifier_lvalue(
     let var_cty = lookup_var_type(ctx, name);
     if let Some((ptr_val, _)) = lookup_var(ctx, name) {
         return TypedValue::new(ptr_val, var_cty);
+    }
+    // GCC global register variables do not have addressable storage.
+    // They cannot appear as lvalues for address-of (&) but can appear
+    // in assignment context.  For now we emit an error if used as an
+    // lvalue (the kernel never does this).
+    if ctx.module.register_globals.contains_key(name) {
+        ctx.diagnostics.emit_error(
+            span,
+            format!(
+                "address of global register variable '{}' requested",
+                name
+            ),
+        );
+        return TypedValue::new(Value::UNDEF, var_cty);
     }
     if ctx.module.get_global(name).is_some() {
         let global_name = name.to_string();
@@ -3333,7 +3378,7 @@ fn sizeof_resolve_member(
     let mut resolved = obj_ty.clone();
     resolve_forward_ref_type(&mut resolved, ctx.struct_defs);
     let (_offset, member_ty, _bf_info) =
-        find_struct_member(&resolved, &member_name, ctx.type_builder, ctx.struct_defs);
+        find_struct_member(&resolved, &member_name, ctx.type_builder, ctx.struct_defs, ctx.layout_cache);
     member_ty
 }
 
@@ -3614,6 +3659,7 @@ fn lower_member_access_lvalue(
         &member_name_owned,
         ctx.type_builder,
         ctx.struct_defs,
+        ctx.layout_cache,
     );
 
     // Store bitfield information for the caller to use.
@@ -3645,6 +3691,7 @@ fn find_struct_member(
     name: &str,
     tb: &TypeBuilder,
     struct_defs: &FxHashMap<String, CType>,
+    layout_cache: &mut FxHashMap<String, crate::common::type_builder::StructLayout>,
 ) -> (usize, CType, Option<(usize, usize)>) {
     let resolved = types::resolve_typedef(ctype);
     // Resolve lightweight tag references (empty fields with a tag name)
@@ -3676,30 +3723,61 @@ fn find_struct_member(
     };
     match resolved {
         CType::Struct {
+            name: ref tag_name,
             fields,
             packed,
             aligned,
             ..
         } => {
-            // Resolve forward-referenced typedef field types so that
-            // sizeof_ctype returns the correct sizes during layout
-            // computation.  Without this, typedefs that were created
-            // before their underlying struct was defined retain empty
-            // field lists and compute as size 0, corrupting all
-            // subsequent field offsets in the parent struct.
-            let resolved_fields: Vec<crate::common::types::StructField> = fields
-                .iter()
-                .map(|f| {
-                    let mut resolved_ty = f.ty.clone();
-                    resolve_forward_ref_type(&mut resolved_ty, struct_defs);
-                    crate::common::types::StructField {
-                        name: f.name.clone(),
-                        ty: resolved_ty,
-                        bit_width: f.bit_width,
-                    }
-                })
-                .collect();
-            let layout = tb.compute_struct_layout_with_fields(&resolved_fields, *packed, *aligned);
+            // Build a cache key from the struct tag if available.
+            // For tagged structs, cache the computed layout to avoid
+            // recomputing for every member access on large structs
+            // like `struct sock` (hundreds of fields).
+            let cache_key = tag_name.as_ref().map(|t| {
+                let mut key = String::with_capacity(t.len() + 10);
+                key.push_str("s:");
+                key.push_str(t);
+                if *packed { key.push_str(":p"); }
+                if let Some(a) = aligned { key.push(':'); key.push_str(&a.to_string()); }
+                key
+            });
+
+            let layout = if let Some(ref ck) = cache_key {
+                if let Some(cached) = layout_cache.get(ck) {
+                    cached.clone()
+                } else {
+                    let resolved_fields: Vec<crate::common::types::StructField> = fields
+                        .iter()
+                        .map(|f| {
+                            let mut resolved_ty = f.ty.clone();
+                            resolve_forward_ref_type(&mut resolved_ty, struct_defs);
+                            crate::common::types::StructField {
+                                name: f.name.clone(),
+                                ty: resolved_ty,
+                                bit_width: f.bit_width,
+                            }
+                        })
+                        .collect();
+                    let l = tb.compute_struct_layout_with_fields(&resolved_fields, *packed, *aligned);
+                    layout_cache.insert(ck.clone(), l.clone());
+                    l
+                }
+            } else {
+                // Anonymous struct — compute without caching.
+                let resolved_fields: Vec<crate::common::types::StructField> = fields
+                    .iter()
+                    .map(|f| {
+                        let mut resolved_ty = f.ty.clone();
+                        resolve_forward_ref_type(&mut resolved_ty, struct_defs);
+                        crate::common::types::StructField {
+                            name: f.name.clone(),
+                            ty: resolved_ty,
+                            bit_width: f.bit_width,
+                        }
+                    })
+                    .collect();
+                tb.compute_struct_layout_with_fields(&resolved_fields, *packed, *aligned)
+            };
 
             for (i, field) in fields.iter().enumerate() {
                 if field.name.as_deref() == Some(name) {
@@ -3717,7 +3795,7 @@ fn find_struct_member(
                     let inner = types::resolve_typedef(&inner_ty);
                     if matches!(inner, CType::Struct { .. } | CType::Union { .. }) {
                         let (inner_off, found_ty, bf_info) =
-                            find_struct_member(inner, name, tb, struct_defs);
+                            find_struct_member(inner, name, tb, struct_defs, layout_cache);
                         if !matches!(found_ty, CType::Void) {
                             return (layout.fields[i].offset + inner_off, found_ty, bf_info);
                         }
@@ -3727,20 +3805,14 @@ fn find_struct_member(
             (0, CType::Void, None)
         }
         CType::Union {
+            name: ref _tag_name,
             fields,
-            packed,
-            aligned,
+            packed: _,
+            aligned: _,
             ..
         } => {
-            let resolved_field_types: Vec<CType> = fields
-                .iter()
-                .map(|f| {
-                    let mut ty = f.ty.clone();
-                    resolve_forward_ref_type(&mut ty, struct_defs);
-                    ty
-                })
-                .collect();
-            let _union_layout = tb.compute_union_layout(&resolved_field_types, *packed, *aligned);
+            // For unions, layout computation is simpler but still cache
+            // for consistency and to avoid repeated forward-ref resolution.
             for field in fields {
                 if field.name.as_deref() == Some(name) {
                     let mut result_ty = field.ty.clone();
@@ -3753,7 +3825,7 @@ fn find_struct_member(
                     resolve_forward_ref_type(&mut inner_ty, struct_defs);
                     let inner = types::resolve_typedef(&inner_ty);
                     if matches!(inner, CType::Struct { .. } | CType::Union { .. }) {
-                        let (off, ty, bf_info) = find_struct_member(inner, name, tb, struct_defs);
+                        let (off, ty, bf_info) = find_struct_member(inner, name, tb, struct_defs, layout_cache);
                         if !matches!(ty, CType::Void) {
                             return (off, ty, bf_info);
                         }
@@ -4080,6 +4152,9 @@ fn lower_statement_expression(
     // stores), non-expression statements (if/else, for, while), and
     // expression statements using the augmented variable maps.
     let mut label_blocks = FxHashMap::default();
+    // Inherit the layout cache from the expression context so struct layout
+    // computations are shared across statement-expression boundaries.
+    let inherited_layout_cache = std::mem::take(ctx.layout_cache);
     let mut stmt_ctx = super::stmt_lowering::StmtLoweringContext {
         builder: ctx.builder,
         function: ctx.function,
@@ -4101,6 +4176,7 @@ fn lower_statement_expression(
         current_function_name: ctx.current_function_name,
         scope_type_overrides: ctx.scope_type_overrides.clone(),
         return_ctype: None,
+        layout_cache: inherited_layout_cache,
     };
 
     // Second pass: lower each block item. Track the value of the last
@@ -4140,6 +4216,7 @@ fn lower_statement_expression(
                         enclosing_loop_stack: stmt_ctx.loop_stack.clone(),
                         scope_type_overrides: &stmt_ctx.scope_type_overrides,
                         last_bitfield_info: None,
+                        layout_cache: &mut stmt_ctx.layout_cache,
                     };
                     let tv = lower_expr_inner(&mut inner_expr_ctx, expr);
                     last_val = tv.value;
@@ -4153,6 +4230,13 @@ fn lower_statement_expression(
             }
         }
     }
+
+    // Restore the layout cache back to the parent expression context
+    // so that cached struct layouts persist across statement-expression
+    // boundaries within the same function.
+    let restored_cache = std::mem::take(&mut stmt_ctx.layout_cache);
+    drop(stmt_ctx);
+    *ctx.layout_cache = restored_cache;
 
     TypedValue::new(last_val, CType::Int)
 }

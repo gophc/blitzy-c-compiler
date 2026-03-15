@@ -51,7 +51,7 @@ use bcc::common::diagnostics::DiagnosticEngine;
 use bcc::common::source_map::SourceMap;
 use bcc::common::string_interner::Interner;
 use bcc::common::target::Target;
-use bcc::common::temp_files::{create_temp_object_file, TempDir, TempFile};
+use bcc::common::temp_files::{create_temp_assembly_file, create_temp_object_file, TempDir, TempFile};
 use bcc::common::type_builder::TypeBuilder;
 
 use bcc::backend::generation::{generate_code, CodegenContext};
@@ -69,7 +69,7 @@ use bcc::passes::run_optimization_pipeline;
 
 /// Worker thread stack size: 64 MiB. Required for deeply nested kernel macro
 /// expansions and complex AST structures. Mandated by AAP §0.7.3.
-const WORKER_STACK_SIZE: usize = 256 * 1024 * 1024;
+const WORKER_STACK_SIZE: usize = 64 * 1024 * 1024;
 
 /// Maximum recursion depth for the parser and macro expander.
 /// Prevents stack overflow on deeply nested constructs. Mandated by AAP §0.7.3.
@@ -160,6 +160,12 @@ struct CliArgs {
     nostdinc: bool,
     /// `--verbose`: enable verbose compilation debugging output.
     verbose: bool,
+    /// `-march=<value>`: architecture string to pass through to the external
+    /// assembler for `.S` files (e.g. `rv64imafdc`).
+    march: Option<String>,
+    /// `-mabi=<value>`: ABI string to pass through to the external assembler
+    /// for `.S` files (e.g. `lp64d`).
+    mabi: Option<String>,
 }
 
 impl Default for CliArgs {
@@ -189,6 +195,8 @@ impl Default for CliArgs {
             depfile_phony: false,
             nostdinc: false,
             verbose: false,
+            march: None,
+            mabi: None,
         }
     }
 }
@@ -554,9 +562,13 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
         // -m32, -m64, -march=, -mtune=, -mabi= — accepted for GCC compat.
         // Additionally, -march= and -mabi= are used to infer the target
         // architecture when --target= is not explicitly provided.
+        // We also STORE -march= and -mabi= so they can be forwarded to the
+        // external assembler when compiling `.S` files.
         if arg.starts_with("-m") && arg != "-mretpoline" {
             // Infer target from -march=rv64... or -march=rv32...
             if let Some(march_val) = arg.strip_prefix("-march=") {
+                // Store the value for pass-through to the external assembler.
+                cli.march = Some(march_val.to_string());
                 if march_val.starts_with("rv64") {
                     if cli.target == Target::X86_64 {
                         // Only override if target hasn't been explicitly set
@@ -575,6 +587,8 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
             }
             // Infer from -mabi=lp64 (RISC-V LP64D ABI) or -mabi=ilp32
             if let Some(mabi_val) = arg.strip_prefix("-mabi=") {
+                // Store the value for pass-through to the external assembler.
+                cli.mabi = Some(mabi_val.to_string());
                 if mabi_val.starts_with("lp64") && cli.target == Target::X86_64 {
                     cli.target = Target::RiscV64;
                 } else if mabi_val.starts_with("ilp32") && cli.target == Target::X86_64 {
@@ -707,6 +721,15 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
 
         // -P — suppress line markers in preprocessor output (GCC compat)
         if arg == "-P" {
+            i += 1;
+            continue;
+        }
+
+        // -C — keep comments in preprocessor output (GCC compat, silently accepted).
+        // BCC's preprocessor strips comments; this flag is accepted for GCC
+        // compatibility (e.g., VDSO linker script preprocessing in the Linux
+        // kernel build system).
+        if arg == "-C" || arg == "-CC" {
             i += 1;
             continue;
         }
@@ -1177,15 +1200,22 @@ fn run_preprocess_only(
         }
 
         // Process forced-include files (-include <file>) before the main source.
+        // Collect their tokens so they appear in the preprocessed output.
+        let mut forced_tokens: Vec<bcc::frontend::preprocessor::PPToken> = Vec::new();
         for forced in &ctx.forced_includes {
-            if pp.preprocess_file(forced).is_err() {
-                diagnostics.print_all(&source_map);
-                return Err(format!("forced include '{}' failed", forced));
+            match pp.preprocess_file(forced) {
+                Ok(mut ft) => {
+                    forced_tokens.append(&mut ft);
+                }
+                Err(()) => {
+                    diagnostics.print_all(&source_map);
+                    return Err(format!("forced include '{}' failed", forced));
+                }
             }
         }
 
-        // Run preprocessor
-        let tokens = match pp.preprocess_file(input) {
+        // Run preprocessor on main source
+        let main_tokens = match pp.preprocess_file(input) {
             Ok(t) => t,
             Err(()) => {
                 diagnostics.print_all(&source_map);
@@ -1193,17 +1223,55 @@ fn run_preprocess_only(
             }
         };
 
+        // Combine forced-include tokens with main file tokens
+        let tokens = if forced_tokens.is_empty() {
+            main_tokens
+        } else {
+            forced_tokens.extend(main_tokens);
+            forced_tokens
+        };
+
         // Reconstruct preprocessed output from tokens, preserving newlines
         // so that `-E` output has correct line structure for downstream
         // tools (e.g. `wc -l`, diff, further compilation).
+        //
+        // CRITICAL: Suppress space insertion around `.` punctuators to keep
+        // compound names like `.hash`, `.text`, `.gnu.hash`, `.rodata.*`,
+        // `.data.*`, `.bss` intact — essential for linker script
+        // preprocessing (`-E` on `.lds.S` files) and assembly directives.
+        //
+        // Strategy: track whether the last non-whitespace token was `.` and
+        // whether the current token IS `.`. Suppress spaces in both
+        // directions so that `identifier.identifier` and `.identifier`
+        // patterns are preserved without internal spaces.
         let mut output = String::new();
         use bcc::frontend::preprocessor::PPTokenKind;
+        let mut pending_space = false;
         for token in &tokens {
-            if token.kind == PPTokenKind::Newline {
-                output.push('\n');
-            } else if !token.text.is_empty() {
-                output.push_str(&token.text);
-                output.push(' ');
+            match token.kind {
+                PPTokenKind::Newline => {
+                    output.push('\n');
+                    pending_space = false;
+                }
+                PPTokenKind::Whitespace => {
+                    // Mark that whitespace was seen; actual emission is
+                    // deferred until the next non-whitespace token.
+                    // When NO whitespace token appears between two tokens
+                    // (e.g. `.` immediately followed by `hash`), pending_space
+                    // stays false and no space is inserted — this reconstructs
+                    // compound names like `.hash`, `.gnu.hash`, `.rodata.*`.
+                    if !output.is_empty() && !output.ends_with('\n') {
+                        pending_space = true;
+                    }
+                }
+                _ if !token.text.is_empty() => {
+                    if pending_space {
+                        output.push(' ');
+                    }
+                    pending_space = false;
+                    output.push_str(&token.text);
+                }
+                _ => {}
             }
         }
 
@@ -1224,6 +1292,55 @@ fn run_preprocess_only(
         if diagnostics.has_errors() {
             diagnostics.print_all(&source_map);
             return Err(format!("preprocessing failed for '{}'", input));
+        }
+
+        // Generate dependency file when requested (kernel builds use -E -MD
+        // together, and fixdep requires the .d file to exist even for
+        // preprocess-only invocations).
+        if args.gen_depfile {
+            let dep_path = if let Some(ref dp) = args.depfile_path {
+                dp.clone()
+            } else {
+                // Default: .{stem}.o.d in the same directory as input
+                let inp = Path::new(input);
+                let stem = inp.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
+                let parent = inp.parent().unwrap_or(Path::new("."));
+                parent
+                    .join(format!(".{}.o.d", stem))
+                    .to_string_lossy()
+                    .to_string()
+            };
+            let dep_target = if let Some(ref tgt) = args.depfile_target {
+                tgt.as_str()
+            } else if let Some(op) = output_path {
+                op
+            } else {
+                input
+            };
+            // Collect included files from the preprocessor for a more accurate
+            // dependency list.  The preprocessor tracks all files it has opened
+            // via the SourceMap.
+            let mut deps = vec![input.to_string()];
+            let mut fid: u32 = 0;
+            loop {
+                match source_map.get_filename(fid) {
+                    Some(name) if name != input => {
+                        deps.push(name.to_string());
+                    }
+                    None => break,
+                    _ => {}
+                }
+                fid += 1;
+            }
+            let mut dep_content = format!("{}: {}\n", dep_target, deps.join(" \\\n  "));
+            // Emit phony targets when -MP is active (prevents make errors when
+            // a header is deleted).
+            if args.depfile_phony {
+                for d in &deps[1..] {
+                    dep_content.push_str(&format!("\n{}:\n", d));
+                }
+            }
+            let _ = fs::write(&dep_path, dep_content);
         }
     }
 
@@ -1256,12 +1373,270 @@ fn is_object_or_archive(path: &str) -> bool {
     false
 }
 
+/// Compile an assembly source file (.S) by preprocessing with BCC's
+/// preprocessor and then invoking the system cross-assembler appropriate
+/// for the target architecture.
+///
+/// This is required because the Linux kernel build system passes `.S` files
+/// through `$(CC) -c`, expecting the compiler to preprocess and assemble
+/// them.
+fn compile_assembly_file(
+    input: &str,
+    output: &str,
+    args: &CliArgs,
+    ctx: &CompilationContext,
+) -> Result<(), String> {
+    use std::process::Command;
+
+    // Step 1: Preprocess the assembly file using BCC's preprocessor.
+    let mut source_map = SourceMap::new();
+    let mut diagnostics = DiagnosticEngine::new();
+    let mut interner = Interner::new();
+
+    let mut pp = Preprocessor::new(&mut source_map, &mut diagnostics, ctx.target, &mut interner);
+
+    for path in &ctx.include_paths {
+        pp.add_include_path(path);
+    }
+    if !ctx.nostdinc {
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(exe_dir) = exe.parent() {
+                let builtin = exe_dir.join("../../include");
+                if builtin.is_dir() {
+                    if let Some(s) = builtin
+                        .canonicalize()
+                        .ok()
+                        .and_then(|p| p.to_str().map(|s| s.to_string()))
+                    {
+                        pp.add_system_include_path(&s);
+                    }
+                }
+                let builtin2 = exe_dir.join("include");
+                if builtin2.is_dir() {
+                    if let Some(s) = builtin2
+                        .canonicalize()
+                        .ok()
+                        .and_then(|p| p.to_str().map(|s| s.to_string()))
+                    {
+                        pp.add_system_include_path(&s);
+                    }
+                }
+            }
+        }
+        let target_sys_paths = ctx.target.system_include_paths();
+        let extra_sys_paths: &[&str] = &["/usr/local/include", "/usr/include/linux"];
+        for sp in target_sys_paths.iter().chain(extra_sys_paths.iter()) {
+            if std::path::Path::new(sp).is_dir() {
+                pp.add_system_include_path(sp);
+            }
+        }
+    }
+    // GCC automatically defines __ASSEMBLER__ when preprocessing .S files.
+    // We must do the same so that kernel headers (e.g. linux/elfnote.h) can
+    // use `#ifdef __ASSEMBLER__` guards to select assembly-only code paths.
+    pp.add_define("__ASSEMBLER__", "1");
+
+    for (name, value) in &ctx.defines {
+        let val = value.as_deref().unwrap_or("1");
+        pp.add_define(name, val);
+    }
+    for name in &ctx.undefs {
+        pp.add_undef(name);
+    }
+    // Process forced-include files (-include <file>) before the main source.
+    // Collect their tokens so they appear in the preprocessed output (e.g. for
+    // -E mode) and so that typedefs/macros from forced headers are visible to
+    // the main source file during parsing.
+    let mut forced_asm_tokens: Vec<bcc::frontend::preprocessor::PPToken> = Vec::new();
+    for forced in &ctx.forced_includes {
+        match pp.preprocess_file(forced) {
+            Ok(mut ft) => {
+                forced_asm_tokens.append(&mut ft);
+            }
+            Err(()) => {
+                diagnostics.print_all(&source_map);
+                return Err(format!("forced include '{}' failed", forced));
+            }
+        }
+    }
+
+    let main_asm_tokens = match pp.preprocess_file(input) {
+        Ok(t) => t,
+        Err(()) => {
+            diagnostics.print_all(&source_map);
+            return Err(format!("preprocessing failed for '{}'", input));
+        }
+    };
+
+    let pp_tokens = if forced_asm_tokens.is_empty() {
+        main_asm_tokens
+    } else {
+        forced_asm_tokens.extend(main_asm_tokens);
+        forced_asm_tokens
+    };
+
+    // Reconstruct preprocessed output preserving whitespace structure.
+    // For assembly files, it is critical that `.text` stays as `.text`
+    // (no space between `.` and `text`) because the GNU assembler treats
+    // them as a single directive.  We suppress space insertion after `.'
+    // punctuators so that assembly directives like `.text`, `.globl`,
+    // `.cfi_startproc`, `.L__local_label` are emitted correctly.
+    let mut pp_output = String::new();
+    use bcc::frontend::preprocessor::PPTokenKind;
+    let mut need_space = false;
+    let mut last_was_dot = false;
+    for token in &pp_tokens {
+        match token.kind {
+            PPTokenKind::Newline => {
+                pp_output.push('\n');
+                need_space = false;
+                last_was_dot = false;
+            }
+            PPTokenKind::Whitespace => {
+                if !pp_output.is_empty() && !pp_output.ends_with('\n') {
+                    need_space = true;
+                }
+            }
+            _ if !token.text.is_empty() => {
+                // Suppress space after `.` when followed by an identifier or
+                // keyword — this forms assembly directives like `.text`,
+                // `.globl`, `.cfi_startproc`, `.L__local_label`, `.type`.
+                if need_space && !last_was_dot {
+                    pp_output.push(' ');
+                }
+                pp_output.push_str(&token.text);
+                last_was_dot = token.kind == PPTokenKind::Punctuator && token.text == ".";
+                need_space = false;
+            }
+            _ => {
+                last_was_dot = false;
+            }
+        }
+    }
+
+    if diagnostics.has_errors() {
+        diagnostics.print_all(&source_map);
+        return Err(format!("preprocessing failed for '{}'", input));
+    }
+
+    // Step 2: Write preprocessed assembly to a temporary file.
+    let temp_asm = create_temp_assembly_file()
+        .map_err(|e| format!("failed to create temp assembly file: {}", e))?;
+    fs::write(temp_asm.path(), &pp_output)
+        .map_err(|e| format!("failed to write preprocessed assembly: {}", e))?;
+
+    // Step 3: Determine the system cross-assembler for the target.
+    let assembler = match ctx.target {
+        Target::X86_64 => "as",
+        Target::I686 => "i686-linux-gnu-as",
+        Target::AArch64 => "aarch64-linux-gnu-as",
+        Target::RiscV64 => "riscv64-linux-gnu-as",
+    };
+
+    // Step 4: Invoke the system assembler, forwarding architecture flags.
+    let mut asm_cmd = Command::new(assembler);
+    asm_cmd.arg("-o").arg(output);
+
+    // Forward -march= and -mabi= to the external assembler so that
+    // architecture-specific instructions (e.g. RISC-V compressed `c.li`)
+    // are accepted. Without these flags the assembler rejects instructions
+    // requiring extensions like 'c' or 'zca'.
+    if let Some(ref march) = args.march {
+        asm_cmd.arg(format!("-march={}", march));
+    } else {
+        // Provide sensible default -march when none was specified on the
+        // command line, so that compressed-instruction assembly files
+        // assemble correctly out of the box.
+        match ctx.target {
+            Target::RiscV64 => {
+                asm_cmd.arg("-march=rv64imafdc");
+            }
+            Target::AArch64 => {
+                asm_cmd.arg("-march=armv8-a");
+            }
+            _ => {}
+        }
+    }
+    if let Some(ref mabi) = args.mabi {
+        asm_cmd.arg(format!("-mabi={}", mabi));
+    } else {
+        // Default ABI when not specified.
+        match ctx.target {
+            Target::RiscV64 => {
+                asm_cmd.arg("-mabi=lp64d");
+            }
+            _ => {}
+        }
+    }
+
+    asm_cmd.arg(temp_asm.path());
+
+    let status = asm_cmd
+        .status()
+        .map_err(|e| format!("failed to invoke assembler '{}': {}", assembler, e))?;
+
+    if !status.success() {
+        return Err(format!(
+            "assembler '{}' failed with exit code {:?}",
+            assembler,
+            status.code()
+        ));
+    }
+
+    // Step 5: Generate dependency file if requested.
+    if args.gen_depfile {
+        let dep_path = if let Some(ref dp) = args.depfile_path {
+            dp.clone()
+        } else {
+            let out_path = Path::new(output);
+            let stem = out_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("output");
+            let parent = out_path.parent().unwrap_or(Path::new("."));
+            parent
+                .join(format!(".{}.o.d", stem))
+                .to_string_lossy()
+                .to_string()
+        };
+        let dep_target = args.depfile_target.as_deref().unwrap_or(output);
+        let mut deps = vec![input.to_string()];
+        let mut fid: u32 = 0;
+        loop {
+            match source_map.get_filename(fid) {
+                Some(name) if name != input => {
+                    deps.push(name.to_string());
+                }
+                None => break,
+                _ => {}
+            }
+            fid += 1;
+        }
+        let mut dep_content = format!("{}: {}\n", dep_target, deps.join(" \\\n  "));
+        if args.depfile_phony {
+            for d in &deps[1..] {
+                dep_content.push_str(&format!("\n{}:\n", d));
+            }
+        }
+        let _ = fs::write(&dep_path, dep_content);
+    }
+
+    Ok(())
+}
+
 fn compile_single_file(
     input: &str,
     output: &str,
     args: &CliArgs,
     ctx: &CompilationContext,
 ) -> Result<(), String> {
+    // Handle assembly source files (.S, .s) — preprocess with BCC, then
+    // invoke the system cross-assembler for the target architecture.
+    let input_lower = input.to_lowercase();
+    if input_lower.ends_with(".s") {
+        return compile_assembly_file(input, output, args, ctx);
+    }
+
     let mut source_map = SourceMap::new();
     let mut diagnostics = DiagnosticEngine::new();
     let mut interner = Interner::new();
@@ -1324,19 +1699,32 @@ fn compile_single_file(
     }
 
     // Process forced-include files (-include <file>) before the main source.
+    let mut forced_asm_tokens: Vec<bcc::frontend::preprocessor::PPToken> = Vec::new();
     for forced in &ctx.forced_includes {
-        if pp.preprocess_file(forced).is_err() {
-            diagnostics.print_all(&source_map);
-            return Err(format!("forced include '{}' failed", forced));
+        match pp.preprocess_file(forced) {
+            Ok(mut ft) => {
+                forced_asm_tokens.append(&mut ft);
+            }
+            Err(()) => {
+                diagnostics.print_all(&source_map);
+                return Err(format!("forced include '{}' failed", forced));
+            }
         }
     }
 
-    let pp_tokens = match pp.preprocess_file(input) {
+    let main_asm_tokens = match pp.preprocess_file(input) {
         Ok(t) => t,
         Err(()) => {
             diagnostics.print_all(&source_map);
             return Err(format!("preprocessing failed for '{}'", input));
         }
+    };
+
+    let pp_tokens = if forced_asm_tokens.is_empty() {
+        main_asm_tokens
+    } else {
+        forced_asm_tokens.extend(main_asm_tokens);
+        forced_asm_tokens
     };
 
     // Check for preprocessing errors

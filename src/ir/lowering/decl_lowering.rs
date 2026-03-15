@@ -111,6 +111,23 @@ pub fn lower_global_variable(
         .any(|q| matches!(q, ast::TypeQualifier::Const));
 
     for init_decl in &decl.declarators {
+        // GCC global register variable: `register T *name __asm__("reg");`
+        // These bind a C identifier to a specific hardware register (e.g.
+        // `tp` on RISC-V for `current`).  They must NOT produce any
+        // storage in the ELF output — no .bss, .data, or .comm entry.
+        // Instead, store the mapping in `register_globals` so expression
+        // lowering can emit register reads/writes.
+        if let Some(ref reg_name) = init_decl.asm_register {
+            if let Some(var_name) = extract_declarator_name(&init_decl.declarator, name_table) {
+                let c_type = resolve_declaration_type(specifiers, &init_decl.declarator, target, name_table);
+                module.register_globals.insert(
+                    var_name.to_string(),
+                    (reg_name.clone(), c_type),
+                );
+            }
+            continue;
+        }
+
         let declarator = &init_decl.declarator;
 
         // Determine whether the *variable* itself is const.  When the
@@ -552,6 +569,7 @@ pub fn lower_function_definition(
             current_function_name: Some(&func_name),
             scope_type_overrides: FxHashMap::default(),
             return_ctype: Some(return_c_type.clone()),
+            layout_cache: FxHashMap::default(),
         };
         stmt_lowering::lower_statement(&mut stmt_ctx, &body_stmt);
     }
@@ -1714,8 +1732,9 @@ fn lower_static_local(
     // address-of expressions, designated initializers, and other non-trivial
     // constant expressions are handled correctly — matching how global
     // variable initializers are processed.
-    let name_table: Vec<String> =
-        super::INTERNER_SNAPSHOT.with(|snap| snap.borrow().as_ref().cloned().unwrap_or_default());
+    let name_table_rc__ =
+        super::INTERNER_SNAPSHOT.with(|snap| snap.borrow().as_ref().cloned().unwrap_or_else(|| std::rc::Rc::new(Vec::new())));
+    let name_table: &[String] = &name_table_rc__;
     let constant = if has_initializer {
         if let Some(init) = init_expr {
             evaluate_initializer_constant(
@@ -1897,8 +1916,9 @@ fn extract_section_attribute(
 /// `StructField` entries that can be used in `CType::Struct` / `CType::Union`.
 pub fn extract_struct_union_fields(spec: &ast::StructOrUnionSpecifier) -> Vec<StructField> {
     // Clone the thread-local name table once for this call (fallback path).
-    let name_table =
-        super::INTERNER_SNAPSHOT.with(|snap| snap.borrow().as_ref().cloned().unwrap_or_default());
+    let name_table_rc__ =
+        super::INTERNER_SNAPSHOT.with(|snap| snap.borrow().as_ref().cloned().unwrap_or_else(|| std::rc::Rc::new(Vec::new())));
+    let name_table: &[String] = &name_table_rc__;
     extract_struct_union_fields_fast(spec, &name_table)
 }
 
@@ -1955,16 +1975,24 @@ pub fn extract_struct_union_fields_fast(
 /// has a tag name but empty fields, replace it with the full definition from the
 /// struct definitions registry.
 fn resolve_struct_forward_ref(ctype: &mut CType, struct_defs: &FxHashMap<String, CType>) {
-    // Use a visited set to prevent infinite recursion on self-referential
-    // types (e.g., struct list_head { struct list_head *next; }).
-    let mut visited = std::collections::HashSet::new();
-    resolve_struct_forward_ref_inner(ctype, struct_defs, &mut visited);
+    // Resolve the outermost lightweight tag reference (empty fields +
+    // named) by looking up the full definition in struct_defs.  We limit
+    // recursion to avoid the quadratic/exponential expansion that occurs
+    // when every nested struct field is eagerly expanded.  Deeper fields
+    // are resolved on-demand via sizeof_resolved and field-offset lookups.
+    resolve_struct_forward_ref_inner(ctype, struct_defs, 0);
 }
 
+/// Shallow forward-reference resolution: resolve only the outermost
+/// lightweight tag reference (empty fields, named struct/union) by
+/// replacing it with the full definition from struct_defs.  Does NOT
+/// recurse into the resolved definition's fields — nested forward
+/// references are resolved lazily during sizeof/field-offset lookups
+/// via `sizeof_ctype_resolved` and `lookup_member_offset`.
 fn resolve_struct_forward_ref_inner(
     ctype: &mut CType,
     struct_defs: &FxHashMap<String, CType>,
-    visited: &mut std::collections::HashSet<String>,
+    _depth: usize,
 ) {
     match ctype {
         CType::Struct {
@@ -1972,30 +2000,19 @@ fn resolve_struct_forward_ref_inner(
             ref fields,
             ..
         } if fields.is_empty() => {
-            let tag_clone = tag.clone();
-            if visited.contains(&tag_clone) {
-                // Already resolving this struct — break the cycle.
-                return;
-            }
-            if let Some(full_def) = struct_defs.get(&tag_clone) {
-                *ctype = full_def.clone();
-                visited.insert(tag_clone);
-                // Recurse into the resolved struct's fields to resolve any
-                // nested forward references (e.g., a struct containing another
-                // struct that is also forward-referenced).
-                resolve_struct_forward_ref_inner(ctype, struct_defs, visited);
-            }
-        }
-        CType::Struct { ref mut fields, .. } => {
-            // Non-empty struct: recurse into field types to resolve nested
-            // forward references (e.g., struct Nested { struct Point origin; }).
-            // Each field gets its own copy of the visited set so that sibling
-            // fields referencing the same struct type can both be resolved.
-            // Without this, only the first `struct Inner` field would get
-            // resolved and subsequent siblings would be left empty.
-            for field in fields.iter_mut() {
-                let mut field_visited = visited.clone();
-                resolve_struct_forward_ref_inner(&mut field.ty, struct_defs, &mut field_visited);
+            if let Some(full_def) = struct_defs.get(tag.as_str()) {
+                let has_fields = match full_def {
+                    CType::Struct { fields: f, .. } | CType::Union { fields: f, .. } => {
+                        !f.is_empty()
+                    }
+                    _ => true,
+                };
+                if has_fields {
+                    *ctype = full_def.clone();
+                    // Do NOT recurse into the resolved struct's fields.
+                    // Nested lightweight references will be resolved lazily
+                    // when field sizes or offsets are needed.
+                }
             }
         }
         CType::Union {
@@ -2003,41 +2020,34 @@ fn resolve_struct_forward_ref_inner(
             ref fields,
             ..
         } if fields.is_empty() => {
-            let tag_clone = tag.clone();
-            if visited.contains(&tag_clone) {
-                return;
-            }
-            if let Some(full_def) = struct_defs.get(&tag_clone) {
-                *ctype = full_def.clone();
-                visited.insert(tag_clone);
-                resolve_struct_forward_ref_inner(ctype, struct_defs, visited);
-            }
-        }
-        CType::Union { ref mut fields, .. } => {
-            for field in fields.iter_mut() {
-                resolve_struct_forward_ref_inner(&mut field.ty, struct_defs, visited);
+            if let Some(full_def) = struct_defs.get(tag.as_str()) {
+                let has_fields = match full_def {
+                    CType::Struct { fields: f, .. } | CType::Union { fields: f, .. } => {
+                        !f.is_empty()
+                    }
+                    _ => true,
+                };
+                if has_fields {
+                    *ctype = full_def.clone();
+                }
             }
         }
-        // Do NOT recurse through pointers — pointer targets are opaque in IR
-        // (IrType::Ptr), and recursing into them causes exponential type-tree
-        // cloning on large codebases (e.g. SQLite).  Instead, incomplete
-        // pointee types are resolved lazily via `sizeof_resolved` when
-        // array subscript element sizes are computed.
+        // For non-empty structs/unions, don't recurse into fields — the
+        // definition already carries its field types and nested references
+        // will be resolved lazily.
+        CType::Struct { .. } | CType::Union { .. } => {}
         CType::Pointer(_, _) => {}
+        // Unwrap containers that might hold a forward-referenced tag.
         CType::Array(inner, _) => {
-            resolve_struct_forward_ref_inner(inner, struct_defs, visited);
+            resolve_struct_forward_ref_inner(inner, struct_defs, 0);
         }
-        // Recurse through typedef wrappers so that `typedef struct S T;`
-        // followed by `T arr[] = { ... }` correctly resolves the inner
-        // struct fields for constant initializer fixup and sizeof.
-        // Typedef cycles are impossible in C, so this is safe.
         CType::Typedef {
             ref mut underlying, ..
         } => {
-            resolve_struct_forward_ref_inner(underlying, struct_defs, visited);
+            resolve_struct_forward_ref_inner(underlying, struct_defs, 0);
         }
         CType::Atomic(inner) | CType::Complex(inner) => {
-            resolve_struct_forward_ref_inner(inner, struct_defs, visited);
+            resolve_struct_forward_ref_inner(inner, struct_defs, 0);
         }
         _ => {}
     }
@@ -2046,8 +2056,9 @@ fn resolve_struct_forward_ref_inner(
 /// Resolve a base C type from a specifier-qualifier list (used for struct members).
 pub fn resolve_base_type_from_sqlist(sqlist: &ast::SpecifierQualifierList) -> CType {
     // Fallback for callers without a name_table — clones the interner snapshot.
-    let name_table =
-        super::INTERNER_SNAPSHOT.with(|snap| snap.borrow().as_ref().cloned().unwrap_or_default());
+    let name_table_rc__ =
+        super::INTERNER_SNAPSHOT.with(|snap| snap.borrow().as_ref().cloned().unwrap_or_else(|| std::rc::Rc::new(Vec::new())));
+    let name_table: &[String] = &name_table_rc__;
     resolve_base_type_from_sqlist_fast(sqlist, &name_table)
 }
 
@@ -2104,8 +2115,9 @@ fn collect_all_attributes(
 /// Fallback for callers without a name_table — clones the interner snapshot.
 #[allow(dead_code)]
 fn resolve_base_type(specifiers: &ast::DeclarationSpecifiers, _target: &Target) -> CType {
-    let name_table =
-        super::INTERNER_SNAPSHOT.with(|snap| snap.borrow().as_ref().cloned().unwrap_or_default());
+    let name_table_rc__ =
+        super::INTERNER_SNAPSHOT.with(|snap| snap.borrow().as_ref().cloned().unwrap_or_else(|| std::rc::Rc::new(Vec::new())));
+    let name_table: &[String] = &name_table_rc__;
     resolve_base_type_fast(specifiers, &name_table)
 }
 
@@ -2143,8 +2155,9 @@ fn sym_to_string(sym: &crate::common::string_interner::Symbol, name_table: &[Str
 /// `map_single_type_specifier_with_names` with an already-borrowed table.
 #[allow(dead_code)]
 fn map_single_type_specifier(spec: &ast::TypeSpecifier) -> CType {
-    let name_table =
-        super::INTERNER_SNAPSHOT.with(|snap| snap.borrow().as_ref().cloned().unwrap_or_default());
+    let name_table_rc__ =
+        super::INTERNER_SNAPSHOT.with(|snap| snap.borrow().as_ref().cloned().unwrap_or_else(|| std::rc::Rc::new(Vec::new())));
+    let name_table: &[String] = &name_table_rc__;
     map_single_type_specifier_with_names(spec, &name_table)
 }
 
@@ -2333,7 +2346,7 @@ fn map_single_type_specifier_with_names(spec: &ast::TypeSpecifier, name_table: &
         ast::TypeSpecifier::Float32 => CType::Float,
         ast::TypeSpecifier::Float16 => CType::Float,
         ast::TypeSpecifier::Struct(s) => {
-            let fields = extract_struct_union_fields(s);
+            let fields = extract_struct_union_fields_fast(s, name_table);
             CType::Struct {
                 name: s.tag.as_ref().map(|t| sym_to_string(t, name_table)),
                 fields,
@@ -2342,7 +2355,7 @@ fn map_single_type_specifier_with_names(spec: &ast::TypeSpecifier, name_table: &
             }
         }
         ast::TypeSpecifier::Union(u) => {
-            let fields = extract_struct_union_fields(u);
+            let fields = extract_struct_union_fields_fast(u, name_table);
             CType::Union {
                 name: u.tag.as_ref().map(|t| sym_to_string(t, name_table)),
                 fields,
@@ -2384,8 +2397,9 @@ fn map_single_type_specifier_with_names(spec: &ast::TypeSpecifier, name_table: &
 
 #[allow(dead_code)]
 fn resolve_multi_word_type(specs: &[ast::TypeSpecifier]) -> CType {
-    let name_table =
-        super::INTERNER_SNAPSHOT.with(|snap| snap.borrow().as_ref().cloned().unwrap_or_default());
+    let name_table_rc__ =
+        super::INTERNER_SNAPSHOT.with(|snap| snap.borrow().as_ref().cloned().unwrap_or_else(|| std::rc::Rc::new(Vec::new())));
+    let name_table: &[String] = &name_table_rc__;
     resolve_multi_word_type_fast(specs, &name_table)
 }
 
@@ -2855,8 +2869,9 @@ fn extract_offsetof_member_chain(expr: &ast::Expression) -> Vec<OffsetofMemberSt
 }
 
 fn extract_offsetof_chain_recursive(expr: &ast::Expression, chain: &mut Vec<OffsetofMemberStep>) {
-    let name_table: Vec<String> =
-        super::INTERNER_SNAPSHOT.with(|snap| snap.borrow().as_ref().cloned().unwrap_or_default());
+    let name_table_rc__ =
+        super::INTERNER_SNAPSHOT.with(|snap| snap.borrow().as_ref().cloned().unwrap_or_else(|| std::rc::Rc::new(Vec::new())));
+    let name_table: &[String] = &name_table_rc__;
     match expr {
         ast::Expression::Identifier { name, .. } => {
             let field_name = if (name.as_u32() as usize) < name_table.len() {
