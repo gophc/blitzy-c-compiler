@@ -939,7 +939,7 @@ fn test_encoding_subsystem() {
 /// These are approximately 5-10× the observed RSS on the reference system.
 #[test]
 fn test_memory_regression() {
-    let root = project_root();
+    let _root = project_root();
 
     // Locate BCC binary
     let bcc = common::bcc_path();
