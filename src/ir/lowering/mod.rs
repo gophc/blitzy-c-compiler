@@ -727,10 +727,12 @@ pub fn lower_translation_unit(
     // top-level declaration names.  This ensures function parameters,
     // local variables, and all other identifiers are resolvable during
     // expression and statement lowering.
-    let name_table_rc: std::rc::Rc<Vec<String>> =
-        INTERNER_SNAPSHOT.with(|snap| {
-            snap.borrow().as_ref().cloned().unwrap_or_else(|| std::rc::Rc::new(Vec::new()))
-        });
+    let name_table_rc: std::rc::Rc<Vec<String>> = INTERNER_SNAPSHOT.with(|snap| {
+        snap.borrow()
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| std::rc::Rc::new(Vec::new()))
+    });
     let name_table: &[String] = &name_table_rc;
 
     // ====================================================================
@@ -772,13 +774,13 @@ pub fn lower_translation_unit(
                 for init_decl in &decl.declarators {
                     let declarator = &init_decl.declarator;
                     if let Some(td_name) =
-                        decl_lowering::extract_declarator_name(declarator, &name_table)
+                        decl_lowering::extract_declarator_name(declarator, name_table)
                     {
                         let full_type = decl_lowering::resolve_declaration_type(
                             &decl.specifiers,
                             declarator,
                             target,
-                            &name_table,
+                            name_table,
                         );
                         // Chase Typedef wrappers to get the real underlying type.
                         let resolved = crate::common::types::resolve_typedef(&full_type).clone();
@@ -816,14 +818,14 @@ pub fn lower_translation_unit(
                 ast::ExternalDeclaration::Declaration(decl) => {
                     collect_struct_defs_from_specifiers(
                         &decl.specifiers.type_specifiers,
-                        &name_table,
+                        name_table,
                         &mut map,
                     );
                 }
                 ast::ExternalDeclaration::FunctionDefinition(func_def) => {
                     collect_struct_defs_from_specifiers(
                         &func_def.specifiers.type_specifiers,
-                        &name_table,
+                        name_table,
                         &mut map,
                     );
                 }
@@ -849,7 +851,10 @@ pub fn lower_translation_unit(
 
     eprintln!(
         "[BCC-TIMING] ir-pass0-struct-collect: {:.3}s (gather={:.3}s, resolve={:.3}s, {} tags)",
-        _t0b, _t0a, _t0b - _t0a, struct_defs.len()
+        _t0b,
+        _t0a,
+        _t0b - _t0a,
+        struct_defs.len()
     );
     // Populate the thread-local struct definitions registry so that
     // sizeof/alignof evaluation in global constant expressions can
@@ -896,7 +901,7 @@ pub fn lower_translation_unit(
                         &mut module,
                         target,
                         diagnostics,
-                        &name_table,
+                        name_table,
                     );
                 } else {
                     decl_lowering::lower_global_variable(
@@ -905,7 +910,7 @@ pub fn lower_translation_unit(
                         target,
                         type_builder,
                         diagnostics,
-                        &name_table,
+                        name_table,
                     );
                 }
             }
@@ -942,20 +947,20 @@ pub fn lower_translation_unit(
                 ast::ExternalDeclaration::Declaration(decl) => {
                     collect_enum_constants_from_specifiers(
                         &decl.specifiers.type_specifiers,
-                        &name_table,
+                        name_table,
                         &mut map,
                     );
                 }
                 ast::ExternalDeclaration::FunctionDefinition(func_def) => {
                     collect_enum_constants_from_specifiers(
                         &func_def.specifiers.type_specifiers,
-                        &name_table,
+                        name_table,
                         &mut map,
                     );
                     // Also collect block-scope enum constants from
                     // inside the function body (e.g., kernel patterns
                     // like `enum { MIX_INFLIGHT = 1U << 31 };`).
-                    collect_enum_constants_from_compound(&func_def.body, &name_table, &mut map);
+                    collect_enum_constants_from_compound(&func_def.body, name_table, &mut map);
                 }
                 _ => {}
             }
@@ -985,7 +990,7 @@ pub fn lower_translation_unit(
                 target,
                 type_builder,
                 diagnostics,
-                &name_table,
+                name_table,
                 &enum_constants,
                 &struct_defs,
             );
@@ -994,20 +999,29 @@ pub fn lower_translation_unit(
             if _fn_elapsed > 0.5 {
                 // Report slow function lowering
                 let fname = {
-                    fn extract_name_dd(dd: &ast::DirectDeclarator, nt: &[String]) -> Option<String> {
+                    fn extract_name_dd(
+                        dd: &ast::DirectDeclarator,
+                        nt: &[String],
+                    ) -> Option<String> {
                         match dd {
                             ast::DirectDeclarator::Identifier(sym, _) => {
                                 let idx = sym.as_u32() as usize;
-                                if idx < nt.len() { Some(nt[idx].clone()) } else { None }
+                                if idx < nt.len() {
+                                    Some(nt[idx].clone())
+                                } else {
+                                    None
+                                }
                             }
-                            ast::DirectDeclarator::Function { base, .. } => extract_name_dd(base, nt),
+                            ast::DirectDeclarator::Function { base, .. } => {
+                                extract_name_dd(base, nt)
+                            }
                             ast::DirectDeclarator::Array { base, .. } => extract_name_dd(base, nt),
                             ast::DirectDeclarator::Parenthesized(inner) => {
                                 extract_name_dd(&inner.direct, nt)
                             }
                         }
                     }
-                    extract_name_dd(&func_def.declarator.direct, &name_table)
+                    extract_name_dd(&func_def.declarator.direct, name_table)
                         .unwrap_or_else(|| "<anon>".to_string())
                 };
                 eprintln!("[BCC-TIMING] slow fn: {} = {:.3}s", fname, _fn_elapsed);
@@ -1021,7 +1035,9 @@ pub fn lower_translation_unit(
     }
     eprintln!(
         "[BCC-TIMING] ir-pass2-functions: {} fns in {:.3}s ({} slow)",
-        _fn_count, _t2.elapsed().as_secs_f64(), _fn_slow_count
+        _fn_count,
+        _t2.elapsed().as_secs_f64(),
+        _fn_slow_count
     );
 
     // If any fatal errors were emitted during lowering, report the failure

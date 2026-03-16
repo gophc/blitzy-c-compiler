@@ -51,7 +51,9 @@ use bcc::common::diagnostics::DiagnosticEngine;
 use bcc::common::source_map::SourceMap;
 use bcc::common::string_interner::Interner;
 use bcc::common::target::Target;
-use bcc::common::temp_files::{create_temp_assembly_file, create_temp_object_file, TempDir, TempFile};
+use bcc::common::temp_files::{
+    create_temp_assembly_file, create_temp_object_file, TempDir, TempFile,
+};
 use bcc::common::type_builder::TypeBuilder;
 
 use bcc::backend::generation::{generate_code, CodegenContext};
@@ -1561,11 +1563,8 @@ fn compile_assembly_file(
         asm_cmd.arg(format!("-mabi={}", mabi));
     } else {
         // Default ABI when not specified.
-        match ctx.target {
-            Target::RiscV64 => {
-                asm_cmd.arg("-mabi=lp64d");
-            }
-            _ => {}
+        if ctx.target == Target::RiscV64 {
+            asm_cmd.arg("-mabi=lp64d");
         }
     }
 

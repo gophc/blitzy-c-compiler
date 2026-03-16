@@ -1676,10 +1676,7 @@ fn lower_identifier_lvalue(
     if ctx.module.register_globals.contains_key(name) {
         ctx.diagnostics.emit_error(
             span,
-            format!(
-                "address of global register variable '{}' requested",
-                name
-            ),
+            format!("address of global register variable '{}' requested", name),
         );
         return TypedValue::new(Value::UNDEF, var_cty);
     }
@@ -3377,8 +3374,13 @@ fn sizeof_resolve_member(
     let member_name = resolve_sym(ctx, member_sym.as_u32()).to_string();
     let mut resolved = obj_ty.clone();
     resolve_forward_ref_type(&mut resolved, ctx.struct_defs);
-    let (_offset, member_ty, _bf_info) =
-        find_struct_member(&resolved, &member_name, ctx.type_builder, ctx.struct_defs, ctx.layout_cache);
+    let (_offset, member_ty, _bf_info) = find_struct_member(
+        &resolved,
+        &member_name,
+        ctx.type_builder,
+        ctx.struct_defs,
+        ctx.layout_cache,
+    );
     member_ty
 }
 
@@ -3737,8 +3739,13 @@ fn find_struct_member(
                 let mut key = String::with_capacity(t.len() + 10);
                 key.push_str("s:");
                 key.push_str(t);
-                if *packed { key.push_str(":p"); }
-                if let Some(a) = aligned { key.push(':'); key.push_str(&a.to_string()); }
+                if *packed {
+                    key.push_str(":p");
+                }
+                if let Some(a) = aligned {
+                    key.push(':');
+                    key.push_str(&a.to_string());
+                }
                 key
             });
 
@@ -3758,7 +3765,8 @@ fn find_struct_member(
                             }
                         })
                         .collect();
-                    let l = tb.compute_struct_layout_with_fields(&resolved_fields, *packed, *aligned);
+                    let l =
+                        tb.compute_struct_layout_with_fields(&resolved_fields, *packed, *aligned);
                     layout_cache.insert(ck.clone(), l.clone());
                     l
                 }
@@ -3825,7 +3833,8 @@ fn find_struct_member(
                     resolve_forward_ref_type(&mut inner_ty, struct_defs);
                     let inner = types::resolve_typedef(&inner_ty);
                     if matches!(inner, CType::Struct { .. } | CType::Union { .. }) {
-                        let (off, ty, bf_info) = find_struct_member(inner, name, tb, struct_defs, layout_cache);
+                        let (off, ty, bf_info) =
+                            find_struct_member(inner, name, tb, struct_defs, layout_cache);
                         if !matches!(ty, CType::Void) {
                             return (off, ty, bf_info);
                         }

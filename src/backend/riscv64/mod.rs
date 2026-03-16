@@ -1113,10 +1113,8 @@ impl ArchCodegen for RiscV64Codegen {
                                 || reloc.reloc_type
                                     == crate::backend::riscv64::assembler::R_RISCV_GOT_HI20;
                             if is_hi20 {
-                                let label = format!(
-                                    ".Lpcrel_hi{}",
-                                    primary_offset + reloc.offset as usize
-                                );
+                                let label =
+                                    format!(".Lpcrel_hi{}", primary_offset + reloc.offset as usize);
                                 pcrel_hi_label = Some(label);
                             }
                             relocations.push(FunctionRelocation {
@@ -1133,13 +1131,16 @@ impl ArchCodegen for RiscV64Codegen {
                             if let Some(ref cont_reloc) = cont.relocation {
                                 // For PCREL_LO12_I/S, reference the
                                 // local label at the AUIPC instruction.
-                                let cont_sym = if pcrel_hi_label.is_some()
-                                    && (cont_reloc.reloc_type
+                                let cont_sym = if let Some(ref label) = pcrel_hi_label {
+                                    if cont_reloc.reloc_type
                                         == crate::backend::riscv64::assembler::R_RISCV_PCREL_LO12_I
                                         || cont_reloc.reloc_type
-                                            == crate::backend::riscv64::assembler::R_RISCV_PCREL_LO12_S)
-                                {
-                                    pcrel_hi_label.as_ref().unwrap().clone()
+                                            == crate::backend::riscv64::assembler::R_RISCV_PCREL_LO12_S
+                                    {
+                                        label.clone()
+                                    } else {
+                                        sym_name.clone()
+                                    }
                                 } else {
                                     sym_name.clone()
                                 };

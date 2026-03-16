@@ -119,11 +119,11 @@ pub fn lower_global_variable(
         // lowering can emit register reads/writes.
         if let Some(ref reg_name) = init_decl.asm_register {
             if let Some(var_name) = extract_declarator_name(&init_decl.declarator, name_table) {
-                let c_type = resolve_declaration_type(specifiers, &init_decl.declarator, target, name_table);
-                module.register_globals.insert(
-                    var_name.to_string(),
-                    (reg_name.clone(), c_type),
-                );
+                let c_type =
+                    resolve_declaration_type(specifiers, &init_decl.declarator, target, name_table);
+                module
+                    .register_globals
+                    .insert(var_name.to_string(), (reg_name.clone(), c_type));
             }
             continue;
         }
@@ -1732,8 +1732,12 @@ fn lower_static_local(
     // address-of expressions, designated initializers, and other non-trivial
     // constant expressions are handled correctly — matching how global
     // variable initializers are processed.
-    let name_table_rc__ =
-        super::INTERNER_SNAPSHOT.with(|snap| snap.borrow().as_ref().cloned().unwrap_or_else(|| std::rc::Rc::new(Vec::new())));
+    let name_table_rc__ = super::INTERNER_SNAPSHOT.with(|snap| {
+        snap.borrow()
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| std::rc::Rc::new(Vec::new()))
+    });
     let name_table: &[String] = &name_table_rc__;
     let constant = if has_initializer {
         if let Some(init) = init_expr {
@@ -1743,7 +1747,7 @@ fn lower_static_local(
                 target,
                 type_builder,
                 diagnostics,
-                &name_table,
+                name_table,
             )
         } else {
             Some(Constant::ZeroInit)
@@ -1916,10 +1920,14 @@ fn extract_section_attribute(
 /// `StructField` entries that can be used in `CType::Struct` / `CType::Union`.
 pub fn extract_struct_union_fields(spec: &ast::StructOrUnionSpecifier) -> Vec<StructField> {
     // Clone the thread-local name table once for this call (fallback path).
-    let name_table_rc__ =
-        super::INTERNER_SNAPSHOT.with(|snap| snap.borrow().as_ref().cloned().unwrap_or_else(|| std::rc::Rc::new(Vec::new())));
+    let name_table_rc__ = super::INTERNER_SNAPSHOT.with(|snap| {
+        snap.borrow()
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| std::rc::Rc::new(Vec::new()))
+    });
     let name_table: &[String] = &name_table_rc__;
-    extract_struct_union_fields_fast(spec, &name_table)
+    extract_struct_union_fields_fast(spec, name_table)
 }
 
 /// Performance-optimized struct/union field extraction.
@@ -2056,10 +2064,14 @@ fn resolve_struct_forward_ref_inner(
 /// Resolve a base C type from a specifier-qualifier list (used for struct members).
 pub fn resolve_base_type_from_sqlist(sqlist: &ast::SpecifierQualifierList) -> CType {
     // Fallback for callers without a name_table — clones the interner snapshot.
-    let name_table_rc__ =
-        super::INTERNER_SNAPSHOT.with(|snap| snap.borrow().as_ref().cloned().unwrap_or_else(|| std::rc::Rc::new(Vec::new())));
+    let name_table_rc__ = super::INTERNER_SNAPSHOT.with(|snap| {
+        snap.borrow()
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| std::rc::Rc::new(Vec::new()))
+    });
     let name_table: &[String] = &name_table_rc__;
-    resolve_base_type_from_sqlist_fast(sqlist, &name_table)
+    resolve_base_type_from_sqlist_fast(sqlist, name_table)
 }
 
 /// Performance-optimized specifier-qualifier list resolution.
@@ -2115,10 +2127,14 @@ fn collect_all_attributes(
 /// Fallback for callers without a name_table — clones the interner snapshot.
 #[allow(dead_code)]
 fn resolve_base_type(specifiers: &ast::DeclarationSpecifiers, _target: &Target) -> CType {
-    let name_table_rc__ =
-        super::INTERNER_SNAPSHOT.with(|snap| snap.borrow().as_ref().cloned().unwrap_or_else(|| std::rc::Rc::new(Vec::new())));
+    let name_table_rc__ = super::INTERNER_SNAPSHOT.with(|snap| {
+        snap.borrow()
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| std::rc::Rc::new(Vec::new()))
+    });
     let name_table: &[String] = &name_table_rc__;
-    resolve_base_type_fast(specifiers, &name_table)
+    resolve_base_type_fast(specifiers, name_table)
 }
 
 /// Performance-optimized base type resolution.
@@ -2155,10 +2171,14 @@ fn sym_to_string(sym: &crate::common::string_interner::Symbol, name_table: &[Str
 /// `map_single_type_specifier_with_names` with an already-borrowed table.
 #[allow(dead_code)]
 fn map_single_type_specifier(spec: &ast::TypeSpecifier) -> CType {
-    let name_table_rc__ =
-        super::INTERNER_SNAPSHOT.with(|snap| snap.borrow().as_ref().cloned().unwrap_or_else(|| std::rc::Rc::new(Vec::new())));
+    let name_table_rc__ = super::INTERNER_SNAPSHOT.with(|snap| {
+        snap.borrow()
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| std::rc::Rc::new(Vec::new()))
+    });
     let name_table: &[String] = &name_table_rc__;
-    map_single_type_specifier_with_names(spec, &name_table)
+    map_single_type_specifier_with_names(spec, name_table)
 }
 
 /// Performance-optimized base type resolution for a single type specifier.
@@ -2397,10 +2417,14 @@ fn map_single_type_specifier_with_names(spec: &ast::TypeSpecifier, name_table: &
 
 #[allow(dead_code)]
 fn resolve_multi_word_type(specs: &[ast::TypeSpecifier]) -> CType {
-    let name_table_rc__ =
-        super::INTERNER_SNAPSHOT.with(|snap| snap.borrow().as_ref().cloned().unwrap_or_else(|| std::rc::Rc::new(Vec::new())));
+    let name_table_rc__ = super::INTERNER_SNAPSHOT.with(|snap| {
+        snap.borrow()
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| std::rc::Rc::new(Vec::new()))
+    });
     let name_table: &[String] = &name_table_rc__;
-    resolve_multi_word_type_fast(specs, &name_table)
+    resolve_multi_word_type_fast(specs, name_table)
 }
 
 /// Performance-optimized multi-word type resolution.
@@ -2869,8 +2893,12 @@ fn extract_offsetof_member_chain(expr: &ast::Expression) -> Vec<OffsetofMemberSt
 }
 
 fn extract_offsetof_chain_recursive(expr: &ast::Expression, chain: &mut Vec<OffsetofMemberStep>) {
-    let name_table_rc__ =
-        super::INTERNER_SNAPSHOT.with(|snap| snap.borrow().as_ref().cloned().unwrap_or_else(|| std::rc::Rc::new(Vec::new())));
+    let name_table_rc__ = super::INTERNER_SNAPSHOT.with(|snap| {
+        snap.borrow()
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| std::rc::Rc::new(Vec::new()))
+    });
     let name_table: &[String] = &name_table_rc__;
     match expr {
         ast::Expression::Identifier { name, .. } => {

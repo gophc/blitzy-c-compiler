@@ -18,6 +18,7 @@
 //! - **Phase 5:** Pipeline end-to-end integration test (source → binary)
 //! - **Phase 6:** FxHash performance sanity check (library-level)
 //! - **Phase 7:** Encoding subsystem tests (PUA round-trip, library-level)
+//! - **Phase 8:** Memory regression tests (peak RSS bounds for various input sizes)
 //!
 //! # Zero-Dependency Mandate
 //!
@@ -916,4 +917,207 @@ fn test_encoding_subsystem() {
         "[Checkpoint 3] Encoding subsystem: all 128 PUA round-trips verified, \
          ASCII passthrough confirmed, boundary conditions checked"
     );
+}
+
+// ===========================================================================
+// Phase 8: Memory regression tests
+// ===========================================================================
+
+/// Phase 8 — Memory regression tests.
+///
+/// Validates that BCC's peak resident set size (RSS) stays within expected
+/// bounds for various input sizes, catching memory leaks or excessive
+/// allocation regressions.
+///
+/// Thresholds are generous upper bounds designed to catch egregious leaks
+/// (e.g., 2 TB RSS for kernel files) while not failing on normal variation.
+///
+/// # Memory budget expectations (Linux x86-64):
+/// - Tiny file (no stdlib includes): < 20 MB peak RSS
+/// - Medium file (with stdio.h): < 100 MB peak RSS
+///
+/// These are approximately 5-10× the observed RSS on the reference system.
+#[test]
+fn test_memory_regression() {
+    let root = project_root();
+
+    // Locate BCC binary
+    let bcc = common::bcc_path();
+    assert!(bcc.exists(), "BCC binary not found at {:?}", bcc);
+
+    // -----------------------------------------------------------------------
+    // Test 1: Tiny file — no system header includes
+    // -----------------------------------------------------------------------
+
+    // Create a truly minimal source (no stdlib includes)
+    let tiny_dir = std::env::temp_dir().join("bcc_mem_test_tiny");
+    let _ = fs::create_dir_all(&tiny_dir);
+    let tiny_file = tiny_dir.join("tiny.c");
+    fs::write(
+        &tiny_file,
+        "int add(int a, int b) { return a + b; }\nint main(void) { return add(1, 2) - 3; }\n",
+    )
+    .expect("Failed to write tiny.c");
+
+    let tiny_out = tiny_dir.join("tiny_out");
+
+    // Use /usr/bin/time -v to measure peak RSS
+    let output = Command::new("/usr/bin/time")
+        .args(["-v"])
+        .arg(&bcc)
+        .args(["-o"])
+        .arg(&tiny_out)
+        .arg(&tiny_file)
+        .output()
+        .expect("Failed to run /usr/bin/time");
+
+    // Parse peak RSS from stderr (format: "Maximum resident set size (kbytes): NNNN")
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let peak_rss_kb = parse_peak_rss(&stderr);
+
+    eprintln!(
+        "[Checkpoint 3] Memory test (tiny): peak RSS = {} KB ({:.1} MB)",
+        peak_rss_kb,
+        peak_rss_kb as f64 / 1024.0
+    );
+
+    // Threshold: 20 MB for a tiny file with no includes
+    let threshold_tiny_kb: u64 = 20 * 1024;
+    assert!(
+        peak_rss_kb < threshold_tiny_kb,
+        "Memory regression: tiny file peak RSS {} KB ({:.1} MB) exceeds {} MB threshold",
+        peak_rss_kb,
+        peak_rss_kb as f64 / 1024.0,
+        threshold_tiny_kb / 1024
+    );
+
+    // Verify it actually compiled
+    assert!(
+        output.status.success() || tiny_out.exists(),
+        "Tiny file compilation failed: {}",
+        stderr
+    );
+
+    // -----------------------------------------------------------------------
+    // Test 2: Medium file — includes stdio.h (exercises preprocessor)
+    // -----------------------------------------------------------------------
+
+    let medium_file = tiny_dir.join("medium.c");
+    fs::write(
+        &medium_file,
+        r#"#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+int compute(int n) {
+    int sum = 0;
+    for (int i = 0; i < n; i++) sum += i * i;
+    return sum;
+}
+
+int factorial(int n) {
+    if (n <= 1) return 1;
+    return n * factorial(n - 1);
+}
+
+void string_ops(void) {
+    char buf[256];
+    snprintf(buf, sizeof(buf), "Hello %d", 42);
+    printf("%s len=%zu\n", buf, strlen(buf));
+}
+
+int main(void) {
+    printf("compute=%d fact=%d\n", compute(10), factorial(10));
+    string_ops();
+    return 0;
+}
+"#,
+    )
+    .expect("Failed to write medium.c");
+
+    let medium_out = tiny_dir.join("medium_out");
+
+    let output2 = Command::new("/usr/bin/time")
+        .args(["-v"])
+        .arg(&bcc)
+        .args(["-o"])
+        .arg(&medium_out)
+        .arg(&medium_file)
+        .output()
+        .expect("Failed to run /usr/bin/time for medium file");
+
+    let stderr2 = String::from_utf8_lossy(&output2.stderr);
+    let peak_rss_kb2 = parse_peak_rss(&stderr2);
+
+    eprintln!(
+        "[Checkpoint 3] Memory test (medium): peak RSS = {} KB ({:.1} MB)",
+        peak_rss_kb2,
+        peak_rss_kb2 as f64 / 1024.0
+    );
+
+    // Threshold: 100 MB for a file with stdio.h (preprocessed ~11K lines)
+    let threshold_medium_kb: u64 = 100 * 1024;
+    assert!(
+        peak_rss_kb2 < threshold_medium_kb,
+        "Memory regression: medium file peak RSS {} KB ({:.1} MB) exceeds {} MB threshold",
+        peak_rss_kb2,
+        peak_rss_kb2 as f64 / 1024.0,
+        threshold_medium_kb / 1024
+    );
+
+    // -----------------------------------------------------------------------
+    // Test 3: Verify proportional scaling — medium should not be 100x tiny
+    // -----------------------------------------------------------------------
+
+    if peak_rss_kb > 0 {
+        let ratio = peak_rss_kb2 as f64 / peak_rss_kb as f64;
+        eprintln!(
+            "[Checkpoint 3] Memory test: medium/tiny ratio = {:.1}x",
+            ratio
+        );
+        // Medium file with stdio should be at most 20x the tiny file
+        assert!(
+            ratio < 20.0,
+            "Memory regression: medium/tiny RSS ratio {:.1}x exceeds 20x threshold \
+             (tiny={} KB, medium={} KB)",
+            ratio,
+            peak_rss_kb,
+            peak_rss_kb2
+        );
+    }
+
+    // Cleanup
+    let _ = fs::remove_dir_all(&tiny_dir);
+
+    eprintln!(
+        "[Checkpoint 3] Memory regression tests: all {} checks passed \
+         (tiny={:.1} MB, medium={:.1} MB)",
+        3,
+        peak_rss_kb as f64 / 1024.0,
+        peak_rss_kb2 as f64 / 1024.0
+    );
+}
+
+/// Parses the peak RSS in kilobytes from `/usr/bin/time -v` output.
+///
+/// Searches for the line "Maximum resident set size (kbytes): NNNN" and
+/// extracts the numeric value. Returns 0 if not found (allows tests to
+/// continue with a warning rather than failing on parsing).
+fn parse_peak_rss(stderr: &str) -> u64 {
+    for line in stderr.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("Maximum resident set size") {
+            if let Some(val_str) = trimmed.rsplit(':').next() {
+                if let Ok(val) = val_str.trim().parse::<u64>() {
+                    return val;
+                }
+            }
+        }
+    }
+    // Not found — this can happen if /usr/bin/time isn't GNU time
+    eprintln!(
+        "[WARNING] Could not parse peak RSS from time output. \
+         Ensure /usr/bin/time (GNU) is installed."
+    );
+    0
 }

@@ -695,7 +695,7 @@ impl<'a> SemanticAnalyzer<'a> {
                             let count = Self::count_initializer_elements(
                                 _init,
                                 &self.enum_constant_values,
-                                &self.interner,
+                                self.interner,
                             );
                             if count > 0 {
                                 let sym_mut = self.symbols.get_mut(id);
@@ -749,9 +749,9 @@ impl<'a> SemanticAnalyzer<'a> {
                             match d {
                                 Designator::Index(expr, _) => {
                                     has_array_index = true;
-                                    if let Some(idx) = Self::try_eval_index_expr(
-                                        expr, enum_values, interner,
-                                    ) {
+                                    if let Some(idx) =
+                                        Self::try_eval_index_expr(expr, enum_values, interner)
+                                    {
                                         let idx_usize = idx as usize;
                                         if idx_usize + 1 > max_index {
                                             max_index = idx_usize + 1;
@@ -762,9 +762,9 @@ impl<'a> SemanticAnalyzer<'a> {
                                 }
                                 Designator::IndexRange(_lo, hi, _) => {
                                     has_array_index = true;
-                                    if let Some(idx) = Self::try_eval_index_expr(
-                                        hi, enum_values, interner,
-                                    ) {
+                                    if let Some(idx) =
+                                        Self::try_eval_index_expr(hi, enum_values, interner)
+                                    {
                                         let idx_usize = idx as usize;
                                         if idx_usize + 1 > max_index {
                                             max_index = idx_usize + 1;
@@ -875,10 +875,7 @@ impl<'a> SemanticAnalyzer<'a> {
             CType::Array(base, None) => CType::Array(base.clone(), Some(count)),
             CType::Qualified(inner, quals) => {
                 if let CType::Array(base, None) = inner.as_ref() {
-                    CType::Qualified(
-                        Box::new(CType::Array(base.clone(), Some(count))),
-                        *quals,
-                    )
+                    CType::Qualified(Box::new(CType::Array(base.clone(), Some(count))), *quals)
                 } else {
                     ty.clone()
                 }

@@ -1517,8 +1517,12 @@ impl<'a> ConstantEvaluator<'a> {
             CType::Struct { fields, .. } | CType::Union { fields, .. } => {
                 if fields.is_empty() {
                     // Forward reference — try tag registries
-                    if let CType::Struct { name: Some(tag), .. }
-                    | CType::Union { name: Some(tag), .. } = resolved
+                    if let CType::Struct {
+                        name: Some(tag), ..
+                    }
+                    | CType::Union {
+                        name: Some(tag), ..
+                    } = resolved
                     {
                         if let Some(full) = self.tag_types_by_name.get(tag) {
                             return self.find_member_type(full, member_name);
@@ -2047,7 +2051,7 @@ impl<'a> ConstantEvaluator<'a> {
                 let member_name = self.resolve_symbol_name(*member);
                 self.find_member_type(&obj_type, &member_name)
                     .ok_or(())
-                    .or_else(|_| Ok(CType::Int))
+                    .or(Ok(CType::Int))
             }
             Expression::PointerMemberAccess { object, member, .. } => {
                 // sizeof(ptr->member) — infer type of pointer, dereference
@@ -2060,7 +2064,7 @@ impl<'a> ConstantEvaluator<'a> {
                 let member_name = self.resolve_symbol_name(*member);
                 self.find_member_type(&pointee, &member_name)
                     .ok_or(())
-                    .or_else(|_| Ok(CType::Int))
+                    .or(Ok(CType::Int))
             }
             Expression::ArraySubscript { base, .. } => {
                 // sizeof(arr[i]) — the element type of the array/pointer
