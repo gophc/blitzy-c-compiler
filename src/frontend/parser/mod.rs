@@ -461,8 +461,7 @@ impl<'src> Parser<'src> {
                 | TokenKind::Continue
                 | TokenKind::Goto
                 | TokenKind::StaticAssert
-                | TokenKind::Asm
-                | TokenKind::AsmVolatile => {
+                | TokenKind::Asm => {
                     return;
                 }
                 // Not a sync point — skip this token.
@@ -726,7 +725,7 @@ impl<'src> Parser<'src> {
         }
 
         // Top-level inline assembly statement.
-        if self.check(&TokenKind::Asm) || self.check(&TokenKind::AsmVolatile) {
+        if self.check(&TokenKind::Asm) {
             let asm_stmt = inline_asm::parse_asm_statement(self)?;
             return Ok(ExternalDeclaration::AsmStatement(asm_stmt));
         }

@@ -22,8 +22,8 @@
 //!
 //! - Every GCC extension keyword and builtin is a distinct [`TokenKind`] variant
 //!   (not a plain `Identifier`). The parser depends on exact keyword dispatch.
-//! - `__volatile__` maps to [`TokenKind::AsmVolatile`] (for `asm volatile`),
-//!   while `volatile` maps to [`TokenKind::Volatile`] (the C type qualifier).
+//! - `__volatile__` maps to [`TokenKind::Volatile`] (the standard C type
+//!   qualifier), which also serves as an asm qualifier in `asm volatile`.
 //! - `__inline__` maps to [`TokenKind::Inline`] (same variant as C `inline`).
 //! - `typeof` and `__typeof__` both map to [`TokenKind::Typeof`].
 //! - `asm` and `__asm__` both map to [`TokenKind::Asm`].
@@ -269,7 +269,10 @@ pub enum TokenKind {
     Extension,
     /// `asm` / `__asm__`
     Asm,
-    /// `__volatile__` (used in `asm volatile` context; distinct from C `volatile`)
+    /// Legacy `AsmVolatile` variant — no longer produced by the lexer.
+    /// `__volatile__` now maps to [`TokenKind::Volatile`], the standard C
+    /// type qualifier, which also serves as an asm qualifier in `asm volatile`.
+    /// Kept for exhaustive-match compatibility; dead-code in practice.
     AsmVolatile,
     /// `__label__` (local label declaration in GCC)
     Label,
@@ -1187,8 +1190,11 @@ pub fn lookup_keyword(s: &str) -> Option<TokenKind> {
         // `asm` and `__asm__` both map to the same variant.
         "asm" => Some(TokenKind::Asm),
         "__asm__" => Some(TokenKind::Asm),
-        // `__volatile__` maps to AsmVolatile (distinct from C `volatile`).
-        "__volatile__" => Some(TokenKind::AsmVolatile),
+        // `__volatile__` is the GCC alternate spelling for `volatile`.
+        // Treated as the same `Volatile` token so it works both as a type
+        // qualifier (`__volatile__ int x;`) and as an asm qualifier
+        // (`asm __volatile__("nop")`).
+        "__volatile__" => Some(TokenKind::Volatile),
         // `__inline__` maps to the same `Inline` variant as C `inline`.
         "__inline__" => Some(TokenKind::Inline),
         "__label__" => Some(TokenKind::Label),

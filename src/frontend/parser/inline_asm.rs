@@ -220,15 +220,10 @@ pub fn parse_asm_statement(parser: &mut Parser<'_>) -> Result<AsmStatement, ()> 
     let mut is_volatile = false;
     let mut is_goto = false;
 
-    if parser.match_token(&TokenKind::AsmVolatile) {
-        // `__volatile__` in asm-start position implies volatile.
-        is_volatile = true;
-    } else {
-        // Consume `asm` / `__asm__`.
-        parser.expect(TokenKind::Asm).map_err(|()| {
-            parser.leave_recursion();
-        })?;
-    }
+    // Consume `asm` / `__asm__`.
+    parser.expect(TokenKind::Asm).map_err(|()| {
+        parser.leave_recursion();
+    })?;
 
     // -----------------------------------------------------------------------
     // Phase 1: Parse additional qualifiers (volatile, goto, inline) in any
@@ -400,8 +395,8 @@ pub fn parse_asm_statement(parser: &mut Parser<'_>) -> Result<AsmStatement, ()> 
 /// * `is_goto` — Set to `true` if `goto` found.
 fn parse_qualifiers(parser: &mut Parser<'_>, is_volatile: &mut bool, is_goto: &mut bool) {
     loop {
-        // Check for `volatile` (C keyword) or `__volatile__` (GCC spelling).
-        if parser.match_token(&TokenKind::Volatile) || parser.match_token(&TokenKind::AsmVolatile) {
+        // Check for `volatile` / `__volatile__` (both map to TokenKind::Volatile).
+        if parser.match_token(&TokenKind::Volatile) {
             *is_volatile = true;
         }
         // Check for `goto` qualifier.

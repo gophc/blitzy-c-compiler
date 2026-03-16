@@ -163,7 +163,7 @@ pub fn parse_statement(parser: &mut Parser<'_>) -> Result<Statement, ()> {
         // -----------------------------------------------------------------
         // Inline assembly: asm / __asm__
         // -----------------------------------------------------------------
-        TokenKind::Asm | TokenKind::AsmVolatile => {
+        TokenKind::Asm => {
             let asm_stmt: AsmStatement = inline_asm::parse_asm_statement(parser)?;
             Ok(Statement::Asm(asm_stmt))
         }
