@@ -283,8 +283,38 @@ pub fn eliminate_trivial_phis(func: &mut IrFunction) -> bool {
         return false;
     }
 
+    // Phase 1.5: Resolve trivial-phi chains transitively.
+    //
+    // When trivial phis form a chain (e.g. A→B and B→C), applying
+    // replacements in arbitrary order can leave dangling references.
+    // For example, if B→C is applied first and then A→B, all uses of A
+    // become B — but B's phi is removed in Phase 3, leaving B undefined.
+    //
+    // To fix this, we follow the replacement map transitively: if A→B
+    // and B→C, we resolve A directly to C before applying any
+    // replacements.  This guarantees that regardless of application
+    // order, every value maps to its final non-trivial-phi target.
+    {
+        let trivial_map: FxHashMap<Value, Value> = trivial.iter().copied().collect();
+        for pair in trivial.iter_mut() {
+            let mut target = pair.1;
+            // Follow the chain: target → next → next → ...
+            // Guard against cycles (shouldn't happen, but be defensive).
+            let mut steps = 0u32;
+            while let Some(&next) = trivial_map.get(&target) {
+                if next == target || steps > 1000 {
+                    break;
+                }
+                target = next;
+                steps += 1;
+            }
+            pair.1 = target;
+        }
+    }
+
     // Phase 2: Replace all uses of each trivial phi's result with its
-    // replacement value throughout the entire function.
+    // (now transitively resolved) replacement value throughout the
+    // entire function.
     for &(old_val, new_val) in &trivial {
         replace_value_uses(func, old_val, new_val);
     }
@@ -633,6 +663,7 @@ fn insert_copies_before_terminator(block: &mut BasicBlock, copies: &[PhiCopy]) {
             result: copy.dest,
             value: copy.src,
             to_type: copy.ty.clone(),
+            source_unsigned: false,
             span: copy.span,
         };
         block.insert_instruction(insert_base + i, copy_inst);

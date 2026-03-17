@@ -357,10 +357,14 @@ pub enum RegClass {
 /// values) and callee-saved registers last (preferred for long-lived values
 /// since they require save/restore in prologue/epilogue).
 pub const ALLOCATABLE_GPRS: &[u16] = &[
-    // X5 (t0) is EXCLUDED — reserved as spill scratch register by
+    // X5 (t0) is EXCLUDED — reserved as primary spill scratch register by
     // apply_allocation_result.  Allocating vregs to t0 would cause
     // spill operations for OTHER vregs to clobber t0's live value.
-    X6, X7, // t1–t2 (caller-saved)
+    // X6 (t1) is EXCLUDED — reserved as secondary spill scratch register.
+    // On load-store architectures, ALU instructions cannot use Memory
+    // operands. When two operands are both spilled, X5 loads the first
+    // and X6 loads the second.
+    X7, // t2 (caller-saved)
     X10, X11, X12, X13, X14, X15, X16, X17, // a0–a7 (caller-saved)
     X28, X29, X30, X31, // t3–t6 (caller-saved)
     // X8 (s0/fp) is EXCLUDED — reserved as frame pointer by the prologue.

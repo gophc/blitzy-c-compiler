@@ -648,6 +648,15 @@ impl<'a> TypeChecker<'a> {
             BuiltinKind::ExtractReturnAddr => {
                 Ok(CType::Pointer(Box::new(CType::Void), EMPTY_QUALS))
             }
+            // All other builtins — use BuiltinEvaluator for comprehensive return type.
+            other => {
+                let eval = crate::frontend::sema::builtin_eval::BuiltinEvaluator::new(
+                    self.diagnostics,
+                    self.type_builder,
+                    self.target,
+                );
+                Ok(eval.get_builtin_return_type(other))
+            }
         }
     }
 
@@ -1058,9 +1067,28 @@ impl<'a> TypeChecker<'a> {
         for field in fields {
             if let Some(ref name) = field.name {
                 if name == member_name {
-                    // Bitfield width is recorded in StructField.bit_width
-                    // and used during IR lowering, not here in the type checker.
-                    let _is_bitfield = field.bit_width.is_some();
+                    // C11 §6.3.1.1p1: If an int can represent all values of the original
+                    // type, the value is converted to an int; otherwise, it is converted to
+                    // an unsigned int.  For a bitfield of type `unsigned int : N` where
+                    // N < 32, all values (0 .. 2^N-1) fit in a signed int (2^31-1 max),
+                    // so the expression type after integer promotion is `int`, NOT
+                    // `unsigned int`.  We apply this adjustment at the point of member
+                    // access so that downstream arithmetic uses the correct signedness.
+                    if let Some(width) = field.bit_width {
+                        let base = crate::common::types::resolve_and_strip(&field.ty);
+                        match base {
+                            CType::UInt if width < 32 => return Some(CType::Int),
+                            CType::ULong | CType::ULongLong if width < 64 => {
+                                // For ULong/ULongLong bitfields narrower than 64 bits
+                                // that fit in int, promote to int; otherwise keep original.
+                                if width < 32 {
+                                    return Some(CType::Int);
+                                }
+                                return Some(field.ty.clone());
+                            }
+                            _ => return Some(field.ty.clone()),
+                        }
+                    }
                     return Some(field.ty.clone());
                 }
             } else {

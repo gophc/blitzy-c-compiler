@@ -50,6 +50,8 @@ pub enum BuiltinResult {
     ConstantInt(i128),
     /// Compile-time evaluated to a boolean value (e.g. `__builtin_constant_p`).
     ConstantBool(bool),
+    /// Compile-time evaluated to a floating-point constant (e.g. `__builtin_inf`).
+    ConstantFloat(f64),
     /// Compile-time resolved to a type (e.g. `__builtin_choose_expr` branch type).
     ResolvedType(CType),
     /// Runtime-deferred: IR lowering must generate a call for this builtin.
@@ -213,6 +215,139 @@ impl<'a> BuiltinEvaluator<'a> {
                     ),
                 })
             }
+
+            // -- Abort / Exit -------------------------------------------------
+            BuiltinKind::Abort => {
+                // __builtin_abort() — emit a call to abort().
+                Ok(BuiltinResult::NoValue)
+            }
+            BuiltinKind::Exit => {
+                // __builtin_exit(status) — emit a call to exit(status).
+                Ok(BuiltinResult::NoValue)
+            }
+
+            // -- Memory/string builtins (runtime calls) -----------------------
+            BuiltinKind::Memcpy
+            | BuiltinKind::Memset
+            | BuiltinKind::Memcmp
+            | BuiltinKind::Strlen
+            | BuiltinKind::Strcmp
+            | BuiltinKind::Strncmp => {
+                let rt = self.get_builtin_return_type(builtin);
+                Ok(BuiltinResult::RuntimeCall {
+                    builtin: builtin.clone(),
+                    result_type: rt,
+                })
+            }
+
+            // -- Abs builtins (runtime calls) --------------------------------
+            BuiltinKind::Abs | BuiltinKind::Labs | BuiltinKind::Llabs => {
+                let rt = self.get_builtin_return_type(builtin);
+                Ok(BuiltinResult::RuntimeCall {
+                    builtin: builtin.clone(),
+                    result_type: rt,
+                })
+            }
+
+            // -- Alloca (runtime call) ----------------------------------------
+            BuiltinKind::Alloca => {
+                let rt = self.get_builtin_return_type(builtin);
+                Ok(BuiltinResult::RuntimeCall {
+                    builtin: BuiltinKind::Alloca,
+                    result_type: rt,
+                })
+            }
+
+            // -- Floating-point constants (compile-time evaluable) -----------
+            BuiltinKind::Inf | BuiltinKind::HugeVal => Ok(BuiltinResult::ConstantFloat(f64::INFINITY)),
+            BuiltinKind::Inff | BuiltinKind::HugeValf => Ok(BuiltinResult::ConstantFloat(f64::INFINITY)),
+            BuiltinKind::Infl | BuiltinKind::HugeVall => Ok(BuiltinResult::ConstantFloat(f64::INFINITY)),
+            BuiltinKind::Nan | BuiltinKind::Nanf | BuiltinKind::Nanl => {
+                Ok(BuiltinResult::ConstantFloat(f64::NAN))
+            }
+
+            // -- Float predicates (runtime calls) ----------------------------
+            BuiltinKind::Signbit
+            | BuiltinKind::Isnan
+            | BuiltinKind::Isinf
+            | BuiltinKind::Isfinite
+            | BuiltinKind::IsinfSign => {
+                Ok(BuiltinResult::RuntimeCall {
+                    builtin: builtin.clone(),
+                    result_type: CType::Int,
+                })
+            }
+
+            // -- Copysign / fabs (runtime calls) ----------------------------
+            BuiltinKind::Copysign
+            | BuiltinKind::Copysignf
+            | BuiltinKind::Copysignl
+            | BuiltinKind::Fabs
+            | BuiltinKind::Fabsf
+            | BuiltinKind::Fabsl => {
+                let rt = self.get_builtin_return_type(builtin);
+                Ok(BuiltinResult::RuntimeCall {
+                    builtin: builtin.clone(),
+                    result_type: rt,
+                })
+            }
+
+            // -- classify_type (compile-time) --------------------------------
+            BuiltinKind::ClassifyType => {
+                // GCC __builtin_classify_type returns an integer enum:
+                // 0=no_type, 1=void, 2=int, 5=pointer, 8=real, etc.
+                // Conservative: return runtime call to handle complex types.
+                Ok(BuiltinResult::RuntimeCall {
+                    builtin: BuiltinKind::ClassifyType,
+                    result_type: CType::Int,
+                })
+            }
+
+            // -- Sync atomics (runtime calls) --------------------------------
+            BuiltinKind::SyncValCompareAndSwap
+            | BuiltinKind::SyncBoolCompareAndSwap
+            | BuiltinKind::SyncFetchAndAdd
+            | BuiltinKind::SyncFetchAndSub
+            | BuiltinKind::SyncFetchAndAnd
+            | BuiltinKind::SyncFetchAndOr
+            | BuiltinKind::SyncFetchAndXor
+            | BuiltinKind::SyncLockTestAndSet
+            | BuiltinKind::SyncLockRelease
+            | BuiltinKind::SyncSynchronize => {
+                let rt = self.get_builtin_return_type(builtin);
+                Ok(BuiltinResult::RuntimeCall {
+                    builtin: builtin.clone(),
+                    result_type: rt,
+                })
+            }
+
+            // -- C11 atomics (runtime calls) ---------------------------------
+            BuiltinKind::AtomicLoadN
+            | BuiltinKind::AtomicStoreN
+            | BuiltinKind::AtomicExchangeN
+            | BuiltinKind::AtomicCompareExchangeN
+            | BuiltinKind::AtomicFetchAdd
+            | BuiltinKind::AtomicFetchSub
+            | BuiltinKind::AtomicFetchAnd
+            | BuiltinKind::AtomicFetchOr
+            | BuiltinKind::AtomicFetchXor => {
+                let rt = self.get_builtin_return_type(builtin);
+                Ok(BuiltinResult::RuntimeCall {
+                    builtin: builtin.clone(),
+                    result_type: rt,
+                })
+            }
+
+            // -- Overflow _p variants (runtime calls) -----------------------
+            BuiltinKind::MulOverflowP | BuiltinKind::AddOverflowP | BuiltinKind::SubOverflowP => {
+                Ok(BuiltinResult::RuntimeCall {
+                    builtin: builtin.clone(),
+                    result_type: CType::Bool,
+                })
+            }
+
+            // -- BuiltinConstantP alias (same as ConstantP) ------------------
+            BuiltinKind::BuiltinConstantP => self.eval_constant_p(args, span),
         }
     }
 
@@ -225,34 +360,8 @@ impl<'a> BuiltinEvaluator<'a> {
     /// This is a fast lookup used by the parser/lexer to distinguish
     /// builtin calls from ordinary function calls.
     pub fn is_builtin_name(name: &str) -> bool {
-        matches!(
-            name,
-            "__builtin_expect"
-                | "__builtin_unreachable"
-                | "__builtin_constant_p"
-                | "__builtin_offsetof"
-                | "__builtin_types_compatible_p"
-                | "__builtin_choose_expr"
-                | "__builtin_clz"
-                | "__builtin_ctz"
-                | "__builtin_popcount"
-                | "__builtin_bswap16"
-                | "__builtin_bswap32"
-                | "__builtin_bswap64"
-                | "__builtin_ffs"
-                | "__builtin_va_start"
-                | "__builtin_va_end"
-                | "__builtin_va_arg"
-                | "__builtin_va_copy"
-                | "__builtin_frame_address"
-                | "__builtin_return_address"
-                | "__builtin_trap"
-                | "__builtin_assume_aligned"
-                | "__builtin_add_overflow"
-                | "__builtin_sub_overflow"
-                | "__builtin_mul_overflow"
-                | "__builtin_prefetch"
-        )
+        // Use the comprehensive name_to_builtin_kind mapping
+        Self::name_to_builtin_kind(name).is_some()
     }
 
     /// Return the C result type for a given builtin kind on this target.
@@ -325,6 +434,81 @@ impl<'a> BuiltinEvaluator<'a> {
             // __builtin_object_size returns size_t.
             BuiltinKind::ObjectSize => self.size_t_type(),
 
+            // Abort/exit — noreturn void.
+            BuiltinKind::Abort | BuiltinKind::Exit => CType::Void,
+
+            // Memory/string builtins.
+            BuiltinKind::Memcpy | BuiltinKind::Memset => {
+                CType::Pointer(Box::new(CType::Void), TypeQualifiers::default())
+            }
+            BuiltinKind::Memcmp | BuiltinKind::Strcmp | BuiltinKind::Strncmp => CType::Int,
+            BuiltinKind::Strlen => self.size_t_type(),
+
+            // Abs builtins.
+            BuiltinKind::Abs => CType::Int,
+            BuiltinKind::Labs => CType::Long,
+            BuiltinKind::Llabs => CType::LongLong,
+
+            // Alloca returns void *.
+            BuiltinKind::Alloca => {
+                CType::Pointer(Box::new(CType::Void), TypeQualifiers::default())
+            }
+
+            // Floating-point constants.
+            BuiltinKind::Inf | BuiltinKind::HugeVal | BuiltinKind::Nan => CType::Double,
+            BuiltinKind::Inff | BuiltinKind::HugeValf | BuiltinKind::Nanf => CType::Float,
+            BuiltinKind::Infl | BuiltinKind::HugeVall | BuiltinKind::Nanl => CType::LongDouble,
+
+            // Float predicates return int.
+            BuiltinKind::Signbit
+            | BuiltinKind::Isnan
+            | BuiltinKind::Isinf
+            | BuiltinKind::Isfinite
+            | BuiltinKind::IsinfSign => CType::Int,
+
+            // Copysign returns matching float type.
+            BuiltinKind::Copysign => CType::Double,
+            BuiltinKind::Copysignf => CType::Float,
+            BuiltinKind::Copysignl => CType::LongDouble,
+
+            // Fabs returns matching float type.
+            BuiltinKind::Fabs => CType::Double,
+            BuiltinKind::Fabsf => CType::Float,
+            BuiltinKind::Fabsl => CType::LongDouble,
+
+            // classify_type returns int.
+            BuiltinKind::ClassifyType => CType::Int,
+
+            // Sync atomics return the value type — use Int as conservative fallback.
+            BuiltinKind::SyncValCompareAndSwap
+            | BuiltinKind::SyncFetchAndAdd
+            | BuiltinKind::SyncFetchAndSub
+            | BuiltinKind::SyncFetchAndAnd
+            | BuiltinKind::SyncFetchAndOr
+            | BuiltinKind::SyncFetchAndXor
+            | BuiltinKind::SyncLockTestAndSet => CType::Int,
+            BuiltinKind::SyncBoolCompareAndSwap => CType::Bool,
+            BuiltinKind::SyncLockRelease | BuiltinKind::SyncSynchronize => CType::Void,
+
+            // C11 atomics — return types depend on pointer target.
+            BuiltinKind::AtomicLoadN
+            | BuiltinKind::AtomicExchangeN
+            | BuiltinKind::AtomicFetchAdd
+            | BuiltinKind::AtomicFetchSub
+            | BuiltinKind::AtomicFetchAnd
+            | BuiltinKind::AtomicFetchOr
+            | BuiltinKind::AtomicFetchXor => CType::Int,
+            BuiltinKind::AtomicStoreN => CType::Void,
+            BuiltinKind::AtomicCompareExchangeN => CType::Bool,
+
+            // Overflow _p variants return bool.
+            BuiltinKind::MulOverflowP | BuiltinKind::AddOverflowP | BuiltinKind::SubOverflowP => {
+                CType::Bool
+            }
+
+            // BuiltinConstantP — maps to ConstantP.
+            BuiltinKind::BuiltinConstantP => CType::Int,
+
             // __builtin_extract_return_addr returns void*.
             BuiltinKind::ExtractReturnAddr => CType::Pointer(
                 Box::new(CType::Void),
@@ -334,6 +518,51 @@ impl<'a> BuiltinEvaluator<'a> {
     }
 
     // ===================================================================
+    /// Get a builtin return type by name and target (static method).
+    /// Used for implicit builtin declarations when the identifier is undeclared.
+    pub fn builtin_return_type_by_name(name: &str, target: crate::common::target::Target) -> CType {
+        use crate::common::target::Target;
+        let size_t = if matches!(target, Target::X86_64 | Target::AArch64 | Target::RiscV64) {
+            CType::ULong
+        } else {
+            CType::UInt
+        };
+        let void_ptr = CType::Pointer(Box::new(CType::Void), TypeQualifiers::default());
+        // Match on known builtin name patterns
+        match name {
+            n if n.ends_with("abort") => CType::Void,
+            n if n.ends_with("exit") => CType::Void,
+            n if n.contains("memcpy") || n.contains("memmove") || n.contains("memset") => {
+                void_ptr
+            }
+            n if n.contains("memcmp") || n.contains("strcmp") || n.contains("strncmp") => CType::Int,
+            n if n.contains("strlen") => size_t,
+            n if n.contains("alloca") => {
+                CType::Pointer(Box::new(CType::Void), TypeQualifiers::default())
+            }
+            "__builtin_inf" | "__builtin_huge_val" => CType::Double,
+            "__builtin_inff" | "__builtin_huge_valf" => CType::Float,
+            "__builtin_infl" | "__builtin_huge_vall" => CType::LongDouble,
+            "__builtin_nan" => CType::Double,
+            "__builtin_nanf" => CType::Float,
+            "__builtin_nanl" => CType::LongDouble,
+            n if n.contains("copysignf") || n.contains("fabsf") => CType::Float,
+            n if n.contains("copysignl") || n.contains("fabsl") => CType::LongDouble,
+            n if n.contains("copysign") || n.contains("fabs") => CType::Double,
+            n if n.contains("classify_type") => CType::Int,
+            n if n.contains("constant_p") => CType::Int,
+            n if n.contains("clz") || n.contains("ctz") || n.contains("popcount") ||
+                 n.contains("parity") || n.contains("clrsb") || n.contains("ffs") => CType::Int,
+            n if n.contains("bswap16") => CType::UShort,
+            n if n.contains("bswap32") => CType::UInt,
+            n if n.contains("bswap64") => CType::ULongLong,
+            n if n.contains("signbit") || n.contains("isnan") ||
+                 n.contains("isinf") || n.contains("isfinite") => CType::Int,
+            n if n.starts_with("__sync_") || n.starts_with("__atomic_") => CType::Int,
+            _ => CType::Int, // safe default
+        }
+    }
+
     // Compile-time builtins
     // ===================================================================
 
@@ -1483,7 +1712,7 @@ impl<'a> BuiltinEvaluator<'a> {
     }
 
     /// Map a builtin name string to its [`BuiltinKind`] variant.
-    fn name_to_builtin_kind(name: &str) -> Option<BuiltinKind> {
+    pub fn name_to_builtin_kind(name: &str) -> Option<BuiltinKind> {
         match name {
             "__builtin_expect" => Some(BuiltinKind::Expect),
             "__builtin_unreachable" => Some(BuiltinKind::Unreachable),
@@ -1513,6 +1742,67 @@ impl<'a> BuiltinEvaluator<'a> {
             "__builtin_prefetch" => Some(BuiltinKind::PrefetchData),
             "__builtin_extract_return_addr" => Some(BuiltinKind::ExtractReturnAddr),
             "__builtin_object_size" => Some(BuiltinKind::ObjectSize),
+            "__builtin_abort" => Some(BuiltinKind::Abort),
+            "__builtin_exit" => Some(BuiltinKind::Exit),
+            "__builtin_memcpy" | "__builtin___memcpy_chk" => Some(BuiltinKind::Memcpy),
+            "__builtin_memset" | "__builtin___memset_chk" => Some(BuiltinKind::Memset),
+            "__builtin_memcmp" => Some(BuiltinKind::Memcmp),
+            "__builtin_strlen" => Some(BuiltinKind::Strlen),
+            "__builtin_strcmp" => Some(BuiltinKind::Strcmp),
+            "__builtin_strncmp" => Some(BuiltinKind::Strncmp),
+            "__builtin_abs" => Some(BuiltinKind::Abs),
+            "__builtin_labs" => Some(BuiltinKind::Labs),
+            "__builtin_llabs" => Some(BuiltinKind::Llabs),
+            "__builtin_alloca" | "__builtin_alloca_with_align" => Some(BuiltinKind::Alloca),
+            "__builtin_inf" => Some(BuiltinKind::Inf),
+            "__builtin_inff" => Some(BuiltinKind::Inff),
+            "__builtin_infl" => Some(BuiltinKind::Infl),
+            "__builtin_nan" => Some(BuiltinKind::Nan),
+            "__builtin_nanf" => Some(BuiltinKind::Nanf),
+            "__builtin_nanl" => Some(BuiltinKind::Nanl),
+            "__builtin_huge_val" => Some(BuiltinKind::HugeVal),
+            "__builtin_huge_valf" => Some(BuiltinKind::HugeValf),
+            "__builtin_huge_vall" => Some(BuiltinKind::HugeVall),
+            "__builtin_signbit" | "__builtin_signbitf" | "__builtin_signbitl" => {
+                Some(BuiltinKind::Signbit)
+            }
+            "__builtin_isnan" | "__builtin_isnanf" | "__builtin_isnanl" => {
+                Some(BuiltinKind::Isnan)
+            }
+            "__builtin_isinf" | "__builtin_isinff" | "__builtin_isinfl" => {
+                Some(BuiltinKind::Isinf)
+            }
+            "__builtin_isfinite" => Some(BuiltinKind::Isfinite),
+            "__builtin_isinf_sign" => Some(BuiltinKind::IsinfSign),
+            "__builtin_copysign" => Some(BuiltinKind::Copysign),
+            "__builtin_copysignf" => Some(BuiltinKind::Copysignf),
+            "__builtin_copysignl" => Some(BuiltinKind::Copysignl),
+            "__builtin_fabs" => Some(BuiltinKind::Fabs),
+            "__builtin_fabsf" => Some(BuiltinKind::Fabsf),
+            "__builtin_fabsl" => Some(BuiltinKind::Fabsl),
+            "__builtin_classify_type" => Some(BuiltinKind::ClassifyType),
+            "__sync_val_compare_and_swap" => Some(BuiltinKind::SyncValCompareAndSwap),
+            "__sync_bool_compare_and_swap" => Some(BuiltinKind::SyncBoolCompareAndSwap),
+            "__sync_fetch_and_add" => Some(BuiltinKind::SyncFetchAndAdd),
+            "__sync_fetch_and_sub" => Some(BuiltinKind::SyncFetchAndSub),
+            "__sync_fetch_and_and" => Some(BuiltinKind::SyncFetchAndAnd),
+            "__sync_fetch_and_or" => Some(BuiltinKind::SyncFetchAndOr),
+            "__sync_fetch_and_xor" => Some(BuiltinKind::SyncFetchAndXor),
+            "__sync_lock_test_and_set" => Some(BuiltinKind::SyncLockTestAndSet),
+            "__sync_lock_release" => Some(BuiltinKind::SyncLockRelease),
+            "__sync_synchronize" => Some(BuiltinKind::SyncSynchronize),
+            "__atomic_load_n" => Some(BuiltinKind::AtomicLoadN),
+            "__atomic_store_n" => Some(BuiltinKind::AtomicStoreN),
+            "__atomic_exchange_n" => Some(BuiltinKind::AtomicExchangeN),
+            "__atomic_compare_exchange_n" => Some(BuiltinKind::AtomicCompareExchangeN),
+            "__atomic_fetch_add" => Some(BuiltinKind::AtomicFetchAdd),
+            "__atomic_fetch_sub" => Some(BuiltinKind::AtomicFetchSub),
+            "__atomic_fetch_and" => Some(BuiltinKind::AtomicFetchAnd),
+            "__atomic_fetch_or" => Some(BuiltinKind::AtomicFetchOr),
+            "__atomic_fetch_xor" => Some(BuiltinKind::AtomicFetchXor),
+            "__builtin_mul_overflow_p" => Some(BuiltinKind::MulOverflowP),
+            "__builtin_add_overflow_p" => Some(BuiltinKind::AddOverflowP),
+            "__builtin_sub_overflow_p" => Some(BuiltinKind::SubOverflowP),
             _ => None,
         }
     }

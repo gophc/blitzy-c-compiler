@@ -88,6 +88,10 @@ fn has_side_effects(inst: &Instruction) -> bool {
         // modify global state, or have other observable effects.
         Instruction::Call { .. } => true,
 
+        // StackAlloc — dynamic stack allocation (__builtin_alloca).
+        // Always side-effectful because it modifies the stack pointer.
+        Instruction::StackAlloc { .. } => true,
+
         // Volatile load — the hardware memory model considers this observable.
         Instruction::Load { volatile, .. } => *volatile,
 

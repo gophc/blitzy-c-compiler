@@ -426,6 +426,14 @@ pub struct Declarator {
     pub span: Span,
 }
 
+impl Declarator {
+    /// Returns `true` if the outermost direct-declarator suffix is a function
+    /// parameter list — i.e. this declarator has the shape `name(...)`.
+    pub fn has_function_suffix(&self) -> bool {
+        matches!(self.direct, DirectDeclarator::Function { .. })
+    }
+}
+
 /// A pointer declarator component: `*` optionally followed by type qualifiers
 /// and another pointer level.
 #[derive(Debug, Clone, PartialEq)]
@@ -1069,6 +1077,119 @@ pub enum BuiltinKind {
     /// `__builtin_extract_return_addr(addr)` — extract return address
     /// (no-op identity on most architectures).
     ExtractReturnAddr,
+    /// `__builtin_abort()` — call `abort()` to terminate the program.
+    Abort,
+    /// `__builtin_exit(status)` — call `exit(status)` to terminate the program.
+    Exit,
+    /// `__builtin_memcpy(dst, src, n)` — inline memory copy.
+    Memcpy,
+    /// `__builtin_memset(dst, c, n)` — inline memory set.
+    Memset,
+    /// `__builtin_memcmp(s1, s2, n)` — inline memory compare.
+    Memcmp,
+    /// `__builtin_strlen(s)` — inline string length.
+    Strlen,
+    /// `__builtin_strcmp(s1, s2)` — inline string compare.
+    Strcmp,
+    /// `__builtin_strncmp(s1, s2, n)` — inline string compare with limit.
+    Strncmp,
+    /// `__builtin_abs(x)` — absolute value of int.
+    Abs,
+    /// `__builtin_labs(x)` — absolute value of long.
+    Labs,
+    /// `__builtin_llabs(x)` — absolute value of long long.
+    Llabs,
+    /// `__builtin_alloca(size)` — allocate stack memory.
+    Alloca,
+    /// `__builtin_inf()` — positive infinity (double).
+    Inf,
+    /// `__builtin_inff()` — positive infinity (float).
+    Inff,
+    /// `__builtin_infl()` — positive infinity (long double).
+    Infl,
+    /// `__builtin_nan(str)` — quiet NaN (double).
+    Nan,
+    /// `__builtin_nanf(str)` — quiet NaN (float).
+    Nanf,
+    /// `__builtin_nanl(str)` — quiet NaN (long double).
+    Nanl,
+    /// `__builtin_huge_val()` — positive infinity (double), alias for inf.
+    HugeVal,
+    /// `__builtin_huge_valf()` — positive infinity (float).
+    HugeValf,
+    /// `__builtin_huge_vall()` — positive infinity (long double).
+    HugeVall,
+    /// `__builtin_signbit(x)` — nonzero if sign bit is set (works for all float types).
+    Signbit,
+    /// `__builtin_isnan(x)` — nonzero if argument is NaN.
+    Isnan,
+    /// `__builtin_isinf(x)` — nonzero if argument is infinity.
+    Isinf,
+    /// `__builtin_isfinite(x)` — nonzero if argument is finite.
+    Isfinite,
+    /// `__builtin_isinf_sign(x)` — -1, 0, or 1 depending on inf sign.
+    IsinfSign,
+    /// `__builtin_copysign(x, y)` — copy sign of y to x (double).
+    Copysign,
+    /// `__builtin_copysignf(x, y)` — copy sign (float).
+    Copysignf,
+    /// `__builtin_copysignl(x, y)` — copy sign (long double).
+    Copysignl,
+    /// `__builtin_fabs(x)` — absolute value (double).
+    Fabs,
+    /// `__builtin_fabsf(x)` — absolute value (float).
+    Fabsf,
+    /// `__builtin_fabsl(x)` — absolute value (long double).
+    Fabsl,
+    /// `__builtin_classify_type(expr)` — return enum for type class.
+    ClassifyType,
+    /// `__builtin_constant_p` applied to a whole expression tree (for macro tricks).
+    /// Maps to ConstantP semantics but can be distinguished if needed.
+    BuiltinConstantP,
+    /// `__sync_val_compare_and_swap(ptr, old, new)` — atomic CAS returning old val.
+    SyncValCompareAndSwap,
+    /// `__sync_bool_compare_and_swap(ptr, old, new)` — atomic CAS returning bool.
+    SyncBoolCompareAndSwap,
+    /// `__sync_fetch_and_add(ptr, val)` — atomic fetch-and-add.
+    SyncFetchAndAdd,
+    /// `__sync_fetch_and_sub(ptr, val)` — atomic fetch-and-sub.
+    SyncFetchAndSub,
+    /// `__sync_fetch_and_and(ptr, val)` — atomic fetch-and-and.
+    SyncFetchAndAnd,
+    /// `__sync_fetch_and_or(ptr, val)` — atomic fetch-and-or.
+    SyncFetchAndOr,
+    /// `__sync_fetch_and_xor(ptr, val)` — atomic fetch-and-xor.
+    SyncFetchAndXor,
+    /// `__sync_lock_test_and_set(ptr, val)` — atomic exchange.
+    SyncLockTestAndSet,
+    /// `__sync_lock_release(ptr)` — atomic store zero with release semantics.
+    SyncLockRelease,
+    /// `__sync_synchronize()` — full memory barrier.
+    SyncSynchronize,
+    /// `__atomic_load_n(ptr, order)` — C11 atomic load.
+    AtomicLoadN,
+    /// `__atomic_store_n(ptr, val, order)` — C11 atomic store.
+    AtomicStoreN,
+    /// `__atomic_exchange_n(ptr, val, order)` — C11 atomic exchange.
+    AtomicExchangeN,
+    /// `__atomic_compare_exchange_n(ptr, expected, desired, weak, succ, fail)` — C11 CAS.
+    AtomicCompareExchangeN,
+    /// `__atomic_fetch_add(ptr, val, order)` — C11 atomic fetch-and-add.
+    AtomicFetchAdd,
+    /// `__atomic_fetch_sub(ptr, val, order)` — C11 atomic fetch-and-sub.
+    AtomicFetchSub,
+    /// `__atomic_fetch_and(ptr, val, order)` — C11 atomic fetch-and-and.
+    AtomicFetchAnd,
+    /// `__atomic_fetch_or(ptr, val, order)` — C11 atomic fetch-and-or.
+    AtomicFetchOr,
+    /// `__atomic_fetch_xor(ptr, val, order)` — C11 atomic fetch-and-xor.
+    AtomicFetchXor,
+    /// `__builtin_mul_overflow_p(a, b, c)` — overflow check without storing result.
+    MulOverflowP,
+    /// `__builtin_add_overflow_p(a, b, c)` — overflow check without storing result.
+    AddOverflowP,
+    /// `__builtin_sub_overflow_p(a, b, c)` — overflow check without storing result.
+    SubOverflowP,
 }
 
 // ===========================================================================

@@ -264,6 +264,16 @@ impl IrBuilder {
         (result, inst)
     }
 
+    /// Builds an [`Instruction::StackAlloc`] — dynamic stack allocation.
+    ///
+    /// Implements `alloca(size)` / `__builtin_alloca(size)` by adjusting
+    /// the stack pointer at runtime.
+    pub fn build_stack_alloc(&mut self, size: Value, span: Span) -> (Value, Instruction) {
+        let result = self.fresh_value();
+        let inst = Instruction::StackAlloc { result, size, span };
+        (result, inst)
+    }
+
     /// Builds an [`Instruction::Load`] — reads a value from a memory address.
     ///
     /// # Parameters
@@ -799,11 +809,27 @@ impl IrBuilder {
     /// - `to_ty`: The target type.
     /// - `span`: Source location for diagnostic reporting.
     pub fn build_bitcast(&mut self, val: Value, to_ty: IrType, span: Span) -> (Value, Instruction) {
+        self.build_bitcast_ex(val, to_ty, false, span)
+    }
+
+    /// Builds a bitcast instruction with explicit unsigned flag.
+    ///
+    /// When `source_unsigned` is true and the conversion is int→float,
+    /// the backend emits an unsigned-to-float conversion instead of
+    /// the default signed conversion.
+    pub fn build_bitcast_ex(
+        &mut self,
+        val: Value,
+        to_ty: IrType,
+        source_unsigned: bool,
+        span: Span,
+    ) -> (Value, Instruction) {
         let result = self.fresh_value();
         let inst = Instruction::BitCast {
             result,
             value: val,
             to_type: to_ty,
+            source_unsigned,
             span,
         };
         (result, inst)

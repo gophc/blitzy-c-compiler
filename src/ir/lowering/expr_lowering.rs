@@ -1028,7 +1028,7 @@ fn lower_lvalue_inner(ctx: &mut ExprLoweringContext<'_>, expr: &ast::Expression)
             type_name,
             initializer,
             span,
-        } => lower_compound_literal(ctx, type_name, initializer, *span),
+        } => lower_compound_literal_lvalue(ctx, type_name, initializer, *span),
         // Cast expressions can be lvalues in GCC extension mode.
         ast::Expression::Cast { .. } => lower_expr_inner(ctx, expr),
         // Statement expressions can be lvalues (GCC extension).
@@ -1506,30 +1506,13 @@ fn lower_identifier(ctx: &mut ExprLoweringContext<'_>, sym_idx: u32, span: Span)
                     visibility: crate::ir::module::Visibility::Default,
                 });
         }
-        // Also add the __builtin_* name as an alias so the call site resolves.
-        let already_builtin = ctx
-            .module
-            .declarations()
-            .iter()
-            .any(|d| d.name == owned_name)
-            || ctx.module.get_function(&owned_name).is_some();
-        if !already_builtin {
-            ctx.module
-                .add_declaration(crate::ir::module::FunctionDeclaration {
-                    name: owned_name.clone(),
-                    return_type: ret_ir,
-                    param_types: params_ir,
-                    is_variadic: variadic,
-                    linkage: crate::ir::module::Linkage::External,
-                    visibility: crate::ir::module::Visibility::Default,
-                });
-        }
-        // Return a function reference value.
+        // Return a function reference value pointing to the libc name.
+        // Do NOT use the __builtin_ prefixed name — it doesn't exist in libc.
         let fptr = ctx.builder.fresh_value();
-        ctx.module.func_ref_map.insert(fptr, owned_name.clone());
+        ctx.module.func_ref_map.insert(fptr, lib_name_owned.clone());
         {
             let current_func = &mut *ctx.function;
-            current_func.func_ref_map.insert(fptr, owned_name);
+            current_func.func_ref_map.insert(fptr, lib_name_owned);
         }
         return TypedValue::new(
             fptr,
@@ -1652,6 +1635,126 @@ fn lower_identifier(ctx: &mut ExprLoweringContext<'_>, sym_idx: u32, span: Span)
             fptr,
             CType::Pointer(Box::new(CType::Void), TypeQualifiers::default()),
         );
+    }
+
+    // Implicit function declarations for common C library functions.
+    // These are functions that torture tests and real C code call without
+    // prior declaration, relying on implicit int-returning convention.
+    {
+        let implicit_func: Option<(IrType, Vec<IrType>, bool)> = match name {
+            "abort" | "_abort" => Some((IrType::Void, vec![], false)),
+            "exit" | "_exit" | "_Exit" => Some((IrType::Void, vec![IrType::I32], false)),
+            "malloc" | "calloc" | "realloc" => Some((IrType::Ptr, vec![], true)),
+            "free" => Some((IrType::Void, vec![IrType::Ptr], false)),
+            "memcpy" | "memmove" => {
+                Some((IrType::Ptr, vec![IrType::Ptr, IrType::Ptr, IrType::I64], false))
+            }
+            "memset" => {
+                Some((IrType::Ptr, vec![IrType::Ptr, IrType::I32, IrType::I64], false))
+            }
+            "memcmp" | "strcmp" | "strncmp" => Some((IrType::I32, vec![], true)),
+            "strlen" => Some((IrType::I64, vec![IrType::Ptr], false)),
+            "strcpy" | "strncpy" | "strcat" | "strncat" => {
+                Some((IrType::Ptr, vec![], true))
+            }
+            "printf" | "fprintf" | "sprintf" | "snprintf" => {
+                Some((IrType::I32, vec![], true))
+            }
+            "puts" | "fputs" | "putchar" | "putc" | "fputc" => {
+                Some((IrType::I32, vec![], true))
+            }
+            "getchar" | "fgetc" | "getc" => Some((IrType::I32, vec![], true)),
+            "fopen" | "fdopen" => Some((IrType::Ptr, vec![], true)),
+            "fclose" | "fflush" => Some((IrType::I32, vec![IrType::Ptr], false)),
+            "fread" | "fwrite" => Some((IrType::I64, vec![], true)),
+            "fseek" | "ftell" | "feof" | "ferror" => Some((IrType::I32, vec![], true)),
+            "atoi" | "atol" => Some((IrType::I32, vec![IrType::Ptr], false)),
+            "abs" | "labs" => Some((IrType::I32, vec![IrType::I32], false)),
+            "llabs" => Some((IrType::I64, vec![IrType::I64], false)),
+            "fabs" => Some((IrType::F64, vec![IrType::F64], false)),
+            "fabsf" => Some((IrType::F32, vec![IrType::F32], false)),
+            "sqrt" | "sin" | "cos" | "tan" | "log" | "log2" | "log10" | "exp"
+            | "pow" | "ceil" | "floor" | "round" | "fmod" | "atan2" | "atan"
+            | "asin" | "acos" | "sinh" | "cosh" | "tanh" => {
+                Some((IrType::F64, vec![], true))
+            }
+            "sqrtf" | "sinf" | "cosf" | "tanf" | "logf" | "expf" | "powf"
+            | "ceilf" | "floorf" | "roundf" | "fmodf" => {
+                Some((IrType::F32, vec![], true))
+            }
+            "qsort" | "bsearch" => Some((IrType::Void, vec![], true)),
+            "signal" => Some((IrType::Ptr, vec![], true)),
+            "setjmp" | "_setjmp" | "sigsetjmp" => Some((IrType::I32, vec![IrType::Ptr], false)),
+            "longjmp" | "siglongjmp" => Some((IrType::Void, vec![], true)),
+            "strtol" | "strtoul" | "strtoll" | "strtoull" | "strtod" | "strtof" => {
+                Some((IrType::I64, vec![], true))
+            }
+            "sscanf" | "fscanf" | "scanf" => Some((IrType::I32, vec![], true)),
+            "perror" => Some((IrType::Void, vec![IrType::Ptr], false)),
+            "raise" | "system" | "atexit" => Some((IrType::I32, vec![], true)),
+            "getenv" => Some((IrType::Ptr, vec![IrType::Ptr], false)),
+            "isalpha" | "isdigit" | "isalnum" | "isspace" | "isupper" | "islower"
+            | "ispunct" | "isprint" | "iscntrl" | "isxdigit" | "toupper" | "tolower" => {
+                Some((IrType::I32, vec![IrType::I32], false))
+            }
+            _ => None,
+        };
+        if let Some((ret_ir, params_ir, variadic)) = implicit_func {
+            let owned_name = name.to_string();
+            let already_declared = ctx
+                .module
+                .declarations()
+                .iter()
+                .any(|d| d.name == owned_name)
+                || ctx.module.get_function(&owned_name).is_some();
+            if !already_declared {
+                ctx.module
+                    .add_declaration(crate::ir::module::FunctionDeclaration {
+                        name: owned_name.clone(),
+                        return_type: ret_ir,
+                        param_types: params_ir,
+                        is_variadic: variadic,
+                        linkage: crate::ir::module::Linkage::External,
+                        visibility: crate::ir::module::Visibility::Default,
+                    });
+            }
+            let fptr = ctx.builder.fresh_value();
+            ctx.module.func_ref_map.insert(fptr, owned_name.clone());
+            {
+                let current_func = &mut *ctx.function;
+                current_func.func_ref_map.insert(fptr, owned_name);
+            }
+            return TypedValue::new(
+                fptr,
+                CType::Pointer(Box::new(CType::Void), TypeQualifiers::default()),
+            );
+        }
+    }
+
+    // Global variables like stdout, stderr, stdin — accessed without declaration
+    if matches!(name, "stdout" | "stderr" | "stdin") {
+        let owned_name = name.to_string();
+        // Declare as an extern global variable of type pointer
+        if ctx.module.get_global(&owned_name).is_none() {
+            let mut gv = crate::ir::module::GlobalVariable::new(
+                owned_name.clone(),
+                IrType::Ptr,
+                None,
+            );
+            gv.linkage = crate::ir::module::Linkage::External;
+            ctx.module.add_global(gv);
+        }
+        let ptr_val = ctx.builder.fresh_value();
+        ctx.module
+            .global_var_refs
+            .insert(ptr_val, owned_name.clone());
+        {
+            let current_func = &mut *ctx.function;
+            current_func.global_var_refs.insert(ptr_val, owned_name);
+        }
+        let (loaded, li) = ctx.builder.build_load(ptr_val, IrType::Ptr, span);
+        emit_inst(ctx, li);
+        return TypedValue::new(loaded, CType::Pointer(Box::new(CType::Void), TypeQualifiers::default()));
     }
 
     ctx.diagnostics
@@ -2150,10 +2253,22 @@ fn lower_unary(
         ast::UnaryOp::Deref => {
             let p = lower_expr_inner(ctx, operand);
             let pt = pointee_of(&p.ty);
-            let it = ctype_to_ir(&pt, ctx.target);
-            let (v, li) = ctx.builder.build_load(p.value, it, span);
-            emit_inst(ctx, li);
-            TypedValue::new(v, pt)
+            // In C, dereferencing a function pointer is an identity
+            // operation — `(*fptr)(args)` is equivalent to `fptr(args)`.
+            // The function pointer value IS the callable address; emitting
+            // a Load would read the first bytes of the function's machine
+            // code instead of using the pointer as an address.  Skip the
+            // Load for function and function-pointer pointee types.
+            if matches!(&pt, CType::Function { .. }) {
+                // Return the pointer value unchanged with function type.
+                // The call lowering will use this value directly.
+                TypedValue::new(p.value, pt)
+            } else {
+                let it = ctype_to_ir(&pt, ctx.target);
+                let (v, li) = ctx.builder.build_load(p.value, it, span);
+                emit_inst(ctx, li);
+                TypedValue::new(v, pt)
+            }
         }
         ast::UnaryOp::Plus => {
             let inner = lower_expr_inner(ctx, operand);
@@ -2335,11 +2450,25 @@ fn lower_assignment(
                 v
             };
             let rhs = lower_expr_inner(ctx, value);
-            let rhs_conv = insert_implicit_conversion(ctx, rhs.value, &rhs.ty, &lhs_ptr.ty, span);
-            let uns = is_unsigned(&lhs_ptr.ty);
+
+            // C11 §6.5.16.2: Compound assignment  E1 op= E2  is equivalent to
+            //   E1 = (typeof(E1))(E1 op E2)
+            // where E1 op E2 follows the usual arithmetic conversions (§6.3.1.8).
+            // We must NOT convert rhs to lhs type before the operation — instead
+            // promote both operands to the common type, perform the operation,
+            // and then convert the result back to lhs type for storage.
+            let lhs_ty_for_arith = lhs_ptr.ty.clone();
+            let common_ty = type_builder::usual_arithmetic_conversion(&lhs_ty_for_arith, &rhs.ty);
+            let common_ir = ctype_to_ir(&common_ty, ctx.target);
+            let cur_promoted =
+                insert_implicit_conversion(ctx, cur_val, &lhs_ty_for_arith, &common_ty, span);
+            let rhs_promoted =
+                insert_implicit_conversion(ctx, rhs.value, &rhs.ty, &common_ty, span);
+            let uns = is_unsigned(&common_ty);
             let new_val = match op {
                 ast::AssignOp::AddAssign => {
                     if is_pointer_type(&lhs_ptr.ty) {
+                        // Pointer arithmetic: keep original cur_val (pointer)
                         let es = pointee_size_resolved(
                             &lhs_ptr.ty,
                             ctx.type_builder,
@@ -2363,7 +2492,7 @@ fn lower_assignment(
                     } else {
                         let (v, i) = ctx
                             .builder
-                            .build_add(cur_val, rhs_conv, lhs_ir.clone(), span);
+                            .build_add(cur_promoted, rhs_promoted, common_ir.clone(), span);
                         emit_inst(ctx, i);
                         v
                     }
@@ -2371,68 +2500,73 @@ fn lower_assignment(
                 ast::AssignOp::SubAssign => {
                     let (v, i) = ctx
                         .builder
-                        .build_sub(cur_val, rhs_conv, lhs_ir.clone(), span);
+                        .build_sub(cur_promoted, rhs_promoted, common_ir.clone(), span);
                     emit_inst(ctx, i);
                     v
                 }
                 ast::AssignOp::MulAssign => {
                     let (v, i) = ctx
                         .builder
-                        .build_mul(cur_val, rhs_conv, lhs_ir.clone(), span);
+                        .build_mul(cur_promoted, rhs_promoted, common_ir.clone(), span);
                     emit_inst(ctx, i);
                     v
                 }
                 ast::AssignOp::DivAssign => {
                     let (v, i) =
                         ctx.builder
-                            .build_div(cur_val, rhs_conv, lhs_ir.clone(), !uns, span);
+                            .build_div(cur_promoted, rhs_promoted, common_ir.clone(), !uns, span);
                     emit_inst(ctx, i);
                     v
                 }
                 ast::AssignOp::ModAssign => {
                     let (v, i) =
                         ctx.builder
-                            .build_rem(cur_val, rhs_conv, lhs_ir.clone(), !uns, span);
+                            .build_rem(cur_promoted, rhs_promoted, common_ir.clone(), !uns, span);
                     emit_inst(ctx, i);
                     v
                 }
                 ast::AssignOp::AndAssign => {
                     let (v, i) = ctx
                         .builder
-                        .build_and(cur_val, rhs_conv, lhs_ir.clone(), span);
+                        .build_and(cur_promoted, rhs_promoted, common_ir.clone(), span);
                     emit_inst(ctx, i);
                     v
                 }
                 ast::AssignOp::OrAssign => {
                     let (v, i) = ctx
                         .builder
-                        .build_or(cur_val, rhs_conv, lhs_ir.clone(), span);
+                        .build_or(cur_promoted, rhs_promoted, common_ir.clone(), span);
                     emit_inst(ctx, i);
                     v
                 }
                 ast::AssignOp::XorAssign => {
                     let (v, i) = ctx
                         .builder
-                        .build_xor(cur_val, rhs_conv, lhs_ir.clone(), span);
+                        .build_xor(cur_promoted, rhs_promoted, common_ir.clone(), span);
                     emit_inst(ctx, i);
                     v
                 }
                 ast::AssignOp::ShlAssign => {
+                    // C11 §6.5.7: Shift uses the promoted lhs type, not common type
                     let (v, i) = ctx
                         .builder
-                        .build_shl(cur_val, rhs_conv, lhs_ir.clone(), span);
+                        .build_shl(cur_promoted, rhs_promoted, common_ir.clone(), span);
                     emit_inst(ctx, i);
                     v
                 }
                 ast::AssignOp::ShrAssign => {
                     let (v, i) =
                         ctx.builder
-                            .build_shr(cur_val, rhs_conv, lhs_ir.clone(), !uns, span);
+                            .build_shr(cur_promoted, rhs_promoted, common_ir.clone(), !uns, span);
                     emit_inst(ctx, i);
                     v
                 }
                 ast::AssignOp::Assign => unreachable!(),
             };
+
+            // Convert result back from common type to lhs type
+            let new_val =
+                insert_implicit_conversion(ctx, new_val, &common_ty, &lhs_ptr.ty, span);
 
             // For bitfields, use read-modify-write to store the computed
             // value back without clobbering adjacent fields.
@@ -2981,14 +3115,43 @@ fn lower_function_call(
         }
     }
 
+    // Look up the callee's declared C-level parameter types from the
+    // module map.  This is necessary because `lower_identifier` returns
+    // the callee as an opaque `Pointer(Void)` without function type info.
+    let param_ctypes: Option<Vec<CType>> = ctx
+        .function
+        .func_ref_map
+        .get(&callee_tv.value)
+        .and_then(|fname| ctx.module.func_c_param_types.get(fname))
+        .cloned()
+        // Also try extracting from callee's CType (for function pointers
+        // that preserve their type information).
+        .or_else(|| extract_function_param_types(&callee_tv.ty));
+
     // Lower arguments left-to-right.
     let mut arg_vals = Vec::with_capacity(args.len());
-    for arg in args {
+    for (i, arg) in args.iter().enumerate() {
         let atv = lower_expr_inner(ctx, arg);
 
-        // Apply default argument promotions for variadic calls.
-        let promoted = types::integer_promotion(&atv.ty);
-        let v = insert_implicit_conversion(ctx, atv.value, &atv.ty, &promoted, span);
+        // If a declared parameter type is available for this position,
+        // convert the argument to match the parameter type (this handles
+        // int → long long sign-extension, int → float, etc.).
+        // For variadic extra arguments (beyond the declared params) or
+        // when no parameter type list is available, apply default argument
+        // promotions (C11 §6.5.2.2p7).
+        let target_ty = if let Some(pty) = param_ctypes.as_ref().and_then(|p| p.get(i)) {
+            pty.clone()
+        } else {
+            // Default argument promotions for variadic / unprototyped calls.
+            let promoted = types::integer_promotion(&atv.ty);
+            // float → double for variadic.
+            if matches!(types::resolve_typedef(&atv.ty), CType::Float) {
+                CType::Double
+            } else {
+                promoted
+            }
+        };
+        let v = insert_implicit_conversion(ctx, atv.value, &atv.ty, &target_ty, span);
         arg_vals.push(v);
     }
 
@@ -3025,6 +3188,36 @@ fn extract_function_return_type(ctype: &CType) -> (CType, bool) {
             }
         }
         _ => (CType::Int, false),
+    }
+}
+
+/// Extract the declared parameter types from a function or function-pointer
+/// C type.  Returns `None` when the callee has no known prototype (K&R or
+/// untyped function pointer).
+fn extract_function_param_types(ctype: &CType) -> Option<Vec<CType>> {
+    let resolved = types::resolve_typedef(ctype);
+    match resolved {
+        CType::Function { params, .. } => {
+            if params.is_empty() {
+                None // empty param list ⇒ unprototyped (K&R `int f()`)
+            } else {
+                Some(params.clone())
+            }
+        }
+        CType::Pointer(inner, _) => {
+            let inner_resolved = types::resolve_typedef(inner);
+            match inner_resolved {
+                CType::Function { params, .. } => {
+                    if params.is_empty() {
+                        None
+                    } else {
+                        Some(params.clone())
+                    }
+                }
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 
@@ -3068,6 +3261,25 @@ fn lower_cast(
         return value;
     }
 
+    // Cast to Bool must use comparison against zero (not truncation).
+    // C11 §6.3.1.2: "When any scalar value is converted to _Bool, the
+    // result is 0 if the value compares equal to 0; otherwise, the result is 1."
+    // This must run BEFORE the generic integer→integer path, which would
+    // use trunc (extracting the low bit) — incorrect for e.g. (_Bool)42.
+    if matches!(to, CType::Bool) && from_ir.is_integer() {
+        let zero = emit_zero(ctx, from_ir, span);
+        let (v, i) = ctx.builder.build_icmp(ICmpOp::Ne, value, zero, span);
+        emit_inst(ctx, i);
+        return v;
+    }
+
+    // Bool (I1) to integer — zero-extend.
+    if matches!(from, CType::Bool) && to_ir.is_integer() {
+        let (v, i) = ctx.builder.build_zext_from(value, IrType::I1, to_ir, span);
+        emit_inst(ctx, i);
+        return v;
+    }
+
     // Integer → Integer.
     if from_ir.is_integer() && to_ir.is_integer() {
         let fw = from_ir.int_width();
@@ -3102,14 +3314,16 @@ fn lower_cast(
 
     // Integer → Float.
     if from_ir.is_integer() && to_ir.is_float() {
-        let (v, i) = ctx.builder.build_bitcast(value, to_ir, span);
+        let src_unsigned = types::is_unsigned(from);
+        let (v, i) = ctx.builder.build_bitcast_ex(value, to_ir, src_unsigned, span);
         emit_inst(ctx, i);
         return v;
     }
 
     // Float → Integer.
     if from_ir.is_float() && to_ir.is_integer() {
-        let (v, i) = ctx.builder.build_bitcast(value, to_ir, span);
+        let dst_unsigned = types::is_unsigned(to);
+        let (v, i) = ctx.builder.build_bitcast_ex(value, to_ir, dst_unsigned, span);
         emit_inst(ctx, i);
         return v;
     }
@@ -3170,7 +3384,7 @@ fn resolve_type_name(ctx: &ExprLoweringContext<'_>, tn: &ast::TypeName) -> CType
 /// If `ctype` is a `Struct` or `Union` with a tag name but empty fields,
 /// replace it with the full definition from the `struct_defs` registry.
 /// Also recurses into pointer and array element types.
-fn resolve_forward_ref_type(ctype: &mut CType, struct_defs: &FxHashMap<String, CType>) {
+pub fn resolve_forward_ref_type(ctype: &mut CType, struct_defs: &FxHashMap<String, CType>) {
     match ctype {
         CType::Struct {
             name: Some(ref tag),
@@ -3354,8 +3568,40 @@ fn sizeof_infer_type(ctx: &mut ExprLoweringContext<'_>, expr: &ast::Expression) 
             }
         }
 
+        // String literal: type is char[N] (including null terminator),
+        // NOT char * — sizeof("abc") must return 4, not pointer size.
+        ast::Expression::StringLiteral { segments, .. } => {
+            let total_bytes: usize = segments.iter().map(|s| s.value.len()).sum();
+            CType::Array(Box::new(CType::Char), Some(total_bytes + 1))
+        }
+
         // Cast: use the target type
         ast::Expression::Cast { type_name, .. } => resolve_type_name(ctx, type_name),
+
+        // Compound literal: resolve its TypeName to get the declared type
+        // (preserving array types — e.g. sizeof((int[]){1,2,3}) == 3*sizeof(int))
+        ast::Expression::CompoundLiteral {
+            type_name,
+            initializer,
+            ..
+        } => {
+            let resolved = resolve_type_name(ctx, type_name);
+            // If the type is an incomplete array (size = 0), infer the size
+            // from the number of initializer elements.
+            match &resolved {
+                CType::Array(elem, Some(0)) | CType::Array(elem, None) => {
+                    let count = match initializer {
+                        ast::Initializer::List {
+                            designators_and_initializers,
+                            ..
+                        } => designators_and_initializers.len(),
+                        ast::Initializer::Expression(_) => 1,
+                    };
+                    CType::Array(elem.clone(), Some(count))
+                }
+                _ => resolved,
+            }
+        }
 
         // For all other expressions, fall back to normal lowering.
         // This handles arithmetic, function calls, etc. where array
@@ -3536,8 +3782,49 @@ fn lower_bitfield_read(
         masked
     };
 
+    // C11 §6.3.1.1p1: Integer promotion for bitfields.  An unsigned
+    // bitfield whose width is less than the width of `int` (31 value bits
+    // for a 32-bit int) gets promoted to `int` because all its
+    // representable values fit in signed int.  A signed bitfield that fits
+    // in `int` also promotes to `int`.  This applies regardless of the
+    // declared base type (unsigned int, unsigned long, unsigned long long).
+    let promoted_ty = {
+        let base = crate::common::types::resolve_and_strip(field_ty);
+        let is_unsigned_base = matches!(
+            base,
+            CType::UChar
+                | CType::UShort
+                | CType::UInt
+                | CType::ULong
+                | CType::ULongLong
+                | CType::UInt128
+        );
+        let is_signed_base = matches!(
+            base,
+            CType::Char
+                | CType::SChar
+                | CType::Short
+                | CType::Int
+                | CType::Long
+                | CType::LongLong
+                | CType::Int128
+        );
+        if is_unsigned_base && bit_width < 32 {
+            // All values 0..2^(bit_width)-1 fit in signed int (max 2^31-1).
+            CType::Int
+        } else if is_signed_base && bit_width <= 32 {
+            // Signed bitfield: if it fits in int, promote to int.
+            CType::Int
+        } else if is_unsigned_base && bit_width == 32 {
+            // Unsigned 32-bit bitfield doesn't fit in signed int → unsigned int.
+            CType::UInt
+        } else {
+            field_ty.clone()
+        }
+    };
+
     // If the C type is smaller/larger than the storage IR type, cast.
-    let target_ir = ctype_to_ir(field_ty, ctx.target);
+    let target_ir = ctype_to_ir(&promoted_ty, ctx.target);
     let final_val = if target_ir != storage_ir {
         let (cast_val, cast_inst) = ctx.builder.build_bitcast(result, target_ir, span);
         emit_inst(ctx, cast_inst);
@@ -3546,13 +3833,13 @@ fn lower_bitfield_read(
         result
     };
 
-    TypedValue::new(final_val, field_ty.clone())
+    TypedValue::new(final_val, promoted_ty)
 }
 
 /// Emit IR for writing a bitfield: load the storage unit, clear the
 /// target bits, OR in the new value, and store back.  This preserves
 /// adjacent fields packed in the same storage unit.
-fn lower_bitfield_store(
+pub(crate) fn lower_bitfield_store(
     ctx: &mut ExprLoweringContext<'_>,
     storage_ptr: Value,
     new_value: Value,
@@ -4072,7 +4359,7 @@ fn lower_comma(
 fn lower_compound_literal(
     ctx: &mut ExprLoweringContext<'_>,
     type_name: &ast::TypeName,
-    _initializer: &ast::Initializer,
+    initializer: &ast::Initializer,
     span: Span,
 ) -> TypedValue {
     let cty = resolve_type_name(ctx, type_name);
@@ -4085,18 +4372,78 @@ fn lower_compound_literal(
 
     let ir_ty = ctype_to_ir(&cty, ctx.target);
 
-    // Allocate storage for the compound literal.
+    // Allocate storage for the compound literal in the entry block.
     let (alloca, ai) = ctx.builder.build_alloca(ir_ty.clone(), span);
     emit_inst(ctx, ai);
 
-    // Initializer lowering is handled by decl_lowering; for now we
-    // zero-initialize the alloca (the initializer dispatcher will be
-    // invoked from the lowering driver in the full pipeline).
-    // Store zero-init.
+    // Zero-initialize first so that any fields not explicitly initialised
+    // in the initializer list default to zero.
+    let zero = emit_zero(ctx, ir_ty.clone(), span);
+    let si = ctx.builder.build_store(zero, alloca, span);
+    emit_inst(ctx, si);
+
+    // Now actually process the initializer list to populate the compound
+    // literal storage.  This delegates to the same initializer lowering
+    // used for local variable declarations.
+    super::decl_lowering::lower_local_initializer(alloca, initializer, &cty, ctx);
+
+    // A compound literal is an lvalue in C, so the alloca pointer is
+    // its canonical representation.  However, when used as an rvalue
+    // (e.g., `return (S){1,2}`, `x = (S){1,2}`, or passing to a
+    // function), the caller needs the loaded value for types that fit
+    // in a register.
+    //
+    // - Arrays: decay to pointer (return alloca address)
+    // - Large structs/unions (>8 bytes): returned as pointer; the caller
+    //   (return stmt, assignment) copies chunk-by-chunk
+    // - Scalar + small aggregates (≤8 bytes): load and return the value
+    let resolved = crate::common::types::resolve_typedef(&cty);
+    let is_array = matches!(resolved, CType::Array(..));
+    let is_agg = crate::common::types::is_struct_or_union(&resolved);
+    let agg_size = if is_agg {
+        crate::common::types::sizeof_ctype(&resolved, ctx.target)
+    } else {
+        0
+    };
+    if is_array || (is_agg && agg_size > 8) {
+        // Return the alloca address — caller will copy.
+        TypedValue::new(alloca, cty)
+    } else {
+        // Load the scalar / small-aggregate value.
+        let (loaded, li) = ctx.builder.build_load(alloca, ir_ty, span);
+        emit_inst(ctx, li);
+        TypedValue::new(loaded, cty)
+    }
+}
+
+/// Lower a compound literal as an **lvalue**, returning the alloca pointer.
+/// Used when the compound literal appears in address-of (`&(S){1,2}`) or
+/// member access (`(S){1,2}.field`) contexts.
+fn lower_compound_literal_lvalue(
+    ctx: &mut ExprLoweringContext<'_>,
+    type_name: &ast::TypeName,
+    initializer: &ast::Initializer,
+    span: Span,
+) -> TypedValue {
+    let cty = resolve_type_name(ctx, type_name);
+
+    if !type_builder::is_complete_type(&cty) {
+        ctx.diagnostics
+            .emit_warning(span, "compound literal of incomplete type");
+    }
+
+    let ir_ty = ctype_to_ir(&cty, ctx.target);
+
+    let (alloca, ai) = ctx.builder.build_alloca(ir_ty.clone(), span);
+    emit_inst(ctx, ai);
+
     let zero = emit_zero(ctx, ir_ty, span);
     let si = ctx.builder.build_store(zero, alloca, span);
     emit_inst(ctx, si);
 
+    super::decl_lowering::lower_local_initializer(alloca, initializer, &cty, ctx);
+
+    // Return the alloca pointer — the compound literal is an lvalue.
     TypedValue::new(alloca, cty)
 }
 
@@ -4471,6 +4818,314 @@ fn lower_builtin(
                 TypedValue::void()
             }
         }
+
+        // ----- Abort / Exit -----
+        ast::BuiltinKind::Abort => {
+            // __builtin_abort() — emit a call to abort() then a return.
+            let callee = emit_global_ref(ctx, "abort", span);
+            let (_result, ci) = ctx
+                .builder
+                .build_call(callee, vec![], IrType::Void, span);
+            emit_inst(ctx, ci);
+            let ri = ctx.builder.build_return(None, span);
+            emit_inst(ctx, ri);
+            TypedValue::void()
+        }
+
+        ast::BuiltinKind::Exit => {
+            // __builtin_exit(status) — emit a call to exit(status) then a return.
+            let mut call_args = Vec::new();
+            if let Some(arg) = args.first() {
+                let v = lower_expr_inner(ctx, arg);
+                call_args.push(v.value);
+            }
+            let callee = emit_global_ref(ctx, "exit", span);
+            let (_result, ci) = ctx
+                .builder
+                .build_call(callee, call_args, IrType::Void, span);
+            emit_inst(ctx, ci);
+            let ri = ctx.builder.build_return(None, span);
+            emit_inst(ctx, ri);
+            TypedValue::void()
+        }
+
+        // ----- Memory/string builtins -----
+        ast::BuiltinKind::Memcpy => {
+            lower_libc_builtin(ctx, args, "memcpy", IrType::Ptr, CType::Pointer(Box::new(CType::Void), TypeQualifiers::default()), span)
+        }
+        ast::BuiltinKind::Memset => {
+            lower_libc_builtin(ctx, args, "memset", IrType::Ptr, CType::Pointer(Box::new(CType::Void), TypeQualifiers::default()), span)
+        }
+        ast::BuiltinKind::Memcmp => {
+            lower_libc_builtin(ctx, args, "memcmp", IrType::I32, CType::Int, span)
+        }
+        ast::BuiltinKind::Strlen => {
+            lower_libc_builtin(ctx, args, "strlen", size_ir_type(ctx.target), CType::ULong, span)
+        }
+        ast::BuiltinKind::Strcmp => {
+            lower_libc_builtin(ctx, args, "strcmp", IrType::I32, CType::Int, span)
+        }
+        ast::BuiltinKind::Strncmp => {
+            lower_libc_builtin(ctx, args, "strncmp", IrType::I32, CType::Int, span)
+        }
+
+        // ----- Abs builtins -----
+        ast::BuiltinKind::Abs => {
+            lower_libc_builtin(ctx, args, "abs", IrType::I32, CType::Int, span)
+        }
+        ast::BuiltinKind::Labs => {
+            lower_libc_builtin(ctx, args, "labs", IrType::I64, CType::Long, span)
+        }
+        ast::BuiltinKind::Llabs => {
+            lower_libc_builtin(ctx, args, "llabs", IrType::I64, CType::LongLong, span)
+        }
+
+        // ----- Alloca -----
+        ast::BuiltinKind::Alloca => {
+            // __builtin_alloca(size) — dynamic stack allocation.
+            // Lower to StackAlloc IR instruction which the backend
+            // translates to a runtime SUB RSP + alignment sequence.
+            if let Some(size_expr) = args.first() {
+                let size_tv = lower_expr_inner(ctx, size_expr);
+                let size_val = insert_implicit_conversion(
+                    ctx,
+                    size_tv.value,
+                    &size_tv.ty,
+                    &size_ctype(ctx.target),
+                    span,
+                );
+                let (result, inst) = ctx.builder.build_stack_alloc(size_val, span);
+                emit_inst(ctx, inst);
+                TypedValue::new(
+                    result,
+                    CType::Pointer(Box::new(CType::Void), TypeQualifiers::default()),
+                )
+            } else {
+                let zero = emit_int_const(ctx, 0, IrType::Ptr, span);
+                TypedValue::new(
+                    zero,
+                    CType::Pointer(Box::new(CType::Void), TypeQualifiers::default()),
+                )
+            }
+        }
+
+        // ----- Float constants (compile-time) -----
+        ast::BuiltinKind::Inf | ast::BuiltinKind::HugeVal => {
+            let val = f64::INFINITY;
+            let v = emit_float_const(ctx, val, IrType::F64, span);
+            TypedValue::new(v, CType::Double)
+        }
+        ast::BuiltinKind::Inff | ast::BuiltinKind::HugeValf => {
+            let val = f64::INFINITY;
+            let v = emit_float_const(ctx, val, IrType::F32, span);
+            TypedValue::new(v, CType::Float)
+        }
+        ast::BuiltinKind::Infl | ast::BuiltinKind::HugeVall => {
+            let val = f64::INFINITY;
+            let v = emit_float_const(ctx, val, IrType::F64, span);
+            TypedValue::new(v, CType::LongDouble)
+        }
+        ast::BuiltinKind::Nan | ast::BuiltinKind::Nanl => {
+            let val = f64::NAN;
+            let v = emit_float_const(ctx, val, IrType::F64, span);
+            TypedValue::new(v, CType::Double)
+        }
+        ast::BuiltinKind::Nanf => {
+            let val = f64::NAN;
+            let v = emit_float_const(ctx, val, IrType::F32, span);
+            TypedValue::new(v, CType::Float)
+        }
+
+        // ----- Float predicates -----
+        ast::BuiltinKind::Signbit | ast::BuiltinKind::Isnan | ast::BuiltinKind::Isinf
+        | ast::BuiltinKind::Isfinite | ast::BuiltinKind::IsinfSign => {
+            let fname = match kind {
+                ast::BuiltinKind::Signbit => "__builtin_signbit",
+                ast::BuiltinKind::Isnan => "__builtin_isnan",
+                ast::BuiltinKind::Isinf => "__builtin_isinf",
+                ast::BuiltinKind::Isfinite => "__builtin_isfinite",
+                ast::BuiltinKind::IsinfSign => "__builtin_isinf_sign",
+                _ => unreachable!(),
+            };
+            lower_libc_builtin(ctx, args, fname, IrType::I32, CType::Int, span)
+        }
+
+        // ----- Copysign / fabs -----
+        ast::BuiltinKind::Copysign => {
+            lower_libc_builtin(ctx, args, "copysign", IrType::F64, CType::Double, span)
+        }
+        ast::BuiltinKind::Copysignf => {
+            lower_libc_builtin(ctx, args, "copysignf", IrType::F32, CType::Float, span)
+        }
+        ast::BuiltinKind::Copysignl => {
+            lower_libc_builtin(ctx, args, "copysignl", IrType::F64, CType::LongDouble, span)
+        }
+        ast::BuiltinKind::Fabs => {
+            lower_libc_builtin(ctx, args, "fabs", IrType::F64, CType::Double, span)
+        }
+        ast::BuiltinKind::Fabsf => {
+            lower_libc_builtin(ctx, args, "fabsf", IrType::F32, CType::Float, span)
+        }
+        ast::BuiltinKind::Fabsl => {
+            lower_libc_builtin(ctx, args, "fabsl", IrType::F64, CType::LongDouble, span)
+        }
+
+        // ----- classify_type -----
+        ast::BuiltinKind::ClassifyType => {
+            // GCC __builtin_classify_type:
+            // void=0, integer=1, char=2, enum=3, bool=4, pointer=5, 
+            // reference=6, offset=7, real=8, complex=9, function=10, method=11
+            // We'll classify based on the argument type.
+            if let Some(arg) = args.first() {
+                let tv = lower_expr_inner(ctx, arg);
+                let type_class = classify_type_for_builtin(&tv.ty);
+                let v = emit_int_const(ctx, type_class as i128, IrType::I32, span);
+                TypedValue::new(v, CType::Int)
+            } else {
+                let v = emit_int_const(ctx, 0, IrType::I32, span);
+                TypedValue::new(v, CType::Int)
+            }
+        }
+
+        // ----- Sync atomics -----
+        ast::BuiltinKind::SyncValCompareAndSwap
+        | ast::BuiltinKind::SyncBoolCompareAndSwap
+        | ast::BuiltinKind::SyncFetchAndAdd
+        | ast::BuiltinKind::SyncFetchAndSub
+        | ast::BuiltinKind::SyncFetchAndAnd
+        | ast::BuiltinKind::SyncFetchAndOr
+        | ast::BuiltinKind::SyncFetchAndXor
+        | ast::BuiltinKind::SyncLockTestAndSet => {
+            let fname = match kind {
+                ast::BuiltinKind::SyncValCompareAndSwap => "__sync_val_compare_and_swap",
+                ast::BuiltinKind::SyncBoolCompareAndSwap => "__sync_bool_compare_and_swap",
+                ast::BuiltinKind::SyncFetchAndAdd => "__sync_fetch_and_add",
+                ast::BuiltinKind::SyncFetchAndSub => "__sync_fetch_and_sub",
+                ast::BuiltinKind::SyncFetchAndAnd => "__sync_fetch_and_and",
+                ast::BuiltinKind::SyncFetchAndOr => "__sync_fetch_and_or",
+                ast::BuiltinKind::SyncFetchAndXor => "__sync_fetch_and_xor",
+                ast::BuiltinKind::SyncLockTestAndSet => "__sync_lock_test_and_set",
+                _ => unreachable!(),
+            };
+            let ret_ty = if matches!(kind, ast::BuiltinKind::SyncBoolCompareAndSwap) {
+                IrType::I32
+            } else {
+                IrType::I64
+            };
+            let ret_cty = if matches!(kind, ast::BuiltinKind::SyncBoolCompareAndSwap) {
+                CType::Bool
+            } else {
+                CType::Int
+            };
+            lower_libc_builtin(ctx, args, fname, ret_ty, ret_cty, span)
+        }
+        ast::BuiltinKind::SyncLockRelease => {
+            lower_libc_builtin(ctx, args, "__sync_lock_release", IrType::Void, CType::Void, span)
+        }
+        ast::BuiltinKind::SyncSynchronize => {
+            lower_libc_builtin(ctx, args, "__sync_synchronize", IrType::Void, CType::Void, span)
+        }
+
+        // ----- C11 atomics -----
+        ast::BuiltinKind::AtomicLoadN => {
+            lower_libc_builtin(ctx, args, "__atomic_load_n", IrType::I64, CType::Int, span)
+        }
+        ast::BuiltinKind::AtomicStoreN => {
+            lower_libc_builtin(ctx, args, "__atomic_store_n", IrType::Void, CType::Void, span)
+        }
+        ast::BuiltinKind::AtomicExchangeN => {
+            lower_libc_builtin(ctx, args, "__atomic_exchange_n", IrType::I64, CType::Int, span)
+        }
+        ast::BuiltinKind::AtomicCompareExchangeN => {
+            lower_libc_builtin(ctx, args, "__atomic_compare_exchange_n", IrType::I32, CType::Bool, span)
+        }
+        ast::BuiltinKind::AtomicFetchAdd => {
+            lower_libc_builtin(ctx, args, "__atomic_fetch_add", IrType::I64, CType::Int, span)
+        }
+        ast::BuiltinKind::AtomicFetchSub => {
+            lower_libc_builtin(ctx, args, "__atomic_fetch_sub", IrType::I64, CType::Int, span)
+        }
+        ast::BuiltinKind::AtomicFetchAnd => {
+            lower_libc_builtin(ctx, args, "__atomic_fetch_and", IrType::I64, CType::Int, span)
+        }
+        ast::BuiltinKind::AtomicFetchOr => {
+            lower_libc_builtin(ctx, args, "__atomic_fetch_or", IrType::I64, CType::Int, span)
+        }
+        ast::BuiltinKind::AtomicFetchXor => {
+            lower_libc_builtin(ctx, args, "__atomic_fetch_xor", IrType::I64, CType::Int, span)
+        }
+
+        // ----- Overflow _p variants -----
+        ast::BuiltinKind::AddOverflowP | ast::BuiltinKind::SubOverflowP | ast::BuiltinKind::MulOverflowP => {
+            // _p variants: overflow check without storing result.
+            // Semantically same as overflow arithmetic, but result pointer is unused.
+            let op = match kind {
+                ast::BuiltinKind::AddOverflowP => IrBinOp::Add,
+                ast::BuiltinKind::SubOverflowP => IrBinOp::Sub,
+                ast::BuiltinKind::MulOverflowP => IrBinOp::Mul,
+                _ => unreachable!(),
+            };
+            lower_overflow_arith(ctx, args, op, span)
+        }
+
+        // ----- BuiltinConstantP alias -----
+        ast::BuiltinKind::BuiltinConstantP => {
+            if let Some(arg) = args.first() {
+                let is_const = is_compile_time_constant(arg);
+                let v = emit_int_const(ctx, if is_const { 1 } else { 0 }, IrType::I32, span);
+                TypedValue::new(v, CType::Int)
+            } else {
+                let v = emit_int_const(ctx, 0, IrType::I32, span);
+                TypedValue::new(v, CType::Int)
+            }
+        }
+    }
+}
+
+/// Helper: lower a builtin that maps directly to a libc or intrinsic function call.
+fn lower_libc_builtin(
+    ctx: &mut ExprLoweringContext<'_>,
+    args: &[ast::Expression],
+    func_name: &str,
+    ret_ir_type: IrType,
+    ret_c_type: CType,
+    span: Span,
+) -> TypedValue {
+    let mut call_args = Vec::new();
+    for arg in args {
+        let tv = lower_expr_inner(ctx, arg);
+        call_args.push(tv.value);
+    }
+    let callee = emit_global_ref(ctx, func_name, span);
+    if ret_ir_type == IrType::Void {
+        let (_result, ci) = ctx
+            .builder
+            .build_call(callee, call_args, IrType::Void, span);
+        emit_inst(ctx, ci);
+        TypedValue::void()
+    } else {
+        let (result, ci) = ctx
+            .builder
+            .build_call(callee, call_args, ret_ir_type, span);
+        emit_inst(ctx, ci);
+        TypedValue::new(result, ret_c_type)
+    }
+}
+
+/// Helper: classify a C type for __builtin_classify_type.
+fn classify_type_for_builtin(ctype: &CType) -> i32 {
+    match ctype {
+        CType::Void => 0,
+        CType::Bool => 4,
+        CType::Char | CType::SChar | CType::UChar => 2,
+        CType::Short | CType::UShort | CType::Int | CType::UInt
+        | CType::Long | CType::ULong | CType::LongLong | CType::ULongLong => 1,
+        CType::Float | CType::Double | CType::LongDouble => 8,
+        CType::Pointer(..) => 5,
+        CType::Function { .. } => 10,
+        CType::Enum { .. } => 3,
+        CType::Complex(..) => 9,
+        _ => 1, // default: integer
     }
 }
 
@@ -4985,13 +5640,15 @@ pub fn insert_implicit_conversion(
     // Integer ↔ Float.
     if types::is_integer(from) && types::is_floating(to) {
         let to_ir = ctype_to_ir(to, ctx.target);
-        let (v, i) = ctx.builder.build_bitcast(value, to_ir, span);
+        let src_unsigned = types::is_unsigned(from);
+        let (v, i) = ctx.builder.build_bitcast_ex(value, to_ir, src_unsigned, span);
         emit_inst(ctx, i);
         return v;
     }
     if types::is_floating(from) && types::is_integer(to) {
         let to_ir = ctype_to_ir(to, ctx.target);
-        let (v, i) = ctx.builder.build_bitcast(value, to_ir, span);
+        let dst_unsigned = types::is_unsigned(to);
+        let (v, i) = ctx.builder.build_bitcast_ex(value, to_ir, dst_unsigned, span);
         emit_inst(ctx, i);
         return v;
     }

@@ -329,10 +329,35 @@ pub fn phase1_trigraphs(input: &str) -> String {
                 continue;
             }
         }
-        // Multi-byte UTF-8 characters: inner continuation bytes (0x80–0xBF)
-        // never equal '?' (0x3F), so this byte-by-byte scan is safe.
-        result.push(bytes[i] as char);
-        i += 1;
+        // Multi-byte UTF-8 characters (including PUA code points) must be
+        // copied as complete sequences. `bytes[i] as char` would treat each
+        // byte individually, converting e.g. 0xEE to U+00EE instead of
+        // recognising the full 3-byte PUA sequence EE 83 BF as U+E0FF.
+        if bytes[i] < 0x80 {
+            result.push(bytes[i] as char);
+            i += 1;
+        } else {
+            // Determine UTF-8 sequence length from the lead byte.
+            let seq_len = if bytes[i] >= 0xF0 {
+                4
+            } else if bytes[i] >= 0xE0 {
+                3
+            } else if bytes[i] >= 0xC0 {
+                2
+            } else {
+                1 // bare continuation byte — push as-is
+            };
+            let end = std::cmp::min(i + seq_len, len);
+            if let Ok(s) = std::str::from_utf8(&bytes[i..end]) {
+                result.push_str(s);
+            } else {
+                // Fallback for malformed sequences: push each byte as a char.
+                for &b in &bytes[i..end] {
+                    result.push(b as char);
+                }
+            }
+            i = end;
+        }
     }
 
     result
@@ -361,8 +386,30 @@ pub fn phase1_line_splice(input: &str) -> String {
                 continue;
             }
         }
-        result.push(bytes[i] as char);
-        i += 1;
+        // Preserve multi-byte UTF-8 sequences (including PUA code points).
+        if bytes[i] < 0x80 {
+            result.push(bytes[i] as char);
+            i += 1;
+        } else {
+            let seq_len = if bytes[i] >= 0xF0 {
+                4
+            } else if bytes[i] >= 0xE0 {
+                3
+            } else if bytes[i] >= 0xC0 {
+                2
+            } else {
+                1
+            };
+            let end = std::cmp::min(i + seq_len, len);
+            if let Ok(s) = std::str::from_utf8(&bytes[i..end]) {
+                result.push_str(s);
+            } else {
+                for &b in &bytes[i..end] {
+                    result.push(b as char);
+                }
+            }
+            i = end;
+        }
     }
 
     result

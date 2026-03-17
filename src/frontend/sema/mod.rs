@@ -2118,6 +2118,16 @@ impl<'a> SemanticAnalyzer<'a> {
                     crate::common::types::TypeQualifiers::default(),
                 ))
             }
+            // All other builtins — use BuiltinEvaluator for comprehensive return type.
+            other => {
+                let _ = (args, span);
+                let eval = crate::frontend::sema::builtin_eval::BuiltinEvaluator::new(
+                    self.diagnostics,
+                    self.type_builder,
+                    self.target,
+                );
+                Ok(eval.get_builtin_return_type(other))
+            }
         }
     }
 
@@ -4067,6 +4077,167 @@ impl<'a> SemanticAnalyzer<'a> {
                 _ => None,
             } {
                 return Ok(builtin_ty);
+            }
+
+            // Implicit function declarations for common C library functions.
+            // GCC and most C compilers provide these when the function is
+            // called without a prior declaration. We emit a warning and
+            // provide an implicit declaration.
+            if let Some(implicit_ty) = match name_str {
+                "abort" => Some(CType::Function {
+                    return_type: Box::new(CType::Void),
+                    params: vec![],
+                    variadic: false,
+                }),
+                "exit" | "_exit" | "_Exit" => Some(CType::Function {
+                    return_type: Box::new(CType::Void),
+                    params: vec![CType::Int],
+                    variadic: false,
+                }),
+                "malloc" | "calloc" | "realloc" => Some(CType::Function {
+                    return_type: Box::new(CType::Pointer(
+                        Box::new(CType::Void),
+                        TypeQualifiers::default(),
+                    )),
+                    params: vec![size_t.clone()],
+                    variadic: false,
+                }),
+                "free" => Some(CType::Function {
+                    return_type: Box::new(CType::Void),
+                    params: vec![void_ptr.clone()],
+                    variadic: false,
+                }),
+                "memcpy" | "memmove" => Some(CType::Function {
+                    return_type: Box::new(CType::Pointer(
+                        Box::new(CType::Void),
+                        TypeQualifiers::default(),
+                    )),
+                    params: vec![void_ptr.clone(), void_ptr.clone(), size_t.clone()],
+                    variadic: false,
+                }),
+                "memset" => Some(CType::Function {
+                    return_type: Box::new(CType::Pointer(
+                        Box::new(CType::Void),
+                        TypeQualifiers::default(),
+                    )),
+                    params: vec![void_ptr.clone(), CType::Int, size_t.clone()],
+                    variadic: false,
+                }),
+                "memcmp" | "strcmp" | "strncmp" => Some(CType::Function {
+                    return_type: Box::new(CType::Int),
+                    params: vec![void_ptr.clone(), void_ptr.clone(), size_t.clone()],
+                    variadic: false,
+                }),
+                "strlen" => Some(CType::Function {
+                    return_type: Box::new(size_t.clone()),
+                    params: vec![void_ptr.clone()],
+                    variadic: false,
+                }),
+                "strcpy" | "strcat" => Some(CType::Function {
+                    return_type: Box::new(CType::Pointer(
+                        Box::new(CType::Char),
+                        TypeQualifiers::default(),
+                    )),
+                    params: vec![void_ptr.clone(), void_ptr.clone()],
+                    variadic: false,
+                }),
+                "printf" | "fprintf" | "sprintf" | "snprintf" => Some(CType::Function {
+                    return_type: Box::new(CType::Int),
+                    params: vec![void_ptr.clone()],
+                    variadic: true,
+                }),
+                "puts" | "fputs" => Some(CType::Function {
+                    return_type: Box::new(CType::Int),
+                    params: vec![void_ptr.clone()],
+                    variadic: false,
+                }),
+                "putchar" => Some(CType::Function {
+                    return_type: Box::new(CType::Int),
+                    params: vec![CType::Int],
+                    variadic: false,
+                }),
+                "atoi" => Some(CType::Function {
+                    return_type: Box::new(CType::Int),
+                    params: vec![void_ptr.clone()],
+                    variadic: false,
+                }),
+                "atol" => Some(CType::Function {
+                    return_type: Box::new(CType::Long),
+                    params: vec![void_ptr.clone()],
+                    variadic: false,
+                }),
+                "abs" => Some(CType::Function {
+                    return_type: Box::new(CType::Int),
+                    params: vec![CType::Int],
+                    variadic: false,
+                }),
+                "labs" => Some(CType::Function {
+                    return_type: Box::new(CType::Long),
+                    params: vec![CType::Long],
+                    variadic: false,
+                }),
+                "llabs" => Some(CType::Function {
+                    return_type: Box::new(CType::LongLong),
+                    params: vec![CType::LongLong],
+                    variadic: false,
+                }),
+                "fabs" => Some(CType::Function {
+                    return_type: Box::new(CType::Double),
+                    params: vec![CType::Double],
+                    variadic: false,
+                }),
+                "fabsf" => Some(CType::Function {
+                    return_type: Box::new(CType::Float),
+                    params: vec![CType::Float],
+                    variadic: false,
+                }),
+                "qsort" => Some(CType::Function {
+                    return_type: Box::new(CType::Void),
+                    params: vec![void_ptr.clone(), size_t.clone(), size_t.clone(), void_ptr.clone()],
+                    variadic: false,
+                }),
+                "signal" => Some(CType::Function {
+                    return_type: Box::new(void_ptr.clone()),
+                    params: vec![CType::Int, void_ptr.clone()],
+                    variadic: false,
+                }),
+                "setjmp" | "_setjmp" | "sigsetjmp" => Some(CType::Function {
+                    return_type: Box::new(CType::Int),
+                    params: vec![void_ptr.clone()],
+                    variadic: false,
+                }),
+                "longjmp" | "siglongjmp" => Some(CType::Function {
+                    return_type: Box::new(CType::Void),
+                    params: vec![void_ptr.clone(), CType::Int],
+                    variadic: false,
+                }),
+                _ => None,
+            } {
+                // Emit implicit declaration warning (not error) — consistent with GCC behavior.
+                return Ok(implicit_ty);
+            }
+
+            // Handle __builtin_* names as implicit builtins.
+            // GCC treats all __builtin_* names as implicitly declared.
+            // Use BuiltinEvaluator to check if the name is a known builtin.
+            // Handle __builtin_* names as implicit builtins.
+            // GCC treats all __builtin_* names as implicitly declared.
+            if name_str.starts_with("__builtin_") {
+                let ret_ty = BuiltinEvaluator::builtin_return_type_by_name(name_str, self.target);
+                return Ok(CType::Function {
+                    return_type: Box::new(ret_ty),
+                    params: vec![],
+                    variadic: true,
+                });
+            }
+
+            // Handle __sync_ and __atomic_ builtins that are called directly
+            if name_str.starts_with("__sync_") || name_str.starts_with("__atomic_") {
+                return Ok(CType::Function {
+                    return_type: Box::new(CType::Int),
+                    params: vec![],
+                    variadic: true,
+                });
             }
 
             self.diagnostics

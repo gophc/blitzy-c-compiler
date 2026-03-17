@@ -828,6 +828,10 @@ pub fn lower_translation_unit(
                         name_table,
                         &mut map,
                     );
+                    // Also collect struct/union definitions from within the
+                    // function body. This handles function-local struct defs
+                    // like `void f(void) { struct S { int x; }; ... }`.
+                    collect_struct_defs_from_compound(&func_def.body, name_table, &mut map);
                 }
                 _ => {}
             }
@@ -863,6 +867,60 @@ pub fn lower_translation_unit(
         *defs.borrow_mut() = Some(struct_defs.clone());
     });
 
+    // Also populate the common::types tag resolution registry so that
+    // sizeof_ctype / alignof_ctype (used inside compute_struct_size and
+    // compute_union_size) can resolve lightweight tag references.
+    // Without this, any struct containing a field whose type is a
+    // lightweight tag reference (name + empty fields) would compute the
+    // wrong struct layout.
+    {
+        let mut std_map = std::collections::HashMap::new();
+        for (k, v) in &struct_defs {
+            std_map.insert(k.clone(), v.clone());
+        }
+        crate::common::types::set_tag_type_defs(std_map);
+    }
+
+    // ====================================================================
+    // Pass 0.5 — Collect enum constants from the AST (needed by globals)
+    // ====================================================================
+    let _t05 = std::time::Instant::now();
+    // Enum constants are file-scope integer constants that must be
+    // resolvable during global initializer evaluation and expression
+    // lowering.  Collect them before Pass 1 so that global variable
+    // initializers like `SAC_NoConsole` resolve to their integer values.
+    let enum_constants: FxHashMap<String, i128> = {
+        let mut map = FxHashMap::default();
+        for ext_decl in &translation_unit.declarations {
+            match ext_decl {
+                ast::ExternalDeclaration::Declaration(decl) => {
+                    collect_enum_constants_from_specifiers(
+                        &decl.specifiers.type_specifiers,
+                        name_table,
+                        &mut map,
+                    );
+                }
+                ast::ExternalDeclaration::FunctionDefinition(func_def) => {
+                    collect_enum_constants_from_specifiers(
+                        &func_def.specifiers.type_specifiers,
+                        name_table,
+                        &mut map,
+                    );
+                    // Also collect block-scope enum constants from
+                    // inside the function body (e.g., kernel patterns
+                    // like `enum { MIX_INFLIGHT = 1U << 31 };`).
+                    collect_enum_constants_from_compound(&func_def.body, name_table, &mut map);
+                }
+                _ => {}
+            }
+        }
+        map
+    };
+
+    eprintln!(
+        "[BCC-TIMING] ir-pass0.5-enums: {:.3}s",
+        _t05.elapsed().as_secs_f64()
+    );
     // ====================================================================
     // Pass 1 — Global declarations, function prototypes, file-scope asm
     // ====================================================================
@@ -911,6 +969,7 @@ pub fn lower_translation_unit(
                         type_builder,
                         diagnostics,
                         name_table,
+                        &enum_constants,
                     );
                 }
             }
@@ -931,46 +990,6 @@ pub fn lower_translation_unit(
     eprintln!(
         "[BCC-TIMING] ir-pass1-globals: {:.3}s",
         _t1.elapsed().as_secs_f64()
-    );
-    // ====================================================================
-    // Pass 1.5 — Collect enum constants from the AST
-    // ====================================================================
-    let _t15 = std::time::Instant::now();
-    // Enum constants are file-scope integer constants that must be
-    // resolvable during expression lowering (e.g., `return RED;`).
-    // We scan all top-level declarations for enum definitions and
-    // build a name → value map.
-    let enum_constants: FxHashMap<String, i128> = {
-        let mut map = FxHashMap::default();
-        for ext_decl in &translation_unit.declarations {
-            match ext_decl {
-                ast::ExternalDeclaration::Declaration(decl) => {
-                    collect_enum_constants_from_specifiers(
-                        &decl.specifiers.type_specifiers,
-                        name_table,
-                        &mut map,
-                    );
-                }
-                ast::ExternalDeclaration::FunctionDefinition(func_def) => {
-                    collect_enum_constants_from_specifiers(
-                        &func_def.specifiers.type_specifiers,
-                        name_table,
-                        &mut map,
-                    );
-                    // Also collect block-scope enum constants from
-                    // inside the function body (e.g., kernel patterns
-                    // like `enum { MIX_INFLIGHT = 1U << 31 };`).
-                    collect_enum_constants_from_compound(&func_def.body, name_table, &mut map);
-                }
-                _ => {}
-            }
-        }
-        map
-    };
-
-    eprintln!(
-        "[BCC-TIMING] ir-pass1.5-enums: {:.3}s",
-        _t15.elapsed().as_secs_f64()
     );
     // ====================================================================
     // Pass 2 — Function definitions (alloca-first pattern)
@@ -1428,6 +1447,79 @@ fn resolve_type_forward_refs_shallow(ty: &mut CType, tags: &FxHashMap<String, CT
             resolve_type_forward_refs_shallow(inner, tags);
         }
         _ => {} // Don't recurse into Pointer, Function, etc.
+    }
+}
+
+/// Recursively collect struct/union definitions from within a compound
+/// statement (function body). This handles function-local struct definitions
+/// like `void f() { struct S { int x; char y; }; ... }` which are not
+/// visible to the top-level struct collection pass.
+fn collect_struct_defs_from_compound(
+    compound: &ast::CompoundStatement,
+    name_table: &[String],
+    out: &mut FxHashMap<String, CType>,
+) {
+    for item in &compound.items {
+        match item {
+            ast::BlockItem::Declaration(decl) => {
+                collect_struct_defs_from_specifiers(
+                    &decl.specifiers.type_specifiers,
+                    name_table,
+                    out,
+                );
+            }
+            ast::BlockItem::Statement(stmt) => {
+                collect_struct_defs_from_statement(stmt, name_table, out);
+            }
+        }
+    }
+}
+
+/// Recursively collect struct/union definitions from a statement.
+fn collect_struct_defs_from_statement(
+    stmt: &ast::Statement,
+    name_table: &[String],
+    out: &mut FxHashMap<String, CType>,
+) {
+    match stmt {
+        ast::Statement::Compound(compound) => {
+            collect_struct_defs_from_compound(compound, name_table, out);
+        }
+        ast::Statement::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_struct_defs_from_statement(then_branch, name_table, out);
+            if let Some(eb) = else_branch {
+                collect_struct_defs_from_statement(eb, name_table, out);
+            }
+        }
+        ast::Statement::While { body, .. }
+        | ast::Statement::DoWhile { body, .. }
+        | ast::Statement::Switch { body, .. }
+        | ast::Statement::Labeled {
+            statement: body, ..
+        }
+        | ast::Statement::Case {
+            statement: body, ..
+        }
+        | ast::Statement::Default {
+            statement: body, ..
+        } => {
+            collect_struct_defs_from_statement(body, name_table, out);
+        }
+        ast::Statement::For { init, body, .. } => {
+            if let Some(ast::ForInit::Declaration(decl)) = init {
+                collect_struct_defs_from_specifiers(
+                    &decl.specifiers.type_specifiers,
+                    name_table,
+                    out,
+                );
+            }
+            collect_struct_defs_from_statement(body, name_table, out);
+        }
+        _ => {}
     }
 }
 

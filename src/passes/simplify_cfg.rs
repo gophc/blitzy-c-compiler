@@ -700,6 +700,66 @@ fn eliminate_empty_blocks(func: &mut IrFunction) -> bool {
                 continue;
             }
 
+            // Safety check: do NOT eliminate E if any of E's phi results
+            // are used in instructions outside of E and outside of T's phi
+            // incoming values.
+            //
+            // When E has a phi like `v617 = phi [v1, bb1], [v2, bb14], [v3, bb15]`
+            // and v617 is used in a return statement at a distant block (e.g.,
+            // `return v617` at the function exit), eliminating E would remove
+            // the phi instruction but leave the dangling reference to v617.
+            // The existing phi resolution only handles T's phi nodes, not
+            // arbitrary uses of E's phi results throughout the function.
+            let e_phi_results: FxHashSet<Value> = func.blocks[e_idx]
+                .instructions
+                .iter()
+                .filter_map(|inst| {
+                    if let Instruction::Phi { result, .. } = inst {
+                        Some(*result)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            if !e_phi_results.is_empty() {
+                let mut phi_used_outside = false;
+                // Check if any phi result is used in blocks other than E itself
+                for (bi, blk) in func.blocks.iter().enumerate() {
+                    if bi == e_idx {
+                        continue;
+                    }
+                    for inst in blk.instructions.iter() {
+                        // For phi nodes in T, the phi_resolution already handles the
+                        // incoming values. But check uses in non-phi instructions.
+                        let is_phi_incoming_in_t = bi == t_idx && inst.is_phi();
+                        if is_phi_incoming_in_t {
+                            // Phi incoming values in T are handled by the resolution.
+                            // But check if ANY phi result from E is used as a non-incoming
+                            // operand (e.g., used in the phi's own result).
+                            continue;
+                        }
+                        // Check all operands of this instruction for uses of E's phi results.
+                        let operands = inst.operands();
+                        for &op in &operands {
+                            if e_phi_results.contains(&op) {
+                                phi_used_outside = true;
+                                break;
+                            }
+                        }
+                        if phi_used_outside {
+                            break;
+                        }
+                    }
+                    if phi_used_outside {
+                        break;
+                    }
+                }
+                if phi_used_outside {
+                    continue;
+                }
+            }
+
             // --- Bypass E ---
 
             // 1. Redirect each predecessor P to target T directly.

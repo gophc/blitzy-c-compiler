@@ -1072,7 +1072,12 @@ impl RiscV64InstructionSelector {
         // Shift left by 32
         result.push(RvInstruction::i_type(RvOpcode::SLLI, rd, rd, 32));
 
-        // Add lower 32 bits if non-zero
+        // Add lower 32 bits if non-zero.
+        //
+        // On RV64, LUI sign-extends the 32-bit result into 64 bits.  If
+        // bit 31 of the lower 32 bits is set (e.g. lower32 = 0xFFFF0000),
+        // LUI produces a negative 64-bit value.  We must zero-extend T0
+        // with SLLI+SRLI before adding it to the shifted upper portion.
         if lower32_u != 0 {
             // Decompose lower 32 bits: upper 20 + lower 12
             let lo_raw = lower32_u as i64;
@@ -1085,9 +1090,32 @@ impl RiscV64InstructionSelector {
                 if lo_lo != 0 {
                     result.push(RvInstruction::i_type(RvOpcode::ADDI, T0, T0, lo_lo));
                 }
+                // If bit 31 of the lower 32 is set, LUI sign-extends on
+                // RV64 and contaminates the upper 32 bits.  Zero-extend
+                // T0 with a SLLI+SRLI pair to clear the upper 32 bits.
+                if lower32_u & 0x8000_0000 != 0 {
+                    result.push(RvInstruction::i_type(RvOpcode::SLLI, T0, T0, 32));
+                    result.push(RvInstruction::i_type(RvOpcode::SRLI, T0, T0, 32));
+                }
                 result.push(RvInstruction::r_type(RvOpcode::ADD, rd, rd, T0));
             } else if lo_lo != 0 {
-                result.push(RvInstruction::i_type(RvOpcode::ADDI, rd, rd, lo_lo));
+                // lo_lo fits in 12 bits — ADDI sign-extends, but since
+                // lo_hi == 0 the value is small enough that no upper-bit
+                // contamination occurs (< 2048 or >= -2048 in the low
+                // portion means bit 31 is not set from LUI).
+                // However, if bit 11 is set in lo_lo, ADDI sign-extends
+                // it to fill bits 12-63 of the result.  When the destination
+                // is rd (which holds the upper portion shifted by 32),
+                // this sign-extension contaminates the result.  Use T0
+                // and zero-extend when lo_lo is negative.
+                if lo_lo < 0 {
+                    result.push(RvInstruction::i_type(RvOpcode::ADDI, T0, ZERO, lo_lo));
+                    result.push(RvInstruction::i_type(RvOpcode::SLLI, T0, T0, 32));
+                    result.push(RvInstruction::i_type(RvOpcode::SRLI, T0, T0, 32));
+                    result.push(RvInstruction::r_type(RvOpcode::ADD, rd, rd, T0));
+                } else {
+                    result.push(RvInstruction::i_type(RvOpcode::ADDI, rd, rd, lo_lo));
+                }
             }
         }
     }
@@ -2723,8 +2751,24 @@ impl RiscV64InstructionSelector {
                     } else {
                         let rd = self.dest_reg(*result, ty);
                         if let Some(&imm) = self.constant_values.get(&result.index()) {
-                            // Use LI (LUI+ADDI) to materialize the integer constant.
-                            let insts = self.materialize_immediate(rd, imm);
+                            // On RV64, all 32-bit (and smaller) integer
+                            // values in registers must be sign-extended to
+                            // 64 bits.  W-suffix instructions (ADDW, SUBW,
+                            // NEGW, etc.) always sign-extend their 32-bit
+                            // result, so computed values already satisfy
+                            // this invariant.  But raw i64 constant values
+                            // stored in the IR may be zero-extended (e.g.
+                            // unsigned int 0xFFFFFFF8 stored as i64
+                            // 4294967288 = 0x00000000_FFFFFFF8).  We must
+                            // sign-extend to match the register convention.
+                            let imm_adjusted = match ty {
+                                IrType::I1 => imm & 1,
+                                IrType::I8 => (imm as i8) as i64,
+                                IrType::I16 => (imm as i16) as i64,
+                                IrType::I32 => (imm as i32) as i64,
+                                _ => imm,
+                            };
+                            let insts = self.materialize_immediate(rd, imm_adjusted);
                             for inst in insts {
                                 self.emit(inst);
                             }
@@ -2739,6 +2783,28 @@ impl RiscV64InstructionSelector {
                     let lhs_reg = self.src_reg(*lhs);
                     let rd = self.dest_reg(*result, ty);
                     self.emit_i(RvOpcode::XORI, rd, lhs_reg, -1i64 as i32 as i64);
+                } else if *op == BinOp::Sub && *lhs == Value::UNDEF {
+                    // Negation: Sub(UNDEF, operand) → SUB rd, x0, rs
+                    // The IR builder encodes negation as `0 - operand` with
+                    // Value::UNDEF as the zero placeholder.  On RISC-V we
+                    // use the hardware zero register (x0) directly.
+                    let rhs_reg = self.src_reg(*rhs);
+                    let rd = self.dest_reg(*result, ty);
+                    if matches!(ty, IrType::I32) {
+                        self.emit_r(RvOpcode::SUBW, rd, ZERO, rhs_reg);
+                    } else {
+                        self.emit_r(RvOpcode::SUB, rd, ZERO, rhs_reg);
+                    }
+                } else if *op == BinOp::FSub && *lhs == Value::UNDEF {
+                    // Float negation: FSub(UNDEF, operand) → FNEG rd, rs
+                    // Encoded as FSGNJN rd, rs, rs (sign-inject-negate).
+                    let rhs_reg = self.vmap.get_reg(*rhs);
+                    let rd = self.vmap.alloc_fpr(*result);
+                    if matches!(ty, IrType::F32) {
+                        self.emit_r(RvOpcode::FSGNJN_S, rd, rhs_reg, rhs_reg);
+                    } else {
+                        self.emit_r(RvOpcode::FSGNJN_D, rd, rhs_reg, rhs_reg);
+                    }
                 } else {
                     let lhs_reg = self.src_reg(*lhs);
                     let rhs_reg = self.src_reg(*rhs);
@@ -2939,10 +3005,12 @@ impl RiscV64InstructionSelector {
                 result,
                 value,
                 to_type,
+                source_unsigned,
                 span: _,
             } => {
                 let src = self.src_reg(*value);
                 let rd = self.dest_reg(*result, to_type);
+                let _is_unsigned = *source_unsigned;
                 // BitCast: reinterpret bits, no conversion
                 if rd != src {
                     if Self::uses_fpr(to_type) && is_gpr(src) {
@@ -2988,12 +3056,12 @@ impl RiscV64InstructionSelector {
                 result,
                 value,
                 to_type,
-                from_type: _,
+                from_type,
                 span: _,
             } => {
                 let src = self.src_reg(*value);
                 let rd = self.vmap.alloc_gpr(*result);
-                self.emit_conversion(rd, src, &IrType::I32, to_type);
+                self.emit_conversion(rd, src, from_type, to_type);
                 self.value_types.insert(result.index(), to_type.clone());
             }
 
@@ -3001,29 +3069,31 @@ impl RiscV64InstructionSelector {
                 result,
                 value,
                 to_type,
-                from_type: _,
+                from_type,
                 span: _,
             } => {
                 let src = self.src_reg(*value);
                 let rd = self.vmap.alloc_gpr(*result);
-                // Sign extension: use SLLI+SRAI pattern
-                // Infer source width from current register width (heuristic)
-                // Default: sign-extend from 32 to 64
-                match to_type {
-                    IrType::I64 | IrType::Ptr => {
-                        // ADDIW sign-extends 32→64
-                        self.emit_i(RvOpcode::ADDIW, rd, src, 0);
-                    }
-                    IrType::I32 => {
-                        // Sign-extend from smaller type
-                        self.emit_i(RvOpcode::SLLI, rd, src, 48);
-                        self.emit_i(RvOpcode::SRAI, rd, rd, 48);
-                    }
-                    _ => {
-                        if rd != src {
-                            self.emit_i(RvOpcode::ADDI, rd, src, 0);
-                        }
-                    }
+                // Sign extension: use SLLI+SRAI to replicate the sign
+                // bit of the source width across the destination width.
+                // The shift amount is (64 - source_bits).
+                let shift = match from_type {
+                    IrType::I1 => 63,
+                    IrType::I8 => 56,
+                    IrType::I16 => 48,
+                    IrType::I32 => 32,
+                    _ => 0,
+                };
+                if shift == 32 {
+                    // ADDIW is the canonical I32→I64 sign extension on
+                    // RV64: it takes the low 32 bits of src and sign-
+                    // extends them to 64 bits.
+                    self.emit_i(RvOpcode::ADDIW, rd, src, 0);
+                } else if shift > 0 {
+                    self.emit_i(RvOpcode::SLLI, rd, src, shift);
+                    self.emit_i(RvOpcode::SRAI, rd, rd, shift);
+                } else if rd != src {
+                    self.emit_i(RvOpcode::ADDI, rd, src, 0);
                 }
                 self.value_types.insert(result.index(), to_type.clone());
             }
@@ -3069,6 +3139,18 @@ impl RiscV64InstructionSelector {
                     _ => {}
                 }
                 self.value_types.insert(result.index(), to_type.clone());
+            }
+
+            // ----- StackAlloc (dynamic stack allocation: __builtin_alloca) -----
+            Instruction::StackAlloc { result, size, .. } => {
+                let size_reg = self.src_reg(*size);
+                let rd = self.vmap.alloc_gpr(*result);
+                // SUB SP, SP, size_reg
+                self.emit_r(RvOpcode::SUB, SP, SP, size_reg);
+                // ANDI SP, SP, -16  (align to 16 bytes)
+                self.emit_i(RvOpcode::ANDI, SP, SP, -16);
+                // MV result, SP  (encoded as ADDI rd, SP, 0)
+                self.emit_i(RvOpcode::ADDI, rd, SP, 0);
             }
 
             Instruction::InlineAsm {

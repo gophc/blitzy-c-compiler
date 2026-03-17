@@ -697,25 +697,6 @@ pub fn allocate_registers(
     // Active list: indices into `intervals`, maintained sorted by end point.
     let mut active: Vec<usize> = Vec::new();
 
-    let debug_regalloc = std::env::var("BCC_DEBUG_REGALLOC").is_ok();
-    if debug_regalloc {
-        eprintln!("=== REGALLOC INTERVALS ===");
-        for iv in intervals.iter() {
-            eprintln!(
-                "  v{}: [{}, {}] {:?} cross_call={}",
-                iv.vreg.index(),
-                iv.start,
-                iv.end,
-                iv.reg_class,
-                iv.crosses_call
-            );
-        }
-        eprintln!(
-            "=== GPR pool: {:?} ===",
-            free_gpr.iter().map(|r| r.0).collect::<Vec<_>>()
-        );
-    }
-
     for i in 0..intervals.len() {
         let cur_start = intervals[i].start;
 
@@ -758,15 +739,6 @@ pub fn allocate_registers(
             // Register available — assign it.
             intervals[i].assigned = Some(reg);
             assignments.insert(intervals[i].vreg, reg);
-            if debug_regalloc {
-                eprintln!(
-                    "  ASSIGN v{} [{},{}] -> r{}",
-                    intervals[i].vreg.index(),
-                    intervals[i].start,
-                    intervals[i].end,
-                    reg.0
-                );
-            }
 
             if reg_info.callee_saved.contains(&reg) {
                 callee_saved_used.insert(reg);
@@ -790,18 +762,6 @@ pub fn allocate_registers(
             if let Some(far_idx) = spill_candidate {
                 if intervals[far_idx].end > intervals[i].end {
                     // Spill the farther interval; re-use its register.
-                    if debug_regalloc {
-                        eprintln!(
-                            "  SPILL-FAR v{} [{},{}] (was r{}), give to v{} [{},{}]",
-                            intervals[far_idx].vreg.index(),
-                            intervals[far_idx].start,
-                            intervals[far_idx].end,
-                            intervals[far_idx].assigned.unwrap().0,
-                            intervals[i].vreg.index(),
-                            intervals[i].start,
-                            intervals[i].end
-                        );
-                    }
                     let reg = intervals[far_idx].assigned.take().unwrap();
                     assignments.remove(&intervals[far_idx].vreg);
 

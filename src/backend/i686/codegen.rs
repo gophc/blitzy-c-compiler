@@ -1597,6 +1597,32 @@ impl I686Codegen {
                 value_map.insert(result.index(), MachineOperand::VirtualRegister(vreg));
             }
 
+            // ----- StackAlloc (dynamic stack allocation: __builtin_alloca) -----
+            Instruction::StackAlloc { result, size, .. } => {
+                let vreg = vregs.alloc();
+                // Resolve size operand
+                let size_op = self.resolve_operand(size, value_map, alloca_offsets);
+                // SUB ESP, size
+                out.push(
+                    MachineInstruction::new(I686_SUB)
+                        .with_operand(MachineOperand::Register(registers::ESP))
+                        .with_operand(size_op),
+                );
+                // AND ESP, -16  (align to 16 bytes)
+                out.push(
+                    MachineInstruction::new(I686_AND)
+                        .with_operand(MachineOperand::Register(registers::ESP))
+                        .with_operand(MachineOperand::Immediate(-16i64)),
+                );
+                // MOV result, ESP
+                out.push(
+                    MachineInstruction::new(I686_MOV)
+                        .with_operand(MachineOperand::VirtualRegister(vreg))
+                        .with_operand(MachineOperand::Register(registers::ESP)),
+                );
+                value_map.insert(result.index(), MachineOperand::VirtualRegister(vreg));
+            }
+
             // ----- Inline assembly -----
             Instruction::InlineAsm { result, .. } => {
                 let vreg = vregs.alloc();

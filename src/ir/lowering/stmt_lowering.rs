@@ -480,8 +480,16 @@ fn ctypes_compatible_for_scope_shadowing(a: &CType, b: &CType, target: &Target) 
         // Named union — same tag means same type.
         (CType::Union { name: Some(na), .. }, CType::Union { name: Some(nb), .. }) => na == nb,
         // Array — recurse into element type and compare sizes.
+        // When one side has None (unsized array, e.g. `T arr[]`), treat
+        // it as compatible with any sized variant — the pre-scan may have
+        // already inferred the size from the initializer while
+        // resolve_declaration_type preserves the raw unsized form.
         (CType::Array(ea, sa), CType::Array(eb, sb)) => {
-            sa == sb && ctypes_compatible_for_scope_shadowing(ea, eb, target)
+            let sizes_compatible = match (sa, sb) {
+                (Some(a), Some(b)) => a == b,
+                _ => true,
+            };
+            sizes_compatible && ctypes_compatible_for_scope_shadowing(ea, eb, target)
         }
         // Pointer — recurse into pointee type.
         (CType::Pointer(pa, _), CType::Pointer(pb, _)) => {
@@ -584,6 +592,7 @@ pub fn ensure_allocas_for_declaration(ctx: &mut StmtLoweringContext<'_>, decl: &
                     ctx.type_builder,
                     ctx.diagnostics,
                     ctx.name_table,
+                    ctx.enum_constants,
                 )
             } else {
                 Some(crate::ir::module::Constant::ZeroInit)
@@ -650,12 +659,16 @@ pub fn ensure_allocas_for_declaration(ctx: &mut StmtLoweringContext<'_>, decl: &
             if !types_match {
                 // Scope shadowing: create a new alloca with the correct type
                 // and update both local_vars and scope_type_overrides.
+                // Resolve forward-referenced struct/union tags so the alloca
+                // gets the correct struct field layout and size.
                 let sized_c_type = infer_array_size_from_init(
                     &c_type,
                     init_decl.initializer.as_ref(),
                     ctx.name_table,
                 );
-                let ir_type = IrType::from_ctype(&sized_c_type, ctx.target);
+                let resolved_c_type =
+                    decl_lowering::resolve_sizeof_struct_ref_pub(sized_c_type.clone(), ctx.target);
+                let ir_type = IrType::from_ctype(&resolved_c_type, ctx.target);
                 let (alloca_val, alloca_inst) = ctx.builder.build_alloca(ir_type, decl.span);
                 ctx.function.entry_block_mut().push_alloca(alloca_inst);
                 ctx.local_vars.insert(var_name.clone(), alloca_val);
@@ -667,9 +680,13 @@ pub fn ensure_allocas_for_declaration(ctx: &mut StmtLoweringContext<'_>, decl: &
         // For unsized arrays (e.g., `char data[] = "hello"` or `int a[] = {1,2,3}`),
         // infer the size from the initializer BEFORE creating the alloca so that
         // the frame layout allocates the correct number of bytes.
+        // Also resolve forward-referenced struct/union tags so the alloca
+        // gets the correct struct field layout and size.
         let c_type =
             infer_array_size_from_init(&c_type, init_decl.initializer.as_ref(), ctx.name_table);
-        let ir_type = IrType::from_ctype(&c_type, ctx.target);
+        let resolved_c_type =
+            decl_lowering::resolve_sizeof_struct_ref_pub(c_type.clone(), ctx.target);
+        let ir_type = IrType::from_ctype(&resolved_c_type, ctx.target);
         let (alloca_val, alloca_inst) = ctx.builder.build_alloca(ir_type, decl.span);
         ctx.function.entry_block_mut().push_alloca(alloca_inst);
         ctx.local_vars.insert(var_name.clone(), alloca_val);

@@ -1126,7 +1126,29 @@ impl<'a> ConstantEvaluator<'a> {
     /// expression. In a full semantic analyser, this would use the type
     /// checker. Here we handle common literal cases and produce an error
     /// for expressions whose type cannot be determined statically.
+    /// Strip parenthesized wrappers from an expression for pattern matching.
+    fn strip_parens(expr: &Expression) -> &Expression {
+        match expr {
+            Expression::Parenthesized { inner, .. } => Self::strip_parens(inner),
+            _ => expr,
+        }
+    }
+
     fn evaluate_sizeof_expr(&mut self, operand: &Expression, span: Span) -> Result<ConstValue, ()> {
+        // C11 §6.3.2.1p3: sizeof suppresses the array-to-pointer decay.
+        // String literals have type char[N], not char *.
+        // Handle string literals specially before infer_expr_type (which
+        // returns Pointer for string literals in general-expression context).
+        let expr_no_parens = Self::strip_parens(operand);
+        if let Expression::StringLiteral { segments, .. } = expr_no_parens {
+            // String literal type is char[N] where N = total byte length + 1 (null).
+            // Multiple segments (from adjacent string literal concatenation) are summed.
+            let total_bytes: usize = segments.iter().map(|s| s.value.len()).sum();
+            let len = total_bytes + 1; // +1 for null terminator
+            let arr_ty = CType::Array(Box::new(CType::Char), Some(len));
+            let size = sizeof_ctype_resolved(&arr_ty, &self.target, &self.tag_types_by_name);
+            return Ok(ConstValue::UnsignedInt(size as u128));
+        }
         // Try to infer the type of the expression for sizeof
         let ctype = self.infer_expr_type(operand, span)?;
         let size = sizeof_ctype_resolved(&ctype, &self.target, &self.tag_types_by_name);

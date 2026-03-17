@@ -278,6 +278,38 @@ impl<'src> Parser<'src> {
         &self.current.kind
     }
 
+    /// Returns `true` if the current token looks like the start of a type
+    /// specifier — used for detecting K&R-style parameter declarations.
+    pub fn is_type_specifier_start(&self) -> bool {
+        matches!(
+            self.current.kind,
+            TokenKind::Void
+                | TokenKind::Char
+                | TokenKind::Short
+                | TokenKind::Int
+                | TokenKind::Long
+                | TokenKind::Float
+                | TokenKind::Double
+                | TokenKind::Signed
+                | TokenKind::Unsigned
+                | TokenKind::Bool
+                | TokenKind::Complex
+                | TokenKind::Struct
+                | TokenKind::Union
+                | TokenKind::Enum
+                | TokenKind::Const
+                | TokenKind::Volatile
+                | TokenKind::Restrict
+                | TokenKind::Atomic
+                | TokenKind::Typeof
+                | TokenKind::Register
+                | TokenKind::Static
+                | TokenKind::Extern
+                | TokenKind::Attribute
+                | TokenKind::Extension
+        ) || matches!(&self.current.kind, TokenKind::Identifier(sym) if self.is_typedef_name(*sym))
+    }
+
     /// Peek at the *n*-th future token (0 = the token after `current`).
     ///
     /// This supports multi-token lookahead for disambiguation (e.g.,
@@ -751,7 +783,17 @@ impl<'src> Parser<'src> {
         let declarator = declarations::parse_declarator(self)?;
 
         // Detect function definition: specifiers declarator `{` body `}`.
-        if self.check(&TokenKind::LeftBrace) {
+        // Also detect K&R-style function definitions where parameter type
+        // declarations appear between the declarator and the opening brace:
+        //   int f(a, b) int a; double b; { ... }
+        let is_function_declarator = declarator.has_function_suffix();
+        let is_knr_style = is_function_declarator
+            && !self.check(&TokenKind::Semicolon)
+            && !self.check(&TokenKind::Comma)
+            && !self.check(&TokenKind::Equal)
+            && !self.check(&TokenKind::LeftBrace)
+            && self.is_type_specifier_start();
+        if self.check(&TokenKind::LeftBrace) || is_knr_style {
             let func_def = declarations::parse_function_definition(self, specifiers, declarator)?;
             return Ok(ExternalDeclaration::FunctionDefinition(Box::new(func_def)));
         }

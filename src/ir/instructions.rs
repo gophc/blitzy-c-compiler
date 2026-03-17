@@ -349,6 +349,21 @@ pub enum Instruction {
         span: Span,
     },
 
+    /// Dynamic stack allocation (`alloca(size)` / `__builtin_alloca`).
+    ///
+    /// Adjusts the stack pointer at runtime by `size` bytes (with proper
+    /// alignment) and returns a pointer to the allocated region.  Unlike
+    /// `Alloca`, the size is a runtime-computed value, not a compile-time
+    /// type.
+    StackAlloc {
+        /// SSA result value (pointer to allocated memory).
+        result: Value,
+        /// Runtime size value (in bytes).
+        size: Value,
+        /// Source location.
+        span: Span,
+    },
+
     /// Load a value from a memory address.
     ///
     /// Reads `ty`-sized data from the pointer `ptr`.  When `volatile` is
@@ -561,6 +576,8 @@ pub enum Instruction {
         value: Value,
         /// Target type (same size as source type).
         to_type: IrType,
+        /// Whether the source integer is unsigned (for int→float / float→int).
+        source_unsigned: bool,
         /// Source location.
         span: Span,
     },
@@ -685,6 +702,7 @@ impl Instruction {
     pub fn result(&self) -> Option<Value> {
         match self {
             Instruction::Alloca { result, .. }
+            | Instruction::StackAlloc { result, .. }
             | Instruction::Load { result, .. }
             | Instruction::BinOp { result, .. }
             | Instruction::ICmp { result, .. }
@@ -715,6 +733,7 @@ impl Instruction {
     pub fn span(&self) -> Span {
         match self {
             Instruction::Alloca { span, .. }
+            | Instruction::StackAlloc { span, .. }
             | Instruction::Load { span, .. }
             | Instruction::Store { span, .. }
             | Instruction::BinOp { span, .. }
@@ -794,6 +813,7 @@ impl Instruction {
     pub fn operands(&self) -> Vec<Value> {
         match self {
             Instruction::Alloca { .. } => vec![],
+            Instruction::StackAlloc { size, .. } => vec![*size],
 
             Instruction::Load { ptr, .. } => vec![*ptr],
 
@@ -848,6 +868,7 @@ impl Instruction {
     pub fn operands_mut(&mut self) -> Vec<&mut Value> {
         match self {
             Instruction::Alloca { .. } => vec![],
+            Instruction::StackAlloc { size, .. } => vec![size],
 
             Instruction::Load { ptr, .. } => vec![ptr],
 
@@ -969,6 +990,10 @@ impl fmt::Display for Instruction {
                     write!(f, ", align {}", align)?;
                 }
                 Ok(())
+            }
+
+            Instruction::StackAlloc { result, size, .. } => {
+                write!(f, "{} = stackalloc {}", result, size)
             }
 
             Instruction::Load {

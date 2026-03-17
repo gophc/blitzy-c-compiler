@@ -952,6 +952,19 @@ impl ArchCodegen for AArch64Codegen {
         // later to account for spill slots.
         mf.frame_size = selector.get_locals_size();
 
+        // Record parameter-copy MOV count so the post-register-allocation
+        // parallel-move resolver knows how many MOVs at the entry-block
+        // head are parameter copies (not regular codegen instructions).
+        mf.num_param_moves = selector.get_num_param_moves();
+
+        // Propagate variadic function metadata to MachineFunction so the
+        // prologue can save X0-X7 and va_start can compute the correct
+        // address of the first unnamed argument.
+        if let Some(offset) = selector.get_vararg_save_offset() {
+            mf.va_save_area_offset = Some(offset as i32);
+            mf.named_gpr_count = selector.get_named_gpr_count();
+        }
+
         // Build vreg → IR Value mapping so that apply_allocation_result can
         // translate codegen virtual register numbers back to the register
         // allocator's Value-indexed assignment table.
@@ -960,6 +973,20 @@ impl ArchCodegen for AArch64Codegen {
         // avoid collision with AArch64 physical register IDs 0–63.  The
         // register allocator indexes assignments by IR Value directly, so
         // this mapping bridges the two numbering schemes.
+        // Map function parameters first — their SSA Values have
+        // corresponding virtual registers (param.value.index() + VREG_BASE)
+        // produced by emit_arg_setup.  Without this, apply_allocation_result
+        // cannot resolve the parameter MOV instructions' VirtualRegister
+        // operands to their allocator-assigned physical registers.
+        for param in &func.params {
+            if param.value != crate::ir::instructions::Value::UNDEF {
+                let vreg_id = param.value.index() + 64; // VREG_BASE
+                mf.vreg_to_ir_value.insert(vreg_id, param.value);
+            }
+        }
+
+        // Map instruction results — each IR instruction that produces a
+        // result value has a corresponding virtual register.
         for block in &func.blocks {
             for inst in block.instructions() {
                 if let Some(result) = inst.result() {
@@ -1186,6 +1213,28 @@ impl ArchCodegen for AArch64Codegen {
             mi.operands.push(MachineOperand::Immediate(0));
             mi.operand_size = 8;
             prologue.push(mi);
+        }
+
+        // For variadic functions: save X0-X7 to the vararg save area at
+        // [FP+16..FP+80].  va_start later points to [FP + 16 + named*8].
+        if mf.va_save_area_offset.is_some() {
+            // Save X0-X7 as 4 STP pairs.
+            let arg_regs: [(u16, u16); 4] = [(0, 1), (2, 3), (4, 5), (6, 7)];
+            let mut off = 16i64;
+            for &(r1, r2) in &arg_regs {
+                let mut mi = MachineInstruction::new(OPCODE_STP);
+                mi.operands.push(MachineOperand::Register(r1));
+                mi.operands.push(MachineOperand::Register(r2));
+                mi.operands.push(MachineOperand::Memory {
+                    base: Some(fp),
+                    index: None,
+                    scale: 1,
+                    displacement: off,
+                });
+                mi.operand_size = 8;
+                prologue.push(mi);
+                off += 16;
+            }
         }
 
         // Step 3: Save callee-saved registers in pairs.
@@ -2139,7 +2188,7 @@ mod tests {
     fn test_register_info() {
         let codegen = AArch64Codegen::new(false, false);
         let info = codegen.register_info();
-        assert_eq!(info.allocatable_gpr.len(), 28); // X16 reserved as scratch
+        assert_eq!(info.allocatable_gpr.len(), 27); // X16 (IP0), X17 (IP1) reserved as scratch
         assert_eq!(info.allocatable_fpr.len(), 32);
         assert_eq!(info.callee_saved.len(), 18);
         assert_eq!(info.argument_gpr.len(), 8);

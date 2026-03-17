@@ -99,6 +99,7 @@ pub fn lower_global_variable(
     type_builder: &TypeBuilder,
     diagnostics: &mut DiagnosticEngine,
     name_table: &[String],
+    enum_constants: &FxHashMap<String, i128>,
 ) {
     let specifiers = &decl.specifiers;
     let storage_class = specifiers.storage_class;
@@ -165,6 +166,7 @@ pub fn lower_global_variable(
                 type_builder,
                 diagnostics,
                 name_table,
+                enum_constants,
             );
             (constant, true)
         } else if matches!(storage_class, Some(ast::StorageClass::Extern)) || is_function_type {
@@ -357,19 +359,39 @@ pub fn lower_function_definition(
 
     let mut builder = IrBuilder::new();
 
-    // Build parameter list with SSA values.
+    // Build parameter list with SSA values, and collect C-level param types
+    // for correct implicit conversions in `lower_function_call`.
     let mut ir_params = Vec::with_capacity(param_declarations.len());
+    let mut c_param_types = Vec::with_capacity(param_declarations.len());
     for param_decl in &param_declarations {
         let param_name = extract_param_name(param_decl, name_table);
         let mut param_c_type = resolve_param_type(param_decl, target, name_table);
+        // C11 §6.7.6.3p7: Parameter type adjustments — array→pointer, function→pointer.
+        param_c_type = match param_c_type {
+            CType::Array(elem, _) => {
+                CType::Pointer(elem, crate::common::types::TypeQualifiers::default())
+            }
+            CType::Function { .. } => CType::Pointer(
+                Box::new(param_c_type),
+                crate::common::types::TypeQualifiers::default(),
+            ),
+            other => other,
+        };
         // Resolve struct forward references so the IR type has the full
         // field layout — required for correct ABI classification (e.g.,
         // 16-byte structs passed in register pairs).
         resolve_struct_forward_ref(&mut param_c_type, struct_defs);
+        c_param_types.push(param_c_type.clone());
         let param_ir_type = IrType::from_ctype(&param_c_type, target);
         let param_value = builder.fresh_value();
         ir_params.push(FunctionParam::new(param_name, param_ir_type, param_value));
     }
+
+    // Store C-level parameter types so `lower_function_call` can insert
+    // correct implicit conversions (e.g. sign-extend int → long long).
+    module
+        .func_c_param_types
+        .insert(func_name.clone(), c_param_types);
 
     // Create IrFunction.
     let mut ir_function = IrFunction::new(func_name.clone(), ir_params, return_ir_type.clone());
@@ -458,6 +480,7 @@ pub fn lower_function_definition(
                 target,
                 type_builder,
                 diagnostics,
+                enum_constants,
             );
         }
     }
@@ -498,10 +521,22 @@ pub fn lower_function_definition(
     // Add parameter types as well — resolve struct forward references so
     // that `struct Item *arr` parameter types carry the full struct layout,
     // enabling correct sizeof computation for pointer arithmetic.
+    // C11 §6.7.6.3p7: parameter type adjustments (array→pointer, function→pointer).
     for param_decl in &param_declarations {
         let pname = extract_param_name(param_decl, name_table);
         if !pname.is_empty() {
             let mut ptype = resolve_param_type(param_decl, target, name_table);
+            // Array-to-pointer / function-to-pointer decay for parameter types.
+            ptype = match ptype {
+                CType::Array(elem, _) => {
+                    CType::Pointer(elem, crate::common::types::TypeQualifiers::default())
+                }
+                CType::Function { .. } => CType::Pointer(
+                    Box::new(ptype),
+                    crate::common::types::TypeQualifiers::default(),
+                ),
+                other => other,
+            };
             resolve_struct_forward_ref(&mut ptype, struct_defs);
             local_types.insert(pname, ptype);
         }
@@ -619,13 +654,22 @@ pub fn lower_function_declaration(
             .or_insert_with(|| return_c_type.clone());
 
         let (param_decls, is_variadic) = extract_function_params(declarator);
+        let mut c_param_types_decl = Vec::with_capacity(param_decls.len());
         let param_types: Vec<IrType> = param_decls
             .iter()
             .map(|pd| {
                 let param_c_type = resolve_param_type(pd, target, name_table);
+                c_param_types_decl.push(param_c_type.clone());
                 IrType::from_ctype(&param_c_type, target)
             })
             .collect();
+
+        // Store C-level parameter types so `lower_function_call` can insert
+        // correct implicit conversions (e.g. sign-extend int → long long).
+        module
+            .func_c_param_types
+            .entry(func_name.clone())
+            .or_insert(c_param_types_decl);
 
         let attributes = &specifiers.attributes;
         let linkage = determine_linkage(specifiers.storage_class, attributes, name_table);
@@ -657,21 +701,112 @@ pub fn lower_local_initializer(
 ) {
     match initializer {
         ast::Initializer::Expression(expr) => {
-            // Lower the expression and get its C type so we can insert
-            // an implicit conversion when the variable type differs.
-            // This is critical for cases like `char *p = 0;` where the
-            // literal 0 has type `int` (I32) but the variable needs a
-            // pointer-width (I64) store to initialize all 8 bytes.
-            let typed_val = expr_lowering::lower_expression_typed(ctx, expr);
-            let init_val = expr_lowering::insert_implicit_conversion(
-                ctx,
-                typed_val.value,
-                &typed_val.ty,
-                var_type,
-                Span::dummy(),
-            );
-            let store_inst = ctx.builder.build_store(init_val, var_alloca, Span::dummy());
-            emit_inst_to_ctx(ctx, store_inst);
+            // ---------------------------------------------------------------
+            // Special case: char/unsigned-char array initialized from a
+            // string literal — `char a[4] = "abc"`.
+            //
+            // The expression evaluates to a *pointer* to the .rodata string
+            // constant, but C semantics require *copying* the string bytes
+            // into the local array (with zero-fill for any remaining
+            // elements).  We detect this pattern here and emit byte-by-byte
+            // stores (coalesced into word-size stores for efficiency).
+            // ---------------------------------------------------------------
+            let mut resolved_var_ty = var_type.clone();
+            expr_lowering::resolve_forward_ref_type(&mut resolved_var_ty, ctx.struct_defs);
+
+            if let Some((elem_ty, arr_size)) = is_char_array_type(&resolved_var_ty) {
+                if let Some(str_bytes) = extract_string_literal_bytes(expr) {
+                    lower_char_array_from_string(
+                        var_alloca, &str_bytes, arr_size, &elem_ty, ctx,
+                    );
+                    return;
+                }
+            }
+
+            // For aggregate types (struct/union) larger than 8 bytes,
+            // the backend cannot load/store the entire aggregate through
+            // a single register.  Instead we get the source as an lvalue
+            // (pointer) and emit chunk-by-chunk load/store pairs, exactly
+            // as the assignment path does in expr_lowering::lower_assignment.
+            let is_agg = crate::common::types::is_struct_or_union(&resolved_var_ty);
+            let struct_size = if is_agg {
+                crate::common::types::sizeof_ctype(&resolved_var_ty, ctx.target)
+            } else {
+                0
+            };
+            if is_agg && struct_size > 8 {
+                // Get the RHS as an lvalue (pointer) — do NOT dereference.
+                let rhs_ptr = expr_lowering::lower_lvalue(ctx, expr);
+
+                // Emit individual 8-byte load/store pairs to copy the
+                // aggregate from source to destination.
+                let span = Span::dummy();
+                let mut offset: usize = 0;
+                while offset < struct_size {
+                    let remaining = struct_size - offset;
+                    let (chunk_sz, chunk_ir) = if remaining >= 8 {
+                        (8, IrType::I64)
+                    } else if remaining >= 4 {
+                        (4, IrType::I32)
+                    } else if remaining >= 2 {
+                        (2, IrType::I16)
+                    } else {
+                        (1, IrType::I8)
+                    };
+
+                    // Compute source address: rhs_ptr + offset
+                    let src_addr = if offset == 0 {
+                        rhs_ptr
+                    } else {
+                        let off_val = make_index_value(ctx, offset as i64);
+                        let (gep_val, gep_inst) =
+                            ctx.builder
+                                .build_gep(rhs_ptr, vec![off_val], chunk_ir.clone(), span);
+                        emit_inst_to_ctx(ctx, gep_inst);
+                        gep_val
+                    };
+
+                    // Load chunk from source.
+                    let (loaded, li) = ctx.builder.build_load(src_addr, chunk_ir.clone(), span);
+                    emit_inst_to_ctx(ctx, li);
+
+                    // Compute destination address: var_alloca + offset
+                    let dst_addr = if offset == 0 {
+                        var_alloca
+                    } else {
+                        let off_val2 = make_index_value(ctx, offset as i64);
+                        let (gep_val2, gep_inst2) = ctx.builder.build_gep(
+                            var_alloca,
+                            vec![off_val2],
+                            chunk_ir.clone(),
+                            span,
+                        );
+                        emit_inst_to_ctx(ctx, gep_inst2);
+                        gep_val2
+                    };
+
+                    // Store chunk to destination.
+                    let si = ctx.builder.build_store(loaded, dst_addr, span);
+                    emit_inst_to_ctx(ctx, si);
+
+                    offset += chunk_sz;
+                }
+            } else {
+                // Scalar or small-aggregate (≤8 bytes): lower the expression
+                // and emit a single store.  This handles cases like
+                // `char *p = 0;` where the literal 0 has type `int` (I32) but
+                // the variable needs a pointer-width (I64) store.
+                let typed_val = expr_lowering::lower_expression_typed(ctx, expr);
+                let init_val = expr_lowering::insert_implicit_conversion(
+                    ctx,
+                    typed_val.value,
+                    &typed_val.ty,
+                    var_type,
+                    Span::dummy(),
+                );
+                let store_inst = ctx.builder.build_store(init_val, var_alloca, Span::dummy());
+                emit_inst_to_ctx(ctx, store_inst);
+            }
         }
         ast::Initializer::List {
             designators_and_initializers,
@@ -783,9 +918,17 @@ fn lower_aggregate_local_init(
                 }
             }
         }
-        CType::Struct { ref fields, .. } => {
-            // Compute field byte offsets for the struct layout.
-            let field_offsets = compute_struct_field_offsets(fields, ctx.type_builder);
+        CType::Struct {
+            ref fields,
+            packed: is_packed,
+            aligned: explicit_align,
+            ..
+        } => {
+            // Compute full struct layout (handles bitfields properly).
+            let layout =
+                ctx.type_builder
+                    .compute_struct_layout_with_fields(fields, *is_packed, *explicit_align);
+            let field_offsets: Vec<usize> = layout.fields.iter().map(|fl| fl.offset).collect();
 
             // C99 §6.7.9/19: members not explicitly initialized shall
             // be zero-initialized.  Only emit zero-init stores for
@@ -793,28 +936,67 @@ fn lower_aggregate_local_init(
             // This avoids generating excessive IR instructions for the
             // common case where all fields are supplied.
             let has_designators = init_list.iter().any(|di| !di.designators.is_empty());
-            let needs_zero_init = init_list.len() < fields.len() || has_designators;
-            if needs_zero_init {
+
+            // Detect struct-level brace elision: when the init list is a
+            // flat list of scalar expressions with no designators, and
+            // the number of items exceeds the number of struct fields,
+            // one or more fields must be aggregate sub-objects (arrays
+            // or nested structs) that should consume multiple
+            // initializers via brace elision per C99 §6.7.9/20.
+            //
+            // Also detect: struct has fewer fields than init items, AND
+            // at least one field is an aggregate type.  This handles
+            // `struct { int f[4]; } s = {1,2,3,4};`.
+            let all_flat_exprs = !has_designators
+                && init_list
+                    .iter()
+                    .all(|di| matches!(di.initializer, ast::Initializer::Expression(_)));
+            let any_aggregate_field = fields.iter().any(|f| {
+                let ft = crate::common::types::resolve_typedef(&f.ty);
+                matches!(
+                    ft,
+                    CType::Struct { .. } | CType::Array(..) | CType::Union { .. }
+                )
+            });
+            let use_brace_elision =
+                all_flat_exprs && any_aggregate_field && init_list.len() > fields.len();
+
+            if use_brace_elision {
+                // Zero-initialize the entire struct first.
                 for (fi, field) in fields.iter().enumerate() {
                     let byte_offset = field_offsets.get(fi).copied().unwrap_or(0) as i64;
                     zero_init_field(base_alloca, byte_offset, &field.ty, ctx, span);
                 }
-            }
-
-            // Now store explicitly initialized fields, handling nested
-            // designators (e.g., `.origin.x = 1`).
-            for (idx, desig_init) in init_list.iter().enumerate() {
-                lower_designated_struct_init(
-                    base_alloca,
-                    &desig_init.designators,
-                    &desig_init.initializer,
-                    fields,
-                    &field_offsets,
-                    0, // base byte offset
-                    idx,
-                    ctx,
-                    span,
+                // Use the recursive brace-elision lowering to consume the
+                // correct number of flat initializers per aggregate field.
+                lower_brace_elision_into_aggregate(
+                    base_alloca, init_list, 0, resolved, ctx, span,
                 );
+            } else {
+                let needs_zero_init = init_list.len() < fields.len() || has_designators;
+                if needs_zero_init {
+                    for (fi, field) in fields.iter().enumerate() {
+                        let byte_offset = field_offsets.get(fi).copied().unwrap_or(0) as i64;
+                        zero_init_field(base_alloca, byte_offset, &field.ty, ctx, span);
+                    }
+                }
+
+                // Now store explicitly initialized fields, handling nested
+                // designators (e.g., `.origin.x = 1`).
+                for (idx, desig_init) in init_list.iter().enumerate() {
+                    lower_designated_struct_init(
+                        base_alloca,
+                        &desig_init.designators,
+                        &desig_init.initializer,
+                        fields,
+                        &field_offsets,
+                        &layout.fields,
+                        0, // base byte offset
+                        idx,
+                        ctx,
+                        span,
+                    );
+                }
             }
         }
         CType::Union { ref fields, .. } => {
@@ -880,6 +1062,7 @@ pub(super) fn evaluate_initializer_constant(
     type_builder: &TypeBuilder,
     diagnostics: &mut DiagnosticEngine,
     name_table: &[String],
+    enum_constants: &FxHashMap<String, i128>,
 ) -> Option<Constant> {
     match init {
         ast::Initializer::Expression(expr) => evaluate_constant_expr(
@@ -889,6 +1072,7 @@ pub(super) fn evaluate_initializer_constant(
             type_builder,
             diagnostics,
             name_table,
+            enum_constants,
         ),
         ast::Initializer::List {
             designators_and_initializers,
@@ -900,6 +1084,7 @@ pub(super) fn evaluate_initializer_constant(
             type_builder,
             diagnostics,
             name_table,
+            enum_constants,
         ),
     }
 }
@@ -912,6 +1097,7 @@ fn evaluate_constant_expr(
     type_builder: &TypeBuilder,
     diagnostics: &mut DiagnosticEngine,
     name_table: &[String],
+    enum_constants: &FxHashMap<String, i128>,
 ) -> Option<Constant> {
     match expr {
         ast::Expression::IntegerLiteral { value, .. } => Some(Constant::Integer(*value as i128)),
@@ -930,6 +1116,11 @@ fn evaluate_constant_expr(
         ast::Expression::CharLiteral { value, .. } => Some(Constant::Integer(*value as i128)),
         ast::Expression::Identifier { name, .. } => {
             let name_str = resolve_sym(name_table, name).to_string();
+            // Check if this identifier is an enum constant — resolve to
+            // its integer value rather than emitting a symbol reference.
+            if let Some(&val) = enum_constants.get(&name_str) {
+                return Some(Constant::Integer(val));
+            }
             Some(Constant::GlobalRef(name_str))
         }
         ast::Expression::UnaryOp { op, operand, .. } => match op {
@@ -969,6 +1160,7 @@ fn evaluate_constant_expr(
                     type_builder,
                     diagnostics,
                     name_table,
+                    enum_constants,
                 )?;
                 match inner {
                     Constant::Integer(v) => Some(Constant::Integer(-v)),
@@ -984,6 +1176,7 @@ fn evaluate_constant_expr(
                     type_builder,
                     diagnostics,
                     name_table,
+                    enum_constants,
                 )?;
                 match inner {
                     Constant::Integer(v) => Some(Constant::Integer(!v)),
@@ -998,6 +1191,7 @@ fn evaluate_constant_expr(
                     type_builder,
                     diagnostics,
                     name_table,
+                    enum_constants,
                 )?;
                 match inner {
                     Constant::Integer(v) => Some(Constant::Integer(if v == 0 { 1 } else { 0 })),
@@ -1016,6 +1210,7 @@ fn evaluate_constant_expr(
                 type_builder,
                 diagnostics,
                 name_table,
+                enum_constants,
             )?;
             let rhs = evaluate_constant_expr(
                 right,
@@ -1024,6 +1219,7 @@ fn evaluate_constant_expr(
                 type_builder,
                 diagnostics,
                 name_table,
+                enum_constants,
             )?;
             evaluate_const_binop(op, &lhs, &rhs)
         }
@@ -1034,6 +1230,7 @@ fn evaluate_constant_expr(
             type_builder,
             diagnostics,
             name_table,
+            enum_constants,
         ),
         ast::Expression::SizeofExpr { .. } | ast::Expression::SizeofType { .. } => Some(
             Constant::Integer(evaluate_sizeof_expr(expr, target, type_builder) as i128),
@@ -1056,6 +1253,7 @@ fn evaluate_constant_expr(
                 type_builder,
                 diagnostics,
                 name_table,
+                enum_constants,
             )?;
             match cond {
                 Constant::Integer(v) if v != 0 => {
@@ -1067,6 +1265,7 @@ fn evaluate_constant_expr(
                             type_builder,
                             diagnostics,
                             name_table,
+                            enum_constants,
                         )
                     } else {
                         // GCC extension: x ?: y — if condition is true, value is condition
@@ -1080,6 +1279,7 @@ fn evaluate_constant_expr(
                     type_builder,
                     diagnostics,
                     name_table,
+                    enum_constants,
                 ),
                 _ => Some(Constant::Undefined),
             }
@@ -1091,6 +1291,7 @@ fn evaluate_constant_expr(
             type_builder,
             diagnostics,
             name_table,
+            enum_constants,
         ),
         // BuiltinCall in constant context (e.g. __builtin_constant_p,
         // __builtin_choose_expr) — evaluate known builtins.
@@ -1104,6 +1305,7 @@ fn evaluate_constant_expr(
                     type_builder,
                     diagnostics,
                     name_table,
+                    enum_constants,
                 );
                 match cond {
                     Some(Constant::Integer(v)) if v != 0 => evaluate_constant_expr(
@@ -1113,6 +1315,7 @@ fn evaluate_constant_expr(
                         type_builder,
                         diagnostics,
                         name_table,
+                        enum_constants,
                     ),
                     _ => evaluate_constant_expr(
                         &args[2],
@@ -1121,6 +1324,7 @@ fn evaluate_constant_expr(
                         type_builder,
                         diagnostics,
                         name_table,
+                        enum_constants,
                     ),
                 }
             }
@@ -1132,6 +1336,7 @@ fn evaluate_constant_expr(
                 type_builder,
                 diagnostics,
                 name_table,
+                enum_constants,
             ),
             _ => Some(Constant::Undefined),
         },
@@ -1145,6 +1350,7 @@ fn evaluate_constant_expr(
                     type_builder,
                     diagnostics,
                     name_table,
+                    enum_constants,
                 )
             } else {
                 Some(Constant::Undefined)
@@ -1286,6 +1492,7 @@ fn lower_designated_initializer(
     type_builder: &TypeBuilder,
     diagnostics: &mut DiagnosticEngine,
     name_table: &[String],
+    enum_constants: &FxHashMap<String, i128>,
 ) -> Option<Constant> {
     let resolved_ref = crate::common::types::resolve_typedef(target_type);
 
@@ -1331,6 +1538,7 @@ fn lower_designated_initializer(
                         type_builder,
                         diagnostics,
                         name_table,
+                        enum_constants,
                     ) {
                         elements[current_idx] = c;
                     }
@@ -1359,6 +1567,7 @@ fn lower_designated_initializer(
                         type_builder,
                         diagnostics,
                         name_table,
+                        enum_constants,
                     ) {
                         field_values[current_idx] = c;
                     }
@@ -1378,6 +1587,7 @@ fn lower_designated_initializer(
                         type_builder,
                         diagnostics,
                         name_table,
+                        enum_constants,
                     );
                 }
             }
@@ -1392,6 +1602,7 @@ fn lower_designated_initializer(
                     type_builder,
                     diagnostics,
                     name_table,
+                    enum_constants,
                 )
             } else {
                 Some(Constant::ZeroInit)
@@ -1420,6 +1631,20 @@ fn allocate_parameters(
         }
 
         let param_c_type = resolve_param_type(param_decl, target, name_table);
+        // C11 §6.7.6.3p7: Function parameter type adjustments —
+        // "array of T" → "pointer to T", "function returning T" → "pointer to function returning T".
+        // Without this, `char bar[]` would produce a 0/1-byte alloca instead
+        // of an 8-byte pointer alloca, causing stack corruption.
+        let param_c_type = match param_c_type {
+            CType::Array(elem, _) => {
+                CType::Pointer(elem, crate::common::types::TypeQualifiers::default())
+            }
+            CType::Function { .. } => CType::Pointer(
+                Box::new(param_c_type),
+                crate::common::types::TypeQualifiers::default(),
+            ),
+            other => other,
+        };
         // Resolve forward-referenced struct/union tag references to their
         // full definitions so that the alloca gets the correct size.
         // Without this, `union YYMINORTYPE minor` (tag reference without
@@ -1724,6 +1949,7 @@ fn lower_static_local(
     target: &Target,
     type_builder: &TypeBuilder,
     diagnostics: &mut DiagnosticEngine,
+    enum_constants: &FxHashMap<String, i128>,
 ) {
     let mangled_name = format!("{}.{}", func_name, name);
 
@@ -1748,6 +1974,7 @@ fn lower_static_local(
                 type_builder,
                 diagnostics,
                 name_table,
+                enum_constants,
             )
         } else {
             Some(Constant::ZeroInit)
@@ -3223,6 +3450,11 @@ fn apply_direct_abstract_decl_to_type(
 /// Resolve a struct/union forward reference for sizeof evaluation.
 /// Uses SIZEOF_STRUCT_DEFS thread-local when available, otherwise
 /// falls back to the struct_defs from the lowering context.
+/// Public wrapper for resolve_sizeof_struct_ref for use in stmt_lowering.
+pub fn resolve_sizeof_struct_ref_pub(cty: CType, target: &Target) -> CType {
+    resolve_sizeof_struct_ref(cty, target)
+}
+
 fn resolve_sizeof_struct_ref(mut cty: CType, _target: &Target) -> CType {
     // Use thread-local struct defs registry if available
     super::SIZEOF_STRUCT_DEFS.with(|cell| {
@@ -3343,16 +3575,79 @@ fn lower_brace_elision_into_aggregate(
 ) -> usize {
     let resolved = crate::common::types::resolve_typedef(target_type);
     match resolved {
-        CType::Struct { fields, .. } => {
-            let field_offsets = compute_struct_field_offsets(fields, ctx.type_builder);
+        CType::Struct {
+            fields,
+            packed,
+            aligned,
+            ..
+        } => {
+            // Use the proper struct layout computation which handles
+            // bitfield packing, zero-width bitfields, and alignment.
+            let layout = ctx
+                .type_builder
+                .compute_struct_layout_with_fields(fields, *packed, *aligned);
             let mut cur = cursor;
             for (fi, field) in fields.iter().enumerate() {
                 if cur >= init_list.len() {
                     break;
                 }
-                let byte_offset = field_offsets.get(fi).copied().unwrap_or(0) as i64;
+                let fl = &layout.fields[fi];
+                let byte_offset = fl.offset as i64;
+
+                // Skip zero-width bitfields (they produce no storage).
+                if let Some((_, 0)) = fl.bitfield_info {
+                    continue;
+                }
+
                 let field_resolved = crate::common::types::resolve_typedef(&field.ty);
-                if matches!(field_resolved, CType::Struct { .. } | CType::Array(..)) {
+
+                if let Some((bit_offset, bit_width)) = fl.bitfield_info {
+                    // ----- Bitfield field -----
+                    // Must use read-modify-write pattern: load the storage
+                    // unit, mask out the old bits, shift the new value into
+                    // position, OR, store back.
+                    let idx_val = make_index_value(ctx, byte_offset);
+                    let (storage_ptr, gep_inst) =
+                        ctx.builder
+                            .build_gep(base_ptr, vec![idx_val], IrType::Ptr, span);
+                    emit_inst_to_ctx(ctx, gep_inst);
+
+                    // Lower the initializer expression to get the value.
+                    let val = match &init_list[cur].initializer {
+                        ast::Initializer::Expression(expr) => {
+                            expr_lowering::lower_expression(ctx, expr)
+                        }
+                        ast::Initializer::List {
+                            designators_and_initializers,
+                            ..
+                        } => {
+                            // Scalar bitfield with braced initializer, e.g. {1}
+                            if let Some(first) = designators_and_initializers.first() {
+                                if let ast::Initializer::Expression(expr) = &first.initializer {
+                                    expr_lowering::lower_expression(ctx, expr)
+                                } else {
+                                    expr_lowering::emit_int_const_for_zero(
+                                        ctx,
+                                        IrType::I32,
+                                    )
+                                }
+                            } else {
+                                expr_lowering::emit_int_const_for_zero(ctx, IrType::I32)
+                            }
+                        }
+                    };
+
+                    expr_lowering::lower_bitfield_store(
+                        ctx,
+                        storage_ptr,
+                        val,
+                        &field.ty,
+                        bit_offset,
+                        bit_width,
+                        span,
+                    );
+                    cur += 1;
+                } else if matches!(field_resolved, CType::Struct { .. } | CType::Array(..)) {
                     // Recurse into nested aggregate
                     let idx_val = make_index_value(ctx, byte_offset);
                     let (field_ptr, gep_inst) =
@@ -3487,6 +3782,7 @@ fn lower_designated_struct_init(
     initializer: &ast::Initializer,
     fields: &[crate::common::types::StructField],
     field_offsets: &[usize],
+    field_layouts: &[crate::common::type_builder::FieldLayout],
     accumulated_offset: i64,
     default_idx: usize,
     ctx: &mut expr_lowering::ExprLoweringContext<'_>,
@@ -3508,16 +3804,25 @@ fn lower_designated_struct_init(
         let resolved_field_ty = crate::common::types::resolve_typedef(&field.ty);
         if let CType::Struct {
             fields: ref sub_fields,
+            packed: sub_packed,
+            aligned: sub_aligned,
             ..
         } = resolved_field_ty
         {
-            let inner_offsets = compute_struct_field_offsets(sub_fields, ctx.type_builder);
+            let sub_layout = ctx.type_builder.compute_struct_layout_with_fields(
+                sub_fields,
+                *sub_packed,
+                *sub_aligned,
+            );
+            let inner_offsets: Vec<usize> =
+                sub_layout.fields.iter().map(|fl| fl.offset).collect();
             lower_designated_struct_init(
                 base_alloca,
                 remaining_designators,
                 initializer,
                 sub_fields,
                 &inner_offsets,
+                &sub_layout.fields,
                 byte_offset,
                 0,
                 ctx,
@@ -3527,6 +3832,54 @@ fn lower_designated_struct_init(
         }
         // If the field type is not a struct but there are more designators,
         // fall through to treat as a simple store at the current offset.
+    }
+
+    // Check if this field is a bitfield — if so, use read-modify-write.
+    let bf_info = field_layouts
+        .get(field_idx)
+        .and_then(|fl| fl.bitfield_info);
+    if let Some((bit_offset, bit_width)) = bf_info {
+        if bit_width > 0 {
+            // Bitfield field — GEP to the storage unit offset and use
+            // lower_bitfield_store for correct read-modify-write masking.
+            let field_idx_val = make_index_value(ctx, byte_offset);
+            let (storage_ptr, gep_inst) =
+                ctx.builder
+                    .build_gep(base_alloca, vec![field_idx_val], IrType::Ptr, span);
+            emit_inst_to_ctx(ctx, gep_inst);
+
+            // Lower the initializer to a value.
+            let val = match initializer {
+                ast::Initializer::Expression(expr) => {
+                    expr_lowering::lower_expression(ctx, expr)
+                }
+                ast::Initializer::List {
+                    designators_and_initializers,
+                    ..
+                } => {
+                    if let Some(first) = designators_and_initializers.first() {
+                        if let ast::Initializer::Expression(expr) = &first.initializer {
+                            expr_lowering::lower_expression(ctx, expr)
+                        } else {
+                            expr_lowering::emit_int_const_for_zero(ctx, IrType::I32)
+                        }
+                    } else {
+                        expr_lowering::emit_int_const_for_zero(ctx, IrType::I32)
+                    }
+                }
+            };
+
+            expr_lowering::lower_bitfield_store(
+                ctx,
+                storage_ptr,
+                val,
+                &field.ty,
+                bit_offset,
+                bit_width,
+                span,
+            );
+            return;
+        }
     }
 
     // Leaf case: GEP to the byte offset and lower the initializer.
@@ -3588,6 +3941,113 @@ fn emit_inst_to_ctx(ctx: &mut expr_lowering::ExprLoweringContext<'_>, inst: Inst
         if let Some(block) = ctx.function.get_block_mut(block_idx) {
             block.push_instruction(inst);
         }
+    }
+}
+
+// =========================================================================
+// String literal → char array initialization helpers
+// =========================================================================
+
+/// Check if a resolved type is a character array and return (element_type, array_size).
+/// Matches `char`, `signed char`, `unsigned char` arrays.
+fn is_char_array_type(ty: &CType) -> Option<(CType, usize)> {
+    let resolved = crate::common::types::resolve_typedef(ty);
+    match resolved {
+        CType::Array(elem, Some(size)) => {
+            let stripped = crate::common::types::resolve_typedef(elem.as_ref());
+            match stripped {
+                CType::Char | CType::SChar | CType::UChar => {
+                    Some((stripped.clone(), *size))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Extract raw bytes from a StringLiteral expression (including null terminator).
+fn extract_string_literal_bytes(expr: &ast::Expression) -> Option<Vec<u8>> {
+    match expr {
+        ast::Expression::StringLiteral { segments, .. } => {
+            let mut bytes = Vec::new();
+            for seg in segments {
+                bytes.extend_from_slice(&seg.value);
+            }
+            bytes.push(0); // null terminator
+            Some(bytes)
+        }
+        _ => None,
+    }
+}
+
+/// Emit stores to copy string literal bytes into a local char array variable.
+/// Handles zero-filling of remaining array elements beyond the string length
+/// and truncation when the string is longer than the array.
+fn lower_char_array_from_string(
+    var_alloca: Value,
+    str_bytes: &[u8],
+    arr_size: usize,
+    _elem_ty: &CType,
+    ctx: &mut expr_lowering::ExprLoweringContext<'_>,
+) {
+    let span = Span::dummy();
+
+    // Number of bytes to copy from the string (may be truncated to fit)
+    let copy_len = std::cmp::min(str_bytes.len(), arr_size);
+
+    // Build a full byte buffer: string bytes + zero-fill
+    let mut buf = vec![0u8; arr_size];
+    buf[..copy_len].copy_from_slice(&str_bytes[..copy_len]);
+
+    // Emit stores coalesced into the widest possible chunks (8/4/2/1 bytes)
+    // for efficiency.  We process the array from left to right.
+    let mut offset: usize = 0;
+    while offset < arr_size {
+        let remaining = arr_size - offset;
+
+        // Determine the largest power-of-two chunk we can store at this
+        // alignment.  We only coalesce if offset is naturally aligned for
+        // the chosen width.
+        let (chunk_sz, ir_ty): (usize, IrType) = if remaining >= 8 && offset % 8 == 0 {
+            (8, IrType::I64)
+        } else if remaining >= 4 && offset % 4 == 0 {
+            (4, IrType::I32)
+        } else if remaining >= 2 && offset % 2 == 0 {
+            (2, IrType::I16)
+        } else {
+            (1, IrType::I8)
+        };
+
+        // Read the chunk value from our buffer (little-endian).
+        let chunk_val: i128 = {
+            let mut v: u64 = 0;
+            for i in 0..chunk_sz {
+                v |= (buf[offset + i] as u64) << (i * 8);
+            }
+            v as i128
+        };
+
+        // Create the constant value.
+        let const_val = expr_lowering::emit_int_const_for_index(ctx, chunk_val as i64);
+
+        // Compute the destination address: var_alloca + offset
+        let dst_addr = if offset == 0 {
+            var_alloca
+        } else {
+            let off_val = expr_lowering::emit_int_const_for_index(ctx, offset as i64);
+            let (gep_val, gep_inst) =
+                ctx.builder
+                    .build_gep(var_alloca, vec![off_val], ir_ty.clone(), span);
+            emit_inst_to_ctx(ctx, gep_inst);
+            gep_val
+        };
+
+        // Emit the store instruction.
+        let si = ctx.builder.build_store(const_val, dst_addr, span);
+        emit_inst_to_ctx(ctx, si);
+
+        offset += chunk_sz;
     }
 }
 

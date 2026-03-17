@@ -247,9 +247,10 @@ pub const NUM_FPRS: usize = 32;
 /// Total register count across both classes (GPR + FPR = 64).
 pub const TOTAL_REGS: usize = NUM_GPRS + NUM_FPRS;
 
-/// Number of allocatable GPRs: X0–X15, X17–X28 (28 registers).
-/// Excludes X16 (IP0/spill scratch), X29 (FP), X30 (LR), and SP/XZR (31).
-pub const NUM_ALLOCATABLE_GPRS: usize = 28;
+/// Number of allocatable GPRs: X0–X15, X18–X28 (27 registers).
+/// Excludes X16 (IP0/spill scratch), X17 (IP1/second spill scratch),
+/// X29 (FP), X30 (LR), and SP/XZR (31).
+pub const NUM_ALLOCATABLE_GPRS: usize = 27;
 
 // ===========================================================================
 // Register Sets for the Register Allocator
@@ -266,9 +267,12 @@ pub const ALLOCATABLE_GPRS: &[u32] = &[
     X0, X1, X2, X3, X4, X5, X6, X7, // argument registers, scratch after use
     X8, // indirect result location register
     X9, X10, X11, X12, X13, X14, X15, // scratch temporaries
-    // X16 (IP0) is RESERVED as the spill-reload scratch register and
-    // codegen scratch — never allocatable.
-    X17, // IP1 — intra-procedure scratch (allocatable on Linux)
+    // X16 (IP0) is RESERVED as the primary spill-reload scratch register
+    // and codegen scratch — never allocatable.
+    // X17 (IP1) is RESERVED as the secondary spill-reload scratch register.
+    // On load-store architectures like AArch64, ALU instructions cannot use
+    // Memory operands. When two operands are both spilled, X16 loads the
+    // first and X17 loads the second.
     X18, // platform register (usable on Linux)
     // Callee-saved (allocator will prefer caller-saved first)
     X19, X20, X21, X22, X23, X24, X25, X26, X27, X28,

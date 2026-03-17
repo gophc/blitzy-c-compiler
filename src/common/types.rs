@@ -19,6 +19,58 @@
 //! ILP32 (i686) data models.
 
 use crate::common::target::Target;
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+// ===========================================================================
+// Tag Type Resolution Registry (thread-local)
+// ===========================================================================
+
+thread_local! {
+    /// Thread-local registry mapping struct/union tag names to their fully
+    /// resolved [`CType`] definitions.  Populated by the IR lowering pass
+    /// (and the constant evaluator) so that [`sizeof_ctype`] and
+    /// [`alignof_ctype`] can resolve "lightweight tag references" — i.e.
+    /// `CType::Struct`/`CType::Union` nodes that carry a tag name but have
+    /// an empty field list because the sema phase deliberately avoids
+    /// deep-cloning large struct definitions on every reference.
+    ///
+    /// Without this registry, `sizeof_ctype` would return 0 for any
+    /// lightweight tag reference encountered inside a struct/union field
+    /// list, causing catastrophic struct-layout miscalculations (e.g. the
+    /// SQLite `yyStackEntry` bug where the parser stack stride was 8
+    /// instead of 24).
+    static TAG_TYPE_DEFS: RefCell<Option<HashMap<String, CType>>> = const { RefCell::new(None) };
+}
+
+/// Populate the tag-type resolution registry so that [`sizeof_ctype`] and
+/// [`alignof_ctype`] can resolve lightweight struct/union tag references.
+///
+/// This must be called before any struct-layout computation that may
+/// encounter fields whose types are lightweight tag references (i.e.
+/// `CType::Struct { name: Some(..), fields: [] }`).
+pub fn set_tag_type_defs(defs: HashMap<String, CType>) {
+    TAG_TYPE_DEFS.with(|cell| {
+        *cell.borrow_mut() = Some(defs);
+    });
+}
+
+/// Clear the tag-type resolution registry.
+pub fn clear_tag_type_defs() {
+    TAG_TYPE_DEFS.with(|cell| {
+        *cell.borrow_mut() = None;
+    });
+}
+
+/// Attempt to resolve a lightweight struct/union tag reference via the
+/// thread-local registry.  Returns `Some(resolved_ctype)` if the tag is
+/// found; `None` otherwise.
+fn resolve_tag_ref(tag: &str) -> Option<CType> {
+    TAG_TYPE_DEFS.with(|cell| {
+        let borrow = cell.borrow();
+        borrow.as_ref().and_then(|m| m.get(tag).cloned())
+    })
+}
 
 // ===========================================================================
 // Type Qualifiers
@@ -333,21 +385,45 @@ pub fn sizeof_ctype(ty: &CType, target: &Target) -> usize {
         // -- Function — GCC extension: sizeof(function) == 1
         CType::Function { .. } => 1,
 
-        // -- Struct — compute layout with padding
+        // -- Struct — compute layout with padding.
+        //
+        // If the struct is a lightweight tag reference (has a name but no
+        // fields), attempt to resolve it via the thread-local tag registry
+        // before falling back to the empty-struct computation.
         CType::Struct {
+            name,
             fields,
             packed,
             aligned,
-            ..
-        } => compute_struct_size(fields, *packed, *aligned, target),
+        } => {
+            if fields.is_empty() {
+                if let Some(ref tag) = name {
+                    if let Some(resolved) = resolve_tag_ref(tag) {
+                        return sizeof_ctype(&resolved, target);
+                    }
+                }
+            }
+            compute_struct_size(fields, *packed, *aligned, target)
+        }
 
-        // -- Union — max of all field sizes, padded to alignment
+        // -- Union — max of all field sizes, padded to alignment.
+        //
+        // Same lightweight-reference resolution as for structs above.
         CType::Union {
+            name,
             fields,
             packed,
             aligned,
-            ..
-        } => compute_union_size(fields, *packed, *aligned, target),
+        } => {
+            if fields.is_empty() {
+                if let Some(ref tag) = name {
+                    if let Some(resolved) = resolve_tag_ref(tag) {
+                        return sizeof_ctype(&resolved, target);
+                    }
+                }
+            }
+            compute_union_size(fields, *packed, *aligned, target)
+        }
 
         // -- Enum — size of the underlying integer type
         CType::Enum {
@@ -614,21 +690,41 @@ pub fn alignof_ctype(ty: &CType, target: &Target) -> usize {
         // -- Function — alignment 1
         CType::Function { .. } => 1,
 
-        // -- Struct — max field alignment, with optional explicit override
+        // -- Struct — max field alignment, with optional explicit override.
+        //    Resolve lightweight tag references first.
         CType::Struct {
+            name,
             fields,
             packed,
             aligned,
-            ..
-        } => compute_struct_or_union_align(fields, *packed, *aligned, target),
+        } => {
+            if fields.is_empty() {
+                if let Some(ref tag) = name {
+                    if let Some(resolved) = resolve_tag_ref(tag) {
+                        return alignof_ctype(&resolved, target);
+                    }
+                }
+            }
+            compute_struct_or_union_align(fields, *packed, *aligned, target)
+        }
 
-        // -- Union — same logic as struct
+        // -- Union — same logic as struct.
+        //    Resolve lightweight tag references first.
         CType::Union {
+            name,
             fields,
             packed,
             aligned,
-            ..
-        } => compute_struct_or_union_align(fields, *packed, *aligned, target),
+        } => {
+            if fields.is_empty() {
+                if let Some(ref tag) = name {
+                    if let Some(resolved) = resolve_tag_ref(tag) {
+                        return alignof_ctype(&resolved, target);
+                    }
+                }
+            }
+            compute_struct_or_union_align(fields, *packed, *aligned, target)
+        }
 
         // -- Enum — alignment of the underlying type
         CType::Enum {

@@ -1626,29 +1626,33 @@ impl AArch64Encoder {
             // SIMD / Vector Instructions
             // =========================================================
             A64Opcode::CNT => {
-                // CNT Vd.8B, Vn.8B — AdvSIMD two-reg misc, size=00, opcode=00101
-                // Encoding: 0 Q 0 01110 size 10000 00101 10 Rn Rd
-                // Q=0 (8B), size=00 → 0_0_0_01110_00_10000_00101_10_Rn_Rd
+                // CNT Vd.8B, Vn.8B — AdvSIMD two-reg misc
+                // Bit layout: 0 Q U 01110 size 10000 opcode 10 Rn Rd
+                //              31 30 29 28-24 23-22 21-17 16-12 11-10 9-5 4-0
+                // Q=0 (8B), U=0, size=00, opcode=00101
                 let q = 0u32;
                 let word = (q << 30)
-                    | (0b00_01110_00u32 << 21)
-                    | (0b10000u32 << 16)
-                    | (0b00101u32 << 12)
-                    | (0b10u32 << 10)
+                    | (0b01110u32 << 24) // bits 28-24: fixed 01110
+                    // bits 23-22: size=00 (implicit zero)
+                    | (0b10000u32 << 17) // bits 21-17: fixed 10000
+                    | (0b00101u32 << 12) // bits 16-12: opcode for CNT
+                    | (0b10u32 << 10) // bits 11-10: fixed 10
                     | ((rn & 0x1F) << 5)
                     | (rd & 0x1F);
                 ok(word)
             }
             A64Opcode::ADDV => {
-                // ADDV Bd, Vn.8B — AdvSIMD across lanes, size=00, opcode=11011
-                // Encoding: 0 Q 0 01110 size 11000 11011 10 Rn Rd
-                // Q=0 (8B), size=00 → 0_0_0_01110_00_11000_11011_10_Rn_Rd
+                // ADDV Bd, Vn.8B — AdvSIMD across lanes
+                // Bit layout: 0 Q U 01110 size 11000 opcode 10 Rn Rd
+                //              31 30 29 28-24 23-22 21-17 16-12 11-10 9-5 4-0
+                // Q=0 (8B), U=0, size=00, opcode=11011
                 let q = 0u32;
                 let word = (q << 30)
-                    | (0b00_01110_00u32 << 21)
-                    | (0b11000u32 << 16)
-                    | (0b11011u32 << 12)
-                    | (0b10u32 << 10)
+                    | (0b01110u32 << 24) // bits 28-24: fixed 01110
+                    // bits 23-22: size=00 (implicit zero)
+                    | (0b11000u32 << 17) // bits 21-17: fixed 11000
+                    | (0b11011u32 << 12) // bits 16-12: opcode for ADDV
+                    | (0b10u32 << 10) // bits 11-10: fixed 10
                     | ((rn & 0x1F) << 5)
                     | (rd & 0x1F);
                 ok(word)

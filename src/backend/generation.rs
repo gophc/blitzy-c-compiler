@@ -491,7 +491,10 @@ fn generate_for_arch<A: ArchCodegen>(
         // After register allocation, parameter MOVs (e.g., MOV RCX, RSI)
         // may clobber ABI registers that are sources for later parameter
         // loads.  This pass applies parallel-move sequentialisation.
-        if matches!(ctx.target, Target::X86_64) {
+        if matches!(
+            ctx.target,
+            Target::X86_64 | Target::AArch64 | Target::RiscV64
+        ) {
             resolve_param_load_conflicts(&mut mf);
         }
 
@@ -914,28 +917,6 @@ fn apply_allocation_result(mf: &mut MachineFunction, alloc: &AllocationResult, t
         vreg_phys.entry(vreg).or_insert(phys.0);
     }
 
-    // Debug: dump vreg→phys mapping and vreg_to_ir_value
-    if std::env::var("BCC_DEBUG_REGALLOC").is_ok() {
-        eprintln!("=== VREG_TO_IR_VALUE ===");
-        let mut pairs: Vec<_> = mf.vreg_to_ir_value.iter().collect();
-        pairs.sort_by_key(|(&k, _)| k);
-        for (&vreg, ir_val) in &pairs {
-            let phys = vreg_phys.get(&vreg);
-            eprintln!(
-                "  vreg={} -> ir_v{} -> phys={:?}",
-                vreg,
-                ir_val.index(),
-                phys
-            );
-        }
-        eprintln!("=== VREG_PHYS (full) ===");
-        let mut vp: Vec<_> = vreg_phys.iter().collect();
-        vp.sort_by_key(|(&k, _)| k);
-        for (&vreg, &phys) in &vp {
-            eprintln!("  vreg={} -> r{}", vreg, phys);
-        }
-    }
-
     // Build spilled vreg → frame offset mapping.
     //
     // Frame layout conventions differ by architecture:
@@ -1085,6 +1066,24 @@ fn apply_allocation_result(mf: &mut MachineFunction, alloc: &AllocationResult, t
     let float_spill_scratch: u16 = match target {
         Target::I686 => 1, // ECX (i686 uses x87 stack, no XMM15)
         _ => 31,           // XMM15
+    };
+
+    // Secondary integer spill scratch register — used exclusively on
+    // load-store architectures (AArch64, RISC-V) where ALU instructions
+    // CANNOT use Memory operands.  When two integer operands are both
+    // spilled and the primary scratch (X16/X5) is already occupied by
+    // the first, the second operand is loaded into this register instead
+    // of being left as a Memory operand (which would silently produce
+    // wrong code: the generic operand mapper would ignore the Memory
+    // base/displacement for ALU ops and the rm field would default to
+    // register 0).
+    //
+    // On x86/i686 this is unused because ALU instructions natively
+    // support memory source operands.
+    let spill_scratch2: u16 = match target {
+        Target::AArch64 => 17, // X17 / IP1
+        Target::RiscV64 => 6,  // X6 / T1
+        _ => spill_scratch,    // x86: not used, set to same as primary
     };
 
     // Build a set of codegen vregs that hold float types.
@@ -1276,12 +1275,27 @@ fn apply_allocation_result(mf: &mut MachineFunction, alloc: &AllocationResult, t
             //   → The FIRST spilled float operand loads into XMM15.
             //   → Additional operands of a class become Memory.
             // ----------------------------------------------------------
-            let _int_scratch_reserved_for_result =
-                result_spill_offset.is_some() && !result_is_float;
-            let _float_scratch_reserved_for_result =
-                result_spill_offset.is_some() && result_is_float;
-            let mut int_scratch_used = false;
-            let mut float_scratch_used = false;
+            // CRITICAL: When the result is spilled, the scratch register is
+            // already occupied by Step 2's pre-load of the result value.
+            // Mark the appropriate scratch as "used" so that subsequent
+            // operand resolution does NOT clobber the result by loading
+            // a different value into the same scratch register.
+            //
+            // Without this, a destructive ALU op like ADD whose result
+            // AND operand are both spilled would emit:
+            //   LOAD R11, [result_spill]   (Step 2 pre-load)
+            //   LOAD R11, [operand_spill]  (CLOBBERS result!)
+            //   ADD  R11, R11              (= operand + operand, WRONG!)
+            //
+            // With this fix, the operand falls through to Memory (x86)
+            // or scratch2 (AArch64/RISC-V), producing:
+            //   LOAD R11, [result_spill]   (Step 2 pre-load)
+            //   ADD  R11, [operand_spill]  (= result + operand, CORRECT!)
+            let mut int_scratch_used = result_spill_offset.is_some() && !result_is_float;
+            let mut float_scratch_used = result_spill_offset.is_some() && result_is_float;
+            // Secondary integer scratch usage tracking — only relevant on
+            // load-store architectures (AArch64, RISC-V).
+            let mut int_scratch2_used = false;
 
             // Capture the result vreg (before resolution) so we can detect
             // operands that alias the result — critical for in-place ALU ops
@@ -1307,10 +1321,11 @@ fn apply_allocation_result(mf: &mut MachineFunction, alloc: &AllocationResult, t
                             let same_as_result_f = result_vreg == Some(vreg)
                                 && result_spill_offset.is_some()
                                 && result_is_float;
-                            if same_as_result_f && !float_scratch_used {
+                            if same_as_result_f {
+                                // Reuse float scratch — already loaded from
+                                // the same spill slot in Step 2.
                                 let (scratch, _) = spill_scratch_for(true);
                                 inst.operands[i] = MachineOperand::Register(scratch);
-                                float_scratch_used = true;
                             } else if !float_scratch_used {
                                 let (scratch, mov_op) = spill_scratch_for(true);
                                 let mut ld = make_spill_load(scratch, offset, mov_op);
@@ -1319,7 +1334,13 @@ fn apply_allocation_result(mf: &mut MachineFunction, alloc: &AllocationResult, t
                                 inst.operands[i] = MachineOperand::Register(scratch);
                                 float_scratch_used = true;
                             } else {
-                                // XMM15 occupied — use memory operand (SSE supports mem src).
+                                // Float scratch occupied — use memory operand.
+                                // On x86/i686, SSE ALU instructions support
+                                // memory source operands directly.  On AArch64
+                                // / RISC-V, FP ALU instructions also cannot use
+                                // Memory operands, but two float spills in one
+                                // instruction is extremely rare (would require a
+                                // dedicated second FP scratch register).
                                 inst.operands[i] = MachineOperand::Memory {
                                     base: Some(frame_ptr_reg),
                                     index: None,
@@ -1338,11 +1359,12 @@ fn apply_allocation_result(mf: &mut MachineFunction, alloc: &AllocationResult, t
                             let same_as_result = result_vreg == Some(vreg)
                                 && result_spill_offset.is_some()
                                 && !result_is_float;
-                            if same_as_result && !int_scratch_used {
+                            if same_as_result {
                                 // Reuse scratch — already loaded from the same
-                                // spill slot in Step 2.
+                                // spill slot in Step 2.  The scratch is already
+                                // marked as used (initialized true when result
+                                // is spilled), so no state change needed.
                                 inst.operands[i] = MachineOperand::Register(spill_scratch);
-                                int_scratch_used = true;
                             } else if !int_scratch_used {
                                 // Scratch is available. Load operand's spill
                                 // value into scratch (may overwrite Step 2's
@@ -1355,7 +1377,21 @@ fn apply_allocation_result(mf: &mut MachineFunction, alloc: &AllocationResult, t
                                 new_insts.push(ld);
                                 inst.operands[i] = MachineOperand::Register(spill_scratch);
                                 int_scratch_used = true;
+                            } else if is_risc_or_arm && !int_scratch2_used {
+                                // Load-store architectures: ALU instructions
+                                // CANNOT use Memory operands.  Use the secondary
+                                // scratch register (X17/IP1 on AArch64, X6/T1 on
+                                // RISC-V) to load the second spilled operand.
+                                let mut ld = make_spill_load(spill_scratch2, offset, mov_opcode);
+                                ld.is_call_arg_setup = propagate_call_arg_setup;
+                                new_insts.push(ld);
+                                inst.operands[i] = MachineOperand::Register(spill_scratch2);
+                                int_scratch2_used = true;
                             } else {
+                                // x86/i686: ALU instructions natively support
+                                // Memory source operands — emit directly.
+                                // (Also fallback if both scratch regs are used,
+                                // which is extremely rare for binary ops.)
                                 inst.operands[i] = MachineOperand::Memory {
                                     base: Some(frame_ptr_reg),
                                     index: None,
@@ -1442,6 +1478,7 @@ fn resolve_param_load_conflicts(mf: &mut MachineFunction) {
     const MOV_OPCODE: u32 = 0; // X86Opcode::Mov
     const MOVSD_OPCODE: u32 = 86; // X86Opcode::Movsd
     const SCRATCH_REG: u16 = 11; // R11 (integer scratch)
+    const SCRATCH_REG2: u16 = 10; // R10 (secondary integer scratch)
     const FLOAT_SCRATCH_REG: u16 = 31; // XMM15 (float scratch)
 
     // ABI integer argument registers (System V AMD64).
@@ -1466,121 +1503,358 @@ fn resolve_param_load_conflicts(mf: &mut MachineFunction) {
         s
     };
 
-    let entry = &mut mf.blocks[0];
-    let insts = &entry.instructions;
-
-    // Identify the contiguous parameter-loading MOV/MOVSD sequence at the
-    // beginning of the entry block.  A parameter MOV is a MOV from a
-    // physical ABI register to another physical register.  Float params
-    // use MOVSD (opcode 86).
-    //
-    // CRITICAL: After register allocation, the allocator may insert
-    // additional register-to-register copies right after the true
-    // parameter MOVs.  These copies may source from ABI registers
-    // (because the allocator reuses them), making them
-    // indistinguishable from parameter MOVs by pattern alone.
-    // Including them in the parallel-move set corrupts the output.
-    //
-    // We use `mf.num_param_moves` (set during instruction selection)
-    // to cap the scan at the exact number of true parameter copies.
     let max_param_moves = mf.num_param_moves;
-    let mut seq_len: usize = 0;
-    for inst in insts.iter() {
-        if seq_len >= max_param_moves {
-            break;
-        }
+    if max_param_moves <= 1 {
+        return;
+    }
+    // (Debug: set BCC_DEBUG_PARAM=1 to trace parameter move resolution.)
+
+    // ----------------------------------------------------------------
+    // Phase 1: Parse the entry block to extract logical parameter moves.
+    //
+    // After apply_allocation_result, parameter MOVs come in two forms:
+    //
+    // A) Register-to-register (non-spilled parameter):
+    //    [inst]  MOV dst_reg, abi_reg
+    //
+    // B) Spill-expanded (spilled parameter) — 3 instructions:
+    //    [inst]  MOV R11, [spill_slot]     ; pre-load scratch from result slot
+    //    [inst]  MOV R11, abi_reg          ; actual parameter copy via scratch
+    //    [inst]  MOV [spill_slot], R11     ; write-back scratch to spill slot
+    //
+    // We parse up to `num_param_moves` logical param moves from the entry
+    // block, recognizing both formats.
+    // ----------------------------------------------------------------
+
+    /// A logical parameter move extracted from the entry block.
+    #[derive(Clone)]
+    enum ParamMove {
+        /// Non-spilled: single MOV reg, abi_reg
+        Register {
+            dst: u16,
+            src: u16,
+            opcode: u32,
+            _inst_idx: usize,
+        },
+        /// Spilled: 3-instruction sequence
+        Spill {
+            _src: u16,
+            inst_start: usize, // index of first instruction (pre-load)
+            inst_count: usize, // always 3
+        },
+    }
+
+    let entry = &mf.blocks[0];
+    let insts = &entry.instructions;
+    let mut logical_moves: Vec<ParamMove> = Vec::new();
+    let mut inst_cursor: usize = 0;
+    // Pass-through instructions: struct-pair frame stores and memory
+    // loads that appear in the param region but don't participate in
+    // the parallel-move register conflict.  They are emitted first
+    // (before resolved register moves) in the output.
+    let mut pass_through_insts: Vec<MachineInstruction> = Vec::new();
+
+    while logical_moves.len() < max_param_moves && inst_cursor < insts.len() {
+        let inst = &insts[inst_cursor];
         if inst.opcode != MOV_OPCODE && inst.opcode != MOVSD_OPCODE {
             break;
         }
-        // Instruction format: result = Some(Register(dst)), operands = [Register(src)]
-        let is_param_mov = match (&inst.result, inst.operands.first()) {
-            (Some(MachineOperand::Register(dst)), Some(MachineOperand::Register(src))) => {
-                let _ = dst; // suppress warning
+
+        // Check for struct-pair frame store: MOV [mem], abi_reg
+        //
+        // When a 16-byte struct parameter is saved to a stack alloca,
+        // the codegen emits stores like `MOV [RBP-16], RDI` and
+        // `MOV [RBP-8], RSI` at the very beginning of the entry block,
+        // BEFORE any register-to-register param MOVs.  These read ABI
+        // registers and write to memory — they are safe pass-through
+        // instructions that must be emitted first and don't participate
+        // in the parallel-move register conflict resolution.
+        //
+        // Without this recognition, the scanner would break on the
+        // first frame store (unrecognized format) and never reach the
+        // register-to-register param MOVs that follow, leaving their
+        // cycles unresolved (e.g. MOV RCX,RDX; MOV RDX,RCX).
+        let is_frame_store = match (&inst.result, inst.operands.as_slice()) {
+            (None, [MachineOperand::Memory { .. }, MachineOperand::Register(src)]) => {
                 abi_int_regs.contains(src) || abi_sse_regs.contains(src)
             }
             _ => false,
         };
-        if !is_param_mov {
-            break;
+        if is_frame_store {
+            pass_through_insts.push(inst.clone());
+            inst_cursor += 1;
+            continue;
         }
-        seq_len += 1;
+
+        // Check for memory-to-register load: MOV reg, [mem]
+        //
+        // These include struct-pair lo-half reloads (e.g., MOV RAX, [RBP-16])
+        // and stack parameter loads (e.g., MOV R8, [RBP+16]).
+        //
+        // IMPORTANT: Memory loads CANNOT be treated as simple pass-through
+        // instructions.  Their destination register may be an ABI register
+        // (e.g., R8, R9) that is also a source for a register-to-register
+        // param move.  If the memory load executes first, it overwrites the
+        // ABI register's incoming value before the register move can save it.
+        //
+        // Instead, include memory loads in the parallel-move resolution as
+        // moves with a virtual "memory" source (u16::MAX) that does not
+        // conflict with any register source.  The topological sort will
+        // naturally defer memory loads whose destination register is still
+        // needed as a source by a pending register move.
+        let is_mem_load = match (&inst.result, inst.operands.as_slice()) {
+            (Some(MachineOperand::Register(_)), [MachineOperand::Memory { .. }]) => true,
+            _ => false,
+        };
+        if is_mem_load {
+            if let Some(MachineOperand::Register(dst)) = &inst.result {
+                logical_moves.push(ParamMove::Register {
+                    dst: *dst,
+                    src: u16::MAX, // sentinel: memory source, no register conflict
+                    opcode: inst.opcode,
+                    _inst_idx: inst_cursor,
+                });
+            }
+            inst_cursor += 1;
+            continue;
+        }
+
+        // Check for spill pattern: pre-load scratch from spill slot.
+        // On x86-64: result=None, operands=[Register(R11), Memory{..}]
+        // On i686/arm/riscv: result=Some(Register(scratch)), operands=[Memory{..}]
+        let is_spill_preload = match (&inst.result, inst.operands.as_slice()) {
+            // x86-64 format: result=None, operands=[Register(scratch), Memory]
+            (None, [MachineOperand::Register(dst), MachineOperand::Memory { .. }]) => {
+                *dst == SCRATCH_REG || *dst == FLOAT_SCRATCH_REG
+            }
+            // i686/AArch64/RISC-V format: result=Some(Register(scratch)), operands=[Memory]
+            (Some(MachineOperand::Register(dst)), [MachineOperand::Memory { .. }]) => {
+                *dst == SCRATCH_REG || *dst == FLOAT_SCRATCH_REG
+            }
+            _ => false,
+        };
+
+        if is_spill_preload && inst_cursor + 2 < insts.len() {
+            // Verify the next two instructions complete the spill pattern:
+            // inst+1: MOV R11, abi_reg (actual move)
+            // inst+2: MOV [mem], R11   (write-back)
+            let inst1 = &insts[inst_cursor + 1];
+            let inst2 = &insts[inst_cursor + 2];
+
+            let abi_src = match (&inst1.result, inst1.operands.first()) {
+                (Some(MachineOperand::Register(d)), Some(MachineOperand::Register(s)))
+                    if (*d == SCRATCH_REG || *d == FLOAT_SCRATCH_REG)
+                        && (abi_int_regs.contains(s) || abi_sse_regs.contains(s)) =>
+                {
+                    Some(*s)
+                }
+                _ => None,
+            };
+
+            let is_writeback = matches!(
+                inst2.operands.as_slice(),
+                [MachineOperand::Memory { .. }, MachineOperand::Register(s)]
+                    if *s == SCRATCH_REG || *s == FLOAT_SCRATCH_REG
+            );
+
+            if let (Some(src), true) = (abi_src, is_writeback) {
+                logical_moves.push(ParamMove::Spill {
+                    _src: src,
+                    inst_start: inst_cursor,
+                    inst_count: 3,
+                });
+                inst_cursor += 3;
+                continue;
+            }
+        }
+
+        // Check for register-to-register param MOV: MOV dst_reg, abi_reg
+        match (&inst.result, inst.operands.first()) {
+            (Some(MachineOperand::Register(dst)), Some(MachineOperand::Register(src)))
+                if (abi_int_regs.contains(src) || abi_sse_regs.contains(src))
+                    && *dst != SCRATCH_REG =>
+            {
+                logical_moves.push(ParamMove::Register {
+                    dst: *dst,
+                    src: *src,
+                    opcode: inst.opcode,
+                    _inst_idx: inst_cursor,
+                });
+                inst_cursor += 1;
+            }
+            _ => break, // unrecognized instruction — stop scanning
+        }
     }
 
-    if seq_len <= 1 {
-        // 0 or 1 parameter MOVs — no possible conflicts.
+    // Total instruction count consumed by the param region.
+    let total_param_insts = inst_cursor;
+
+    if logical_moves.len() <= 1 {
         return;
     }
 
-    // Extract (dst, src) pairs from the parameter MOV sequence.
-    // Also detect Movsd (opcode for SSE moves) in addition to regular Mov.
-    let mut moves: Vec<(u16, u16, u32)> = Vec::with_capacity(seq_len); // (dst, src, opcode)
-    for inst in insts[..seq_len].iter() {
-        if let (Some(MachineOperand::Register(dst)), Some(MachineOperand::Register(src))) =
-            (&inst.result, inst.operands.first())
-        {
-            moves.push((*dst, *src, inst.opcode));
+    // ----------------------------------------------------------------
+    // Phase 2: Detect conflicts and resolve using parallel-move
+    //          sequentialisation.
+    //
+    // Strategy: spill-destination moves (type B) write only to memory
+    //   via R11 — their "destination" cannot conflict with any register
+    //   source. However, their ABI source register CAN be clobbered by
+    //   a register-destination move (type A) that executes earlier.
+    //
+    // Solution: emit all spill-destination moves FIRST (they read ABI
+    //   registers before anything writes to them), then emit register-
+    //   destination moves in parallel-move-resolved order.
+    // ----------------------------------------------------------------
+
+    // Separate spill moves from register moves.
+    let mut spill_moves: Vec<ParamMove> = Vec::new();
+    let mut reg_moves: Vec<(u16, u16, u32)> = Vec::new(); // (dst, src, opcode)
+    for lm in &logical_moves {
+        match lm {
+            ParamMove::Spill { .. } => spill_moves.push(lm.clone()),
+            ParamMove::Register {
+                dst, src, opcode, ..
+            } => reg_moves.push((*dst, *src, *opcode)),
         }
     }
 
-    // ---- Parallel-move sequentialisation ----
-    //
-    // Algorithm:
-    //   pending = list of (dst, src, opcode)
-    //   result  = list of resolved MOV instructions
-    //
-    //   Repeat until pending is empty:
-    //     1. Remove self-moves (dst == src).
-    //     2. Find a move whose dst is NOT a src of any other pending move.
-    //        Emit it and remove from pending.
-    //     3. If no such move exists (cycle detected):
-    //        Save one src to SCRATCH_REG, replace src with SCRATCH_REG in
-    //        the move, and continue.
+    // Build the resolved instruction sequence.
+    let mut resolved: Vec<MachineInstruction> = Vec::with_capacity(total_param_insts + 4);
 
-    let mut pending = moves.clone();
-    let mut resolved: Vec<MachineInstruction> = Vec::with_capacity(seq_len + 2);
+    // Emit pass-through instructions first — frame stores and memory
+    // loads that were identified during scanning.  Frame stores write
+    // to memory from ABI registers (must come before any register moves
+    // that might clobber those ABI registers).  Memory loads read from
+    // memory into non-ABI registers (safe after frame stores).
+    for pt in &pass_through_insts {
+        resolved.push(pt.clone());
+    }
 
-    // Remove self-moves upfront.
+    // Emit all spill moves next — they read ABI registers before any
+    // register move can clobber them.
+    for sm in &spill_moves {
+        if let ParamMove::Spill {
+            inst_start,
+            inst_count,
+            ..
+        } = sm
+        {
+            for inst in insts.iter().skip(*inst_start).take(*inst_count) {
+                resolved.push(inst.clone());
+            }
+        }
+    }
+
+    // Apply parallel-move sequentialisation on register moves.
+    //
+    // Moves with src == u16::MAX are memory-source loads (stack param
+    // loads, struct-pair lo reloads).  They have no register source
+    // conflict, but their destination register may be needed as a source
+    // by another register move, so they participate in the topological
+    // ordering.  When emitting them, we reconstruct the original memory
+    // load instruction from `insts` rather than a register-to-register
+    // MOV.
+    //
+    // We also build an index map: for each (dst, src=u16::MAX) entry,
+    // we store the original instruction index so we can retrieve the
+    // memory operand.
+    let mut mem_load_insts: crate::common::fx_hash::FxHashMap<u16, MachineInstruction> =
+        crate::common::fx_hash::FxHashMap::default();
+    for lm in &logical_moves {
+        if let ParamMove::Register {
+            dst,
+            src,
+            _inst_idx,
+            ..
+        } = lm
+        {
+            if *src == u16::MAX {
+                // Memory-source load — save the original instruction.
+                mem_load_insts.insert(*dst, insts[*_inst_idx].clone());
+            }
+        }
+    }
+
+    let mut pending = reg_moves.clone();
+    // Remove self-moves upfront (never applies to mem loads since src=u16::MAX != dst).
     pending.retain(|&(dst, src, _)| dst != src);
 
-    let mut iteration_limit = pending.len() * pending.len() + 10; // safety limit
+    let mut iteration_limit = pending.len() * pending.len() + 10;
     while !pending.is_empty() && iteration_limit > 0 {
         iteration_limit -= 1;
 
-        // Collect all source registers still needed by pending moves.
-        let needed_srcs: crate::common::fx_hash::FxHashSet<u16> =
-            pending.iter().map(|&(_, src, _)| src).collect();
+        // Collect needed source registers.  Memory-source loads (u16::MAX)
+        // are excluded — they don't occupy a physical register that could
+        // be clobbered by another move's destination.
+        let needed_srcs: crate::common::fx_hash::FxHashSet<u16> = pending
+            .iter()
+            .filter_map(|&(_, src, _)| {
+                if src != u16::MAX {
+                    Some(src)
+                } else {
+                    None
+                }
+            })
+            .collect();
 
-        // Find a move whose destination is NOT a needed source.
         let safe_idx = pending
             .iter()
             .position(|&(dst, _, _)| !needed_srcs.contains(&dst));
 
         if let Some(idx) = safe_idx {
             let (dst, src, opcode) = pending.remove(idx);
-            let mut inst = MachineInstruction::new(opcode);
-            inst.result = Some(MachineOperand::Register(dst));
-            inst.operands.push(MachineOperand::Register(src));
-            resolved.push(inst);
+            if src == u16::MAX {
+                // Memory-source load — emit the original instruction.
+                if let Some(orig_inst) = mem_load_insts.get(&dst) {
+                    resolved.push(orig_inst.clone());
+                }
+            } else {
+                let mut inst = MachineInstruction::new(opcode);
+                inst.result = Some(MachineOperand::Register(dst));
+                inst.operands.push(MachineOperand::Register(src));
+                resolved.push(inst);
+            }
         } else {
             // Cycle detected — break it by saving one source to scratch.
-            // Pick the first pending move's source.
-            let (_, cycle_src, cycle_opcode) = pending[0];
-
-            // Determine if this is a float (SSE) or integer move.
+            //
+            // Memory-source loads (src=u16::MAX) can never form a cycle
+            // (they have no register source), so the cycle must involve
+            // register-to-register moves.  Find the first non-mem-load
+            // to break.
+            let cycle_idx = pending
+                .iter()
+                .position(|&(_, s, _)| s != u16::MAX)
+                .unwrap_or(0);
+            let (_, cycle_src, cycle_opcode) = pending[cycle_idx];
             let is_float_cycle = cycle_opcode == MOVSD_OPCODE || (16..32).contains(&cycle_src);
+            // Choose a scratch register that is NOT the destination of
+            // any pending or original move.  This prevents clobbering a
+            // register that was already assigned (e.g., R10 holding x7
+            // from a memory load that was resolved earlier).
+            let all_dsts: crate::common::fx_hash::FxHashSet<u16> = reg_moves
+                .iter()
+                .map(|&(dst, _, _)| dst)
+                .chain(pending.iter().map(|&(dst, _, _)| dst))
+                .collect();
             let (scratch, save_op) = if is_float_cycle {
                 (FLOAT_SCRATCH_REG, MOVSD_OPCODE)
             } else {
-                (SCRATCH_REG, MOV_OPCODE)
+                // Try R10, R11, then other non-ABI registers.
+                let candidates: &[u16] = &[SCRATCH_REG2, SCRATCH_REG, 3, 5]; // R10, R11, RBX, RBP
+                let chosen = candidates
+                    .iter()
+                    .find(|&&r| !all_dsts.contains(&r))
+                    .copied()
+                    .unwrap_or(SCRATCH_REG2);
+                (chosen, MOV_OPCODE)
             };
 
-            // Emit: MOV/MOVSD scratch <- cycle_src
             let mut save_inst = MachineInstruction::new(save_op);
             save_inst.result = Some(MachineOperand::Register(scratch));
             save_inst.operands.push(MachineOperand::Register(cycle_src));
             resolved.push(save_inst);
 
-            // Replace all references to cycle_src with scratch.
             for m in &mut pending {
                 if m.1 == cycle_src {
                     m.1 = scratch;
@@ -1589,13 +1863,13 @@ fn resolve_param_load_conflicts(mf: &mut MachineFunction) {
         }
     }
 
-    // Replace the original sequence in the entry block.
-    if !resolved.is_empty() || seq_len > 0 {
-        let remaining: Vec<MachineInstruction> = entry.instructions.drain(seq_len..).collect();
-        entry.instructions.clear();
-        entry.instructions.extend(resolved);
-        entry.instructions.extend(remaining);
-    }
+    // Replace the original param region in the entry block.
+    let entry = &mut mf.blocks[0];
+    let remaining: Vec<MachineInstruction> =
+        entry.instructions.drain(total_param_insts..).collect();
+    entry.instructions.clear();
+    entry.instructions.extend(resolved);
+    entry.instructions.extend(remaining);
 }
 
 // ===========================================================================
@@ -2244,17 +2518,34 @@ fn resolve_call_arg_conflicts(mf: &mut MachineFunction, target: &Target) {
                             }
                         });
                         if let Some(d_scratch) = eff_load_dst {
-                            // Search forward through remaining setup instructions
-                            // for an instruction that reads d_scratch — either as
-                            // a register source (MV arg, scratch) or as a memory
-                            // base (MOV arg, (scratch) for derefs). This handles
-                            // cases where the paired move is not at idx+1 (e.g.,
-                            // when multiple spill reloads are adjacent).
+                            // Search forward through the IMMEDIATELY FOLLOWING
+                            // non-consumed setup instructions for a paired move
+                            // that reads d_scratch.  This detects spill-reload
+                            // compound pairs (LD scratch, [spill]; MV arg, scratch)
+                            // which must be emitted atomically.
+                            //
+                            // IMPORTANT: Only consider the NEAREST non-consumed
+                            // instruction as a potential pair.  Searching further
+                            // causes incorrect pairing when a struct-pair memory
+                            // load (directly to an arg register like RDI) is
+                            // matched with a distant reg-to-reg move that happens
+                            // to read from the same register.  For example:
+                            //   [0] MOV RDI, [RBP-16]   (struct lo → arg reg)
+                            //   [1] MOV RSI, [RBP-8]    (struct hi → arg reg)
+                            //   [2] MOV RDX, RCX        (scalar arg move)
+                            //   [3] MOV RCX, RSI        (scalar arg move)
+                            //   [4] MOV R8, RDI         (scalar arg move — reads RDI!)
+                            // Without the adjacency restriction, [0] and [4] are
+                            // incorrectly paired, consuming [1],[2],[3] as
+                            // intermediates.  This collapses all moves into one
+                            // compound, bypasses conflict detection, and emits
+                            // them in original order — which clobbers RDI/RSI
+                            // before the scalar moves at [3]/[4] read them.
                             let mut found_pair = false;
-                            for j in (idx + 1)..setup_insts.len() {
-                                if consumed.contains(&j) {
-                                    continue;
-                                }
+                            // Find the nearest non-consumed instruction after idx.
+                            let nearest_j = ((idx + 1)..setup_insts.len())
+                                .find(|j| !consumed.contains(j));
+                            if let Some(j) = nearest_j {
                                 let next_si = &setup_insts[j];
                                 let next_dst = match &next_si.result {
                                     Some(MachineOperand::Register(r)) => Some(*r),
@@ -2273,41 +2564,12 @@ fn resolve_call_arg_conflicts(mf: &mut MachineFunction, target: &Target) {
                                     });
                                 if next_reads_scratch {
                                     if let Some(eff_dst) = next_dst {
-                                        // Compound pair (or chain) found. Collect
-                                        // all instructions from idx to j inclusive.
-                                        let mut chain = vec![si.clone()];
-                                        // Include any intermediate instructions
-                                        // between idx and j that use d_scratch
-                                        // (e.g., a deref through the scratch).
-                                        for (k, setup_inst) in
-                                            setup_insts.iter().enumerate().take(j).skip(idx + 1)
-                                        {
-                                            if !consumed.contains(&k) {
-                                                chain.push(setup_inst.clone());
-                                                consumed.insert(k);
-                                            }
-                                        }
-                                        chain.push(next_si.clone());
+                                        // Compound pair found (load + immediate move).
+                                        let chain = vec![si.clone(), next_si.clone()];
                                         consumed.insert(j);
                                         compound_moves.push((chain, eff_dst));
                                         found_pair = true;
-                                        break;
                                     }
-                                }
-                                // If next_si also writes to d_scratch, stop
-                                // searching — the original load is dead.
-                                let next_writes_scratch = match &next_si.result {
-                                    Some(MachineOperand::Register(r)) => *r == d_scratch,
-                                    _ => false,
-                                } || (next_si.operands.len() >= 2
-                                    && matches!(&next_si.operands[0],
-                                               MachineOperand::Register(r) if *r == d_scratch)
-                                    && next_si
-                                        .operands
-                                        .iter()
-                                        .any(|op| matches!(op, MachineOperand::Memory { .. })));
-                                if next_writes_scratch {
-                                    break;
                                 }
                             }
                             if found_pair {
@@ -2340,7 +2602,38 @@ fn resolve_call_arg_conflicts(mf: &mut MachineFunction, target: &Target) {
                     Some(MachineOperand::Register(r)) => reg_srcs.contains(r),
                     _ => false,
                 });
-                reg_vs_reg || compound_vs_reg || non_reg_vs_reg
+                // Check if any non-reg-move instruction (e.g., PUSH) READS
+                // from a register that is a DESTINATION of a reg-to-reg
+                // move.  Without this check, when no other conflicts are
+                // detected, the original instruction order is preserved
+                // (register-arg MOVs before PUSHes), causing PUSHes to
+                // read clobbered register values instead of the original
+                // stack-argument values.
+                //
+                // Example: `sqlite3GenerateConstraintChecks` has 13 params;
+                // the allocator assigns stack-arg vregs to RCX/RSI/RDX,
+                // which are also destinations for register args 4/2/3.
+                // The PUSHes must execute BEFORE those MOVs.
+                let non_reg_reads_dst = non_reg_move_insts.iter().any(|nrm| {
+                    nrm.operands.iter().any(|op| match op {
+                        MachineOperand::Register(r) => dsts.contains(r),
+                        _ => false,
+                    })
+                });
+                // Also check compound moves that read from reg-move dests.
+                let compound_reads_dst = compound_moves.iter().any(|cm| {
+                    cm.0.iter().any(|inst| {
+                        inst.operands.iter().any(|op| match op {
+                            MachineOperand::Register(r) => dsts.contains(r),
+                            _ => false,
+                        })
+                    })
+                });
+                reg_vs_reg
+                    || compound_vs_reg
+                    || non_reg_vs_reg
+                    || non_reg_reads_dst
+                    || compound_reads_dst
             };
 
             if !has_conflict && indirect_save_needed.is_none() {
@@ -3290,11 +3583,26 @@ fn write_relocatable_object(
     // These are `extern` declarations with no definition in this TU.
     // They must appear as SHN_UNDEF STT_OBJECT entries so the linker
     // resolves them against definitions in other translation units.
+    //
+    // IMPORTANT: Skip any name that already has a defined symbol entry
+    // (i.e., appears in `functions` as a compiled function or in `globals`
+    // as a defined global variable).  The IR may spuriously list function
+    // names as non-definition globals when they are referenced as function
+    // pointers.  Emitting a GLOBAL UNDEF for an already-LOCAL-defined
+    // symbol confuses the linker and causes "undefined reference" errors.
     {
+        let defined_names: crate::common::fx_hash::FxHashSet<&str> = functions
+            .iter()
+            .map(|f| f.name.as_str())
+            .chain(globals.iter().map(|g| g.name.as_str()))
+            .collect();
         let mut seen_extern_vars: crate::common::fx_hash::FxHashSet<String> =
             crate::common::fx_hash::FxHashSet::default();
         for global in module.globals() {
-            if !global.is_definition && seen_extern_vars.insert(global.name.clone()) {
+            if !global.is_definition
+                && !defined_names.contains(global.name.as_str())
+                && seen_extern_vars.insert(global.name.clone())
+            {
                 let binding = match global.linkage {
                     crate::ir::module::Linkage::Weak => STB_WEAK,
                     _ => STB_GLOBAL,
@@ -3368,6 +3676,15 @@ fn write_relocatable_object(
             }
             for decl in module.declarations() {
                 known.insert(decl.name.clone());
+            }
+            // Include extern variable declarations (non-definition globals)
+            // so that relocations referencing them are NOT duplicated into
+            // extra_undef_symbols.  These symbols are already added to the
+            // ELF writer in the extern-var-declaration loop above.
+            for global in module.globals() {
+                if !global.is_definition {
+                    known.insert(global.name.clone());
+                }
             }
             for reloc in text_relocs {
                 if !known.contains(&reloc.symbol) {
@@ -3459,6 +3776,38 @@ fn write_relocatable_object(
                 name: decl.name.clone(),
                 binding: STB_GLOBAL,
             });
+        }
+        // Include extern variable declarations (non-definition globals)
+        // in the same order they were added to the writer.  This ensures
+        // the index map matches the writer's internal symbol ordering.
+        // Use a seen-set to avoid duplicating symbols already covered by
+        // the `globals` parameter (which contains defined globals only).
+        // Also skip any name already present in `functions` or `globals`
+        // (the IR may list function-pointer references as non-definition
+        // globals, but those already have defined symbol entries).
+        {
+            let defined_names_for_extern: crate::common::fx_hash::FxHashSet<&str> = functions
+                .iter()
+                .map(|f| f.name.as_str())
+                .chain(globals.iter().map(|g| g.name.as_str()))
+                .collect();
+            let mut seen_extern_vars: crate::common::fx_hash::FxHashSet<String> =
+                crate::common::fx_hash::FxHashSet::default();
+            for global in module.globals() {
+                if !global.is_definition
+                    && !defined_names_for_extern.contains(global.name.as_str())
+                    && seen_extern_vars.insert(global.name.clone())
+                {
+                    let binding = match global.linkage {
+                        crate::ir::module::Linkage::Weak => STB_WEAK,
+                        _ => STB_GLOBAL,
+                    };
+                    all_syms.push(SymEntry {
+                        name: global.name.clone(),
+                        binding,
+                    });
+                }
+            }
         }
         // RISC-V PCREL local labels are LOCAL symbols
         for (name, _offset) in &pcrel_local_labels {
@@ -3578,6 +3927,12 @@ fn write_relocatable_object(
         for decl in module.declarations() {
             known_syms.insert(decl.name.clone());
         }
+        // Include extern variable declarations (non-definition globals).
+        for global in module.globals() {
+            if !global.is_definition {
+                known_syms.insert(global.name.clone());
+            }
+        }
         // Add any symbols from text relocs that were already added.
         for reloc in text_relocs {
             known_syms.insert(reloc.symbol.clone());
@@ -3588,6 +3943,7 @@ fn write_relocatable_object(
         for (_, sym_name, _, _) in data_relocs {
             if !known_syms.contains(sym_name) {
                 known_syms.insert(sym_name.clone());
+
                 data_extra_undefs.push(sym_name.clone());
             }
         }
@@ -3641,6 +3997,32 @@ fn write_relocatable_object(
                 binding: STB_GLOBAL,
             });
         }
+        // Include extern variable declarations (non-definition globals).
+        // Skip names already defined as functions or global variables.
+        {
+            let data_defined_names: crate::common::fx_hash::FxHashSet<&str> = functions
+                .iter()
+                .map(|f| f.name.as_str())
+                .chain(globals.iter().map(|g| g.name.as_str()))
+                .collect();
+            let mut seen_extern_vars: crate::common::fx_hash::FxHashSet<String> =
+                crate::common::fx_hash::FxHashSet::default();
+            for global in module.globals() {
+                if !global.is_definition
+                    && !data_defined_names.contains(global.name.as_str())
+                    && seen_extern_vars.insert(global.name.clone())
+                {
+                    let binding = match global.linkage {
+                        crate::ir::module::Linkage::Weak => STB_WEAK,
+                        _ => STB_GLOBAL,
+                    };
+                    all_syms.push(DataSymEntry {
+                        name: global.name.clone(),
+                        binding,
+                    });
+                }
+            }
+        }
         // Include extra undef symbols from text relocs (if any were added).
         {
             let mut text_extra: crate::common::fx_hash::FxHashSet<String> =
@@ -3656,6 +4038,12 @@ fn write_relocatable_object(
                     continue; // Filtered — already defined as a function.
                 }
                 text_extra.insert(decl.name.clone());
+            }
+            // Include extern variable declarations.
+            for global in module.globals() {
+                if !global.is_definition {
+                    text_extra.insert(global.name.clone());
+                }
             }
             for reloc in text_relocs {
                 if text_extra.insert(reloc.symbol.clone()) {
