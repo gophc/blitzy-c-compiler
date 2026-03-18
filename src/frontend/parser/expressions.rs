@@ -930,9 +930,13 @@ fn parse_primary_expression(parser: &mut Parser<'_>) -> Result<Expression, ()> {
         TokenKind::FloatLiteral {
             value,
             suffix,
-            base: _,
+            base,
         } => {
-            let val: f64 = value.parse().unwrap_or(0.0);
+            let val: f64 = if *base == crate::frontend::lexer::token::NumericBase::Hexadecimal {
+                parse_hex_float(value)
+            } else {
+                value.parse().unwrap_or(0.0)
+            };
             let sfx = convert_float_suffix(*suffix);
             parser.advance();
             Ok(Expression::FloatLiteral {
@@ -1560,4 +1564,57 @@ fn _get_expression_span_or_dummy(expr: &Expression) -> Span {
     let _ = Span::dummy();
     let _ = Span::new(0, 0, 0);
     expr.span()
+}
+
+/// Parse a hex float literal string like `0x1.fp1` or `0xABCp-10` into an `f64`.
+///
+/// Hex float format: `0x` <hex-digits> [`.` <hex-digits>] `p` [`+`|`-`] <dec-digits>
+/// Value = <significand> × 2^<exponent>
+fn parse_hex_float(s: &str) -> f64 {
+    // Strip 0x/0X prefix and any trailing suffix (f, F, l, L)
+    let s = s.trim();
+    let s = if s.starts_with("0x") || s.starts_with("0X") {
+        &s[2..]
+    } else {
+        s
+    };
+    // Strip trailing float suffixes (f, F, l, L)
+    let s = s.trim_end_matches(|c: char| c == 'f' || c == 'F' || c == 'l' || c == 'L');
+
+    // Split at 'p' or 'P' to get significand and exponent
+    let (sig_str, exp_str) = if let Some(p_pos) = s.find(|c: char| c == 'p' || c == 'P') {
+        (&s[..p_pos], &s[p_pos + 1..])
+    } else {
+        (s, "0")
+    };
+
+    // Parse the significand (hex digits with optional decimal point)
+    let (int_part, frac_part) = if let Some(dot_pos) = sig_str.find('.') {
+        (&sig_str[..dot_pos], &sig_str[dot_pos + 1..])
+    } else {
+        (sig_str, "")
+    };
+
+    // Convert integer part from hex
+    let mut significand: f64 = 0.0;
+    for c in int_part.chars() {
+        if let Some(d) = c.to_digit(16) {
+            significand = significand * 16.0 + d as f64;
+        }
+    }
+
+    // Convert fractional part from hex
+    let mut frac_scale: f64 = 1.0 / 16.0;
+    for c in frac_part.chars() {
+        if let Some(d) = c.to_digit(16) {
+            significand += d as f64 * frac_scale;
+            frac_scale /= 16.0;
+        }
+    }
+
+    // Parse the binary exponent (decimal integer, possibly signed)
+    let exponent: i32 = exp_str.parse().unwrap_or(0);
+
+    // Compute the final value: significand * 2^exponent
+    significand * (2.0_f64).powi(exponent)
 }

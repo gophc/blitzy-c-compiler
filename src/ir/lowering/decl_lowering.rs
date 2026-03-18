@@ -52,7 +52,7 @@ use super::stmt_lowering;
 /// Resolve an AST `Symbol` to its string representation using the name table.
 /// Returns an empty string if the symbol index is out of bounds.
 #[inline]
-fn resolve_sym<'a>(
+pub(super) fn resolve_sym<'a>(
     name_table: &'a [String],
     sym: &crate::common::string_interner::Symbol,
 ) -> &'a str {
@@ -80,6 +80,11 @@ struct LocalVarInfo {
     /// For static locals with initializers, store the AST initializer
     /// for compile-time constant evaluation.
     static_init: Option<ast::Initializer>,
+    /// For VLAs, the size expression (e.g. `n` in `int v[n]`).
+    /// When present, the local is allocated dynamically via StackAlloc
+    /// at the point of declaration rather than as a fixed-size alloca
+    /// in the entry block.
+    vla_size_expr: Option<Box<ast::Expression>>,
 }
 
 // ===========================================================================
@@ -182,7 +187,12 @@ pub fn lower_global_variable(
         let c_type = match (&c_type, &initializer) {
             (CType::Array(elem, None), Some(Constant::String(bytes))) => {
                 // String initializer: bytes already includes null terminator.
-                CType::Array(elem.clone(), Some(bytes.len()))
+                // For wide string literals (wchar_t/char16_t/char32_t), the
+                // bytes are multi-byte encoded, so divide by element byte
+                // size to get the element count.
+                let elem_byte_size = wide_char_elem_size(elem);
+                let elem_count = bytes.len() / elem_byte_size;
+                CType::Array(elem.clone(), Some(elem_count))
             }
             (CType::Array(elem, None), Some(Constant::Array(elems))) => {
                 // Brace-init list: size = number of elements
@@ -235,7 +245,21 @@ pub fn lower_global_variable(
         // Store the original C type so that expression lowering can
         // recover full struct field information (including field names
         // and function pointer signatures) for member access operations.
-        module.global_c_types.insert(var_name_owned, c_type.clone());
+        module.global_c_types.insert(var_name_owned.clone(), c_type.clone());
+
+        // Immediately seed TYPEOF_CONTEXT so that subsequent global
+        // declarations can resolve sizeof(prev_global) correctly during
+        // Pass 1 (e.g. `int arr[3]; char e[sizeof(arr)];`).
+        super::TYPEOF_CONTEXT.with(|ctx| {
+            let mut map = ctx.borrow_mut();
+            if let Some(ref mut m) = *map {
+                m.entry(var_name_owned.clone()).or_insert_with(|| c_type.clone());
+            } else {
+                let mut m = crate::common::fx_hash::FxHashMap::default();
+                m.insert(var_name_owned.clone(), c_type.clone());
+                *map = Some(m);
+            }
+        });
 
         module.add_global(global);
     }
@@ -357,6 +381,27 @@ pub fn lower_function_definition(
 
     let (param_declarations, is_variadic) = extract_function_params(declarator);
 
+    // --- K&R (old-style) parameter type merging ---
+    // For K&R function definitions like `void f(a, b) int a; double b; { ... }`,
+    // the parameter list in the declarator only has identifier names (no types).
+    // The actual parameter types come from `func_def.old_style_params`.
+    // Build a name→CType map from the old-style declarations.
+    let knr_param_types: FxHashMap<String, CType> = {
+        let mut map = FxHashMap::default();
+        for decl in &func_def.old_style_params {
+            let base = resolve_base_type_fast(&decl.specifiers, name_table);
+            for init_decl in &decl.declarators {
+                if let Some(pname) =
+                    extract_declarator_name(&init_decl.declarator, name_table)
+                {
+                    let full_ty = apply_declarator_type(base.clone(), &init_decl.declarator, name_table);
+                    map.insert(pname, full_ty);
+                }
+            }
+        }
+        map
+    };
+
     let mut builder = IrBuilder::new();
 
     // Build parameter list with SSA values, and collect C-level param types
@@ -365,7 +410,13 @@ pub fn lower_function_definition(
     let mut c_param_types = Vec::with_capacity(param_declarations.len());
     for param_decl in &param_declarations {
         let param_name = extract_param_name(param_decl, name_table);
-        let mut param_c_type = resolve_param_type(param_decl, target, name_table);
+        // If K&R type info exists for this parameter, use it; otherwise fall back
+        // to the (possibly empty/int) type from the declarator parameter list.
+        let mut param_c_type = if let Some(knr_ty) = knr_param_types.get(&param_name) {
+            knr_ty.clone()
+        } else {
+            resolve_param_type(param_decl, target, name_table)
+        };
         // C11 §6.7.6.3p7: Parameter type adjustments — array→pointer, function→pointer.
         param_c_type = match param_c_type {
             CType::Array(elem, _) => {
@@ -443,8 +494,14 @@ pub fn lower_function_definition(
     // --- Seed the typeof resolution context with parameter types ---
     // This allows `typeof(param_name)` inside the function body to resolve
     // correctly during the local variable collection pass.
+    // SAVE the current TYPEOF_CONTEXT (which has global variable types) so
+    // we can restore it after this function's lowering completes.  This
+    // prevents parameter names from shadowing global variable types in
+    // TYPEOF_CONTEXT for subsequent functions (e.g. `void f(char *a)` must
+    // not permanently overwrite global `const char a[]`).
+    let saved_typeof_context = super::TYPEOF_CONTEXT.with(|ctx| ctx.borrow().clone());
     super::TYPEOF_CONTEXT.with(|ctx| {
-        let mut map = FxHashMap::default();
+        let mut map = ctx.borrow_mut().take().unwrap_or_default();
         for param_decl in &param_declarations {
             let pname = extract_param_name(param_decl, name_table);
             if !pname.is_empty() {
@@ -516,16 +573,39 @@ pub fn lower_function_definition(
     // --- Build local_types from collected local variable info ---
     let mut local_types: FxHashMap<String, CType> = FxHashMap::default();
     for local_info in &locals {
-        local_types.insert(local_info.name.clone(), local_info.c_type.clone());
+        if local_info.vla_size_expr.is_some() {
+            // VLA variables are stored as pointers to the element type.
+            // This ensures array subscript access (`v[i]`) generates a
+            // Load of the pointer followed by GEP, rather than treating
+            // the alloca itself as the array base.
+            if let CType::Array(ref elem, _) = local_info.c_type {
+                local_types.insert(
+                    local_info.name.clone(),
+                    CType::Pointer(
+                        elem.clone(),
+                        crate::common::types::TypeQualifiers::default(),
+                    ),
+                );
+            } else {
+                local_types.insert(local_info.name.clone(), local_info.c_type.clone());
+            }
+        } else {
+            local_types.insert(local_info.name.clone(), local_info.c_type.clone());
+        }
     }
     // Add parameter types as well — resolve struct forward references so
     // that `struct Item *arr` parameter types carry the full struct layout,
     // enabling correct sizeof computation for pointer arithmetic.
     // C11 §6.7.6.3p7: parameter type adjustments (array→pointer, function→pointer).
+    // For K&R-style functions, use the K&R type map which has the real types.
     for param_decl in &param_declarations {
         let pname = extract_param_name(param_decl, name_table);
         if !pname.is_empty() {
-            let mut ptype = resolve_param_type(param_decl, target, name_table);
+            let mut ptype = if let Some(knr_ty) = knr_param_types.get(&pname) {
+                knr_ty.clone()
+            } else {
+                resolve_param_type(param_decl, target, name_table)
+            };
             // Array-to-pointer / function-to-pointer decay for parameter types.
             ptype = match ptype {
                 CType::Array(elem, _) => {
@@ -605,6 +685,7 @@ pub fn lower_function_definition(
             scope_type_overrides: FxHashMap::default(),
             return_ctype: Some(return_c_type.clone()),
             layout_cache: FxHashMap::default(),
+            vla_sizes: FxHashMap::default(),
         };
         stmt_lowering::lower_statement(&mut stmt_ctx, &body_stmt);
     }
@@ -614,6 +695,12 @@ pub fn lower_function_definition(
 
     // Sync value_count from builder.
     ir_function.value_count = builder.fresh_value().0;
+
+    // Restore TYPEOF_CONTEXT to its pre-function state so that parameter
+    // types from this function don't leak to subsequent functions.
+    super::TYPEOF_CONTEXT.with(|ctx| {
+        *ctx.borrow_mut() = saved_typeof_context;
+    });
 
     module.add_function(ir_function);
 }
@@ -716,8 +803,12 @@ pub fn lower_local_initializer(
 
             if let Some((elem_ty, arr_size)) = is_char_array_type(&resolved_var_ty) {
                 if let Some(str_bytes) = extract_string_literal_bytes(expr) {
+                    // arr_size is in elements; convert to total byte count
+                    // for the byte-level copy in lower_char_array_from_string.
+                    let elem_bsz = wide_char_elem_size(&elem_ty);
+                    let arr_byte_size = arr_size * elem_bsz;
                     lower_char_array_from_string(
-                        var_alloca, &str_bytes, arr_size, &elem_ty, ctx,
+                        var_alloca, &str_bytes, arr_byte_size, &elem_ty, ctx,
                     );
                     return;
                 }
@@ -735,61 +826,77 @@ pub fn lower_local_initializer(
                 0
             };
             if is_agg && struct_size > 8 {
-                // Get the RHS as an lvalue (pointer) — do NOT dereference.
-                let rhs_ptr = expr_lowering::lower_lvalue(ctx, expr);
+                // Determine whether the expression is a natural lvalue
+                // (has a stable memory address) or an rvalue (e.g.,
+                // a function call returning a struct by value).
+                let is_natural_lvalue = is_natural_lvalue_expr(expr);
 
-                // Emit individual 8-byte load/store pairs to copy the
-                // aggregate from source to destination.
-                let span = Span::dummy();
-                let mut offset: usize = 0;
-                while offset < struct_size {
-                    let remaining = struct_size - offset;
-                    let (chunk_sz, chunk_ir) = if remaining >= 8 {
-                        (8, IrType::I64)
-                    } else if remaining >= 4 {
-                        (4, IrType::I32)
-                    } else if remaining >= 2 {
-                        (2, IrType::I16)
-                    } else {
-                        (1, IrType::I8)
-                    };
+                if is_natural_lvalue {
+                    // Get the RHS as an lvalue (pointer) — do NOT dereference.
+                    let rhs_ptr = expr_lowering::lower_lvalue(ctx, expr);
 
-                    // Compute source address: rhs_ptr + offset
-                    let src_addr = if offset == 0 {
-                        rhs_ptr
-                    } else {
-                        let off_val = make_index_value(ctx, offset as i64);
-                        let (gep_val, gep_inst) =
-                            ctx.builder
-                                .build_gep(rhs_ptr, vec![off_val], chunk_ir.clone(), span);
-                        emit_inst_to_ctx(ctx, gep_inst);
-                        gep_val
-                    };
+                    // Emit individual 8-byte load/store pairs to copy the
+                    // aggregate from source to destination.
+                    let span = Span::dummy();
+                    let mut offset: usize = 0;
+                    while offset < struct_size {
+                        let remaining = struct_size - offset;
+                        let (chunk_sz, chunk_ir) = if remaining >= 8 {
+                            (8, IrType::I64)
+                        } else if remaining >= 4 {
+                            (4, IrType::I32)
+                        } else if remaining >= 2 {
+                            (2, IrType::I16)
+                        } else {
+                            (1, IrType::I8)
+                        };
 
-                    // Load chunk from source.
-                    let (loaded, li) = ctx.builder.build_load(src_addr, chunk_ir.clone(), span);
-                    emit_inst_to_ctx(ctx, li);
+                        // Compute source address: rhs_ptr + offset
+                        let src_addr = if offset == 0 {
+                            rhs_ptr
+                        } else {
+                            let off_val = make_index_value(ctx, offset as i64);
+                            let (gep_val, gep_inst) =
+                                ctx.builder
+                                    .build_gep(rhs_ptr, vec![off_val], chunk_ir.clone(), span);
+                            emit_inst_to_ctx(ctx, gep_inst);
+                            gep_val
+                        };
 
-                    // Compute destination address: var_alloca + offset
-                    let dst_addr = if offset == 0 {
-                        var_alloca
-                    } else {
-                        let off_val2 = make_index_value(ctx, offset as i64);
-                        let (gep_val2, gep_inst2) = ctx.builder.build_gep(
-                            var_alloca,
-                            vec![off_val2],
-                            chunk_ir.clone(),
-                            span,
-                        );
-                        emit_inst_to_ctx(ctx, gep_inst2);
-                        gep_val2
-                    };
+                        // Load chunk from source.
+                        let (loaded, li) = ctx.builder.build_load(src_addr, chunk_ir.clone(), span);
+                        emit_inst_to_ctx(ctx, li);
 
-                    // Store chunk to destination.
-                    let si = ctx.builder.build_store(loaded, dst_addr, span);
-                    emit_inst_to_ctx(ctx, si);
+                        // Compute destination address: var_alloca + offset
+                        let dst_addr = if offset == 0 {
+                            var_alloca
+                        } else {
+                            let off_val2 = make_index_value(ctx, offset as i64);
+                            let (gep_val2, gep_inst2) = ctx.builder.build_gep(
+                                var_alloca,
+                                vec![off_val2],
+                                chunk_ir.clone(),
+                                span,
+                            );
+                            emit_inst_to_ctx(ctx, gep_inst2);
+                            gep_val2
+                        };
 
-                    offset += chunk_sz;
+                        // Store chunk to destination.
+                        let si = ctx.builder.build_store(loaded, dst_addr, span);
+                        emit_inst_to_ctx(ctx, si);
+
+                        offset += chunk_sz;
+                    }
+                } else {
+                    // Rvalue expression returning a struct (function call,
+                    // conditional, statement expression, etc.).  Evaluate the
+                    // expression normally — the backend handles struct copies
+                    // via struct_load_source / struct_pair_hi in the Store
+                    // instruction handler.
+                    let typed_val = expr_lowering::lower_expression_typed(ctx, expr);
+                    let store_inst = ctx.builder.build_store(typed_val.value, var_alloca, Span::dummy());
+                    emit_inst_to_ctx(ctx, store_inst);
                 }
             } else {
                 // Scalar or small-aggregate (≤8 bytes): lower the expression
@@ -1031,12 +1138,18 @@ fn lower_single_init_element(
 ) {
     match init {
         ast::Initializer::Expression(expr) => {
-            let val = expr_lowering::lower_expression(ctx, expr);
-            // Insert an implicit conversion (truncation) when the expression
-            // value is wider than the target element type. For example, `0x80`
-            // (I32) stored into a `char` element (I8) needs Trunc(I32 → I8)
-            // so the backend emits a byte store instead of a 32-bit store.
-            let val = expr_lowering::convert_for_store(ctx, val, elem_type);
+            let tv = expr_lowering::lower_expression_typed(ctx, expr);
+            // Insert an implicit conversion when the expression value's type
+            // differs from the target element type. This handles both
+            // narrowing (e.g., `0x80` I32 → `char` I8) and widening
+            // (e.g., `-1` I32 → `long` I64 with sign-extension).
+            let val = expr_lowering::insert_implicit_conversion(
+                ctx,
+                tv.value,
+                &tv.ty,
+                elem_type,
+                Span::dummy(),
+            );
             let store_inst = ctx.builder.build_store(val, ptr, Span::dummy());
             emit_inst_to_ctx(ctx, store_inst);
         }
@@ -1102,15 +1215,26 @@ fn evaluate_constant_expr(
     match expr {
         ast::Expression::IntegerLiteral { value, .. } => Some(Constant::Integer(*value as i128)),
         ast::Expression::FloatLiteral { value, .. } => Some(Constant::Float(*value)),
-        ast::Expression::StringLiteral { segments, .. } => {
+        ast::Expression::StringLiteral {
+            segments, prefix, ..
+        } => {
             // Concatenate all segments for the string value.
             // C string literals include a null terminator — append it
             // so that the byte vector matches the declared array size.
-            let mut bytes = Vec::new();
+            // Wide string literals (L, U, u) encode each character at the
+            // target wchar_t/char16_t/char32_t width.  For wide strings,
+            // raw bytes are UTF-8 decoded to code points first so that
+            // multi-byte UTF-8 sequences produce a single wide character.
+            let char_width: usize = match prefix {
+                ast::StringPrefix::None | ast::StringPrefix::U8 => 1,
+                ast::StringPrefix::L | ast::StringPrefix::U32 => 4,
+                ast::StringPrefix::U16 => 2,
+            };
+            let mut raw_bytes = Vec::new();
             for seg in segments {
-                bytes.extend_from_slice(&seg.value);
+                raw_bytes.extend_from_slice(&seg.value);
             }
-            bytes.push(0); // null terminator
+            let bytes = expand_string_bytes_for_width(&raw_bytes, char_width);
             Some(Constant::String(bytes))
         }
         ast::Expression::CharLiteral { value, .. } => Some(Constant::Integer(*value as i128)),
@@ -1223,15 +1347,24 @@ fn evaluate_constant_expr(
             )?;
             evaluate_const_binop(op, &lhs, &rhs)
         }
-        ast::Expression::Cast { operand, .. } => evaluate_constant_expr(
+        ast::Expression::Cast {
             operand,
-            _expected_type,
-            target,
-            type_builder,
-            diagnostics,
-            name_table,
-            enum_constants,
-        ),
+            type_name,
+            ..
+        } => {
+            let inner = evaluate_constant_expr(
+                operand,
+                _expected_type,
+                target,
+                type_builder,
+                diagnostics,
+                name_table,
+                enum_constants,
+            )?;
+            // Apply cast truncation to match C semantics.
+            let cast_ty = super::resolve_type_name_for_const(type_name, target, type_builder);
+            Some(apply_const_cast(inner, &cast_ty, target))
+        }
         ast::Expression::SizeofExpr { .. } | ast::Expression::SizeofType { .. } => Some(
             Constant::Integer(evaluate_sizeof_expr(expr, target, type_builder) as i128),
         ),
@@ -1391,21 +1524,137 @@ fn evaluate_constant_expr(
     }
 }
 
+/// Apply a C-type cast to a constant value, truncating to the correct bit width.
+///
+/// In C, casts like `(int)(0x100000000ULL)` must truncate to 32 bits, yielding 0.
+/// Similarly, `(long long)(val)` truncates to 64 bits.  The constant evaluator
+/// works with `i128`, so we must manually apply the target type's width.
+fn apply_const_cast(c: Constant, cast_ty: &CType, target: &Target) -> Constant {
+    match c {
+        Constant::Integer(val) => {
+            let truncated = truncate_const_to_ctype(val, cast_ty, target);
+            Constant::Integer(truncated)
+        }
+        // Float → integer or integer → float casts in global initializers:
+        // pass through for now (the caller already evaluated the inner expr).
+        other => other,
+    }
+}
+
+/// Truncate an i128 constant to the bit-width of a C type, performing
+/// sign-extension for signed types and zero-extension for unsigned types.
+fn truncate_const_to_ctype(val: i128, cty: &CType, target: &Target) -> i128 {
+    match cty {
+        CType::Bool => {
+            if val != 0 {
+                1
+            } else {
+                0
+            }
+        }
+        CType::Char | CType::SChar => (val as i8) as i128,
+        CType::UChar => (val as u8) as i128,
+        CType::Short => (val as i16) as i128,
+        CType::UShort => (val as u16) as i128,
+        CType::Int => (val as i32) as i128,
+        CType::UInt => (val as u32) as i128,
+        CType::Long | CType::LongLong => {
+            if target.pointer_width() == 4 {
+                // ILP32: long = 32 bits
+                match cty {
+                    CType::Long => (val as i32) as i128,
+                    _ => (val as i64) as i128,
+                }
+            } else {
+                (val as i64) as i128
+            }
+        }
+        CType::ULong | CType::ULongLong => {
+            if target.pointer_width() == 4 {
+                match cty {
+                    CType::ULong => (val as u32) as i128,
+                    _ => (val as u64) as i128,
+                }
+            } else {
+                (val as u64) as i128
+            }
+        }
+        CType::Pointer(..) => {
+            if target.pointer_width() == 4 {
+                (val as u32) as i128
+            } else {
+                (val as u64) as i128
+            }
+        }
+        CType::Enum { .. } => (val as i32) as i128,
+        // For types we can't determine a width for, pass through unchanged.
+        _ => val,
+    }
+}
+
 /// Evaluate a constant binary operation.
 fn evaluate_const_binop(op: &ast::BinaryOp, lhs: &Constant, rhs: &Constant) -> Option<Constant> {
     match (lhs, rhs) {
         (Constant::Integer(a), Constant::Integer(b)) => {
+            // Determine if both operands fit in 64-bit range.
+            // C's widest standard integer type is `long long` (64-bit).
+            // When both values fit in i64, perform arithmetic in i64
+            // to match C overflow/truncation semantics.
+            let fits_i64 =
+                *a == (*a as i64 as i128) && *b == (*b as i64 as i128);
             let result = match op {
-                ast::BinaryOp::Add => a.wrapping_add(*b),
-                ast::BinaryOp::Sub => a.wrapping_sub(*b),
-                ast::BinaryOp::Mul => a.wrapping_mul(*b),
-                ast::BinaryOp::Div if *b != 0 => a.wrapping_div(*b),
-                ast::BinaryOp::Mod if *b != 0 => a.wrapping_rem(*b),
+                ast::BinaryOp::Add => {
+                    if fits_i64 {
+                        (*a as i64).wrapping_add(*b as i64) as i128
+                    } else {
+                        a.wrapping_add(*b)
+                    }
+                }
+                ast::BinaryOp::Sub => {
+                    if fits_i64 {
+                        (*a as i64).wrapping_sub(*b as i64) as i128
+                    } else {
+                        a.wrapping_sub(*b)
+                    }
+                }
+                ast::BinaryOp::Mul => {
+                    if fits_i64 {
+                        (*a as i64).wrapping_mul(*b as i64) as i128
+                    } else {
+                        a.wrapping_mul(*b)
+                    }
+                }
+                ast::BinaryOp::Div if *b != 0 => {
+                    if fits_i64 {
+                        (*a as i64).wrapping_div(*b as i64) as i128
+                    } else {
+                        a.wrapping_div(*b)
+                    }
+                }
+                ast::BinaryOp::Mod if *b != 0 => {
+                    if fits_i64 {
+                        (*a as i64).wrapping_rem(*b as i64) as i128
+                    } else {
+                        a.wrapping_rem(*b)
+                    }
+                }
                 ast::BinaryOp::BitwiseAnd => *a & *b,
                 ast::BinaryOp::BitwiseOr => *a | *b,
                 ast::BinaryOp::BitwiseXor => *a ^ *b,
-                ast::BinaryOp::ShiftLeft => a.wrapping_shl(*b as u32),
-                ast::BinaryOp::ShiftRight => a.wrapping_shr(*b as u32),
+                ast::BinaryOp::ShiftLeft => {
+                    if fits_i64 {
+                        (*a as i64).wrapping_shl(*b as u32) as i128
+                    } else {
+                        a.wrapping_shl(*b as u32)
+                    }
+                }
+                ast::BinaryOp::ShiftRight => {
+                    if fits_i64 {
+                        (*a as i64).wrapping_shr(*b as u32) as i128
+                    } else {
+                        a.wrapping_shr(*b as u32)
+                    }
+                }
                 ast::BinaryOp::Equal => {
                     if a == b {
                         1
@@ -1547,34 +1796,197 @@ fn lower_designated_initializer(
             }
             Some(Constant::Array(elements))
         }
-        CType::Struct { ref fields, .. } => {
-            let field_count = fields.len();
-            let mut field_values = vec![Constant::ZeroInit; field_count];
-            let mut current_idx = 0usize;
-            for desig_init in init_list {
-                current_idx = resolve_field_designator(
-                    &desig_init.designators,
+        CType::Struct {
+            ref fields,
+            packed: is_packed,
+            aligned: explicit_align,
+            ..
+        } => {
+            // Check if the struct has any bitfield members.
+            let has_bitfields = fields.iter().any(|f| f.bit_width.is_some());
+
+            if has_bitfields {
+                // For bitfield structs, build a packed byte buffer directly
+                // because Constant::Struct(per-field) doesn't handle the
+                // bit-level packing required by bitfield storage units.
+                let layout = type_builder.compute_struct_layout_with_fields(
                     fields,
-                    current_idx,
-                    name_table,
+                    *is_packed,
+                    *explicit_align,
                 );
-                if current_idx < field_count {
-                    let field_type = &fields[current_idx].ty;
-                    if let Some(c) = evaluate_initializer_constant(
-                        &desig_init.initializer,
-                        field_type,
-                        target,
-                        type_builder,
-                        diagnostics,
+                let struct_size = type_builder.sizeof_type(resolved);
+                let mut bytes = vec![0u8; struct_size];
+
+                // Evaluate each field value.
+                let field_count = fields.len();
+                let mut field_values: Vec<Option<i128>> = vec![None; field_count];
+                let mut current_idx = 0usize;
+                for desig_init in init_list {
+                    current_idx = resolve_field_designator(
+                        &desig_init.designators,
+                        fields,
+                        current_idx,
                         name_table,
-                        enum_constants,
-                    ) {
-                        field_values[current_idx] = c;
+                    );
+                    // Skip anonymous bitfields (unnamed padding fields).
+                    while current_idx < field_count && fields[current_idx].name.is_none() {
+                        current_idx += 1;
+                    }
+                    if current_idx < field_count {
+                        let field_type = &fields[current_idx].ty;
+                        if let Some(c) = evaluate_initializer_constant(
+                            &desig_init.initializer,
+                            field_type,
+                            target,
+                            type_builder,
+                            diagnostics,
+                            name_table,
+                            enum_constants,
+                        ) {
+                            field_values[current_idx] = match c {
+                                Constant::Integer(v) => Some(v),
+                                Constant::Float(v) => Some(v.to_bits() as i128),
+                                Constant::ZeroInit => Some(0),
+                                _ => None,
+                            };
+                        }
+                    }
+                    current_idx += 1;
+                }
+
+                // Pack each field into the byte buffer.
+                for (fi, _field) in fields.iter().enumerate() {
+                    let val = match field_values[fi] {
+                        Some(v) => v,
+                        None => 0, // zero-init
+                    };
+                    if let Some(fl) = layout.fields.get(fi) {
+                        if let Some((bit_offset_in_unit, bit_width)) = fl.bitfield_info {
+                            if bit_width == 0 {
+                                continue; // zero-width bitfield
+                            }
+                            // Pack into the storage unit at fl.offset
+                            let mask = if bit_width >= 128 {
+                                !0u128
+                            } else {
+                                (1u128 << bit_width) - 1
+                            };
+                            let masked_val = (val as u128) & mask;
+                            let shifted = masked_val << bit_offset_in_unit;
+
+                            // OR into the byte buffer at the storage unit's
+                            // byte offset (little-endian).
+                            let unit_bytes = fl.size.max(1);
+                            for b in 0..unit_bytes {
+                                let byte_idx = fl.offset + b;
+                                if byte_idx < bytes.len() {
+                                    bytes[byte_idx] |=
+                                        ((shifted >> (b * 8)) & 0xFF) as u8;
+                                }
+                            }
+                        } else {
+                            // Regular (non-bitfield) field — write at byte offset.
+                            let field_size = fl.size;
+                            let v = val as u128;
+                            for b in 0..field_size.min(16) {
+                                let byte_idx = fl.offset + b;
+                                if byte_idx < bytes.len() {
+                                    bytes[byte_idx] = ((v >> (b * 8)) & 0xFF) as u8;
+                                }
+                            }
+                        }
                     }
                 }
-                current_idx += 1;
+
+                Some(Constant::String(bytes))
+            } else {
+                // Non-bitfield struct — use per-field constants, with brace
+                // elision support for aggregate (array/struct) sub-fields.
+                let field_count = fields.len();
+                let mut field_values = vec![Constant::ZeroInit; field_count];
+                let mut current_idx = 0usize;
+                let mut init_iter = init_list.iter().peekable();
+                while let Some(desig_init) = init_iter.next() {
+                    current_idx = resolve_field_designator(
+                        &desig_init.designators,
+                        fields,
+                        current_idx,
+                        name_table,
+                    );
+                    // Skip anonymous fields (unnamed bitfields, anonymous
+                    // struct/union padding fields).
+                    while current_idx < field_count && fields[current_idx].name.is_none() {
+                        current_idx += 1;
+                    }
+                    if current_idx < field_count {
+                        let field_type = &fields[current_idx].ty;
+                        let resolved_ft = crate::common::types::resolve_typedef(field_type);
+
+                        // Detect brace elision: if the current initializer is
+                        // a scalar Expression destined for an aggregate
+                        // (array/struct) field and there are enough remaining
+                        // scalar inits, collect them into a sub-list and
+                        // recurse.
+                        let needs_brace_elision = desig_init.designators.is_empty()
+                            && matches!(
+                                resolved_ft,
+                                CType::Array(..) | CType::Struct { .. }
+                            )
+                            && matches!(
+                                &desig_init.initializer,
+                                ast::Initializer::Expression(_)
+                            );
+
+                        if needs_brace_elision {
+                            // Count how many scalar elements the aggregate
+                            // needs in a flat initializer.
+                            let sub_count = flat_scalar_count(resolved_ft, type_builder);
+                            let mut sub_inits: Vec<ast::DesignatedInitializer> = Vec::new();
+                            // First item is the current desig_init
+                            sub_inits.push(ast::DesignatedInitializer {
+                                designators: Vec::new(),
+                                initializer: desig_init.initializer.clone(),
+                                span: desig_init.span,
+                            });
+                            // Consume additional items from the iterator
+                            for _ in 1..sub_count {
+                                if let Some(next) = init_iter.next() {
+                                    sub_inits.push(ast::DesignatedInitializer {
+                                        designators: Vec::new(),
+                                        initializer: next.initializer.clone(),
+                                        span: next.span,
+                                    });
+                                } else {
+                                    break;
+                                }
+                            }
+                            if let Some(c) = lower_designated_initializer(
+                                &sub_inits,
+                                resolved_ft,
+                                target,
+                                type_builder,
+                                diagnostics,
+                                name_table,
+                                enum_constants,
+                            ) {
+                                field_values[current_idx] = c;
+                            }
+                        } else if let Some(c) = evaluate_initializer_constant(
+                            &desig_init.initializer,
+                            field_type,
+                            target,
+                            type_builder,
+                            diagnostics,
+                            name_table,
+                            enum_constants,
+                        ) {
+                            field_values[current_idx] = c;
+                        }
+                    }
+                    current_idx += 1;
+                }
+                Some(Constant::Struct(field_values))
             }
-            Some(Constant::Struct(field_values))
         }
         CType::Union { ref fields, .. } => {
             if let Some(first) = init_list.first() {
@@ -1652,7 +2064,28 @@ fn allocate_parameters(
         let param_c_type = resolve_sizeof_struct_ref(param_c_type, target);
         let param_ir_type = IrType::from_ctype(&param_c_type, target);
 
-        let (alloca_val, alloca_inst) = builder.build_alloca(param_ir_type, Span::dummy());
+        // Round up struct alloca sizes to the next power-of-2 when the
+        // natural struct size is not a power-of-2 (e.g. 3, 5, 6, 7 bytes).
+        // The ABI passes small structs in registers sized to the next
+        // power-of-2 (3 bytes → I32 register), so a 4-byte register store
+        // into a 3-byte alloca overflows by 1 byte, corrupting the saved
+        // frame pointer.  Padding the alloca to the register width prevents
+        // this while keeping member-access offsets unchanged (GEP uses byte
+        // offsets, not the alloca's IR type).
+        let alloca_ir_type = match &param_ir_type {
+            IrType::Struct(_) | IrType::Array(_, _) => {
+                let sz = param_ir_type.size_bytes(target);
+                if sz > 0 && sz <= 8 && !sz.is_power_of_two() {
+                    let rounded = sz.next_power_of_two();
+                    IrType::Array(Box::new(IrType::I8), rounded)
+                } else {
+                    param_ir_type.clone()
+                }
+            }
+            _ => param_ir_type.clone(),
+        };
+
+        let (alloca_val, alloca_inst) = builder.build_alloca(alloca_ir_type, Span::dummy());
         push_inst_to_entry(function, alloca_inst);
 
         let param_value = if idx < function.params.len() {
@@ -1822,11 +2255,32 @@ fn infer_array_size_from_initializer(init: &ast::Initializer, elem_type: &CType)
             max_index
         }
         ast::Initializer::Expression(expr_box) => {
-            if let ast::Expression::StringLiteral { segments, .. } = expr_box.as_ref() {
-                // String initializer for char arrays — size includes null terminator.
-                let _ = elem_type; // suppress unused warning
-                let total_bytes: usize = segments.iter().map(|s| s.value.len()).sum();
-                total_bytes + 1 // null terminator
+            if let ast::Expression::StringLiteral {
+                segments, prefix, ..
+            } = expr_box.as_ref()
+            {
+                // Count the number of CHARACTERS (not bytes) for array sizing.
+                // For narrow strings, each raw byte is one character.
+                // For wide strings, raw bytes are UTF-8 sequences that must
+                // be decoded to count the actual number of Unicode code points.
+                let char_width: usize = match prefix {
+                    ast::StringPrefix::None | ast::StringPrefix::U8 => 1,
+                    ast::StringPrefix::L | ast::StringPrefix::U32 => 4,
+                    ast::StringPrefix::U16 => 2,
+                };
+                let _ = elem_type;
+                if char_width == 1 {
+                    let total_bytes: usize = segments.iter().map(|s| s.value.len()).sum();
+                    total_bytes + 1 // null terminator
+                } else {
+                    // For wide strings, decode UTF-8 to count code points.
+                    let mut raw_bytes = Vec::new();
+                    for seg in segments {
+                        raw_bytes.extend_from_slice(&seg.value);
+                    }
+                    let codepoints = decode_bytes_to_codepoints(&raw_bytes);
+                    codepoints.len() + 1 // +1 for null terminator
+                }
             } else {
                 0
             }
@@ -1885,6 +2339,14 @@ fn collect_locals_from_declaration(
             }
         });
 
+        // Detect VLA: if the type is Array(_, None) and the declarator
+        // has a non-constant size expression, extract it for dynamic allocation.
+        let vla_size_expr = if matches!(c_type, CType::Array(_, None)) && !is_static {
+            extract_vla_size_expr(declarator)
+        } else {
+            None
+        };
+
         locals.push(LocalVarInfo {
             name: var_name,
             c_type,
@@ -1893,6 +2355,7 @@ fn collect_locals_from_declaration(
             alignment,
             span: decl.span,
             static_init,
+            vla_size_expr,
         });
     }
 }
@@ -1900,6 +2363,37 @@ fn collect_locals_from_declaration(
 // ===========================================================================
 // Local variable allocation
 // ===========================================================================
+
+/// Extract the VLA size expression from a declarator.
+/// For `int v[n]`, returns `Some(Box(n))`.  For constant-sized arrays, returns `None`.
+fn extract_vla_size_expr(declarator: &ast::Declarator) -> Option<Box<ast::Expression>> {
+    extract_vla_from_direct_decl(&declarator.direct)
+}
+
+/// Public variant for use from stmt_lowering.
+pub fn extract_vla_size_expr_pub(declarator: &ast::Declarator) -> Option<Box<ast::Expression>> {
+    extract_vla_size_expr(declarator)
+}
+
+fn extract_vla_from_direct_decl(dd: &ast::DirectDeclarator) -> Option<Box<ast::Expression>> {
+    match dd {
+        ast::DirectDeclarator::Array {
+            size: Some(expr), ..
+        } => {
+            // Check if the expression is a compile-time constant.
+            // If it IS constant, this is not a VLA.
+            if evaluate_const_int_expr(expr).is_some() {
+                None
+            } else {
+                Some(expr.clone())
+            }
+        }
+        ast::DirectDeclarator::Parenthesized(inner) => {
+            extract_vla_size_expr(inner)
+        }
+        _ => None,
+    }
+}
 
 fn allocate_local_variables(
     builder: &mut IrBuilder,
@@ -1909,11 +2403,47 @@ fn allocate_local_variables(
     local_vars: &mut FxHashMap<String, Value>,
 ) {
     for (idx, local) in locals.iter().enumerate() {
+        // Skip VLAs — they are allocated dynamically via StackAlloc
+        // at the point of declaration, not as a fixed-size alloca in the
+        // entry block.  A placeholder Ptr alloca is created so the
+        // variable has an entry in `local_vars`; the actual StackAlloc
+        // pointer will be stored into this alloca at lowering time.
+        if local.vla_size_expr.is_some() {
+            // Create a pointer-sized alloca to hold the VLA pointer.
+            let ptr_ty = IrType::Ptr;
+            let (alloca_val, alloca_inst) =
+                builder.build_alloca(ptr_ty.clone(), local.span);
+            push_inst_to_entry(function, alloca_inst);
+            local_vars.insert(local.name.clone(), alloca_val);
+
+            let decl_line =
+                if local.span.start > 0 { local.span.start } else { 1 };
+            function
+                .local_var_debug_info
+                .push(crate::ir::function::LocalVarDebugInfo {
+                    name: local.name.clone(),
+                    ir_type: ptr_ty,
+                    alloca_index: idx as u32,
+                    decl_line,
+                });
+            continue;
+        }
         // Resolve forward-referenced struct/union tag references so the
         // alloca size matches the full struct/union definition.
         let resolved_type = resolve_sizeof_struct_ref(local.c_type.clone(), target);
         let ir_type = IrType::from_ctype(&resolved_type, target);
-        let (alloca_val, alloca_inst) = builder.build_alloca(ir_type.clone(), local.span);
+        // Round up non-power-of-2 struct allocas so whole-struct register
+        // stores (e.g. `struct s = foo();` returning in I32 for 3-byte
+        // struct) do not overflow the alloca.
+        let alloca_ir_type = {
+            let sz = ir_type.size_bytes(target);
+            if sz > 0 && sz <= 8 && !sz.is_power_of_two() {
+                IrType::Array(Box::new(IrType::I8), sz.next_power_of_two())
+            } else {
+                ir_type.clone()
+            }
+        };
+        let (alloca_val, alloca_inst) = builder.build_alloca(alloca_ir_type, local.span);
         push_inst_to_entry(function, alloca_inst);
         local_vars.insert(local.name.clone(), alloca_val);
 
@@ -1986,7 +2516,8 @@ fn lower_static_local(
     // Infer array size from initializer when declaration uses [].
     let c_type = match (c_type, &constant) {
         (CType::Array(elem, None), Some(Constant::String(bytes))) => {
-            CType::Array(elem.clone(), Some(bytes.len()))
+            let elem_byte_size = wide_char_elem_size(&elem);
+            CType::Array(elem.clone(), Some(bytes.len() / elem_byte_size))
         }
         (CType::Array(elem, None), Some(Constant::Array(elems))) => {
             CType::Array(elem.clone(), Some(elems.len()))
@@ -2271,7 +2802,13 @@ fn resolve_struct_forward_ref_inner(
         // definition already carries its field types and nested references
         // will be resolved lazily.
         CType::Struct { .. } | CType::Union { .. } => {}
-        CType::Pointer(_, _) => {}
+        CType::Pointer(inner, _) => {
+            // Recurse into the pointee type to resolve forward-referenced
+            // struct/union tags.  This is essential for K&R-style function
+            // definitions where `struct S *p` carries a lightweight tag
+            // reference (Struct { name: "S", fields: [] }) as the pointee.
+            resolve_struct_forward_ref_inner(inner, struct_defs, 0);
+        }
         // Unwrap containers that might hold a forward-referenced tag.
         CType::Array(inner, _) => {
             resolve_struct_forward_ref_inner(inner, struct_defs, 0);
@@ -2317,12 +2854,13 @@ fn resolve_base_type_from_sqlist_fast(
     resolve_multi_word_type_fast(type_specs, name_table)
 }
 
-fn extract_alignment_attribute(
+pub(super) fn extract_alignment_attribute(
     attributes: &[ast::Attribute],
     name_table: &[String],
 ) -> Option<usize> {
     for attr in attributes {
-        if resolve_sym(name_table, &attr.name) == "aligned" {
+        let n = resolve_sym(name_table, &attr.name);
+        if n == "aligned" || n == "__aligned__" {
             if let Some(ast::AttributeArg::Expression(expr)) = attr.args.first() {
                 if let ast::Expression::IntegerLiteral { value, .. } = expr.as_ref() {
                     return Some(*value as usize);
@@ -2372,13 +2910,104 @@ pub fn resolve_base_type_fast(
     name_table: &[String],
 ) -> CType {
     let type_specs = &specifiers.type_specifiers;
-    if type_specs.is_empty() {
-        return CType::Int;
+    let mut base = if type_specs.is_empty() {
+        CType::Int
+    } else if type_specs.len() == 1 {
+        map_single_type_specifier_fast(&type_specs[0], name_table)
+    } else {
+        resolve_multi_word_type_fast(type_specs, name_table)
+    };
+    // Apply __attribute__((mode(QI/HI/SI/DI/TI/SF/DF/XF))) if present.
+    base = apply_mode_attribute(base, &specifiers.attributes, name_table);
+    base
+}
+
+/// Apply GCC `__attribute__((mode(...)))` to change the integer/float
+/// size of a type.  QI=1, HI=2, SI=4, DI=8, TI=16, SF=float, DF=double, XF=long double.
+fn apply_mode_attribute(
+    base: CType,
+    attributes: &[ast::Attribute],
+    name_table: &[String],
+) -> CType {
+    for attr in attributes {
+        let n = resolve_sym(name_table, &attr.name);
+        if n == "mode" || n == "__mode__" {
+            if let Some(arg) = attr.args.first() {
+                let mode_name = match arg {
+                    ast::AttributeArg::Identifier(sym, _) => resolve_sym(name_table, sym),
+                    _ => continue,
+                };
+                let is_unsigned = matches!(
+                    base,
+                    CType::UChar
+                        | CType::UShort
+                        | CType::UInt
+                        | CType::ULong
+                        | CType::ULongLong
+                        | CType::UInt128
+                        | CType::Bool
+                );
+                let is_float = matches!(
+                    base,
+                    CType::Float | CType::Double | CType::LongDouble
+                );
+                return match &*mode_name {
+                    "QI" | "__QI__" | "byte" | "__byte__" => {
+                        if is_unsigned {
+                            CType::UChar
+                        } else {
+                            CType::SChar
+                        }
+                    }
+                    "HI" | "__HI__" => {
+                        if is_unsigned {
+                            CType::UShort
+                        } else {
+                            CType::Short
+                        }
+                    }
+                    "SI" | "__SI__" | "word" | "__word__" => {
+                        if is_float {
+                            CType::Float
+                        } else if is_unsigned {
+                            CType::UInt
+                        } else {
+                            CType::Int
+                        }
+                    }
+                    "DI" | "__DI__" => {
+                        if is_float {
+                            CType::Double
+                        } else if is_unsigned {
+                            CType::ULongLong
+                        } else {
+                            CType::LongLong
+                        }
+                    }
+                    "TI" | "__TI__" => {
+                        if is_unsigned {
+                            CType::UInt128
+                        } else {
+                            CType::Int128
+                        }
+                    }
+                    "SF" | "__SF__" => CType::Float,
+                    "DF" | "__DF__" => CType::Double,
+                    "XF" | "__XF__" => CType::LongDouble,
+                    "pointer" | "__pointer__" => {
+                        // mode(pointer) = pointer-width integer (8 bytes on 64-bit)
+                        if is_unsigned {
+                            CType::ULong
+                        } else {
+                            CType::Long
+                        }
+                    }
+                    _ => base,
+                };
+            }
+        }
     }
-    if type_specs.len() == 1 {
-        return map_single_type_specifier_fast(&type_specs[0], name_table);
-    }
-    resolve_multi_word_type_fast(type_specs, name_table)
+    base
 }
 
 /// Resolve a Symbol to its actual string name using the name_table.
@@ -2594,20 +3223,30 @@ fn map_single_type_specifier_with_names(spec: &ast::TypeSpecifier, name_table: &
         ast::TypeSpecifier::Float16 => CType::Float,
         ast::TypeSpecifier::Struct(s) => {
             let fields = extract_struct_union_fields_fast(s, name_table);
+            let packed = s.attributes.iter().any(|a| {
+                let n = resolve_sym(name_table, &a.name);
+                n == "packed" || n == "__packed__"
+            });
+            let aligned = extract_alignment_attribute(&s.attributes, name_table);
             CType::Struct {
                 name: s.tag.as_ref().map(|t| sym_to_string(t, name_table)),
                 fields,
-                packed: false,
-                aligned: None,
+                packed,
+                aligned,
             }
         }
         ast::TypeSpecifier::Union(u) => {
             let fields = extract_struct_union_fields_fast(u, name_table);
+            let packed = u.attributes.iter().any(|a| {
+                let n = resolve_sym(name_table, &a.name);
+                n == "packed" || n == "__packed__"
+            });
+            let aligned = extract_alignment_attribute(&u.attributes, name_table);
             CType::Union {
                 name: u.tag.as_ref().map(|t| sym_to_string(t, name_table)),
                 fields,
-                packed: false,
-                aligned: None,
+                packed,
+                aligned,
             }
         }
         ast::TypeSpecifier::Enum(e) => CType::Enum {
@@ -3034,11 +3673,20 @@ fn evaluate_const_int_expr(expr: &ast::Expression) -> Option<usize> {
             super::LOWERING_TARGET.with(|tl| {
                 let target = tl.borrow();
                 let target = target.as_ref()?;
+                // Strip parentheses from the operand. In C, sizeof(arr) is
+                // parsed as SizeofExpr { operand: Parenthesized { inner:
+                // Identifier } } because the parser sees (arr) as a
+                // parenthesized expression.
+                let mut op = operand.as_ref();
+                while let ast::Expression::Parenthesized { inner, .. } = op {
+                    op = inner.as_ref();
+                }
                 // For sizeof applied to an expression, attempt to determine
                 // the expression's type from context.  Common patterns:
                 //   sizeof(*ptr) — dereference → pointee type
                 //   sizeof(literal) — integer literal → int
-                match operand.as_ref() {
+                //   sizeof(identifier) — look up type from TYPEOF_CONTEXT
+                match op {
                     ast::Expression::IntegerLiteral { .. } => {
                         Some(crate::common::types::sizeof_ctype(&CType::Int, target))
                     }
@@ -3046,6 +3694,98 @@ fn evaluate_const_int_expr(expr: &ast::Expression) -> Option<usize> {
                         // sizeof("string") = total length of segments + 1 (null terminator)
                         let total: usize = segments.iter().map(|s| s.value.len()).sum();
                         Some(total + 1)
+                    }
+                    ast::Expression::Identifier { name, .. } => {
+                        // Look up the identifier's C type from the
+                        // TYPEOF_CONTEXT (populated with globals and locals
+                        // during lowering).  This correctly handles
+                        // sizeof(array_var) returning the full array size
+                        // instead of defaulting to pointer width.
+                        let result = super::TYPEOF_CONTEXT.with(|ctx| {
+                            let ctx_borrow = ctx.borrow();
+                            if let Some(ref map) = *ctx_borrow {
+                                // name is a Symbol — resolve to string via name_table
+                                let name_str = super::NAME_TABLE.with(|nt| {
+                                    let nt_borrow = nt.borrow();
+                                    if let Some(ref table) = *nt_borrow {
+                                        let idx = name.as_u32() as usize;
+                                        if idx < table.len() {
+                                            Some(table[idx].clone())
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                });
+                                if let Some(name_s) = name_str {
+                                    if let Some(cty) = map.get(&name_s) {
+                                        return Some(
+                                            crate::common::types::sizeof_ctype(cty, target),
+                                        );
+                                    }
+                                }
+                            }
+                            None
+                        });
+                        if result.is_some() {
+                            return result;
+                        }
+                        // Fallback: pointer width
+                        Some(target.pointer_width())
+                    }
+                    ast::Expression::UnaryOp {
+                        op: ast::UnaryOp::Deref,
+                        operand: inner,
+                        ..
+                    } => {
+                        // sizeof(*ptr) — try to resolve the pointee type
+                        if let ast::Expression::Identifier { name, .. } = inner.as_ref() {
+                            let result = super::TYPEOF_CONTEXT.with(|ctx| {
+                                let ctx_borrow = ctx.borrow();
+                                if let Some(ref map) = *ctx_borrow {
+                                    let name_str = super::NAME_TABLE.with(|nt| {
+                                        let nt_borrow = nt.borrow();
+                                        if let Some(ref table) = *nt_borrow {
+                                            let idx = name.as_u32() as usize;
+                                            if idx < table.len() {
+                                                Some(table[idx].clone())
+                                            } else {
+                                                None
+                                            }
+                                        } else {
+                                            None
+                                        }
+                                    });
+                                    if let Some(ns) = name_str {
+                                        if let Some(cty) = map.get(&ns) {
+                                            match cty {
+                                                CType::Pointer(pointee, _) => {
+                                                    return Some(
+                                                        crate::common::types::sizeof_ctype(
+                                                            pointee, target,
+                                                        ),
+                                                    );
+                                                }
+                                                CType::Array(elem, _) => {
+                                                    return Some(
+                                                        crate::common::types::sizeof_ctype(
+                                                            elem, target,
+                                                        ),
+                                                    );
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+                                }
+                                None
+                            });
+                            if result.is_some() {
+                                return result;
+                            }
+                        }
+                        Some(target.pointer_width())
                     }
                     _ => {
                         // Default: pointer width for unresolvable expressions.
@@ -3757,6 +4497,12 @@ fn zero_init_field(
                 zero_init_field(base_alloca, arr_off, elem, ctx, span);
             }
         }
+        CType::Array(_, None) => {
+            // Flexible array member — zero-length by definition (C99 §6.7.2.1/18).
+            // Do NOT emit any stores; the FAM contributes zero bytes to
+            // the struct's sizeof and any writes would overflow into
+            // adjacent stack variables.
+        }
         _ => {
             // Scalar: emit GEP + store 0 with the correct width for the
             // field type so that we don't clobber adjacent struct fields.
@@ -3903,6 +4649,24 @@ fn resolve_designator_index(designators: &[ast::Designator], default_idx: usize)
 }
 
 /// Resolve struct/union field index from designator, or fall back to default.
+/// Count the number of flat scalar elements an aggregate type needs for
+/// brace-elided initialization (e.g. `struct S { int a[3]; }` → 3).
+fn flat_scalar_count(ty: &CType, type_builder: &TypeBuilder) -> usize {
+    let resolved = crate::common::types::resolve_typedef(ty);
+    match resolved {
+        CType::Array(elem, Some(n)) => {
+            let inner = flat_scalar_count(elem.as_ref(), type_builder);
+            inner * n
+        }
+        CType::Struct { ref fields, .. } => fields
+            .iter()
+            .filter(|f| f.name.is_some()) // skip anonymous fields
+            .map(|f| flat_scalar_count(&f.ty, type_builder))
+            .sum(),
+        _ => 1,
+    }
+}
+
 fn resolve_field_designator(
     designators: &[ast::Designator],
     fields: &[crate::common::types::StructField],
@@ -3950,13 +4714,114 @@ fn emit_inst_to_ctx(ctx: &mut expr_lowering::ExprLoweringContext<'_>, inst: Inst
 
 /// Check if a resolved type is a character array and return (element_type, array_size).
 /// Matches `char`, `signed char`, `unsigned char` arrays.
+/// Return the byte size of a single element for wide character array types.
+/// Used when converting `Constant::String` byte lengths (which are multi-byte
+/// encoded for wide strings) into element counts for array sizing.
+///
+/// - `Int` / `UInt` → 4 (wchar_t / char32_t on Linux)
+/// - `Short` / `UShort` → 2 (char16_t)
+/// - Everything else → 1 (char / signed char / unsigned char)
+/// Return the byte size of a single element for wide character array types.
+/// Used when converting `Constant::String` byte lengths (which are multi-byte
+/// encoded for wide strings) into element counts for array sizing.
+///
+/// - `Int` / `UInt` → 4 (wchar_t / char32_t on Linux)
+/// - `Short` / `UShort` → 2 (char16_t)
+/// - Everything else → 1 (char / signed char / unsigned char)
+pub fn wide_char_elem_size(elem: &CType) -> usize {
+    let stripped = crate::common::types::resolve_typedef(elem);
+    match stripped {
+        CType::Int | CType::UInt => 4,
+        CType::Short | CType::UShort => 2,
+        _ => 1,
+    }
+}
+
+/// Decode raw bytes (potentially UTF-8 encoded) into Unicode code points.
+/// For each valid multi-byte UTF-8 sequence, yields one u32 code point.
+/// Invalid or PUA-range bytes (0x80–0xFF that aren't valid UTF-8 lead bytes)
+/// are treated as individual Latin-1 code points for backward compatibility.
+pub fn decode_bytes_to_codepoints(bytes: &[u8]) -> Vec<u32> {
+    let mut codepoints = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b < 0x80 {
+            // ASCII
+            codepoints.push(b as u32);
+            i += 1;
+        } else if b & 0xE0 == 0xC0 && i + 1 < bytes.len() && bytes[i + 1] & 0xC0 == 0x80 {
+            // 2-byte UTF-8
+            let cp = ((b as u32 & 0x1F) << 6) | (bytes[i + 1] as u32 & 0x3F);
+            codepoints.push(cp);
+            i += 2;
+        } else if b & 0xF0 == 0xE0
+            && i + 2 < bytes.len()
+            && bytes[i + 1] & 0xC0 == 0x80
+            && bytes[i + 2] & 0xC0 == 0x80
+        {
+            // 3-byte UTF-8
+            let cp = ((b as u32 & 0x0F) << 12)
+                | ((bytes[i + 1] as u32 & 0x3F) << 6)
+                | (bytes[i + 2] as u32 & 0x3F);
+            codepoints.push(cp);
+            i += 3;
+        } else if b & 0xF8 == 0xF0
+            && i + 3 < bytes.len()
+            && bytes[i + 1] & 0xC0 == 0x80
+            && bytes[i + 2] & 0xC0 == 0x80
+            && bytes[i + 3] & 0xC0 == 0x80
+        {
+            // 4-byte UTF-8
+            let cp = ((b as u32 & 0x07) << 18)
+                | ((bytes[i + 1] as u32 & 0x3F) << 12)
+                | ((bytes[i + 2] as u32 & 0x3F) << 6)
+                | (bytes[i + 3] as u32 & 0x3F);
+            codepoints.push(cp);
+            i += 4;
+        } else {
+            // Invalid UTF-8 or bare high byte — treat as Latin-1 code point
+            codepoints.push(b as u32);
+            i += 1;
+        }
+    }
+    codepoints
+}
+
+/// Expand raw segment bytes (UTF-8 encoded) into wide character bytes.
+/// Each byte in narrow strings is treated as-is. For wide strings (char_width > 1),
+/// UTF-8 sequences are decoded to Unicode code points, then each code point is
+/// encoded at the specified width in little-endian byte order.
+pub fn expand_string_bytes_for_width(raw_bytes: &[u8], char_width: usize) -> Vec<u8> {
+    if char_width == 1 {
+        let mut out = raw_bytes.to_vec();
+        out.push(0); // null terminator
+        out
+    } else {
+        let codepoints = decode_bytes_to_codepoints(raw_bytes);
+        let mut bytes = Vec::with_capacity((codepoints.len() + 1) * char_width);
+        for cp in &codepoints {
+            for i in 0..char_width {
+                bytes.push(((*cp >> (i * 8)) & 0xFF) as u8);
+            }
+        }
+        // Null terminator
+        for _ in 0..char_width {
+            bytes.push(0);
+        }
+        bytes
+    }
+}
+
 fn is_char_array_type(ty: &CType) -> Option<(CType, usize)> {
     let resolved = crate::common::types::resolve_typedef(ty);
     match resolved {
         CType::Array(elem, Some(size)) => {
             let stripped = crate::common::types::resolve_typedef(elem.as_ref());
             match stripped {
-                CType::Char | CType::SChar | CType::UChar => {
+                CType::Char | CType::SChar | CType::UChar
+                | CType::Int | CType::UInt
+                | CType::Short | CType::UShort => {
                     Some((stripped.clone(), *size))
                 }
                 _ => None,
@@ -3967,15 +4832,25 @@ fn is_char_array_type(ty: &CType) -> Option<(CType, usize)> {
 }
 
 /// Extract raw bytes from a StringLiteral expression (including null terminator).
+/// For wide string literals (L, U, u), each source byte is expanded to
+/// the appropriate width (4 bytes for wchar_t/char32_t, 2 for char16_t).
 fn extract_string_literal_bytes(expr: &ast::Expression) -> Option<Vec<u8>> {
     match expr {
-        ast::Expression::StringLiteral { segments, .. } => {
-            let mut bytes = Vec::new();
+        ast::Expression::StringLiteral {
+            segments, prefix, ..
+        } => {
+            let char_width: usize = match prefix {
+                crate::frontend::parser::ast::StringPrefix::None
+                | crate::frontend::parser::ast::StringPrefix::U8 => 1,
+                crate::frontend::parser::ast::StringPrefix::L
+                | crate::frontend::parser::ast::StringPrefix::U32 => 4,
+                crate::frontend::parser::ast::StringPrefix::U16 => 2,
+            };
+            let mut raw_bytes = Vec::new();
             for seg in segments {
-                bytes.extend_from_slice(&seg.value);
+                raw_bytes.extend_from_slice(&seg.value);
             }
-            bytes.push(0); // null terminator
-            Some(bytes)
+            Some(expand_string_bytes_for_width(&raw_bytes, char_width))
         }
         _ => None,
     }
@@ -4058,6 +4933,28 @@ fn lower_char_array_from_string(
 /// Previous bug: this function called `fresh_value()` without registering
 /// the constant, producing a dangling Value that the backend defaulted to
 /// 0, causing ALL initializer stores to target the same base address.
+/// Check if an AST expression is a "natural lvalue" — i.e., it refers to
+/// a memory location that can be addressed directly (variable, member
+/// access, dereference, array subscript, compound literal).  Expressions
+/// like function calls, conditional expressions, and casts produce rvalues
+/// (struct data), not addressable memory locations.
+fn is_natural_lvalue_expr(expr: &ast::Expression) -> bool {
+    match expr {
+        ast::Expression::Identifier { .. }
+        | ast::Expression::MemberAccess { .. }
+        | ast::Expression::PointerMemberAccess { .. }
+        | ast::Expression::ArraySubscript { .. }
+        | ast::Expression::CompoundLiteral { .. } => true,
+        ast::Expression::UnaryOp {
+            op: ast::UnaryOp::Deref,
+            ..
+        } => true,
+        ast::Expression::Parenthesized { inner, .. } => is_natural_lvalue_expr(inner),
+        ast::Expression::Cast { operand, .. } => is_natural_lvalue_expr(operand),
+        _ => false,
+    }
+}
+
 fn make_index_value(ctx: &mut expr_lowering::ExprLoweringContext<'_>, byte_offset: i64) -> Value {
     expr_lowering::emit_int_const_for_index(ctx, byte_offset)
 }

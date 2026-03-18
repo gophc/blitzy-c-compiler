@@ -490,12 +490,13 @@ impl ArchCodegen for X86_64Backend {
             }
         }
 
-        // For variadic functions: initialize the 32-byte va_control block.
+        // For variadic functions: initialize the 40-byte va_control block.
         // Layout:
         //   [ctrl+0]  gp_ptr       — &gpr_save_area[named_gpr_count]
         //   [ctrl+8]  fp_ptr       — &fp_save_area[named_fp_count]
-        //   [ctrl+16] gp_end       — &gpr_save_area[6] (one past last register slot)
-        //   [ctrl+24] overflow_ptr — RBP + 16 (stack args above return address)
+        //   [ctrl+16] gp_end       — &gpr_save_area[6] (one past last GPR slot)
+        //   [ctrl+24] fp_end       — &fp_save_area[8] (one past last FP slot)
+        //   [ctrl+32] overflow_ptr — RBP + 16 + fixed_stack_bytes
         if let (Some(ctrl_offset), Some(gpr_offset), Some(fp_offset)) = (
             mf.va_control_offset,
             mf.va_save_area_offset,
@@ -571,15 +572,44 @@ impl ArchCodegen for X86_64Backend {
                 .push(MachineOperand::Register(registers::RAX));
             prologue.push(store_ge);
 
-            // [+24] overflow_ptr = RBP + 16
-            //        (first stack argument above saved RBP and return address)
+            // [+24] fp_end = RBP + fp_save_offset + 8 * 8
+            //        (one past the last FP register save slot)
+            let fp_end_disp = fp_offset as i64 + 8 * 8;
+            let mut lea_fe = MachineInstruction::new(X86Opcode::Lea.as_u32());
+            lea_fe.result = Some(MachineOperand::Register(registers::RAX));
+            lea_fe.operands.push(MachineOperand::Memory {
+                base: Some(RBP),
+                index: None,
+                scale: 1,
+                displacement: fp_end_disp,
+            });
+            prologue.push(lea_fe);
+            let mut store_fe = MachineInstruction::new(X86Opcode::Mov.as_u32());
+            store_fe.operands.push(MachineOperand::Memory {
+                base: Some(RBP),
+                index: None,
+                scale: 1,
+                displacement: ctrl_offset as i64 + 24,
+            });
+            store_fe
+                .operands
+                .push(MachineOperand::Register(registers::RAX));
+            prologue.push(store_fe);
+
+            // [+32] overflow_ptr = RBP + 16 + fixed_stack_bytes
+            //        (first VARIADIC stack argument, skipping past any fixed
+            //        parameters that were passed on the stack because the
+            //        register file was full — i.e. >6 GPR or >8 FP args)
+            let gp_stack_fixed = mf.named_gpr_count.saturating_sub(6);
+            let fp_stack_fixed = mf.named_fp_count.saturating_sub(8);
+            let overflow_disp = 16 + ((gp_stack_fixed + fp_stack_fixed) * 8) as i64;
             let mut lea_ov = MachineInstruction::new(X86Opcode::Lea.as_u32());
             lea_ov.result = Some(MachineOperand::Register(registers::RAX));
             lea_ov.operands.push(MachineOperand::Memory {
                 base: Some(RBP),
                 index: None,
                 scale: 1,
-                displacement: 16,
+                displacement: overflow_disp,
             });
             prologue.push(lea_ov);
             let mut store_ov = MachineInstruction::new(X86Opcode::Mov.as_u32());
@@ -587,7 +617,7 @@ impl ArchCodegen for X86_64Backend {
                 base: Some(RBP),
                 index: None,
                 scale: 1,
-                displacement: ctrl_offset as i64 + 24,
+                displacement: ctrl_offset as i64 + 32,
             });
             store_ov
                 .operands
@@ -944,9 +974,20 @@ fn format_x86_instruction(inst: &MachineInstruction) -> String {
 
     // Inline assembly: emit template with operand substitution.
     // The template is stored in `asm_template` and may contain %0, %1, etc.
-    // operands bound from the IR.
+    // GCC asm numbering: %0..%(n-1) = output registers, %n.. = input operands.
+    // inst.result = output 0 register.
+    // inst.operands = [extra_output_1, ..., extra_output_{n-1}, input_0, ...].
+    // We build a combined list [output_0, extra_outputs..., inputs...] for
+    // correct template substitution matching GCC's numbering scheme.
     if let Some(ref template) = inst.asm_template {
-        return substitute_asm_operands(template, &inst.operands);
+        let mut full_operands = Vec::new();
+        // Output 0 = result register.
+        if let Some(ref result) = inst.result {
+            full_operands.push(result.clone());
+        }
+        // Remaining operands (extra outputs 1..n-1 followed by inputs).
+        full_operands.extend(inst.operands.iter().cloned());
+        return substitute_asm_operands(template, &full_operands);
     }
     if mnemonic == "# inline asm" || mnemonic == "<inline-asm>" {
         if let Some(MachineOperand::GlobalSymbol(ref template)) = inst.operands.first() {

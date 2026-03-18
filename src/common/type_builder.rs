@@ -774,7 +774,7 @@ pub fn usual_arithmetic_conversion(lhs: &CType, rhs: &CType) -> CType {
 ///
 /// Types with rank below `int` are promoted to `int`. All other types
 /// are returned unchanged.
-fn integer_promote(ty: &CType) -> CType {
+pub fn integer_promote(ty: &CType) -> CType {
     match ty {
         CType::Bool | CType::Char | CType::SChar | CType::Short => CType::Int,
         CType::UChar | CType::UShort => {

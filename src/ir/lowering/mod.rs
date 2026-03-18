@@ -108,6 +108,10 @@ thread_local! {
     // resolve `TypedefName` to the actual underlying C type instead of
     // defaulting to `CType::Int`.
     static TYPEDEF_MAP: RefCell<Option<FxHashMap<String, CType>>> = const { RefCell::new(None) };
+
+    // Name table (interned-string vector) used by constant expression evaluators
+    // that only receive an `ast::Symbol` and need to recover the string.
+    static NAME_TABLE: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
 }
 
 // ============================================================================
@@ -802,6 +806,12 @@ pub fn lower_translation_unit(
         *t.borrow_mut() = Some(*target);
     });
 
+    // Populate NAME_TABLE so that evaluate_const_int_expr can resolve
+    // Symbol → String for sizeof(identifier) lookups.
+    NAME_TABLE.with(|nt| {
+        *nt.borrow_mut() = Some(name_table.to_vec());
+    });
+
     // ====================================================================
     // Pass 0 — Collect struct/union/enum definitions before global lowering
     // ====================================================================
@@ -991,6 +1001,16 @@ pub fn lower_translation_unit(
         "[BCC-TIMING] ir-pass1-globals: {:.3}s",
         _t1.elapsed().as_secs_f64()
     );
+    // Seed TYPEOF_CONTEXT with global variable types so that
+    // `typeof(global_var)` resolves correctly inside function bodies.
+    TYPEOF_CONTEXT.with(|ctx| {
+        let mut map = ctx.borrow_mut().take().unwrap_or_default();
+        for (gname, gctype) in &module.global_c_types {
+            map.entry(gname.clone()).or_insert_with(|| gctype.clone());
+        }
+        *ctx.borrow_mut() = Some(map);
+    });
+
     // ====================================================================
     // Pass 2 — Function definitions (alloca-first pattern)
     // ====================================================================
@@ -1536,11 +1556,17 @@ fn collect_struct_defs_from_specifiers(
                     if tag_name_idx < name_table.len() {
                         let tag_name = name_table[tag_name_idx].clone();
                         let fields = decl_lowering::extract_struct_union_fields_fast(s, name_table);
+                        let packed = s.attributes.iter().any(|a| {
+                            let n = decl_lowering::resolve_sym(name_table, &a.name);
+                            n == "packed" || n == "__packed__"
+                        });
+                        let aligned =
+                            decl_lowering::extract_alignment_attribute(&s.attributes, name_table);
                         let ctype = CType::Struct {
                             name: Some(tag_name.clone()),
                             fields,
-                            packed: false,
-                            aligned: None,
+                            packed,
+                            aligned,
                         };
                         out.insert(tag_name, ctype);
                     }
@@ -1571,11 +1597,17 @@ fn collect_struct_defs_from_specifiers(
                     if tag_name_idx < name_table.len() {
                         let tag_name = name_table[tag_name_idx].clone();
                         let fields = decl_lowering::extract_struct_union_fields_fast(u, name_table);
+                        let packed = u.attributes.iter().any(|a| {
+                            let n = decl_lowering::resolve_sym(name_table, &a.name);
+                            n == "packed" || n == "__packed__"
+                        });
+                        let aligned =
+                            decl_lowering::extract_alignment_attribute(&u.attributes, name_table);
                         let ctype = CType::Union {
                             name: Some(tag_name.clone()),
                             fields,
-                            packed: false,
-                            aligned: None,
+                            packed,
+                            aligned,
                         };
                         out.insert(tag_name, ctype);
                     }
@@ -1680,5 +1712,72 @@ fn try_eval_const_int_expr_ctx(
             try_eval_const_int_expr_ctx(inner, name_table, enum_map)
         }
         _ => None,
+    }
+}
+
+// =========================================================================
+// resolve_type_name_for_const — standalone type name resolution for the
+// constant expression evaluator (no ExprLoweringContext required).
+// =========================================================================
+
+/// Resolve an AST [`TypeName`] to a [`CType`] without requiring a full
+/// `ExprLoweringContext`.  Used by the global-initializer constant evaluator
+/// to apply correct C-type truncation on cast expressions.
+pub fn resolve_type_name_for_const(
+    tn: &ast::TypeName,
+    _target: &Target,
+    _type_builder: &TypeBuilder,
+) -> CType {
+    // Resolve the base type from the specifier-qualifier list.
+    let base = decl_lowering::resolve_base_type_from_sqlist(&tn.specifier_qualifiers);
+
+    // Apply the abstract declarator (pointer / array / function layers).
+    if let Some(ref abs_decl) = tn.abstract_declarator {
+        apply_abstract_declarator_const(base, abs_decl)
+    } else {
+        base
+    }
+}
+
+/// Apply an abstract declarator to a base type (standalone helper for const eval).
+fn apply_abstract_declarator_const(base: CType, abs: &ast::AbstractDeclarator) -> CType {
+    let mut result = if let Some(ref pointer) = abs.pointer {
+        apply_pointer_layers_const(base, pointer)
+    } else {
+        base
+    };
+    if let Some(ref direct) = abs.direct {
+        result = apply_direct_abstract_declarator_const(result, direct);
+    }
+    result
+}
+
+fn apply_pointer_layers_const(base: CType, pointer: &ast::Pointer) -> CType {
+    let quals = crate::common::types::TypeQualifiers::default();
+    let mut current = CType::Pointer(Box::new(base), quals);
+    if let Some(ref inner) = pointer.inner {
+        current = apply_pointer_layers_const(current, inner);
+    }
+    current
+}
+
+fn apply_direct_abstract_declarator_const(
+    base: CType,
+    direct: &ast::DirectAbstractDeclarator,
+) -> CType {
+    match direct {
+        ast::DirectAbstractDeclarator::Parenthesized(inner) => {
+            apply_abstract_declarator_const(base, inner)
+        }
+        ast::DirectAbstractDeclarator::Array { size, .. } => {
+            let len = size
+                .as_ref()
+                .and_then(|e| decl_lowering::evaluate_const_int_expr_pub(e));
+            CType::Array(Box::new(base), len)
+        }
+        ast::DirectAbstractDeclarator::Function { .. } => CType::Pointer(
+            Box::new(base),
+            crate::common::types::TypeQualifiers::default(),
+        ),
     }
 }

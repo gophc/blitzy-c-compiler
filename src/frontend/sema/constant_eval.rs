@@ -1604,6 +1604,166 @@ impl<'a> ConstantEvaluator<'a> {
     /// evaluation. It handles basic type specifiers, pointers, and arrays.
     /// Complex cases (typedefs, struct members) would be resolved by the
     /// full semantic analyser.
+    /// Extract `packed` and `aligned` attributes from a list of raw
+    /// [`Attribute`] nodes on a struct/union specifier.
+    fn extract_struct_attrs(&self, attrs: &[Attribute]) -> (bool, Option<usize>) {
+        let mut packed = false;
+        let mut aligned: Option<usize> = None;
+        for attr in attrs {
+            let name = self.resolve_symbol_name(attr.name);
+            match name.as_str() {
+                "packed" | "__packed__" => packed = true,
+                "aligned" | "__aligned__" => {
+                    if let Some(AttributeArg::Expression(expr)) = attr.args.first() {
+                        if let Ok(ConstValue::SignedInt(v)) =
+                            ConstantEvaluator::eval_simple_const_expr(expr)
+                        {
+                            aligned = Some(v as usize);
+                        } else if let Ok(ConstValue::UnsignedInt(v)) =
+                            ConstantEvaluator::eval_simple_const_expr(expr)
+                        {
+                            aligned = Some(v as usize);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        (packed, aligned)
+    }
+
+    /// A lightweight evaluator for attribute argument constant expressions.
+    /// Does not require `&mut self` — only handles integer literals, parens,
+    /// sizeof, and basic arithmetic needed for `aligned(N)`.
+    fn eval_simple_const_expr(expr: &Expression) -> Result<ConstValue, ()> {
+        match expr {
+            Expression::IntegerLiteral { value, suffix, .. } => {
+                match suffix {
+                    IntegerSuffix::U | IntegerSuffix::UL | IntegerSuffix::ULL => {
+                        Ok(ConstValue::UnsignedInt(*value))
+                    }
+                    _ => Ok(ConstValue::SignedInt(*value as i128)),
+                }
+            }
+            Expression::Parenthesized { inner, .. } => Self::eval_simple_const_expr(inner),
+            _ => Err(()),
+        }
+    }
+
+    /// Resolve struct/union members from their AST representation into
+    /// a list of `StructField`s suitable for constructing a `CType::Struct`
+    /// or `CType::Union`.
+    fn resolve_struct_members(
+        &mut self,
+        members: &[StructMember],
+        span: Span,
+    ) -> Vec<crate::common::types::StructField> {
+        let mut fields = Vec::new();
+        for member in members {
+            let member_base_type =
+                match self.resolve_type_specifiers(&member.specifiers.type_specifiers, span) {
+                    Ok(t) => t,
+                    Err(()) => CType::Int, // fallback
+                };
+
+            if member.declarators.is_empty() {
+                // Anonymous member (e.g., anonymous struct/union)
+                fields.push(crate::common::types::StructField {
+                    name: None,
+                    ty: member_base_type,
+                    bit_width: None,
+                });
+                continue;
+            }
+
+            for decl in &member.declarators {
+                let field_type = if let Some(ref d) = decl.declarator {
+                    self.apply_declarator_to_member_type(member_base_type.clone(), d)
+                } else {
+                    member_base_type.clone()
+                };
+
+                let field_name = decl
+                    .declarator
+                    .as_ref()
+                    .and_then(|d| self.extract_declarator_name_str(d));
+
+                let bit_width = decl.bit_width.as_ref().map(|bw| {
+                    crate::frontend::sema::eval_bitfield_width(bw)
+                });
+
+                fields.push(crate::common::types::StructField {
+                    name: field_name,
+                    ty: field_type,
+                    bit_width,
+                });
+            }
+        }
+        fields
+    }
+
+    /// Apply a full declarator (pointer, array, function) to a base type
+    /// for struct member type resolution.
+    fn apply_declarator_to_member_type(&mut self, base: CType, decl: &Declarator) -> CType {
+        let mut result = self.apply_direct_declarator_to_type(base, &decl.direct);
+        if let Some(ref ptr) = decl.pointer {
+            result = self.apply_pointer_chain(result, ptr);
+        }
+        result
+    }
+
+    /// Apply a direct declarator suffix (array/function) to a base type.
+    fn apply_direct_declarator_to_type(&mut self, base: CType, direct: &DirectDeclarator) -> CType {
+        match direct {
+            DirectDeclarator::Identifier(_, _) => base,
+            DirectDeclarator::Parenthesized(inner) => {
+                self.apply_declarator_to_member_type(base, inner)
+            }
+            DirectDeclarator::Array { base: inner_base, size, .. } => {
+                let elem = self.apply_direct_declarator_to_type(base, inner_base);
+                let array_size = size.as_ref().and_then(|expr| {
+                    match self.evaluate_integer_constant(expr, Span::default()) {
+                        Ok(val) if val >= 0 => Some(val as usize),
+                        _ => None,
+                    }
+                });
+                CType::Array(Box::new(elem), array_size)
+            }
+            DirectDeclarator::Function { base: inner_base, .. } => {
+                // Function pointer member — treat the member as a function type
+                let ret = self.apply_direct_declarator_to_type(base, inner_base);
+                CType::Pointer(Box::new(CType::Function {
+                    return_type: Box::new(ret),
+                    params: vec![],
+                    variadic: false,
+                }), crate::common::types::TypeQualifiers::default())
+            }
+        }
+    }
+
+    /// Extract the name from a full Declarator as a string.
+    fn extract_declarator_name_str(&self, decl: &Declarator) -> Option<String> {
+        self.extract_direct_decl_name(&decl.direct)
+    }
+
+    /// Recursively extract the identifier name from a DirectDeclarator.
+    fn extract_direct_decl_name(&self, direct: &DirectDeclarator) -> Option<String> {
+        match direct {
+            DirectDeclarator::Identifier(sym, _) => {
+                Some(self.resolve_symbol_name(*sym))
+            }
+            DirectDeclarator::Parenthesized(inner) => {
+                self.extract_declarator_name_str(inner)
+            }
+            DirectDeclarator::Array { base, .. } => {
+                self.extract_direct_decl_name(base)
+            }
+            DirectDeclarator::Function { base, .. } => {
+                self.extract_direct_decl_name(base)
+            }
+        }
+    }
+
     fn resolve_type_name(&mut self, type_name: &TypeName, span: Span) -> Result<CType, ()> {
         // Resolve the base type from specifiers
         let base_type =
@@ -1673,18 +1833,35 @@ impl<'a> ConstantEvaluator<'a> {
 
                 // Struct/Union/Enum — look up the tag type from the
                 // registered tag map if available, otherwise fall back to
-                // an empty struct (forward declaration).
+                // an empty struct (forward declaration).  When the specifier
+                // carries inline member definitions and/or attributes
+                // (e.g. `sizeof(struct __attribute__((aligned(32))) { int a; })`),
+                // we build the CType directly from the members/attrs so that
+                // sizeof/alignof return the correct value even for anonymous
+                // inline structs that were never registered in `tag_types`.
                 TypeSpecifier::Struct(s) => {
                     if let Some(tag_sym) = s.tag {
                         if let Some(resolved) = self.tag_types.get(&tag_sym) {
                             return Ok(resolved.clone());
                         }
                     }
+                    // Extract attributes from the struct specifier
+                    let (packed, aligned) = self.extract_struct_attrs(&s.attributes);
+                    // If we have inline member definitions, resolve them
+                    if let Some(ref members) = s.members {
+                        let fields = self.resolve_struct_members(members, span);
+                        return Ok(CType::Struct {
+                            name: s.tag.map(|sym| format!("struct_{}", sym.as_u32())),
+                            fields,
+                            packed,
+                            aligned,
+                        });
+                    }
                     return Ok(CType::Struct {
                         name: s.tag.map(|sym| format!("struct_{}", sym.as_u32())),
                         fields: Vec::new(),
-                        packed: false,
-                        aligned: None,
+                        packed,
+                        aligned,
                     });
                 }
                 TypeSpecifier::Union(u) => {
@@ -1693,11 +1870,21 @@ impl<'a> ConstantEvaluator<'a> {
                             return Ok(resolved.clone());
                         }
                     }
+                    let (packed, aligned) = self.extract_struct_attrs(&u.attributes);
+                    if let Some(ref members) = u.members {
+                        let fields = self.resolve_struct_members(members, span);
+                        return Ok(CType::Union {
+                            name: u.tag.map(|sym| format!("union_{}", sym.as_u32())),
+                            fields,
+                            packed,
+                            aligned,
+                        });
+                    }
                     return Ok(CType::Union {
                         name: u.tag.map(|sym| format!("union_{}", sym.as_u32())),
                         fields: Vec::new(),
-                        packed: false,
-                        aligned: None,
+                        packed,
+                        aligned,
                     });
                 }
                 TypeSpecifier::Enum(e) => {

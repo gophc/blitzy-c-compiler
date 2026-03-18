@@ -470,9 +470,21 @@ pub fn register_predefined_macros(macro_defs: &mut FxHashMap<String, MacroDef>, 
     register_object_macro(macro_defs, "__DBL_HAS_QUIET_NAN__", "1");
     register_object_macro(macro_defs, "__DBL_DENORM_MIN__", "4.9406564584124654e-324");
     // Single-precision (32-bit) constants
-    register_object_macro(macro_defs, "__FLT_EPSILON__", "1.19209290e-7F");
-    register_object_macro(macro_defs, "__FLT_MIN__", "1.17549435e-38F");
-    register_object_macro(macro_defs, "__FLT_MAX__", "3.40282347e+38F");
+    register_object_macro(
+        macro_defs,
+        "__FLT_EPSILON__",
+        "1.1920928955078125e-07F",
+    );
+    register_object_macro(
+        macro_defs,
+        "__FLT_MIN__",
+        "1.17549435082228750796873653722225e-38F",
+    );
+    register_object_macro(
+        macro_defs,
+        "__FLT_MAX__",
+        "3.40282346638528859811704183484517e+38F",
+    );
     register_object_macro(macro_defs, "__FLT_DIG__", "6");
     register_object_macro(macro_defs, "__FLT_MANT_DIG__", "24");
     register_object_macro(macro_defs, "__FLT_MIN_EXP__", "(-125)");
@@ -481,7 +493,11 @@ pub fn register_predefined_macros(macro_defs: &mut FxHashMap<String, MacroDef>, 
     register_object_macro(macro_defs, "__FLT_MAX_10_EXP__", "38");
     register_object_macro(macro_defs, "__FLT_HAS_INFINITY__", "1");
     register_object_macro(macro_defs, "__FLT_HAS_QUIET_NAN__", "1");
-    register_object_macro(macro_defs, "__FLT_DENORM_MIN__", "1.40129846e-45F");
+    register_object_macro(
+        macro_defs,
+        "__FLT_DENORM_MIN__",
+        "1.40129846432481707092372958328992e-45F",
+    );
     // Long-double constants (80-bit extended / 128-bit on some arches)
     register_object_macro(
         macro_defs,

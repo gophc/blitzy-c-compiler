@@ -1171,7 +1171,7 @@ pub fn lookup_keyword(s: &str) -> Option<TokenKind> {
         "_Alignof" | "__alignof__" | "__alignof" => Some(TokenKind::Alignof),
         "_Atomic" => Some(TokenKind::Atomic),
         "_Bool" => Some(TokenKind::Bool),
-        "_Complex" => Some(TokenKind::Complex),
+        "_Complex" | "__complex__" | "__complex" => Some(TokenKind::Complex),
         "_Generic" => Some(TokenKind::Generic),
         "_Noreturn" => Some(TokenKind::Noreturn),
         "_Static_assert" => Some(TokenKind::StaticAssert),

@@ -1252,23 +1252,29 @@ impl AArch64InstructionSelector {
             self.named_gpr_count = func.params.len();
         }
         {
+            // Scan ALL blocks for alloca instructions (not just entry block).
+            // Allocas can appear in non-entry blocks (e.g., compound literals
+            // in loop bodies) and must still receive valid frame slot offsets.
             let mut alloca_cursor: usize = 0;
-            for inst in func.entry_block().instructions() {
-                if let Instruction::Alloca {
-                    result,
-                    ty,
-                    alignment,
-                    ..
-                } = inst
-                {
-                    let size = ty.size_bytes(&self.target).max(1);
-                    let align = alignment.unwrap_or_else(|| ty.align_bytes(&self.target));
-                    let mask = if align > 0 { align - 1 } else { 0 };
-                    alloca_cursor = (alloca_cursor + mask) & !mask;
-                    let fp_offset = (16 + vararg_save_size + alloca_cursor) as i64;
-                    self.alloca_offsets
-                        .insert(result.index().wrapping_add(VREG_BASE), fp_offset);
-                    alloca_cursor += size;
+            for block in func.blocks() {
+                for inst in block.instructions() {
+                    if let Instruction::Alloca {
+                        result,
+                        ty,
+                        alignment,
+                        ..
+                    } = inst
+                    {
+                        let size = ty.size_bytes(&self.target).max(1);
+                        let align =
+                            alignment.unwrap_or_else(|| ty.align_bytes(&self.target));
+                        let mask = if align > 0 { align - 1 } else { 0 };
+                        alloca_cursor = (alloca_cursor + mask) & !mask;
+                        let fp_offset = (16 + vararg_save_size + alloca_cursor) as i64;
+                        self.alloca_offsets
+                            .insert(result.index().wrapping_add(VREG_BASE), fp_offset);
+                        alloca_cursor += size;
+                    }
                 }
             }
             self.locals_size = ((vararg_save_size + alloca_cursor) + 15) & !15; // Align to 16
@@ -1293,15 +1299,18 @@ impl AArch64InstructionSelector {
     /// Estimate total stack space needed for local allocas.
     #[allow(dead_code)]
     fn estimate_locals_size(&self, func: &IrFunction) -> usize {
-        let entry = func.entry_block();
         let mut total: usize = 0;
-        for inst in entry.instructions() {
-            if let Instruction::Alloca { ty, alignment, .. } = inst {
-                let size = ty.size_bytes(&self.target);
-                let align = alignment.unwrap_or_else(|| ty.align_bytes(&self.target));
-                let mask = if align > 0 { align - 1 } else { 0 };
-                total = (total + mask) & !mask;
-                total += size;
+        // Scan ALL blocks — allocas can appear in non-entry blocks
+        // (e.g., compound literals in loop bodies).
+        for block in func.blocks() {
+            for inst in block.instructions() {
+                if let Instruction::Alloca { ty, alignment, .. } = inst {
+                    let size = ty.size_bytes(&self.target);
+                    let align = alignment.unwrap_or_else(|| ty.align_bytes(&self.target));
+                    let mask = if align > 0 { align - 1 } else { 0 };
+                    total = (total + mask) & !mask;
+                    total += size;
+                }
             }
         }
         // Round up to 16-byte alignment.

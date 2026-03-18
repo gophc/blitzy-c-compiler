@@ -953,6 +953,57 @@ impl X86_64Encoder {
                         bytes.extend_from_slice(&deref.bytes);
                         EncodedInstruction::new(bytes)
                     }
+                    // GlobalSymbol: LoadInd dst, GlobalSymbol →
+                    // MOV dst, [rip+sym] (RIP-relative 64-bit load).
+                    (
+                        Some(MachineOperand::Register(dst)),
+                        Some(MachineOperand::GlobalSymbol(sym)),
+                    ) => {
+                        let dst = *dst;
+                        let sym_clone = sym.clone();
+                        let opsz: u8 = if inst.operand_size > 0 {
+                            inst.operand_size
+                        } else {
+                            8
+                        };
+                        let mut bytes = Vec::with_capacity(12);
+                        if opsz == 2 {
+                            bytes.push(OPERAND_SIZE_PREFIX);
+                        }
+                        let need_w = opsz == 8;
+                        if opsz == 1 {
+                            // MOVZX r32, byte [rip+disp]
+                            if let Some(rex) = compute_rex(false, Some(dst), None, None) {
+                                bytes.push(rex);
+                            }
+                            bytes.push(0x0F);
+                            bytes.push(0xB6);
+                        } else {
+                            if let Some(rex) = compute_rex(need_w, Some(dst), None, None) {
+                                bytes.push(rex);
+                            } else if need_w {
+                                bytes.push(rex_byte(true, false, false, false));
+                            }
+                            bytes.push(0x8B);
+                        }
+                        let reg_enc = hw_encoding(dst) & 0x7;
+                        bytes.push(modrm_byte(0b00, reg_enc, 0b101));
+                        let reloc_offset = self.current_offset + bytes.len();
+                        bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+                        let reloc_type = if self.pic_enabled {
+                            X86_64RelocationType::RexGotPcRelX
+                        } else {
+                            X86_64RelocationType::Pc32
+                        };
+                        let reloc = RelocationEntry::new(
+                            reloc_offset as u64,
+                            sym_clone,
+                            reloc_type,
+                            -4,
+                            ".text".to_string(),
+                        );
+                        EncodedInstruction::with_relocations(bytes, vec![reloc])
+                    }
                     _ => {
                         eprintln!(
                             "[UD2] opcode={} ops={:?} res={:?}",
@@ -1049,6 +1100,56 @@ impl X86_64Encoder {
                         bytes.extend_from_slice(&pop_ind.bytes);
                         EncodedInstruction::new(bytes)
                     }
+                    // GlobalSymbol: StoreInd GlobalSymbol, Register →
+                    // MOV [rip+sym], src (RIP-relative 64-bit store).
+                    (
+                        Some(MachineOperand::GlobalSymbol(sym)),
+                        Some(MachineOperand::Register(src)),
+                    ) => {
+                        let src = *src;
+                        let sym_clone = sym.clone();
+                        let opsz: u8 = if inst.operand_size > 0 {
+                            inst.operand_size
+                        } else {
+                            8
+                        };
+                        let mut bytes = Vec::with_capacity(12);
+                        if opsz == 2 {
+                            bytes.push(OPERAND_SIZE_PREFIX);
+                        }
+                        let need_w = opsz == 8;
+                        if opsz == 1 {
+                            // MOV byte [rip+disp], r8
+                            if let Some(rex) = compute_rex(false, Some(src), None, None) {
+                                bytes.push(rex);
+                            }
+                            bytes.push(0x88);
+                        } else {
+                            if let Some(rex) = compute_rex(need_w, Some(src), None, None) {
+                                bytes.push(rex);
+                            } else if need_w {
+                                bytes.push(rex_byte(true, false, false, false));
+                            }
+                            bytes.push(0x89);
+                        }
+                        let reg_enc = hw_encoding(src) & 0x7;
+                        bytes.push(modrm_byte(0b00, reg_enc, 0b101));
+                        let reloc_offset = self.current_offset + bytes.len();
+                        bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+                        let reloc_type = if self.pic_enabled {
+                            X86_64RelocationType::RexGotPcRelX
+                        } else {
+                            X86_64RelocationType::Pc32
+                        };
+                        let reloc = RelocationEntry::new(
+                            reloc_offset as u64,
+                            sym_clone,
+                            reloc_type,
+                            -4,
+                            ".text".to_string(),
+                        );
+                        EncodedInstruction::with_relocations(bytes, vec![reloc])
+                    }
                     _ => {
                         eprintln!(
                             "[UD2] opcode={} ops={:?} res={:?}",
@@ -1092,6 +1193,38 @@ impl X86_64Encoder {
                             self.encode_reg_mem_op(&[0x8B], *dst, Some(*dst), None, 1, 0, 4);
                         bytes.extend_from_slice(&deref.bytes);
                         EncodedInstruction::new(bytes)
+                    }
+                    // GlobalSymbol: LoadInd32 dst, GlobalSymbol
+                    // MOV r32, [rip+sym] (32-bit load, zero extends)
+                    (
+                        Some(MachineOperand::Register(dst)),
+                        Some(MachineOperand::GlobalSymbol(sym)),
+                    ) => {
+                        let dst = *dst;
+                        let sym_clone = sym.clone();
+                        let mut bytes = Vec::with_capacity(12);
+                        // 32-bit load — no REX.W
+                        if let Some(rex) = compute_rex(false, Some(dst), None, None) {
+                            bytes.push(rex);
+                        }
+                        bytes.push(0x8B);
+                        let reg_enc = hw_encoding(dst) & 0x7;
+                        bytes.push(modrm_byte(0b00, reg_enc, 0b101));
+                        let reloc_offset = self.current_offset + bytes.len();
+                        bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+                        let reloc_type = if self.pic_enabled {
+                            X86_64RelocationType::RexGotPcRelX
+                        } else {
+                            X86_64RelocationType::Pc32
+                        };
+                        let reloc = RelocationEntry::new(
+                            reloc_offset as u64,
+                            sym_clone,
+                            reloc_type,
+                            -4,
+                            ".text".to_string(),
+                        );
+                        EncodedInstruction::with_relocations(bytes, vec![reloc])
                     }
                     _ => {
                         eprintln!(
@@ -1940,16 +2073,77 @@ impl X86_64Encoder {
                 EncodedInstruction::new(bytes)
             }
             (Some(MachineOperand::Register(reg)), Some(MachineOperand::GlobalSymbol(sym))) => {
-                self.encode_rip_relative(&[0x8B], *reg, sym, 0)
+                // RIP-relative load: MOV reg, [rip + sym]
+                // Use operand size to determine encoding width.
+                // For opsz <= 4 (I32/I16/I8), do NOT set REX.W to avoid
+                // reading 8 bytes from a 4-byte global.
+                let reg = *reg;
+                let sym_clone = sym.clone();
+                let mut bytes = Vec::with_capacity(12);
+                if opsz == 2 {
+                    bytes.push(OPERAND_SIZE_PREFIX);
+                }
+                let need_w = opsz == 8;
+                if opsz == 1 {
+                    // 8-bit load: MOVZX r32, byte [rip+disp32]
+                    // Use 0x0F 0xB6 (MOVZX r32, r/m8) for zero-extension.
+                    if let Some(rex) = compute_rex(false, Some(reg), None, None) {
+                        bytes.push(rex);
+                    }
+                    bytes.push(0x0F);
+                    bytes.push(0xB6);
+                } else {
+                    if let Some(rex) = compute_rex(need_w, Some(reg), None, None) {
+                        bytes.push(rex);
+                    } else if need_w {
+                        bytes.push(rex_byte(true, false, false, false));
+                    }
+                    bytes.push(0x8B);
+                }
+                let reg_enc = hw_encoding(reg) & 0x7;
+                bytes.push(modrm_byte(0b00, reg_enc, 0b101));
+                let reloc_offset = self.current_offset + bytes.len();
+                bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+                let reloc_type = if self.pic_enabled {
+                    X86_64RelocationType::RexGotPcRelX
+                } else {
+                    X86_64RelocationType::Pc32
+                };
+                let reloc = RelocationEntry::new(
+                    reloc_offset as u64,
+                    sym_clone,
+                    reloc_type,
+                    -4,
+                    ".text".to_string(),
+                );
+                EncodedInstruction::with_relocations(bytes, vec![reloc])
             }
             (Some(MachineOperand::GlobalSymbol(sym)), Some(MachineOperand::Register(reg))) => {
                 let sym_clone = sym.clone();
                 let reg = *reg;
                 let mut bytes = Vec::with_capacity(12);
-                if let Some(rex) = compute_rex(true, Some(reg), None, None) {
-                    bytes.push(rex);
+                // Use operand size to determine the encoding width.
+                // opsz 1 → byte store, 2 → word, 4 → dword, 8 → qword.
+                if opsz == 2 {
+                    bytes.push(OPERAND_SIZE_PREFIX);
                 }
-                bytes.push(0x89);
+                let need_w = opsz == 8;
+                if opsz == 1 {
+                    // 8-bit store: MOV [rip+disp32], r8  (opcode 0x88)
+                    if let Some(rex) = compute_rex(false, Some(reg), None, None) {
+                        bytes.push(rex);
+                    }
+                    bytes.push(0x88);
+                } else {
+                    // 16/32/64-bit store: MOV [rip+disp32], r16/r32/r64 (0x89)
+                    // REX.W=1 only for 64-bit.
+                    if let Some(rex) = compute_rex(need_w, Some(reg), None, None) {
+                        bytes.push(rex);
+                    } else if need_w {
+                        bytes.push(rex_byte(true, false, false, false));
+                    }
+                    bytes.push(0x89);
+                }
                 let reg_enc = hw_encoding(reg) & 0x7;
                 bytes.push(modrm_byte(0b00, reg_enc, 0b101));
                 let reloc_offset = self.current_offset + bytes.len();
@@ -3402,26 +3596,80 @@ impl X86_64Encoder {
     }
 
     /// Encode UCOMISD.
+    /// Encode `MOVQ xmm, gpr` (66 REX.W 0F 6E /r) — moves 64-bit GPR value
+    /// into the lower 64 bits of an XMM register.  Used to patch up float
+    /// values that the register allocator placed in GPRs before a UCOMIS*
+    /// comparison.
+    fn encode_movq_gpr_to_xmm(&self, gpr: u16, xmm: u16) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(5);
+        bytes.push(0x66); // mandatory prefix
+        // REX.W (64-bit operand) + register extension bits
+        let rex = rex_byte(
+            true,
+            hw_encoding(xmm) >= 8,
+            false,
+            hw_encoding(gpr) >= 8,
+        );
+        bytes.push(rex);
+        bytes.push(0x0F);
+        bytes.push(0x6E); // MOVQ xmm, r/m64
+        bytes.push(modrm_byte(
+            0b11,
+            hw_encoding(xmm) & 0x7,
+            hw_encoding(gpr) & 0x7,
+        ));
+        bytes
+    }
+
     fn encode_ucomisd(&mut self, inst: &MachineInstruction) -> EncodedInstruction {
         let ops = &inst.operands;
-        match (ops.first(), ops.get(1)) {
-            (Some(MachineOperand::Register(dst)), Some(MachineOperand::Register(src)))
-                if is_sse(*dst) && is_sse(*src) =>
-            {
-                let mut bytes = Vec::with_capacity(6);
-                bytes.push(0x66);
-                if let Some(rex) = compute_rex(false, Some(*dst), None, Some(*src)) {
-                    bytes.push(rex);
-                }
-                bytes.push(0x0F);
-                bytes.push(0x2E);
-                bytes.push(modrm_byte(
-                    0b11,
-                    hw_encoding(*dst) & 0x7,
-                    hw_encoding(*src) & 0x7,
-                ));
-                EncodedInstruction::new(bytes)
+        // Helper: resolve operands; if a GPR is encountered, emit MOVQ GPR→XMM15
+        // and substitute XMM15 as the comparison operand.
+        let lhs = ops.first().and_then(|o| {
+            if let MachineOperand::Register(r) = o {
+                Some(*r)
+            } else {
+                None
             }
+        });
+        let rhs = ops.get(1).and_then(|o| {
+            if let MachineOperand::Register(r) = o {
+                Some(*r)
+            } else {
+                None
+            }
+        });
+
+        if let (Some(mut lhs_reg), Some(mut rhs_reg)) = (lhs, rhs) {
+            let mut prefix_bytes = Vec::new();
+            // If lhs is GPR, move to XMM15 via MOVQ (66 REX.W 0F 6E /r)
+            const XMM15: u16 = 31;
+            const XMM14: u16 = 30;
+            if !is_sse(lhs_reg) {
+                prefix_bytes.extend_from_slice(&self.encode_movq_gpr_to_xmm(lhs_reg, XMM15));
+                lhs_reg = XMM15;
+            }
+            if !is_sse(rhs_reg) {
+                let target = if lhs_reg == XMM15 { XMM14 } else { XMM15 };
+                prefix_bytes.extend_from_slice(&self.encode_movq_gpr_to_xmm(rhs_reg, target));
+                rhs_reg = target;
+            }
+            let mut bytes = prefix_bytes;
+            bytes.push(0x66);
+            if let Some(rex) = compute_rex(false, Some(lhs_reg), None, Some(rhs_reg)) {
+                bytes.push(rex);
+            }
+            bytes.push(0x0F);
+            bytes.push(0x2E);
+            bytes.push(modrm_byte(
+                0b11,
+                hw_encoding(lhs_reg) & 0x7,
+                hw_encoding(rhs_reg) & 0x7,
+            ));
+            return EncodedInstruction::new(bytes);
+        }
+
+        match (ops.first(), ops.get(1)) {
             (
                 Some(MachineOperand::Register(xmm)),
                 Some(MachineOperand::Memory {
@@ -3466,24 +3714,50 @@ impl X86_64Encoder {
     /// Encoding: `0F 2E /r` (no mandatory prefix, unlike UCOMISD which uses 0x66).
     fn encode_ucomiss(&mut self, inst: &MachineInstruction) -> EncodedInstruction {
         let ops = &inst.operands;
-        match (ops.first(), ops.get(1)) {
-            (Some(MachineOperand::Register(dst)), Some(MachineOperand::Register(src)))
-                if is_sse(*dst) && is_sse(*src) =>
-            {
-                let mut bytes = Vec::with_capacity(5);
-                // No mandatory prefix for UCOMISS (unlike UCOMISD's 0x66).
-                if let Some(rex) = compute_rex(false, Some(*dst), None, Some(*src)) {
-                    bytes.push(rex);
-                }
-                bytes.push(0x0F);
-                bytes.push(0x2E);
-                bytes.push(modrm_byte(
-                    0b11,
-                    hw_encoding(*dst) & 0x7,
-                    hw_encoding(*src) & 0x7,
-                ));
-                EncodedInstruction::new(bytes)
+        // Handle GPR→XMM conversion similarly to encode_ucomisd.
+        let lhs = ops.first().and_then(|o| {
+            if let MachineOperand::Register(r) = o {
+                Some(*r)
+            } else {
+                None
             }
+        });
+        let rhs = ops.get(1).and_then(|o| {
+            if let MachineOperand::Register(r) = o {
+                Some(*r)
+            } else {
+                None
+            }
+        });
+        if let (Some(mut lhs_reg), Some(mut rhs_reg)) = (lhs, rhs) {
+            let mut prefix_bytes = Vec::new();
+            const XMM15: u16 = 31;
+            const XMM14: u16 = 30;
+            if !is_sse(lhs_reg) {
+                prefix_bytes.extend_from_slice(&self.encode_movq_gpr_to_xmm(lhs_reg, XMM15));
+                lhs_reg = XMM15;
+            }
+            if !is_sse(rhs_reg) {
+                let target = if lhs_reg == XMM15 { XMM14 } else { XMM15 };
+                prefix_bytes.extend_from_slice(&self.encode_movq_gpr_to_xmm(rhs_reg, target));
+                rhs_reg = target;
+            }
+            let mut bytes = prefix_bytes;
+            // No mandatory prefix for UCOMISS.
+            if let Some(rex) = compute_rex(false, Some(lhs_reg), None, Some(rhs_reg)) {
+                bytes.push(rex);
+            }
+            bytes.push(0x0F);
+            bytes.push(0x2E);
+            bytes.push(modrm_byte(
+                0b11,
+                hw_encoding(lhs_reg) & 0x7,
+                hw_encoding(rhs_reg) & 0x7,
+            ));
+            return EncodedInstruction::new(bytes);
+        }
+
+        match (ops.first(), ops.get(1)) {
             (
                 Some(MachineOperand::Register(xmm)),
                 Some(MachineOperand::Memory {

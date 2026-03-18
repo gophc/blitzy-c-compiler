@@ -1022,6 +1022,23 @@ impl<'src> Parser<'src> {
                 let item_start = self.current_span();
                 let mut designators = Vec::new();
 
+                // GCC extension: `field: value` labeled initializer (no dot,
+                // uses colon).  Detect: current token is identifier, next
+                // token is colon.  Unlike standard C designated initializer
+                // `.field = value`, GCC labeled init uses `field: value`
+                // with no `=` after the colon.
+                let mut gcc_labeled = false;
+                if let TokenKind::Identifier(sym) = self.current.kind {
+                    let next_tok = self.peek_nth(0);
+                    if matches!(next_tok.kind, TokenKind::Colon) {
+                        let fspan = self.current_span();
+                        self.advance(); // consume identifier
+                        self.advance(); // consume colon
+                        designators.push(Designator::Field(sym, fspan));
+                        gcc_labeled = true;
+                    }
+                }
+
                 // Parse optional designators: `.field`, `[index]`, `[low...high]`.
                 while self.check(&TokenKind::Dot) || self.check(&TokenKind::LeftBracket) {
                     if self.match_token(&TokenKind::Dot) {
@@ -1061,7 +1078,8 @@ impl<'src> Parser<'src> {
                 }
 
                 // If designators are present, expect `=`.
-                if !designators.is_empty() {
+                // GCC labeled inits (`field: value`) use `:` instead of `=`.
+                if !designators.is_empty() && !gcc_labeled {
                     self.expect(TokenKind::Equal)?;
                 }
 

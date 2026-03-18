@@ -89,6 +89,9 @@ pub struct SwitchContext {
     pub break_target: BlockId,
     /// Map from case values to their blocks.
     pub case_blocks: Vec<(i64, BlockId)>,
+    /// Case ranges (low, high, target) for large `case low ... high:` ranges
+    /// that are too large to enumerate individually.
+    pub case_ranges: Vec<(i64, i64, BlockId)>,
     /// Default case block (if present).
     pub default_block: Option<BlockId>,
 }
@@ -163,6 +166,10 @@ pub struct StmtLoweringContext<'a> {
     /// Shared with `ExprLoweringContext` to avoid recomputing full layout
     /// for every member access on large structs.
     pub layout_cache: FxHashMap<String, crate::common::type_builder::StructLayout>,
+    /// VLA variable name → IR Value holding the total byte size (runtime).
+    /// When sizeof is applied to a VLA variable, this value is emitted
+    /// instead of the compile-time sizeof (which would be 8 = pointer size).
+    pub vla_sizes: FxHashMap<String, Value>,
 }
 
 // ===========================================================================
@@ -356,17 +363,41 @@ fn lower_compound_statement(
     current_block
 }
 
-/// Returns `true` if the statement introduces a new block (label-like).
-/// These must be lowered even when the current block is terminated because
-/// they are reachable through jumps (goto, computed goto, switch dispatch).
+/// Returns `true` if the statement introduces or **contains** a new block
+/// (label-like). These must be lowered even when the current block is
+/// terminated because they are reachable through jumps (goto, computed goto,
+/// switch dispatch).
+///
+/// This check is recursive: `if (0) { L: x = 0; }` is NOT itself a Labeled
+/// statement, but it contains one, so it must still be lowered (the label is
+/// a goto target that would otherwise be lost).
 fn is_label_like(stmt: &ast::Statement) -> bool {
-    matches!(
-        stmt,
+    match stmt {
         ast::Statement::Labeled { .. }
-            | ast::Statement::Case { .. }
-            | ast::Statement::Default { .. }
-            | ast::Statement::CaseRange { .. }
-    )
+        | ast::Statement::Case { .. }
+        | ast::Statement::Default { .. }
+        | ast::Statement::CaseRange { .. } => true,
+        // Recurse into control-flow structures that may contain labels.
+        ast::Statement::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            is_label_like(then_branch)
+                || else_branch.as_ref().map_or(false, |e| is_label_like(e))
+        }
+        ast::Statement::While { body, .. }
+        | ast::Statement::DoWhile { body, .. }
+        | ast::Statement::For { body, .. } => is_label_like(body),
+        ast::Statement::Switch { body, .. } => is_label_like(body),
+        ast::Statement::Compound(compound) => {
+            compound.items.iter().any(|item| match item {
+                ast::BlockItem::Statement(s) => is_label_like(s),
+                _ => false,
+            })
+        }
+        _ => false,
+    }
 }
 
 // ===========================================================================
@@ -442,12 +473,32 @@ fn infer_array_size_from_init(
 /// Count characters in a string literal expression (including null terminator).
 fn string_literal_length(expr: &ast::Expression) -> Option<usize> {
     match expr {
-        ast::Expression::StringLiteral { segments, .. } => {
-            let mut total: usize = 0;
-            for seg in segments {
-                total += seg.value.len();
+        ast::Expression::StringLiteral {
+            segments, prefix, ..
+        } => {
+            let char_width: usize = match prefix {
+                crate::frontend::parser::ast::StringPrefix::None
+                | crate::frontend::parser::ast::StringPrefix::U8 => 1,
+                crate::frontend::parser::ast::StringPrefix::L
+                | crate::frontend::parser::ast::StringPrefix::U32 => 4,
+                crate::frontend::parser::ast::StringPrefix::U16 => 2,
+            };
+            if char_width == 1 {
+                let mut total: usize = 0;
+                for seg in segments {
+                    total += seg.value.len();
+                }
+                Some(total + 1)
+            } else {
+                // Wide string: decode UTF-8 to count code points.
+                let mut raw_bytes = Vec::new();
+                for seg in segments {
+                    raw_bytes.extend_from_slice(&seg.value);
+                }
+                let codepoints =
+                    super::decl_lowering::decode_bytes_to_codepoints(&raw_bytes);
+                Some(codepoints.len() + 1) // +1 for null terminator
             }
-            Some(total + 1) // +1 for null terminator
         }
         ast::Expression::Parenthesized { inner, .. } => string_literal_length(inner),
         _ => None,
@@ -533,7 +584,13 @@ pub fn ensure_allocas_for_declaration(ctx: &mut StmtLoweringContext<'_>, decl: &
                 Some(name) => name,
                 None => continue,
             };
-            // If already known as a global, skip.
+            // C11 §6.2.2p4: a block-scope `extern` declaration refers to
+            // the external definition, NOT to any local variable of the
+            // same name in an enclosing scope.  Remove the local mapping
+            // so that `lower_identifier` falls through to the global lookup.
+            ctx.local_vars.remove(&var_name);
+
+            // If already known as a global, skip adding again.
             if ctx.module.get_global(&var_name).is_some() {
                 continue;
             }
@@ -601,7 +658,8 @@ pub fn ensure_allocas_for_declaration(ctx: &mut StmtLoweringContext<'_>, decl: &
             // Infer array size from initializer when declaration uses [].
             let ir_type = match (&c_type, &constant) {
                 (CType::Array(elem, None), Some(crate::ir::module::Constant::String(bytes))) => {
-                    let fixed = CType::Array(elem.clone(), Some(bytes.len()));
+                    let elem_byte_size = super::decl_lowering::wide_char_elem_size(elem);
+                    let fixed = CType::Array(elem.clone(), Some(bytes.len() / elem_byte_size));
                     IrType::from_ctype(&fixed, ctx.target)
                 }
                 (CType::Array(elem, None), Some(crate::ir::module::Constant::Array(elems))) => {
@@ -644,6 +702,16 @@ pub fn ensure_allocas_for_declaration(ctx: &mut StmtLoweringContext<'_>, decl: &
         // declared type differs from the pre-scanned type, we must create a
         // new alloca with the correct IR type and update the scope overrides.
         if ctx.local_vars.contains_key(&var_name) {
+            // VLA variables: local_types has Pointer(elem, _) but
+            // resolve_declaration_type returns Array(elem, None).  These
+            // are intentionally different (the alloca holds a *pointer*
+            // to the dynamically-allocated VLA memory).  Skip the
+            // scope-shadowing re-alloca to preserve the Pointer type.
+            if matches!(c_type, CType::Array(_, None)) {
+                if let Some(CType::Pointer(_, _)) = ctx.local_types.get(&var_name) {
+                    continue;
+                }
+            }
             let effective_type = ctx
                 .scope_type_overrides
                 .get(&var_name)
@@ -669,7 +737,17 @@ pub fn ensure_allocas_for_declaration(ctx: &mut StmtLoweringContext<'_>, decl: &
                 let resolved_c_type =
                     decl_lowering::resolve_sizeof_struct_ref_pub(sized_c_type.clone(), ctx.target);
                 let ir_type = IrType::from_ctype(&resolved_c_type, ctx.target);
-                let (alloca_val, alloca_inst) = ctx.builder.build_alloca(ir_type, decl.span);
+                // Round up non-power-of-2 struct allocas so whole-struct register
+                // stores (e.g. 3-byte struct stored via 4-byte movl) don't overflow.
+                let alloca_ir_type = {
+                    let sz = ir_type.size_bytes(ctx.target);
+                    if sz > 0 && sz <= 8 && !sz.is_power_of_two() {
+                        IrType::Array(Box::new(IrType::I8), sz.next_power_of_two())
+                    } else {
+                        ir_type
+                    }
+                };
+                let (alloca_val, alloca_inst) = ctx.builder.build_alloca(alloca_ir_type, decl.span);
                 ctx.function.entry_block_mut().push_alloca(alloca_inst);
                 ctx.local_vars.insert(var_name.clone(), alloca_val);
                 ctx.scope_type_overrides
@@ -687,7 +765,17 @@ pub fn ensure_allocas_for_declaration(ctx: &mut StmtLoweringContext<'_>, decl: &
         let resolved_c_type =
             decl_lowering::resolve_sizeof_struct_ref_pub(c_type.clone(), ctx.target);
         let ir_type = IrType::from_ctype(&resolved_c_type, ctx.target);
-        let (alloca_val, alloca_inst) = ctx.builder.build_alloca(ir_type, decl.span);
+        // Round up non-power-of-2 struct allocas so whole-struct register
+        // stores (e.g. 3-byte struct stored via 4-byte movl) don't overflow.
+        let alloca_ir_type = {
+            let sz = ir_type.size_bytes(ctx.target);
+            if sz > 0 && sz <= 8 && !sz.is_power_of_two() {
+                IrType::Array(Box::new(IrType::I8), sz.next_power_of_two())
+            } else {
+                ir_type
+            }
+        };
+        let (alloca_val, alloca_inst) = ctx.builder.build_alloca(alloca_ir_type, decl.span);
         ctx.function.entry_block_mut().push_alloca(alloca_inst);
         ctx.local_vars.insert(var_name.clone(), alloca_val);
     }
@@ -708,24 +796,253 @@ pub fn lower_declaration_initializers(ctx: &mut StmtLoweringContext<'_>, decl: &
     ) {
         return;
     }
-    // Skip typedef declarations.
+    // Skip typedef declarations — but handle VLA typedefs specially.
     if matches!(
         decl.specifiers.storage_class,
         Some(ast::StorageClass::Typedef)
     ) {
+        // For VLA typedefs like `typedef int c[i+2]`, we need to compute
+        // the runtime total byte size so that `sizeof(c)` works.
+        for init_decl in &decl.declarators {
+            let td_name = match extract_decl_name(&init_decl.declarator, ctx.name_table) {
+                Some(n) => n,
+                None => continue,
+            };
+            if let Some(vla_expr) =
+                decl_lowering::extract_vla_size_expr_pub(&init_decl.declarator)
+            {
+                // Determine the element type from the declaration specifiers.
+                let elem_ty = {
+                    use super::decl_lowering::resolve_base_type_from_sqlist;
+                    let sqlist = crate::frontend::parser::ast::SpecifierQualifierList {
+                        type_specifiers: decl.specifiers.type_specifiers.clone(),
+                        type_qualifiers: decl.specifiers.type_qualifiers.clone(),
+                        attributes: Vec::new(),
+                        span: decl.span,
+                    };
+                    resolve_base_type_from_sqlist(&sqlist)
+                };
+                let span = decl.span;
+                let elem_size =
+                    crate::common::types::sizeof_ctype(&elem_ty, ctx.target) as i64;
+                let ptr_ty = if ctx.target.pointer_width() == 8 {
+                    IrType::I64
+                } else {
+                    IrType::I32
+                };
+                // Build an expression context to evaluate the size expression.
+                let mut expr_ctx = ExprLoweringContext {
+                    builder: ctx.builder,
+                    function: ctx.function,
+                    module: ctx.module,
+                    target: ctx.target,
+                    type_builder: ctx.type_builder,
+                    diagnostics: ctx.diagnostics,
+                    local_vars: ctx.local_vars,
+                    param_values: ctx.param_values,
+                    name_table: ctx.name_table,
+                    local_types: ctx.local_types,
+                    enum_constants: ctx.enum_constants,
+                    static_locals: ctx.static_locals,
+                    struct_defs: ctx.struct_defs,
+                    label_blocks: ctx.label_blocks,
+                    current_function_name: ctx.current_function_name,
+                    enclosing_loop_stack: ctx.loop_stack.clone(),
+                    scope_type_overrides: &ctx.scope_type_overrides,
+                    last_bitfield_info: None,
+                    layout_cache: &mut ctx.layout_cache,
+                    vla_sizes: &ctx.vla_sizes,
+                };
+                // Evaluate the VLA size expression at runtime.
+                let tv =
+                    super::expr_lowering::lower_expression_typed(&mut expr_ctx, &vla_expr);
+                let n_val = tv.value;
+                // ZExt the count to pointer width if needed.
+                let n_wide = {
+                    let (v, inst) = expr_ctx.builder.build_zext_from(
+                        n_val, IrType::I32, ptr_ty.clone(), span,
+                    );
+                    push_inst_to_block(&mut expr_ctx, inst);
+                    v
+                };
+                // Emit element-size constant.
+                let elem_const = {
+                    use crate::ir::instructions::BinOp as IrBinOp;
+                    use crate::ir::module::{Constant, GlobalVariable};
+                    use crate::ir::module as ir_module;
+                    let const_id = expr_ctx.module.globals().len();
+                    let gname = format!(".Lconst.i.{}", const_id);
+                    let mut gv = GlobalVariable::new(
+                        gname,
+                        ptr_ty.clone(),
+                        Some(Constant::Integer(elem_size as i128)),
+                    );
+                    gv.linkage = ir_module::Linkage::Internal;
+                    gv.is_constant = true;
+                    expr_ctx.module.add_global(gv);
+                    let result = expr_ctx.builder.fresh_value();
+                    let inst = Instruction::BinOp {
+                        result,
+                        op: IrBinOp::Add,
+                        lhs: result,
+                        rhs: Value::UNDEF,
+                        ty: ptr_ty.clone(),
+                        span,
+                    };
+                    push_inst_to_block(&mut expr_ctx, inst);
+                    expr_ctx
+                        .function
+                        .constant_values
+                        .insert(result, elem_size);
+                    result
+                };
+                let (total, mul_inst) = expr_ctx.builder.build_mul(
+                    n_wide, elem_const, ptr_ty, span,
+                );
+                push_inst_to_block(&mut expr_ctx, mul_inst);
+                drop(expr_ctx);
+                // Store the total byte size in vla_sizes so sizeof(c) works.
+                ctx.vla_sizes.insert(td_name, total);
+            }
+        }
         return;
     }
 
     for init_decl in &decl.declarators {
-        // Only process declarators with initializers.
-        let initializer = match &init_decl.initializer {
-            Some(init) => init,
-            None => continue,
-        };
-
         // Extract the variable name from the declarator.
         let var_name = match extract_decl_name(&init_decl.declarator, ctx.name_table) {
             Some(name) => name,
+            None => continue,
+        };
+
+        // ----- VLA dynamic allocation -----
+        // Detect VLA declarations by checking the declarator for a
+        // non-constant array size expression.  We cannot check local_types
+        // here because VLA variables were overridden to CType::Pointer
+        // during allocate_local_variables.
+        if let Some(vla_expr) =
+            decl_lowering::extract_vla_size_expr_pub(&init_decl.declarator)
+        {
+            // VLA variable detected — emit runtime stack allocation.
+            // Determine the element type from the Pointer type stored in
+            // local_types (which was set from the original Array element).
+            let elem_from_ptr = {
+                let vty = ctx
+                    .local_types
+                    .get(&var_name)
+                    .cloned()
+                    .unwrap_or(CType::Int);
+                match vty {
+                    CType::Pointer(inner, _) => (*inner).clone(),
+                    _ => CType::Int,
+                }
+            };
+            let elem = elem_from_ptr;
+            // Look up the pointer-sized alloca for this VLA.
+            if let Some(&alloca_val) = ctx.local_vars.get(&var_name) {
+                    let span = decl.span;
+                    let elem_size =
+                        crate::common::types::sizeof_ctype(&elem, ctx.target) as i64;
+                    // Build an expression context to evaluate the size expression.
+                    let mut expr_ctx = ExprLoweringContext {
+                        builder: ctx.builder,
+                        function: ctx.function,
+                        module: ctx.module,
+                        target: ctx.target,
+                        type_builder: ctx.type_builder,
+                        diagnostics: ctx.diagnostics,
+                        local_vars: ctx.local_vars,
+                        param_values: ctx.param_values,
+                        name_table: ctx.name_table,
+                        local_types: ctx.local_types,
+                        enum_constants: ctx.enum_constants,
+                        static_locals: ctx.static_locals,
+                        struct_defs: ctx.struct_defs,
+                        label_blocks: ctx.label_blocks,
+                        current_function_name: ctx.current_function_name,
+                        enclosing_loop_stack: ctx.loop_stack.clone(),
+                        scope_type_overrides: &ctx.scope_type_overrides,
+                        last_bitfield_info: None,
+                        layout_cache: &mut ctx.layout_cache,
+                        vla_sizes: &ctx.vla_sizes,
+                    };
+                    // Evaluate the VLA size expression at runtime.
+                    let tv =
+                        super::expr_lowering::lower_expression_typed(
+                            &mut expr_ctx, &vla_expr,
+                        );
+                    let n_val = tv.value;
+                    // Compute total byte count: n * elem_size.
+                    let ptr_ty = if ctx.target.pointer_width() == 8 {
+                        IrType::I64
+                    } else {
+                        IrType::I32
+                    };
+                    // ZExt the count to pointer width if needed.
+                    // The VLA size expression is typically int (I32) but
+                    // we need pointer-width (I64) for the multiply.
+                    let n_wide = {
+                        let (v, inst) = expr_ctx.builder.build_zext_from(
+                            n_val, IrType::I32, ptr_ty.clone(), span,
+                        );
+                        push_inst_to_block(&mut expr_ctx, inst);
+                        v
+                    };
+                    // Emit element-size constant using the
+                    // Add-result-UNDEF sentinel pattern (same as
+                    // emit_int_const in expr_lowering).
+                    let elem_const = {
+                        use crate::ir::instructions::BinOp as IrBinOp;
+                        use crate::ir::module::{Constant, GlobalVariable};
+                        use crate::ir::module as ir_module;
+                        let const_id = expr_ctx.module.globals().len();
+                        let gname = format!(".Lconst.i.{}", const_id);
+                        let mut gv = GlobalVariable::new(
+                            gname,
+                            ptr_ty.clone(),
+                            Some(Constant::Integer(elem_size as i128)),
+                        );
+                        gv.linkage = ir_module::Linkage::Internal;
+                        gv.is_constant = true;
+                        expr_ctx.module.add_global(gv);
+                        let result = expr_ctx.builder.fresh_value();
+                        let inst = Instruction::BinOp {
+                            result,
+                            op: IrBinOp::Add,
+                            lhs: result,
+                            rhs: Value::UNDEF,
+                            ty: ptr_ty.clone(),
+                            span,
+                        };
+                        push_inst_to_block(&mut expr_ctx, inst);
+                        expr_ctx
+                            .function
+                            .constant_values
+                            .insert(result, elem_size);
+                        result
+                    };
+                    let (total, mul_inst) = expr_ctx.builder.build_mul(
+                        n_wide, elem_const, ptr_ty, span,
+                    );
+                    push_inst_to_block(&mut expr_ctx, mul_inst);
+                    // Emit StackAlloc.
+                    let (ptr_val, sa_inst) =
+                        expr_ctx.builder.build_stack_alloc(total, span);
+                    push_inst_to_block(&mut expr_ctx, sa_inst);
+                    // Store the pointer into the alloca.
+                    let store_inst =
+                        expr_ctx.builder.build_store(ptr_val, alloca_val, span);
+                    push_inst_to_block(&mut expr_ctx, store_inst);
+                    // Record the total byte size so that sizeof(vla) works at runtime.
+                    drop(expr_ctx);
+                    ctx.vla_sizes.insert(var_name.clone(), total);
+            }
+            continue; // VLA handled, skip normal init path.
+        }
+
+        // Only process declarators with initializers.
+        let initializer = match &init_decl.initializer {
+            Some(init) => init,
             None => continue,
         };
 
@@ -764,6 +1081,7 @@ pub fn lower_declaration_initializers(ctx: &mut StmtLoweringContext<'_>, decl: &
             scope_type_overrides: &ctx.scope_type_overrides,
             last_bitfield_info: None,
             layout_cache: &mut ctx.layout_cache,
+            vla_sizes: &ctx.vla_sizes,
         };
         decl_lowering::lower_local_initializer(alloca_val, initializer, &var_type, &mut expr_ctx);
     }
@@ -1239,6 +1557,40 @@ fn lower_for_loop(
 /// [dispatch] -> Switch(val, default, cases) built after body
 /// [exit]    -> continuation
 /// ```
+/// Emit an integer constant value from within a `StmtLoweringContext`.
+/// Uses the same Add+UNDEF sentinel pattern as `emit_int_const` in
+/// `expr_lowering`, but works with the stmt-level context directly.
+fn emit_switch_range_const(
+    ctx: &mut StmtLoweringContext<'_>,
+    value: i128,
+    ir_ty: IrType,
+    span: Span,
+) -> Value {
+    let const_id = ctx.module.globals().len();
+    let gname = format!(".Lconst.i.{}", const_id);
+    let mut gv = crate::ir::module::GlobalVariable::new(
+        gname,
+        ir_ty.clone(),
+        Some(crate::ir::module::Constant::Integer(value)),
+    );
+    gv.linkage = crate::ir::module::Linkage::Internal;
+    gv.is_constant = true;
+    ctx.module.add_global(gv);
+
+    let result = ctx.builder.fresh_value();
+    let inst = Instruction::BinOp {
+        result,
+        op: crate::ir::instructions::BinOp::Add,
+        lhs: result,
+        rhs: Value::UNDEF,
+        ty: ir_ty,
+        span,
+    };
+    emit_instruction_to_current_block(ctx, inst);
+    ctx.function.constant_values.insert(result, value as i64);
+    result
+}
+
 fn lower_switch(
     ctx: &mut StmtLoweringContext<'_>,
     condition: &ast::Expression,
@@ -1261,6 +1613,7 @@ fn lower_switch(
     ctx.switch_ctx = Some(SwitchContext {
         break_target: exit_block,
         case_blocks: Vec::new(),
+        case_ranges: Vec::new(),
         default_block: None,
     });
 
@@ -1300,6 +1653,7 @@ fn lower_switch(
     let switch_info = ctx.switch_ctx.take().unwrap_or(SwitchContext {
         break_target: exit_block,
         case_blocks: Vec::new(),
+        case_ranges: Vec::new(),
         default_block: None,
     });
 
@@ -1311,6 +1665,50 @@ fn lower_switch(
 
     // Build the Switch instruction in the dispatch block.
     ctx.builder.set_insert_point(dispatch_block);
+
+    // Emit range checks BEFORE the cascaded Switch comparisons.
+    // For each case range (low, high, target), emit:
+    //   if (val >= low && val <= high) goto target
+    // This handles large ranges that cannot be enumerated.
+    let mut current_dispatch = dispatch_block;
+    for &(low, high, target) in &switch_info.case_ranges {
+        let ir_ty = crate::ir::types::IrType::I64;
+
+        // Use unsigned range check: (val - low) <=u (high - low).
+        // This works for both signed and unsigned switch values and
+        // avoids signed overflow issues when case values exceed i64 max.
+        let low_val = emit_switch_range_const(ctx, low as i128, ir_ty.clone(), span);
+        let (sub_val, sub_inst) = ctx.builder.build_sub(
+            switch_val, low_val, ir_ty.clone(), span,
+        );
+        emit_instruction_to_current_block(ctx, sub_inst);
+
+        let range_width = (high as u64).wrapping_sub(low as u64);
+        let range_val = emit_switch_range_const(
+            ctx,
+            range_width as i64 as i128,
+            ir_ty.clone(),
+            span,
+        );
+        let (in_range, cmp_inst) = ctx
+            .builder
+            .build_icmp(crate::ir::instructions::ICmpOp::Ule, sub_val, range_val, span);
+        emit_instruction_to_current_block(ctx, cmp_inst);
+
+        // Create a fallthrough block for the next check or the Switch.
+        let next_block = create_block(ctx, "switch.range_next");
+        let cond_br = ctx
+            .builder
+            .build_cond_branch(in_range, target, next_block, span);
+        emit_instruction_to_current_block(ctx, cond_br);
+
+        add_cfg_edge(ctx, current_dispatch.index(), target.index());
+        add_cfg_edge(ctx, current_dispatch.index(), next_block.index());
+
+        ctx.builder.set_insert_point(next_block);
+        current_dispatch = next_block;
+    }
+
     let switch_inst = ctx.builder.build_switch(
         switch_val,
         default_target,
@@ -1319,10 +1717,10 @@ fn lower_switch(
     );
     emit_instruction_to_current_block(ctx, switch_inst);
 
-    // Add CFG edges from dispatch to all case targets and default.
-    add_cfg_edge(ctx, dispatch_block.index(), default_target.index());
+    // Add CFG edges from current dispatch to all case targets and default.
+    add_cfg_edge(ctx, current_dispatch.index(), default_target.index());
     for &(_val, target) in &switch_info.case_blocks {
-        add_cfg_edge(ctx, dispatch_block.index(), target.index());
+        add_cfg_edge(ctx, current_dispatch.index(), target.index());
     }
 
     // Continue at exit block.
@@ -1348,7 +1746,7 @@ fn lower_case(
     let case_block = create_block(ctx, "switch.case");
 
     // Evaluate the case value as a compile-time constant.
-    let case_val = eval_case_constant(value_expr);
+    let case_val = eval_case_constant(value_expr, ctx.name_table, ctx.enum_constants);
 
     // Register in the switch context.
     if let Some(ref mut sctx) = ctx.switch_ctx {
@@ -1375,9 +1773,10 @@ fn lower_case(
 
 /// Lowers a `case low ... high: statement` (GCC case range extension).
 ///
-/// Registers multiple (value, block_id) pairs for every integer in the
-/// inclusive range `[low, high]`. All values in the range target the same
-/// case block.
+/// For small ranges (≤256 values), registers each value individually in
+/// the SwitchContext.  For large ranges, stores as a
+/// `(low, high, target)` range entry that the switch dispatch will emit
+/// as a pair of comparisons: `val >= low && val <= high`.
 fn lower_case_range(
     ctx: &mut StmtLoweringContext<'_>,
     low_expr: &ast::Expression,
@@ -1387,16 +1786,22 @@ fn lower_case_range(
 ) -> Option<BlockId> {
     let case_block = create_block(ctx, "switch.case_range");
 
-    let low_val = eval_case_constant(low_expr);
-    let high_val = eval_case_constant(high_expr);
+    let low_val = eval_case_constant(low_expr, ctx.name_table, ctx.enum_constants);
+    let high_val = eval_case_constant(high_expr, ctx.name_table, ctx.enum_constants);
 
-    // Register all values in [low, high] for this block.
+    // Register in the switch context.
     if let Some(ref mut sctx) = ctx.switch_ctx {
-        // Clamp range to prevent excessive allocation on pathological inputs.
-        let range_size = (high_val.saturating_sub(low_val)).saturating_add(1);
-        let clamped_size = range_size.min(4096); // Safety cap
-        for i in 0..clamped_size {
-            sctx.case_blocks.push((low_val + i, case_block));
+        let range_size = (high_val as u64).wrapping_sub(low_val as u64).wrapping_add(1);
+        if range_size <= 256 {
+            // Small range: enumerate individual values.
+            for i in 0..range_size {
+                sctx.case_blocks
+                    .push((low_val.wrapping_add(i as i64), case_block));
+            }
+        } else {
+            // Large range: store as a range entry for comparison-based
+            // dispatch instead of enumerating all values.
+            sctx.case_ranges.push((low_val, high_val, case_block));
         }
     }
 
@@ -1572,6 +1977,7 @@ fn lower_return(
                 scope_type_overrides: &ctx.scope_type_overrides,
                 last_bitfield_info: None,
                 layout_cache: &mut ctx.layout_cache,
+                vla_sizes: &ctx.vla_sizes,
             };
             val = insert_implicit_conversion(&mut expr_ctx, val, &tv.ty, ret_cty, span);
         }
@@ -1846,6 +2252,17 @@ fn ensure_terminator(ctx: &mut StmtLoweringContext<'_>, target: BlockId) {
     }
 }
 
+/// Pushes an instruction into the current block using an `ExprLoweringContext`.
+/// Used by VLA allocation code that operates within an expression context.
+fn push_inst_to_block(ctx: &mut ExprLoweringContext<'_>, inst: Instruction) {
+    if let Some(block_id) = ctx.builder.get_insert_block() {
+        let idx = block_id.index();
+        if let Some(block) = ctx.function.blocks.get_mut(idx) {
+            block.push_instruction(inst);
+        }
+    }
+}
+
 /// Emits an instruction into the current insertion block.
 fn emit_instruction_to_current_block(ctx: &mut StmtLoweringContext<'_>, inst: Instruction) {
     if let Some(block_id) = ctx.builder.get_insert_block() {
@@ -1914,7 +2331,11 @@ fn statement_span(stmt: &ast::Statement) -> Span {
 /// For the IR lowering phase this extracts the compile-time integer value
 /// from the expression. Full constant evaluation is done by the semantic
 /// analyzer; here we handle the common cases that survive into the AST.
-fn eval_case_constant(expr: &ast::Expression) -> i64 {
+fn eval_case_constant(
+    expr: &ast::Expression,
+    name_table: &[String],
+    enum_constants: &crate::common::fx_hash::FxHashMap<String, i128>,
+) -> i64 {
     match expr {
         ast::Expression::IntegerLiteral { value, .. } => *value as i64,
         ast::Expression::CharLiteral { value, .. } => *value as i64,
@@ -1922,19 +2343,23 @@ fn eval_case_constant(expr: &ast::Expression) -> i64 {
             op: ast::UnaryOp::Negate,
             operand,
             ..
-        } => -eval_case_constant(operand),
+        } => -eval_case_constant(operand, name_table, enum_constants),
         ast::Expression::UnaryOp {
             op: ast::UnaryOp::BitwiseNot,
             operand,
             ..
-        } => !eval_case_constant(operand),
-        ast::Expression::Parenthesized { inner, .. } => eval_case_constant(inner),
-        ast::Expression::Cast { operand: inner, .. } => eval_case_constant(inner),
+        } => !eval_case_constant(operand, name_table, enum_constants),
+        ast::Expression::Parenthesized { inner, .. } => {
+            eval_case_constant(inner, name_table, enum_constants)
+        }
+        ast::Expression::Cast { operand: inner, .. } => {
+            eval_case_constant(inner, name_table, enum_constants)
+        }
         ast::Expression::Binary {
             op, left, right, ..
         } => {
-            let l = eval_case_constant(left);
-            let r = eval_case_constant(right);
+            let l = eval_case_constant(left, name_table, enum_constants);
+            let r = eval_case_constant(right, name_table, enum_constants);
             match op {
                 ast::BinaryOp::Add => l.wrapping_add(r),
                 ast::BinaryOp::Sub => l.wrapping_sub(r),
@@ -1950,11 +2375,17 @@ fn eval_case_constant(expr: &ast::Expression) -> i64 {
             }
         }
         ast::Expression::Identifier { name, .. } => {
-            // Enum constants — look up in enum_constants if available.
-            // Since we don't have direct access to enum_constants here,
-            // this case should have been folded by the semantic analyzer.
-            // Return 0 as fallback.
-            let _ = name;
+            // Resolve enum constants using the name table and enum constant map.
+            let name_str = &name_table[name.as_u32() as usize];
+            if let Some(&val) = enum_constants.get(name_str.as_str()) {
+                val as i64
+            } else {
+                0
+            }
+        }
+        ast::Expression::SizeofExpr { .. } | ast::Expression::SizeofType { .. } => {
+            // sizeof in case expressions — rare but legal.
+            // Would need target info; return 0 as fallback.
             0
         }
         _ => {
@@ -2000,6 +2431,7 @@ fn lower_expr_via_context(ctx: &mut StmtLoweringContext<'_>, expr: &ast::Express
         scope_type_overrides: &ctx.scope_type_overrides,
         last_bitfield_info: None,
         layout_cache: &mut ctx.layout_cache,
+        vla_sizes: &ctx.vla_sizes,
     };
     lower_expression(&mut expr_ctx, expr)
 }
@@ -2032,6 +2464,7 @@ fn lower_expr_typed_via_context(
         scope_type_overrides: &ctx.scope_type_overrides,
         last_bitfield_info: None,
         layout_cache: &mut ctx.layout_cache,
+        vla_sizes: &ctx.vla_sizes,
     };
     lower_expression_typed(&mut expr_ctx, expr)
 }
@@ -2062,6 +2495,7 @@ fn lower_lvalue_via_context(ctx: &mut StmtLoweringContext<'_>, expr: &ast::Expre
         scope_type_overrides: &ctx.scope_type_overrides,
         last_bitfield_info: None,
         layout_cache: &mut ctx.layout_cache,
+        vla_sizes: &ctx.vla_sizes,
     };
     lower_lvalue(&mut expr_ctx, expr)
 }
@@ -2097,15 +2531,65 @@ fn lower_expr_to_i1(
         _ => false,
     };
 
-    // Lower the expression to get its SSA value.
-    let val = lower_expr_via_context(ctx, expr);
+    // Lower the expression with type information so we can detect float conditions.
+    let tv = lower_expr_typed_via_context(ctx, expr);
+    let val = tv.value;
+    let is_float = matches!(
+        tv.ty,
+        CType::Float | CType::Double | CType::LongDouble
+    );
 
     if already_i1 {
         // Expression is a comparison/logical op — already produces 0 or 1.
         return val;
     }
 
-    // Non-comparison expression: emit `val != 0` to convert to boolean.
+    if is_float {
+        // Float-to-bool: emit FCmp One (ordered not equal) against 0.0
+        // Create a float zero constant using the FAdd sentinel pattern.
+        let ir_ty = match tv.ty {
+            CType::Float => IrType::F32,
+            _ => IrType::F64,
+        };
+        let const_id = ctx.module.globals().len();
+        let gname = format!(".Lconst.f.{}", const_id);
+        let gname_clone = gname.clone();
+        let mut gv = crate::ir::module::GlobalVariable::new(
+            gname,
+            ir_ty.clone(),
+            Some(crate::ir::module::Constant::Float(0.0)),
+        );
+        gv.linkage = crate::ir::module::Linkage::Internal;
+        gv.is_constant = true;
+        ctx.module.add_global(gv);
+
+        let fzero = ctx.builder.fresh_value();
+        let fzero_inst = Instruction::BinOp {
+            result: fzero,
+            op: crate::ir::instructions::BinOp::FAdd,
+            lhs: fzero,
+            rhs: Value::UNDEF,
+            ty: ir_ty,
+            span,
+        };
+        emit_instruction_to_current_block(ctx, fzero_inst);
+        ctx.function
+            .float_constant_values
+            .insert(fzero, (gname_clone, 0.0));
+
+        let cmp_result = ctx.builder.fresh_value();
+        let cmp_inst = Instruction::FCmp {
+            result: cmp_result,
+            op: crate::ir::instructions::FCmpOp::One,
+            lhs: val,
+            rhs: fzero,
+            span,
+        };
+        emit_instruction_to_current_block(ctx, cmp_inst);
+        return cmp_result;
+    }
+
+    // Non-comparison, non-float expression: emit `val != 0` to convert to boolean.
     // We create a proper zero constant in the module's global pool so the
     // backend can resolve it correctly during constant cache population.
     let const_id = ctx.module.globals().len();

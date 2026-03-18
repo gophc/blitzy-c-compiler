@@ -259,14 +259,20 @@ impl X86_64Linker {
         }
 
         // Check for undefined symbols (fatal for executables).
+        // When a dynamic context exists (i.e., we link against shared
+        // libraries via DT_NEEDED), allow undefined symbols through — they
+        // will be resolved at runtime by the dynamic linker.  We still
+        // diagnose them later in Phase 8 if no PLT/GOT entry is created.
+        let allow_undef_for_dynamic =
+            self.config.allow_undefined || self.dynamic_context.is_some();
         if let Err(undef_errors) = self
             .symbol_resolver
-            .check_undefined(self.config.allow_undefined)
+            .check_undefined(allow_undef_for_dynamic)
         {
             for err_msg in &undef_errors {
                 diagnostics.emit_error(Span::dummy(), err_msg.clone());
             }
-            if !self.config.allow_undefined {
+            if !allow_undef_for_dynamic {
                 return Err(format!(
                     "linking failed: {} undefined symbol(s)",
                     undef_errors.len()
@@ -277,7 +283,7 @@ impl X86_64Linker {
         // Emit accumulated diagnostics from symbol resolution.
         self.symbol_resolver.emit_diagnostics(diagnostics);
 
-        if diagnostics.has_errors() && !self.config.allow_undefined {
+        if diagnostics.has_errors() && !allow_undef_for_dynamic {
             return Err("linking aborted due to symbol resolution errors".to_string());
         }
 
@@ -362,6 +368,71 @@ impl X86_64Linker {
             }
             if self.reloc_handler.needs_plt(rel.rel_type) && !rel.symbol_name.is_empty() {
                 plt_symbols.insert(rel.symbol_name.clone());
+            }
+        }
+
+        // When dynamically linking, undefined symbols referenced by
+        // R_X86_64_PC32, R_X86_64_64, or R_X86_64_PLT32 need special
+        // handling so the dynamic linker can resolve them at runtime.
+        //
+        // - **Function symbols** (e.g. `abort`, `printf` via PLT32 or
+        //   address-taken via PC32/64) get PLT entries.
+        // - **Data symbols** (e.g. `stdout`, `stderr`, `stdin`) need
+        //   *copy relocations*: we allocate space in .bss, define the symbol
+        //   there, and emit R_X86_64_COPY so ld.so copies the initial value
+        //   from the shared library at program start.
+        //
+        // Known libc data symbols (pointers — 8 bytes each):
+        let mut copy_symbols: Vec<(String, usize)> = Vec::new();
+        if self.dynamic_context.is_some() {
+            use crate::backend::x86_64::linker::relocations::{R_X86_64_64, R_X86_64_PC32};
+            // Build a quick set of defined symbol names from the resolver.
+            let sym_table = self.symbol_resolver.build_symbol_table();
+            let defined_names: FxHashSet<String> = sym_table
+                .symbols
+                .iter()
+                .filter(|s| s.section_index != SHN_UNDEF && !s.name.is_empty())
+                .map(|s| s.name.clone())
+                .collect();
+
+            // Also build a set of symbols referenced via R_X86_64_PLT32 —
+            // these are definitely functions (call targets).
+            let mut plt32_symbols: FxHashSet<String> = FxHashSet::default();
+            for rel in &all_relocs {
+                if rel.rel_type
+                    == crate::backend::x86_64::linker::relocations::R_X86_64_PLT32
+                    && !rel.symbol_name.is_empty()
+                {
+                    plt32_symbols.insert(rel.symbol_name.clone());
+                }
+            }
+
+            for rel in &all_relocs {
+                if rel.symbol_name.is_empty() {
+                    continue;
+                }
+                if (rel.rel_type == R_X86_64_PC32 || rel.rel_type == R_X86_64_64)
+                    && !defined_names.contains(&rel.symbol_name)
+                {
+                    // Determine if this is a data symbol (needs copy reloc)
+                    // or a function symbol (needs PLT).
+                    //
+                    // Heuristic: if the symbol is ALSO referenced via
+                    // R_X86_64_PLT32, it's definitely a function. Otherwise,
+                    // check against known libc data symbols.
+                    if !plt32_symbols.contains(&rel.symbol_name)
+                        && is_known_data_symbol(&rel.symbol_name)
+                    {
+                        // Data symbol → copy relocation
+                        if !copy_symbols.iter().any(|(n, _)| *n == rel.symbol_name) {
+                            let sz = known_data_symbol_size(&rel.symbol_name);
+                            copy_symbols.push((rel.symbol_name.clone(), sz));
+                        }
+                    } else {
+                        // Function symbol or unknown → PLT
+                        plt_symbols.insert(rel.symbol_name.clone());
+                    }
+                }
             }
         }
 
@@ -539,6 +610,37 @@ impl X86_64Linker {
                         });
                     }
                 }
+            }
+
+            // Add copy-relocated data symbols to .dynsym and .rela.dyn.
+            //
+            // The dynsym entry marks the symbol as a GLOBAL OBJECT at an
+            // address that will be determined after layout (Phase 6/7).  We
+            // use value=0 here and patch it in Phase 9 once .bss.copy's VA
+            // is known.  The R_X86_64_COPY relocation's offset will also be
+            // patched to the .bss.copy address in Phase 9.
+            for (sym_name, sym_size) in &copy_symbols {
+                use crate::backend::elf_writer_common::STT_OBJECT;
+                let ds = DynamicSymbol {
+                    name: sym_name.clone(),
+                    value: 0, // patched in Phase 9
+                    size: *sym_size as u64,
+                    binding: STB_GLOBAL,
+                    sym_type: STT_OBJECT,
+                    visibility: STV_DEFAULT,
+                    section_index: 0xFFFF, // placeholder, patched later
+                    is_defined: true,
+                    is_plt_entry: false,
+                    got_offset: None,
+                    plt_index: None,
+                };
+                let sym_idx = ctx.dynsym.add_symbol(ds);
+                ctx.rela.add_rela_dyn(DynamicRelocation {
+                    offset: 0, // placeholder — patched in Phase 9
+                    sym_index: sym_idx,
+                    rel_type: crate::backend::x86_64::linker::relocations::R_X86_64_COPY,
+                    addend: 0,
+                });
             }
 
             // Finalize: build .gnu.hash and .dynamic entries.
@@ -722,6 +824,27 @@ impl X86_64Linker {
         // .bss (NOBITS, must be last in the data segment)
         layout_input.extend(merged_nobits);
 
+        // .bss.copy — space for copy-relocated data symbols (stdout, etc.)
+        // This section is NOBITS and sits after .bss.  Each symbol gets an
+        // 8-byte-aligned slot whose address is embedded in the executable's
+        // symbol table.  R_X86_64_COPY dynamic relocations instruct ld.so to
+        // copy the initial value from the originating shared library.
+        let copy_total_size: u64 = copy_symbols
+            .iter()
+            .map(|(_, sz)| {
+                // Align each allocation to 8 bytes
+                ((*sz as u64) + 7) & !7
+            })
+            .sum();
+        if copy_total_size > 0 {
+            layout_input.push(InputSectionInfo {
+                name: ".bss.copy".to_string(),
+                size: copy_total_size,
+                alignment: 8,
+                flags: (SHF_ALLOC | SHF_WRITE) as u32,
+            });
+        }
+
         let layout = self.linker_script.compute_layout(&layout_input);
 
         // Build a section-name → virtual-address map from the layout.
@@ -816,6 +939,37 @@ impl X86_64Linker {
                 export_dynamic: false,
             };
             symbol_addresses.insert(sym.name.clone(), resolved);
+        }
+
+        // Insert copy-relocated data symbols into symbol_addresses so that
+        // R_X86_64_PC32 / R_X86_64_64 relocations resolve to the .bss.copy
+        // address where ld.so will place the initial value at startup.
+        let mut copy_symbol_addresses: FxHashMap<String, u64> = FxHashMap::default();
+        if !copy_symbols.is_empty() {
+            if let Some(&bss_copy_vaddr) = section_vaddr_map.get(".bss.copy") {
+                let mut offset = 0u64;
+                for (sym_name, sym_size) in &copy_symbols {
+                    let addr = bss_copy_vaddr + offset;
+                    copy_symbol_addresses.insert(sym_name.clone(), addr);
+                    symbol_addresses.insert(
+                        sym_name.clone(),
+                        ResolvedSymbol {
+                            name: sym_name.clone(),
+                            final_address: addr,
+                            size: *sym_size as u64,
+                            binding: crate::backend::elf_writer_common::STB_GLOBAL,
+                            sym_type: crate::backend::elf_writer_common::STT_OBJECT,
+                            visibility: crate::backend::elf_writer_common::STV_DEFAULT,
+                            section_name: ".bss.copy".to_string(),
+                            is_defined: true, // defined at .bss.copy address
+                            from_object: 0,
+                            export_dynamic: false,
+                        },
+                    );
+                    // Align next allocation to 8 bytes
+                    offset += ((*sym_size as u64) + 7) & !7;
+                }
+            }
         }
 
         // Resolve entry point.
@@ -996,6 +1150,25 @@ impl X86_64Linker {
             // Offsets were stored as .got-section-relative; adjust to VAs.
             if let Some(&got_va) = section_vaddr_map.get(".got") {
                 ctx.rela.patch_rela_dyn_offsets(got_va);
+            }
+
+            // Patch R_X86_64_COPY entries: their offsets were 0 and
+            // patch_rela_dyn_offsets added got_va, so they're currently
+            // wrong.  Set them to the correct .bss.copy address instead.
+            {
+                let copy_rel_type =
+                    crate::backend::x86_64::linker::relocations::R_X86_64_COPY;
+                for r in ctx.rela.rela_dyn_mut() {
+                    if r.rel_type == copy_rel_type {
+                        // Find the matching copy symbol by dynsym index.
+                        // The sym_index was stored when we created the entry.
+                        if let Some(ds) = ctx.dynsym.symbols().get(r.sym_index as usize) {
+                            if let Some(&addr) = copy_symbol_addresses.get(&ds.name) {
+                                r.offset = addr;
+                            }
+                        }
+                    }
+                }
             }
 
             // Patch R_X86_64_RELATIVE addends with the symbol's final VA.
@@ -1288,6 +1461,23 @@ impl X86_64Linker {
             }
         }
 
+        // .bss.copy — NOBITS section for copy-relocated data symbols (stdout, etc.)
+        if copy_total_size > 0 {
+            if let Some(&(fo, va)) = section_layout_map.get(".bss.copy") {
+                writer.add_section(Section {
+                    name: ".bss.copy".to_string(),
+                    sh_type: SHT_NOBITS,
+                    sh_flags: SHF_ALLOC | SHF_WRITE,
+                    data: Vec::new(),
+                    sh_addralign: 8,
+                    file_offset_hint: fo,
+                    virtual_address: va,
+                    logical_size: copy_total_size,
+                    ..Section::default()
+                });
+            }
+        }
+
         // Add synthetic _start stub if generated.
         if let Some(code) = &synthetic_start_code {
             use crate::backend::elf_writer_common::PT_LOAD;
@@ -1536,6 +1726,48 @@ impl X86_64Linker {
 
         debug_assert_eq!(buf.len(), PLT_ENTRY_SIZE);
         buf
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Copy Relocation Helpers
+// ---------------------------------------------------------------------------
+
+/// Returns `true` if `name` is a known libc **data** symbol that requires a
+/// copy relocation (R_X86_64_COPY) rather than a PLT entry.  Data symbols
+/// need their *value* accessible at a fixed address in the executable's .bss
+/// segment; a PLT stub is only suitable for *function* symbols.
+fn is_known_data_symbol(name: &str) -> bool {
+    matches!(
+        name,
+        "stdout"
+            | "stderr"
+            | "stdin"
+            | "environ"
+            | "__environ"
+            | "optarg"
+            | "optind"
+            | "opterr"
+            | "optopt"
+            | "program_invocation_name"
+            | "program_invocation_short_name"
+            | "daylight"
+            | "timezone"
+            | "tzname"
+            | "sys_nerr"
+            | "sys_errlist"
+            | "__progname"
+            | "__progname_full"
+    )
+}
+
+/// Returns the size in bytes for a known libc data symbol.  Most are 8-byte
+/// pointers; a few small integers are 4 bytes.
+fn known_data_symbol_size(name: &str) -> usize {
+    match name {
+        "optind" | "opterr" | "optopt" | "daylight" | "sys_nerr" => 4,
+        "tzname" => 16, // char *[2]
+        _ => 8,         // pointer or long
     }
 }
 

@@ -388,6 +388,54 @@ impl<'a> SemanticAnalyzer<'a> {
             (rt, Vec::new(), false)
         };
 
+        // Step 1.5: For K&R (old-style) function definitions, merge the actual
+        // parameter types from old_style_params into param_types.
+        // K&R functions have params as bare identifiers in the declarator:
+        //   void f(a, b) int *a; char *b; { ... }
+        // The declarator gives us only names with default type `int`.
+        // The real types are in func.old_style_params declarations.
+        let param_types = if !func.old_style_params.is_empty() {
+            // Build name→type mapping from old-style parameter declarations.
+            // Each old_style_param is a Declaration like `int *d;` or `char *str;`.
+            let mut knr_type_map =
+                crate::common::fx_hash::FxHashMap::<String, CType>::default();
+            for osp in &func.old_style_params {
+                let osp_base_ty = self.resolve_type_from_specifiers(&osp.specifiers);
+                for init_decl in &osp.declarators {
+                    if let Some(pname) = self.extract_declarator_name(&init_decl.declarator) {
+                        let pty = self.apply_declarator_to_type(
+                            osp_base_ty.clone(),
+                            &init_decl.declarator,
+                        );
+                        let name_str = self.interner.resolve(pname);
+                        knr_type_map.insert(name_str.to_string(), pty);
+                    }
+                }
+            }
+            // Override param_types using the K&R type map
+            let (_, pn, _) = self.extract_function_params(&func.declarator);
+            let mut new_param_types = Vec::with_capacity(pn.len());
+            for (i, maybe_name) in pn.iter().enumerate() {
+                if let Some(sym) = maybe_name {
+                    let name_str = self.interner.resolve(*sym);
+                    if let Some(kty) = knr_type_map.get(name_str) {
+                        new_param_types.push(kty.clone());
+                    } else {
+                        // Not declared in old_style_params — default to int (C89 rule)
+                        new_param_types.push(
+                            param_types.get(i).cloned().unwrap_or(CType::Int),
+                        );
+                    }
+                } else {
+                    new_param_types
+                        .push(param_types.get(i).cloned().unwrap_or(CType::Int));
+                }
+            }
+            new_param_types
+        } else {
+            param_types
+        };
+
         // Step 2: Extract function name and parameter NAMES from the declarator.
         // For complex declarators, extract_function_params finds the innermost
         // Function declarator (the one with the actual parameter names).
@@ -571,6 +619,53 @@ impl<'a> SemanticAnalyzer<'a> {
 
             // Handle typedef declarations specially.
             if storage == StorageClass::Typedef {
+                // Apply aligned/packed attributes from the declaration
+                // to the underlying struct/union type.  This handles
+                // patterns like:
+                //   typedef struct { int a; } __attribute__((aligned(32))) X;
+                let decl_aligned = validated_attrs.iter().find_map(|a| {
+                    if let ValidatedAttribute::Aligned(n) = a {
+                        Some(*n as usize)
+                    } else {
+                        None
+                    }
+                });
+                let decl_packed = validated_attrs
+                    .iter()
+                    .any(|a| matches!(a, ValidatedAttribute::Packed));
+                if decl_aligned.is_some() || decl_packed {
+                    match &mut full_type {
+                        CType::Struct {
+                            ref mut aligned,
+                            ref mut packed,
+                            ..
+                        } => {
+                            if let Some(a) = decl_aligned {
+                                *aligned = Some(
+                                    aligned.map_or(a, |existing| existing.max(a)),
+                                );
+                            }
+                            if decl_packed {
+                                *packed = true;
+                            }
+                        }
+                        CType::Union {
+                            ref mut aligned,
+                            ref mut packed,
+                            ..
+                        } => {
+                            if let Some(a) = decl_aligned {
+                                *aligned = Some(
+                                    aligned.map_or(a, |existing| existing.max(a)),
+                                );
+                            }
+                            if decl_packed {
+                                *packed = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 let entry = SymbolEntry {
                     name: sym_name,
                     ty: full_type.clone(),
@@ -4209,6 +4304,88 @@ impl<'a> SemanticAnalyzer<'a> {
                 "longjmp" | "siglongjmp" => Some(CType::Function {
                     return_type: Box::new(CType::Void),
                     params: vec![void_ptr.clone(), CType::Int],
+                    variadic: false,
+                }),
+                "alloca" => Some(CType::Function {
+                    return_type: Box::new(CType::Pointer(
+                        Box::new(CType::Void),
+                        TypeQualifiers::default(),
+                    )),
+                    params: vec![size_t.clone()],
+                    variadic: false,
+                }),
+                "bcmp" => Some(CType::Function {
+                    return_type: Box::new(CType::Int),
+                    params: vec![void_ptr.clone(), void_ptr.clone(), size_t.clone()],
+                    variadic: false,
+                }),
+                "bzero" => Some(CType::Function {
+                    return_type: Box::new(CType::Void),
+                    params: vec![void_ptr.clone(), size_t.clone()],
+                    variadic: false,
+                }),
+                "strncat" | "strncpy" => Some(CType::Function {
+                    return_type: Box::new(CType::Pointer(
+                        Box::new(CType::Char),
+                        TypeQualifiers::default(),
+                    )),
+                    params: vec![void_ptr.clone(), void_ptr.clone(), size_t.clone()],
+                    variadic: false,
+                }),
+                "fopen" => Some(CType::Function {
+                    return_type: Box::new(void_ptr.clone()),
+                    params: vec![void_ptr.clone(), void_ptr.clone()],
+                    variadic: false,
+                }),
+                "fclose" | "fflush" => Some(CType::Function {
+                    return_type: Box::new(CType::Int),
+                    params: vec![void_ptr.clone()],
+                    variadic: false,
+                }),
+                "fread" | "fwrite" => Some(CType::Function {
+                    return_type: Box::new(size_t.clone()),
+                    params: vec![void_ptr.clone(), size_t.clone(), size_t.clone(), void_ptr.clone()],
+                    variadic: false,
+                }),
+                "sscanf" | "fscanf" | "scanf" => Some(CType::Function {
+                    return_type: Box::new(CType::Int),
+                    params: vec![void_ptr.clone()],
+                    variadic: true,
+                }),
+                "strtol" | "strtoul" => Some(CType::Function {
+                    return_type: Box::new(CType::Long),
+                    params: vec![void_ptr.clone(), void_ptr.clone(), CType::Int],
+                    variadic: false,
+                }),
+                "strtoll" | "strtoull" => Some(CType::Function {
+                    return_type: Box::new(CType::LongLong),
+                    params: vec![void_ptr.clone(), void_ptr.clone(), CType::Int],
+                    variadic: false,
+                }),
+                "strtod" => Some(CType::Function {
+                    return_type: Box::new(CType::Double),
+                    params: vec![void_ptr.clone(), void_ptr.clone()],
+                    variadic: false,
+                }),
+                "strtof" => Some(CType::Function {
+                    return_type: Box::new(CType::Float),
+                    params: vec![void_ptr.clone(), void_ptr.clone()],
+                    variadic: false,
+                }),
+                "strstr" | "strchr" | "strrchr" => Some(CType::Function {
+                    return_type: Box::new(CType::Pointer(
+                        Box::new(CType::Char),
+                        TypeQualifiers::default(),
+                    )),
+                    params: vec![void_ptr.clone(), CType::Int],
+                    variadic: false,
+                }),
+                "getenv" => Some(CType::Function {
+                    return_type: Box::new(CType::Pointer(
+                        Box::new(CType::Char),
+                        TypeQualifiers::default(),
+                    )),
+                    params: vec![void_ptr.clone()],
                     variadic: false,
                 }),
                 _ => None,

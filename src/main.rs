@@ -1952,6 +1952,185 @@ fn compile_single_file(
 ///
 /// Returns `Err(message)` if any object file cannot be read, the linker
 /// reports unresolved symbols, or the output cannot be written.
+/// Extract the DT_SONAME string from a minimal ELF parse.
+/// Returns `None` if the ELF structure cannot be parsed or has no SONAME.
+fn extract_elf_soname(data: &[u8]) -> Option<String> {
+    if data.len() < 64 || &data[..4] != b"\x7fELF" {
+        return None;
+    }
+    let is_64 = data[4] == 2;
+    let le = data[5] == 1; // 1 = little-endian
+
+    macro_rules! read_u16 {
+        ($off:expr) => {
+            if le {
+                u16::from_le_bytes([data[$off], data[$off + 1]])
+            } else {
+                u16::from_be_bytes([data[$off], data[$off + 1]])
+            }
+        };
+    }
+    macro_rules! read_u32 {
+        ($off:expr) => {
+            if le {
+                u32::from_le_bytes([
+                    data[$off],
+                    data[$off + 1],
+                    data[$off + 2],
+                    data[$off + 3],
+                ])
+            } else {
+                u32::from_be_bytes([
+                    data[$off],
+                    data[$off + 1],
+                    data[$off + 2],
+                    data[$off + 3],
+                ])
+            }
+        };
+    }
+    macro_rules! read_u64 {
+        ($off:expr) => {
+            if le {
+                u64::from_le_bytes([
+                    data[$off],
+                    data[$off + 1],
+                    data[$off + 2],
+                    data[$off + 3],
+                    data[$off + 4],
+                    data[$off + 5],
+                    data[$off + 6],
+                    data[$off + 7],
+                ])
+            } else {
+                u64::from_be_bytes([
+                    data[$off],
+                    data[$off + 1],
+                    data[$off + 2],
+                    data[$off + 3],
+                    data[$off + 4],
+                    data[$off + 5],
+                    data[$off + 6],
+                    data[$off + 7],
+                ])
+            }
+        };
+    }
+
+    // Parse program headers to find PT_DYNAMIC.
+    let (ph_off, ph_ent_size, ph_num) = if is_64 {
+        (
+            read_u64!(32) as usize,
+            read_u16!(54) as usize,
+            read_u16!(56) as usize,
+        )
+    } else {
+        (
+            read_u32!(28) as usize,
+            read_u16!(42) as usize,
+            read_u16!(44) as usize,
+        )
+    };
+
+    let mut dyn_off: usize = 0;
+    let mut dyn_size: usize = 0;
+    let pt_dynamic: u32 = 2;
+    for i in 0..ph_num {
+        let base = ph_off + i * ph_ent_size;
+        if base + ph_ent_size > data.len() {
+            break;
+        }
+        let p_type = read_u32!(base);
+        if p_type == pt_dynamic {
+            if is_64 {
+                dyn_off = read_u64!(base + 8) as usize;
+                dyn_size = read_u64!(base + 32) as usize;
+            } else {
+                dyn_off = read_u32!(base + 4) as usize;
+                dyn_size = read_u32!(base + 16) as usize;
+            }
+            break;
+        }
+    }
+    if dyn_off == 0 || dyn_size == 0 {
+        return None;
+    }
+
+    // Parse .dynamic entries to find DT_SONAME (14) and DT_STRTAB (5).
+    let dt_soname_tag: u64 = 14;
+    let dt_strtab_tag: u64 = 5;
+    let entry_size = if is_64 { 16 } else { 8 };
+    let mut soname_offset: Option<u64> = None;
+    let mut strtab_vaddr: u64 = 0;
+
+    let mut off = dyn_off;
+    while off + entry_size <= data.len() && off < dyn_off + dyn_size {
+        let (tag, val) = if is_64 {
+            (read_u64!(off), read_u64!(off + 8))
+        } else {
+            (read_u32!(off) as u64, read_u32!(off + 4) as u64)
+        };
+        if tag == 0 {
+            break; // DT_NULL
+        }
+        if tag == dt_soname_tag {
+            soname_offset = Some(val);
+        }
+        if tag == dt_strtab_tag {
+            strtab_vaddr = val;
+        }
+        off += entry_size;
+    }
+
+    let soname_off = soname_offset?;
+    if strtab_vaddr == 0 {
+        return None;
+    }
+
+    // Convert strtab virtual address to file offset by scanning section headers
+    // or program headers for the LOAD segment containing strtab_vaddr.
+    let mut strtab_file_off: Option<usize> = None;
+    for i in 0..ph_num {
+        let base = ph_off + i * ph_ent_size;
+        if base + ph_ent_size > data.len() {
+            break;
+        }
+        let p_type = read_u32!(base);
+        if p_type != 1 {
+            continue; // Not PT_LOAD
+        }
+        let (p_vaddr, p_offset, p_filesz) = if is_64 {
+            (
+                read_u64!(base + 16),
+                read_u64!(base + 8),
+                read_u64!(base + 32),
+            )
+        } else {
+            (
+                read_u32!(base + 8) as u64,
+                read_u32!(base + 4) as u64,
+                read_u32!(base + 16) as u64,
+            )
+        };
+        if strtab_vaddr >= p_vaddr && strtab_vaddr < p_vaddr + p_filesz {
+            strtab_file_off = Some((p_offset + (strtab_vaddr - p_vaddr)) as usize);
+            break;
+        }
+    }
+
+    let str_base = strtab_file_off?;
+    let name_start = str_base + soname_off as usize;
+    if name_start >= data.len() {
+        return None;
+    }
+    // Read null-terminated string.
+    let mut end = name_start;
+    while end < data.len() && data[end] != 0 {
+        end += 1;
+    }
+    String::from_utf8(data[name_start..end].to_vec()).ok()
+}
+
 fn link_object_files(
     object_files: &[PathBuf],
     output: &str,
@@ -1975,22 +2154,70 @@ fn link_object_files(
     config.emit_debug = ctx.debug_info;
 
     // Resolve -l<lib> flags to DT_NEEDED entries.
-    // For each library name, search -L paths for lib<name>.so.
-    // Also add the implicit C library if not already present.
+    // For each library name, search -L paths + standard dirs for lib<name>.so.
+    // If the found .so is a linker script (not a real ELF), resolve the actual
+    // soname by trying versioned variants (lib<name>.so.6, .so.1, etc.) or by
+    // reading the ELF DT_SONAME of the real shared object.
+    let standard_lib_dirs: &[&str] = &[
+        "/lib/x86_64-linux-gnu",
+        "/usr/lib/x86_64-linux-gnu",
+        "/lib64",
+        "/usr/lib64",
+        "/lib",
+        "/usr/lib",
+    ];
+
     for lib_name in &ctx.libraries {
-        let so_name = format!("lib{}.so", lib_name);
-        let mut found = false;
-        for dir in &ctx.library_paths {
-            let candidate = std::path::Path::new(dir).join(&so_name);
-            if candidate.exists() {
-                found = true;
-                break;
+        let base_so = format!("lib{}.so", lib_name);
+        let mut resolved_soname: Option<String> = None;
+
+        // Build the search path list: user -L dirs + standard dirs.
+        let search_dirs: Vec<&str> = ctx
+            .library_paths
+            .iter()
+            .map(|s| s.as_str())
+            .chain(standard_lib_dirs.iter().copied())
+            .collect();
+
+        for dir in &search_dirs {
+            let candidate = std::path::Path::new(dir).join(&base_so);
+            if !candidate.exists() {
+                continue;
+            }
+            // Check if the file is a real ELF (starts with \x7fELF).
+            if let Ok(header) = std::fs::read(&candidate) {
+                if header.len() >= 4 && &header[..4] == b"\x7fELF" {
+                    // Real ELF — try to extract DT_SONAME.
+                    if let Some(soname) = extract_elf_soname(&header) {
+                        resolved_soname = Some(soname);
+                    } else {
+                        // No DT_SONAME; use the filename.
+                        resolved_soname = Some(base_so.clone());
+                    }
+                    break;
+                }
+                // Not an ELF — likely a GNU ld linker script.
+                // Try versioned variants: lib<name>.so.6, .so.2, .so.1, etc.
+                for ver in &["6", "2", "1", "0"] {
+                    let versioned = format!("lib{}.so.{}", lib_name, ver);
+                    let vpath = std::path::Path::new(dir).join(&versioned);
+                    if vpath.exists() {
+                        resolved_soname = Some(versioned);
+                        break;
+                    }
+                }
+                if resolved_soname.is_some() {
+                    break;
+                }
             }
         }
-        // Add DT_NEEDED regardless of whether the .so was found on disk.
-        // The runtime dynamic linker will search LD_LIBRARY_PATH.
-        if found || !so_name.is_empty() {
-            config.needed_libs.push(so_name);
+
+        // If no resolution found, fall back to lib<name>.so.
+        let final_soname = resolved_soname.unwrap_or(base_so);
+
+        // Avoid duplicating implicit libs (e.g., libm.so.6 already added).
+        if !config.needed_libs.iter().any(|n| *n == final_soname) {
+            config.needed_libs.push(final_soname);
         }
     }
 

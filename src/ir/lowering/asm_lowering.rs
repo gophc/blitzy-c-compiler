@@ -508,13 +508,30 @@ pub fn lower_inline_asm(
     let mut all_operand_values: Vec<Value> = Vec::new();
     let mut read_write_input_values: Vec<Value> = Vec::new();
 
+    // Build a map from alloca Value → element IrType so that
+    // read-write loads use the correct operand size (e.g. I32 for
+    // `int` instead of I64 which would read garbage past the alloca).
+    let mut alloca_elem_types: FxHashMap<Value, IrType> = FxHashMap::default();
+    for blk in function.blocks.iter() {
+        for inst in blk.instructions() {
+            if let Instruction::Alloca { result, ty, .. } = inst {
+                alloca_elem_types.insert(*result, ty.clone());
+            }
+        }
+    }
+
     // Process output operands: they become operands in the InlineAsm instruction
     for (idx, constraint) in output_constraints.iter().enumerate() {
         if idx < output_ptrs.len() {
             let ptr = output_ptrs[idx];
             if constraint.is_read_write {
-                // Read-write: load current value as an implicit input
-                let ir_type = infer_ir_type_for_constraint(constraint, target);
+                // Read-write: load current value as an implicit input.
+                // Use the alloca's element type for the load so we read
+                // exactly the right number of bytes (not pointer-width).
+                let ir_type = alloca_elem_types
+                    .get(&ptr)
+                    .cloned()
+                    .unwrap_or_else(|| infer_ir_type_for_constraint(constraint, target));
                 let (loaded_val, load_inst) = builder.build_load(ptr, ir_type, span);
                 // Insert the load into the current block
                 if let Some(block_id) = builder.get_insert_block() {

@@ -1180,6 +1180,8 @@ fn process_pragma(
             Ok(())
         }
         "pack" => process_pragma_pack(pp, &tokens[1..], directive_span),
+        "push_macro" => process_pragma_push_macro(pp, &tokens[1..]),
+        "pop_macro" => process_pragma_pop_macro(pp, &tokens[1..]),
         // GCC / Clang pragmas — accept silently.
         "GCC" | "clang" => Ok(()),
         // All other pragmas — silently ignore (C11 §6.10.6).
@@ -1272,6 +1274,62 @@ fn process_pragma_pack(
         }
     }
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// #pragma push_macro / pop_macro
+// ---------------------------------------------------------------------------
+
+/// Extract the macro name from `("name")` token sequence.
+fn extract_pragma_macro_name(tokens: &[PPToken]) -> Option<String> {
+    let tokens = skip_whitespace(tokens);
+    if tokens.is_empty() || tokens[0].text != "(" {
+        return None;
+    }
+    let inner = skip_whitespace(&tokens[1..]);
+    if inner.is_empty() {
+        return None;
+    }
+    // Accept both "name" (quoted) and name (unquoted).
+    let name = if inner[0].text.starts_with('"') && inner[0].text.ends_with('"') && inner[0].text.len() >= 2 {
+        inner[0].text[1..inner[0].text.len() - 1].to_string()
+    } else {
+        inner[0].text.clone()
+    };
+    Some(name)
+}
+
+/// Process `#pragma push_macro("name")` — save the current definition of
+/// the named macro onto a per-name stack.
+fn process_pragma_push_macro(pp: &mut Preprocessor, tokens: &[PPToken]) -> Result<(), ()> {
+    if let Some(name) = extract_pragma_macro_name(tokens) {
+        let current_def = pp.macro_defs.get(&name).cloned();
+        pp.macro_push_stack
+            .entry(name)
+            .or_default()
+            .push(current_def);
+    }
+    Ok(())
+}
+
+/// Process `#pragma pop_macro("name")` — restore the most recently pushed
+/// definition of the named macro.
+fn process_pragma_pop_macro(pp: &mut Preprocessor, tokens: &[PPToken]) -> Result<(), ()> {
+    if let Some(name) = extract_pragma_macro_name(tokens) {
+        if let Some(stack) = pp.macro_push_stack.get_mut(&name) {
+            if let Some(saved_def) = stack.pop() {
+                match saved_def {
+                    Some(def) => {
+                        pp.macro_defs.insert(name, def);
+                    }
+                    None => {
+                        pp.macro_defs.remove(&name);
+                    }
+                }
+            }
+        }
+    }
     Ok(())
 }
 

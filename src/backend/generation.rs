@@ -2990,7 +2990,22 @@ fn constant_to_bytes_typed(
             result.resize(16, 0);
             result
         }
-        Constant::String(bytes) => bytes.clone(),
+        Constant::String(bytes) => {
+            // When the target IR type is an array, fit the string bytes
+            // to the exact array size:
+            //  - Pad with zeros if the string is shorter (char[4] = "ab")
+            //  - Truncate if the string is longer (char[4] = "1234" where
+            //    the literal includes a null terminator that doesn't fit)
+            if let Some(ty) = ir_ty {
+                let expected_sz = ir_type_size(ty) as usize;
+                if expected_sz > 0 && bytes.len() != expected_sz {
+                    let mut fitted = bytes[..bytes.len().min(expected_sz)].to_vec();
+                    fitted.resize(expected_sz, 0);
+                    return fitted;
+                }
+            }
+            bytes.clone()
+        }
         Constant::ZeroInit => {
             // When we know the type, emit the correct number of zero bytes.
             if let Some(ty) = ir_ty {
@@ -4243,15 +4258,70 @@ fn link_to_final_output(
     // Add user-specified -l libraries as DT_NEEDED entries.
     config.library_paths = ctx.library_paths.clone();
     config.libraries = ctx.libraries.clone();
+    let standard_lib_dirs: &[&str] = &[
+        "/lib/x86_64-linux-gnu",
+        "/usr/lib/x86_64-linux-gnu",
+        "/lib64",
+        "/usr/lib64",
+        "/lib",
+        "/usr/lib",
+    ];
     for lib_name in &ctx.libraries {
-        let so_name = format!("lib{}.so", lib_name);
-        config.needed_libs.push(so_name);
+        let base_so = format!("lib{}.so", lib_name);
+        let mut final_so = base_so.clone();
+        // Search library paths + standard dirs to resolve the soname.
+        let search_dirs: Vec<&str> = ctx
+            .library_paths
+            .iter()
+            .map(|s| s.as_str())
+            .chain(standard_lib_dirs.iter().copied())
+            .collect();
+        'dir_search: for dir in &search_dirs {
+            let candidate = std::path::Path::new(dir).join(&base_so);
+            if !candidate.exists() {
+                continue;
+            }
+            // Check if the file is a real ELF.
+            if let Ok(bytes) = std::fs::read(&candidate) {
+                if bytes.len() >= 4 && &bytes[..4] == b"\x7fELF" {
+                    // Real ELF — use its filename as DT_NEEDED soname.
+                    // Could also extract DT_SONAME here, but versioned
+                    // name is the standard convention.
+                    final_so = base_so.clone();
+                    break;
+                }
+                // Not ELF (linker script) — try versioned variants.
+                for ver in &["6", "2", "1", "0"] {
+                    let versioned = format!("lib{}.so.{}", lib_name, ver);
+                    let vpath = std::path::Path::new(dir).join(&versioned);
+                    if vpath.exists() {
+                        final_so = versioned;
+                        break 'dir_search;
+                    }
+                }
+            }
+        }
+        if !config.needed_libs.iter().any(|n| *n == final_so) {
+            config.needed_libs.push(final_so);
+        }
     }
 
     if output_type == OutputType::Executable {
         // Add libc if not already present.
         if !config.needed_libs.iter().any(|n| n.starts_with("libc.so")) {
             config.needed_libs.push("libc.so.6".to_string());
+        }
+        // Add libm for math functions (floor, fabs, pow, sqrt, etc.).
+        if !config.needed_libs.iter().any(|n| n.starts_with("libm.so")) {
+            config.needed_libs.push("libm.so.6".to_string());
+        }
+        // Add libgcc_s for compiler runtime helpers (__clzsi2, __divdi3, etc.).
+        if !config
+            .needed_libs
+            .iter()
+            .any(|n| n.starts_with("libgcc_s.so"))
+        {
+            config.needed_libs.push("libgcc_s.so.1".to_string());
         }
         // Allow undefined symbols — they will be resolved at runtime by
         // the dynamic linker via the DT_NEEDED entry.

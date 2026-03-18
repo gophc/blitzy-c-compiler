@@ -291,17 +291,31 @@ impl RelocationHandler for X86_64RelocationHandler {
 
             // ---------------------------------------------------------------
             // R_X86_64_64 — S + A, absolute 64-bit
+            // For undefined symbols with a PLT entry, use the PLT address.
             // ---------------------------------------------------------------
             R_X86_64_64 => {
-                let value = compute_absolute(rel.symbol_value, rel.addend);
+                let effective_sym = if rel.symbol_value == 0 {
+                    rel.plt_address.unwrap_or(rel.symbol_value)
+                } else {
+                    rel.symbol_value
+                };
+                let value = compute_absolute(effective_sym, rel.addend);
                 write_le(section_data, offset, 8, value);
             }
 
             // ---------------------------------------------------------------
             // R_X86_64_PC32 — S + A - P, PC-relative 32-bit signed
+            // For undefined symbols resolved via PLT, use the PLT address
+            // as the effective symbol value (e.g., address-of-function or
+            // extern data symbol that the dynamic linker will resolve).
             // ---------------------------------------------------------------
             R_X86_64_PC32 => {
-                let value = compute_pc_relative(rel.symbol_value, rel.addend, rel.patch_address);
+                let effective_sym = if rel.symbol_value == 0 {
+                    rel.plt_address.unwrap_or(rel.symbol_value)
+                } else {
+                    rel.symbol_value
+                };
+                let value = compute_pc_relative(effective_sym, rel.addend, rel.patch_address);
                 if !fits_signed(value, 32) {
                     return Err(self.overflow_error(rel, value as i128, 32));
                 }

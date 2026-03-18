@@ -865,6 +865,9 @@ pub struct Preprocessor<'a> {
     /// Auto-incrementing counter for `__COUNTER__` macro (GCC extension).
     /// Each expansion of `__COUNTER__` returns the current value and increments it.
     pub counter_value: u64,
+    /// Stack for `#pragma push_macro("name")` / `#pragma pop_macro("name")`.
+    /// Maps macro name → stack of saved definitions (None = was undefined).
+    pub macro_push_stack: FxHashMap<String, Vec<Option<MacroDef>>>,
 }
 
 impl<'a> Preprocessor<'a> {
@@ -900,6 +903,7 @@ impl<'a> Preprocessor<'a> {
             max_recursion_depth: 512,
             conditional_stack: Vec::new(),
             counter_value: 0,
+            macro_push_stack: FxHashMap::default(),
         }
     }
 
@@ -2298,10 +2302,66 @@ impl<'a> Preprocessor<'a> {
                 // Recognized but not fully handled at the preprocessor level.
                 // The parser/sema will handle pack push/pop semantics.
             }
+            "push_macro" => {
+                // #pragma push_macro("name") — save current macro definition.
+                let rest = &tokens[1..];
+                // Extract macro name from ( "name" ) tokens.
+                if let Some(name) = Self::extract_pragma_macro_name_from_tokens(rest) {
+                    let current_def = self.macro_defs.get(&name).cloned();
+                    self.macro_push_stack
+                        .entry(name)
+                        .or_default()
+                        .push(current_def);
+                }
+            }
+            "pop_macro" => {
+                // #pragma pop_macro("name") — restore previously pushed macro definition.
+                let rest = &tokens[1..];
+                if let Some(name) = Self::extract_pragma_macro_name_from_tokens(rest) {
+                    if let Some(stack) = self.macro_push_stack.get_mut(&name) {
+                        if let Some(saved_def) = stack.pop() {
+                            match saved_def {
+                                Some(def) => {
+                                    self.macro_defs.insert(name, def);
+                                }
+                                None => {
+                                    self.macro_defs.remove(&name);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             _ => {
                 // Unknown pragmas are silently ignored per C11 §6.10.6.
             }
         }
+    }
+
+    /// Extract macro name from push_macro/pop_macro pragma tokens.
+    /// Expected format: ( "name" ) — tokens after push_macro/pop_macro keyword.
+    fn extract_pragma_macro_name_from_tokens(tokens: &[PPToken]) -> Option<String> {
+        // Skip whitespace tokens.
+        let non_ws: Vec<&PPToken> = tokens
+            .iter()
+            .filter(|t| !t.text.trim().is_empty() && t.text != " ")
+            .collect();
+        // We expect: ( "name" )
+        // The tokens might be: ["(", "\"NAME\"", ")"] or just ["\"NAME\""]
+        for tok in &non_ws {
+            let t = &tok.text;
+            if t.starts_with('"') && t.ends_with('"') && t.len() >= 2 {
+                return Some(t[1..t.len() - 1].to_string());
+            }
+        }
+        // Try unquoted name after '('.
+        if non_ws.len() >= 3 && non_ws[0].text == "(" {
+            let name = &non_ws[1].text;
+            if name != ")" && name != "(" {
+                return Some(name.clone());
+            }
+        }
+        None
     }
 
     // -- Macro expansion ---------------------------------------------------

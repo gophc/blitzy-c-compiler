@@ -1608,6 +1608,20 @@ fn parse_brace_initializer(parser: &mut Parser<'_>) -> Result<Initializer, ()> {
             let item_start = parser.current_span();
             let mut designators = Vec::new();
 
+            // GCC extension: `field: value` labeled initializer (no dot, uses colon).
+            // Unlike standard C `.field = value`, GCC uses `field: value`.
+            let mut gcc_labeled = false;
+            if let TokenKind::Identifier(sym) = parser.current.kind.clone() {
+                let next_tok = parser.peek_nth(0);
+                if matches!(next_tok.kind, TokenKind::Colon) {
+                    let fspan = parser.current_span();
+                    parser.advance(); // consume identifier
+                    parser.advance(); // consume colon
+                    designators.push(Designator::Field(sym, fspan));
+                    gcc_labeled = true;
+                }
+            }
+
             // Parse optional designators: `.field`, `[index]`, `[low...high]`.
             while parser.check(&TokenKind::Dot) || parser.check(&TokenKind::LeftBracket) {
                 if parser.match_token(&TokenKind::Dot) {
@@ -1647,7 +1661,8 @@ fn parse_brace_initializer(parser: &mut Parser<'_>) -> Result<Initializer, ()> {
             }
 
             // If designators are present, expect `=`.
-            if !designators.is_empty() {
+            // GCC labeled inits (`field: value`) use `:` instead of `=`.
+            if !designators.is_empty() && !gcc_labeled {
                 parser.expect(TokenKind::Equal)?;
             }
 
