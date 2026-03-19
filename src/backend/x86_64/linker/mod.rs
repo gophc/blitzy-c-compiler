@@ -1006,19 +1006,23 @@ impl X86_64Linker {
                         synthetic_start_vaddr = (last_vaddr + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
 
                         // Generate x86-64 machine code for _start.
+                        // Linux kernel ABI: at entry, (%rsp) = argc,
+                        // 8(%rsp) = argv[0], etc.
                         // Equivalent to:
                         //   xor  %ebp, %ebp        ; ABI: clear frame pointer
+                        //   pop  %rdi               ; argc
+                        //   mov  %rsp, %rsi         ; argv (rest of stack)
                         //   and  $-16, %rsp         ; align stack to 16 bytes
-                        //   push %rax               ; padding for call alignment
                         //   movabs $main, %rax      ; load main's absolute address
-                        //   call *%rax              ; call main
+                        //   call *%rax              ; call main(argc, argv)
                         //   mov  %eax, %edi         ; exit code = main's return
                         //   mov  $231, %eax         ; SYS_exit_group
                         //   syscall
-                        let mut code: Vec<u8> = Vec::with_capacity(32);
+                        let mut code: Vec<u8> = Vec::with_capacity(40);
                         code.extend_from_slice(&[0x31, 0xed]); // xor %ebp, %ebp
+                        code.push(0x5f); // pop %rdi  (argc)
+                        code.extend_from_slice(&[0x48, 0x89, 0xe6]); // mov %rsp, %rsi  (argv)
                         code.extend_from_slice(&[0x48, 0x83, 0xe4, 0xf0]); // and $-16, %rsp
-                        code.push(0x50); // push %rax
                         code.extend_from_slice(&[0x48, 0xb8]); // movabs $imm64, %rax
                         code.extend_from_slice(&main_addr.to_le_bytes()); // imm64 = main
                         code.extend_from_slice(&[0xff, 0xd0]); // call *%rax

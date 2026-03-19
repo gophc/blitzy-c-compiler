@@ -3195,6 +3195,23 @@ impl RiscV64InstructionSelector {
                     Self::substitute_template(template, &operand_reprs, &target_labels);
                 self.emit_inline_asm_substituted(&substituted, constraints, clobbers);
             }
+
+            // IndirectBranch — computed goto: jr %reg (JALR x0, rs1, 0)
+            Instruction::IndirectBranch { target, .. } => {
+                let target_reg = self.src_reg(*target);
+                self.emit(RvInstruction::i_type(RvOpcode::JALR, ZERO, target_reg, 0));
+            }
+
+            // BlockAddress — materialize address of a labeled basic block
+            Instruction::BlockAddress { result, block, .. } => {
+                let rd = self.vmap.alloc_gpr(*result);
+                // Use same label convention as block_label() → .LBB_{idx}
+                let block_label = self.block_label(block.index());
+                // Use LA pseudo-instruction (AUIPC+ADDI) to load label address
+                let mut la_inst = RvInstruction::u_type(RvOpcode::LA, rd, 0);
+                la_inst.symbol = Some(block_label);
+                self.emit(la_inst);
+            }
         }
 
         // Return the newly emitted instructions

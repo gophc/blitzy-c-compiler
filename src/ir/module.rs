@@ -752,6 +752,13 @@ pub struct IrModule {
     /// (e.g. RISC-V `tp` for `current`).  No storage is allocated — reads
     /// emit an inline-asm register read; writes emit a register store.
     pub register_globals: FxHashMap<String, (String, crate::common::types::CType)>,
+
+    /// Symbol aliases: `__attribute__((alias("target")))`.
+    ///
+    /// Maps the alias symbol name to the target symbol name. Both functions
+    /// and variables can be aliased. The ELF writer emits the alias as a
+    /// symbol that shares the same address as the target.
+    pub symbol_aliases: Vec<(String, String)>,
 }
 
 // ===========================================================================
@@ -795,6 +802,7 @@ impl IrModule {
             func_c_param_types: FxHashMap::default(),
             global_c_types: FxHashMap::default(),
             register_globals: FxHashMap::default(),
+            symbol_aliases: Vec::new(),
         }
     }
 }

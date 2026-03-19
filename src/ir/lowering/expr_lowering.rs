@@ -222,6 +222,7 @@ fn is_compile_time_constant(expr: &ast::Expression) -> bool {
         ast::Expression::IntegerLiteral { .. }
         | ast::Expression::FloatLiteral { .. }
         | ast::Expression::CharLiteral { .. }
+        | ast::Expression::StringLiteral { .. }
         | ast::Expression::SizeofType { .. }
         | ast::Expression::SizeofExpr { .. }
         | ast::Expression::AlignofType { .. }
@@ -819,11 +820,13 @@ fn integer_literal_ctype(value: u128, suffix: &ast::IntegerSuffix) -> CType {
 }
 
 /// Determine the C type of a float literal from its suffix.
+/// Imaginary suffixes return the base float type — the imaginary nature
+/// is handled during complex expression lowering.
 fn float_literal_ctype(suffix: &ast::FloatSuffix) -> CType {
     match suffix {
-        ast::FloatSuffix::None => CType::Double,
-        ast::FloatSuffix::F => CType::Float,
-        ast::FloatSuffix::L => CType::LongDouble,
+        ast::FloatSuffix::None | ast::FloatSuffix::I => CType::Double,
+        ast::FloatSuffix::F | ast::FloatSuffix::FI => CType::Float,
+        ast::FloatSuffix::L | ast::FloatSuffix::LI => CType::LongDouble,
     }
 }
 
@@ -937,6 +940,7 @@ fn lower_expr_inner(ctx: &mut ExprLoweringContext<'_>, expr: &ast::Expression) -
             value,
             suffix,
             span,
+            ..
         } => lower_integer_literal(ctx, *value, suffix, *span),
         ast::Expression::FloatLiteral {
             value,
@@ -1146,6 +1150,22 @@ fn lower_lvalue_inner(ctx: &mut ExprLoweringContext<'_>, expr: &ast::Expression)
         }
         // Conditional expression can be an lvalue in GCC mode.
         ast::Expression::Conditional { .. } => lower_expr_inner(ctx, expr),
+        // GCC __real__/__imag__ as lvalue: __real__ z = 1.0
+        // For non-complex, __real__ is identity lvalue, __imag__ degrades.
+        ast::Expression::UnaryOp {
+            op: ast::UnaryOp::RealPart,
+            operand,
+            ..
+        } => lower_lvalue_inner(ctx, operand),
+        ast::Expression::UnaryOp {
+            op: ast::UnaryOp::ImagPart,
+            operand,
+            ..
+        } => {
+            // For non-complex, __imag__ as lvalue is degenerate.
+            // Fall through to value lowering.
+            lower_lvalue_inner(ctx, operand)
+        }
         other => {
             // Fallback: try lowering as a value. Many kernel macro
             // expansions produce expressions that look like non-lvalues
@@ -1336,6 +1356,15 @@ fn lower_identifier(ctx: &mut ExprLoweringContext<'_>, sym_idx: u32, span: Span)
     let var_cty = lookup_var_type(ctx, name);
     let ir_ty = ctype_to_ir(&var_cty, ctx.target);
 
+    if std::env::var("BCC_DEBUG_KNR").is_ok() {
+        let in_params = ctx.param_values.contains_key(name);
+        let in_locals = ctx.local_vars.contains_key(name);
+        let in_globals = ctx.module.get_global(name).is_some();
+        let in_local_types = ctx.local_types.contains_key(name);
+        let fn_name = ctx.current_function_name.unwrap_or("?");
+        eprintln!("[KNR-IDENT] fn='{}' name='{}' in_params={} in_locals={} in_globals={} in_local_types={} var_cty={:?}", fn_name, name, in_params, in_locals, in_globals, in_local_types, var_cty);
+    }
+
     // VLA type is correctly Pointer(elem, ...) here via local_types override.
 
     // Arrays decay to pointers: the alloca IS the address of the first
@@ -1422,7 +1451,16 @@ fn lower_identifier(ctx: &mut ExprLoweringContext<'_>, sym_idx: u32, span: Span)
             // Check if the global variable itself is an array type.
             // lookup_var_type only checks local_types and may miss globals,
             // so we also detect array decay by inspecting the IR type.
-            let global_is_array = matches!(&gt, crate::ir::types::IrType::Array(_, _));
+            // IMPORTANT: Structs and unions are also represented as
+            // IrType::Array in the IR (e.g., `union u { int i; }` →
+            // `Array(I32, 1)`).  We must NOT treat those as C-level arrays.
+            let resolved_var = types::resolve_typedef(&var_cty);
+            let ctype_is_struct_or_union = matches!(
+                resolved_var,
+                CType::Struct { .. } | CType::Union { .. }
+            );
+            let global_is_array = matches!(&gt, crate::ir::types::IrType::Array(_, _))
+                && !ctype_is_struct_or_union;
 
             // Arrays decay to pointers: the address of the global IS the
             // pointer to the first element, so return it directly (no load).
@@ -1495,7 +1533,13 @@ fn lower_identifier(ctx: &mut ExprLoweringContext<'_>, sym_idx: u32, span: Span)
             }
             // Check for array-to-pointer decay: arrays and string-initialized
             // arrays should return the pointer directly (no load).
-            let global_is_array = matches!(&gt, IrType::Array(_, _));
+            // Exclude struct/union types which also map to IR Array.
+            let resolved_svar = types::resolve_typedef(&var_cty);
+            let ctype_is_sou = matches!(
+                resolved_svar,
+                CType::Struct { .. } | CType::Union { .. }
+            );
+            let global_is_array = matches!(&gt, IrType::Array(_, _)) && !ctype_is_sou;
             if is_array_decay || global_is_array {
                 // Use the accurately-computed decayed type from
                 // lookup_var_type (which reads global_c_types) when
@@ -1888,9 +1932,41 @@ fn lower_identifier(ctx: &mut ExprLoweringContext<'_>, sym_idx: u32, span: Span)
         return TypedValue::new(loaded, CType::Pointer(Box::new(CType::Void), TypeQualifiers::default()));
     }
 
-    ctx.diagnostics
-        .emit_error(span, format!("undeclared identifier '{}'", name));
-    TypedValue::new(Value::UNDEF, CType::Int)
+    // C89/GNU89 implicit function declaration: treat undeclared identifiers
+    // as `int name(...)` when they appear in call context.  The semantic
+    // analyzer already emitted a warning.  Generate a declaration so that
+    // the linker can resolve the symbol at link time.
+    {
+        let owned_name = name.to_string();
+        let ret_ir = IrType::I32;
+        let already_declared = ctx
+            .module
+            .declarations()
+            .iter()
+            .any(|d| d.name == owned_name)
+            || ctx.module.get_function(&owned_name).is_some();
+        if !already_declared {
+            ctx.module
+                .add_declaration(crate::ir::module::FunctionDeclaration {
+                    name: owned_name.clone(),
+                    return_type: ret_ir,
+                    param_types: vec![],
+                    is_variadic: true,
+                    linkage: crate::ir::module::Linkage::External,
+                    visibility: crate::ir::module::Visibility::Default,
+                });
+        }
+        let fptr = ctx.builder.fresh_value();
+        ctx.module.func_ref_map.insert(fptr, owned_name.clone());
+        {
+            let current_func = &mut *ctx.function;
+            current_func.func_ref_map.insert(fptr, owned_name);
+        }
+        return TypedValue::new(
+            fptr,
+            CType::Pointer(Box::new(CType::Void), TypeQualifiers::default()),
+        );
+    }
 }
 
 fn lower_identifier_lvalue(
@@ -2443,9 +2519,9 @@ fn lower_unary(
                     -value
                 };
                 let (ir_ty, c_ty) = match suffix {
-                    ast::FloatSuffix::F => (IrType::F32, CType::Float),
-                    ast::FloatSuffix::L => (IrType::F64, CType::LongDouble),
-                    ast::FloatSuffix::None => (IrType::F64, CType::Double),
+                    ast::FloatSuffix::F | ast::FloatSuffix::FI => (IrType::F32, CType::Float),
+                    ast::FloatSuffix::L | ast::FloatSuffix::LI => (IrType::F64, CType::LongDouble),
+                    ast::FloatSuffix::None | ast::FloatSuffix::I => (IrType::F64, CType::Double),
                 };
                 let val = emit_float_const(ctx, negated, ir_ty, span);
                 return TypedValue::new(val, c_ty);
@@ -2474,6 +2550,25 @@ fn lower_unary(
             let (r, i) = ctx.builder.build_xor(bv, one, IrType::I1, span);
             emit_inst(ctx, i);
             TypedValue::new(r, CType::Bool)
+        }
+        ast::UnaryOp::RealPart => {
+            // GCC __real__: for non-complex types, acts as identity.
+            // For _Complex, would extract real component.
+            let inner = lower_expr_inner(ctx, operand);
+            inner
+        }
+        ast::UnaryOp::ImagPart => {
+            // GCC __imag__: for non-complex types, returns 0.
+            // For _Complex, would extract imaginary component.
+            let inner = lower_expr_inner(ctx, operand);
+            let ir_ty = ctype_to_ir(&inner.ty, ctx.target);
+            if matches!(ir_ty, IrType::F32 | IrType::F64 | IrType::F80) {
+                let val = emit_float_const(ctx, 0.0, ir_ty, span);
+                TypedValue::new(val, inner.ty)
+            } else {
+                let val = emit_int_const(ctx, 0, ir_ty, span);
+                TypedValue::new(val, inner.ty)
+            }
         }
     }
 }
@@ -2510,8 +2605,33 @@ fn lower_assignment(
                 0
             };
             if is_agg && struct_size > 8 {
-                // Get the RHS as an lvalue (pointer) — do NOT dereference.
-                let rhs_ptr = lower_lvalue_inner(ctx, value);
+                // Get source pointer for the struct copy.
+                // If the RHS is a natural lvalue (variable, array element,
+                // member access, dereference, compound literal), we can take
+                // its address directly.  Otherwise it is an rvalue
+                // (function call, statement expression, conditional, etc.)
+                // and we must spill it to a temporary alloca first.
+                let rhs_ptr = if expr_is_natural_lvalue(value) {
+                    lower_lvalue_inner(ctx, value)
+                } else {
+                    // Evaluate the RHS as an rvalue — this yields the struct
+                    // data packed in registers / as a value, not a pointer.
+                    let rhs_val = lower_expr_inner(ctx, value);
+                    // Create a temp alloca to hold the struct data.
+                    let struct_ir_ty = IrType::from_ctype(&resolved_lhs_ty, ctx.target);
+                    let (tmp_alloca, tmp_inst) =
+                        ctx.builder.build_alloca(struct_ir_ty.clone(), span);
+                    emit_inst(ctx, tmp_inst);
+                    // Store the rvalue into the temporary.
+                    let si = ctx.builder.build_store(rhs_val.value, tmp_alloca, span);
+                    emit_inst(ctx, si);
+                    TypedValue::new(tmp_alloca, CType::Pointer(Box::new(resolved_lhs_ty.clone()), crate::common::types::TypeQualifiers {
+                        is_const: false,
+                        is_volatile: false,
+                        is_restrict: false,
+                        is_atomic: false,
+                    }))
+                };
 
                 // Emit individual 8-byte load/store pairs to copy the
                 // struct from source to destination.  Process in 8-byte
@@ -2651,12 +2771,20 @@ fn lower_assignment(
         }
         _ => {
             // Compound assignment:  lhs <op>= rhs
+            // C11 §6.5.16.2: E1 op= E2 ≡ E1 = (typeof(E1))(E1 op E2), E1 evaluated once.
+            // Evaluation order: compute LHS address, evaluate RHS (with side effects),
+            // THEN read LHS value. This ensures RHS side effects are visible when
+            // reading LHS (e.g., x[0] |= foo() where foo() modifies x[0]).
             let lhs_ptr = lower_lvalue_inner(ctx, target);
             let compound_bf_info = ctx.last_bitfield_info.take();
             let lhs_ir = ctype_to_ir(&lhs_ptr.ty, ctx.target);
 
-            // For bitfields, read the current value using bitfield-aware
-            // extraction (shift + mask) rather than a raw full-width load.
+            // Evaluate RHS FIRST — side effects of E2 must be sequenced before
+            // reading E1's value for the compound operation.
+            let rhs = lower_expr_inner(ctx, value);
+
+            // Now read LHS value AFTER RHS side effects have completed.
+            // For bitfields, use bitfield-aware extraction (shift + mask).
             let cur_val = if let Some((bit_offset, bit_width)) = compound_bf_info {
                 if bit_width > 0 {
                     let tv = lower_bitfield_read(
@@ -2678,7 +2806,6 @@ fn lower_assignment(
                 emit_inst(ctx, li);
                 v
             };
-            let rhs = lower_expr_inner(ctx, value);
 
             // C11 §6.5.16.2: Compound assignment  E1 op= E2  is equivalent to
             //   E1 = (typeof(E1))(E1 op E2)
@@ -3405,50 +3532,27 @@ fn try_lower_builtin_call(
             Some(TypedValue::new(v, CType::Int))
         }
 
-        // ── __builtin_clrsb(x) → count leading redundant sign bits ──
+        // ── __builtin_clrsb / clrsbl / clrsbll → count leading redundant sign bits ──
         "__builtin_clrsb" | "clrsb" => {
-            // clrsb(x) = clz(x ^ (x >> 31)) - 1 for 32-bit.
-            // Implemented inline: forward the XOR'd value to __builtin_clz
-            // via the libgcc runtime function __clzsi2.
-            if args.is_empty() {
-                return None;
-            }
-            let x_tv = lower_expr_inner(ctx, &args[0]);
-            let x_val = insert_implicit_conversion(
-                ctx,
-                x_tv.value,
-                &x_tv.ty,
-                &CType::Int,
-                span,
-            );
-            // x ^ (x >> 31) — if negative, inverts all bits so leading 1s → 0s
-            let shift_amt = emit_int_const(ctx, 31, IrType::I32, span);
-            let (shifted, s1) =
-                ctx.builder
-                    .build_shr(x_val, shift_amt, IrType::I32, true, span);
-            emit_inst(ctx, s1);
-            let (xored, x1) =
-                ctx.builder
-                    .build_xor(x_val, shifted, IrType::I32, span);
-            emit_inst(ctx, x1);
-            // CLZ(xored) — use __clzsi2 from libgcc_s
-            let callee_ref = emit_global_ref(ctx, "__clzsi2", span);
-            let (clz_result, clz_inst) = ctx.builder.build_call(
-                callee_ref,
-                vec![xored],
-                IrType::I32,
-                span,
-            );
-            emit_inst(ctx, clz_inst);
-            // clrsb = clz - 1
-            let one = emit_int_const(ctx, 1, IrType::I32, span);
-            let (result, sub_inst) =
-                ctx.builder
-                    .build_sub(clz_result, one, IrType::I32, span);
-            emit_inst(ctx, sub_inst);
-            Some(TypedValue::new(result, CType::Int))
+            Some(lower_bit_builtin(ctx, args, "clrsb", span))
+        }
+        "__builtin_clrsbl" => {
+            Some(lower_bit_builtin(ctx, args, "clrsbl", span))
+        }
+        "__builtin_clrsbll" => {
+            Some(lower_bit_builtin(ctx, args, "clrsbll", span))
         }
 
+        // ── __builtin_parity / parityl / parityll → popcount & 1 ──
+        "__builtin_parity" => {
+            Some(lower_bit_builtin(ctx, args, "parity", span))
+        }
+        "__builtin_parityl" => {
+            Some(lower_bit_builtin(ctx, args, "parityl", span))
+        }
+        "__builtin_parityll" => {
+            Some(lower_bit_builtin(ctx, args, "parityll", span))
+        }
 
         // ── Math builtins → libc forwarders ──
         "__builtin_copysign" => {
@@ -4480,7 +4584,32 @@ fn lower_bitfield_read(
     emit_inst(ctx, mi);
 
     // For signed bitfields, sign-extend from bit_width to the storage type.
-    let is_signed = !is_unsigned(field_ty);
+    // For enum bitfields, the field_ty's underlying_type may be stale
+    // (defaulting to Int) because struct collection (pass 0) runs before
+    // enum underlying type computation (pass 0.5).  Look up the
+    // authoritative underlying type from the ENUM_UNDERLYING_TYPES map.
+    let effective_unsigned = match field_ty {
+        CType::Enum {
+            name: Some(ref en), ..
+        } => super::ENUM_UNDERLYING_TYPES.with(|m| {
+            let borrow = m.borrow();
+            borrow
+                .as_ref()
+                .and_then(|map| map.get(en).cloned())
+                .map(|ut| is_unsigned(&ut))
+                .unwrap_or_else(|| is_unsigned(field_ty))
+        }),
+        _ => is_unsigned(field_ty),
+    };
+    if std::env::var("BCC_DEBUG_BF").is_ok() {
+        eprintln!(
+            "[BCC_BF] lower_bitfield_read: field_ty={:?}, is_unsigned={}, bit_width={}",
+            field_ty,
+            effective_unsigned,
+            bit_width,
+        );
+    }
+    let is_signed = !effective_unsigned;
     let result = if is_signed && bit_width < storage_size * 8 {
         // Sign extension: shift left to put the sign bit at the MSB of
         // the storage type, then arithmetic shift right to propagate it.
@@ -5945,14 +6074,205 @@ fn lower_bit_builtin(
         return TypedValue::void();
     };
 
-    // Create a pseudo-global for the intrinsic and emit a call.
-    let intrinsic_name = format!("__builtin_{}", name);
-    let callee = emit_global_ref(ctx, &intrinsic_name, span);
-    let (result, ci) = ctx
-        .builder
-        .build_call(callee, vec![arg.value], IrType::I32, span);
-    emit_inst(ctx, ci);
+    // For ffs/ffsl/ffsll — forward to libc `ffs`/`ffsl`/`ffsll` (they exist in libc).
+    match name {
+        "ffs" => {
+            let callee = emit_global_ref(ctx, "ffs", span);
+            let (result, ci) = ctx.builder.build_call(callee, vec![arg.value], IrType::I32, span);
+            emit_inst(ctx, ci);
+            return TypedValue::new(result, CType::Int);
+        }
+        "ffsl" => {
+            let callee = emit_global_ref(ctx, "ffsl", span);
+            let v64 = insert_implicit_conversion(ctx, arg.value, &arg.ty, &CType::Long, span);
+            let (result, ci) = ctx.builder.build_call(callee, vec![v64], IrType::I32, span);
+            emit_inst(ctx, ci);
+            return TypedValue::new(result, CType::Int);
+        }
+        "ffsll" => {
+            let callee = emit_global_ref(ctx, "ffsll", span);
+            let v64 = insert_implicit_conversion(ctx, arg.value, &arg.ty, &CType::LongLong, span);
+            let (result, ci) = ctx.builder.build_call(callee, vec![v64], IrType::I32, span);
+            emit_inst(ctx, ci);
+            return TypedValue::new(result, CType::Int);
+        }
+        _ => {}
+    }
+
+    // Determine operand width from the builtin suffix
+    let (op_bits, op_ir, promote_to) = if name.ends_with("ll") {
+        (64u32, IrType::I64, CType::ULongLong)
+    } else if name.ends_with('l') {
+        (64u32, IrType::I64, CType::ULong)
+    } else {
+        (32u32, IrType::I32, CType::UInt)
+    };
+
+    let val = insert_implicit_conversion(ctx, arg.value, &arg.ty, &promote_to, span);
+
+    // Strip the suffix to get the base operation name
+    let base = name.trim_end_matches('l');
+
+    match base {
+        "clz" => lower_clz_inline(ctx, val, op_bits, &op_ir, span),
+        "ctz" => lower_ctz_inline(ctx, val, op_bits, &op_ir, span),
+        "popcount" => lower_popcount_inline(ctx, val, op_bits, &op_ir, span),
+        "parity" => {
+            let pc = lower_popcount_inline(ctx, val, op_bits, &op_ir, span);
+            let one = emit_int_const(ctx, 1, IrType::I32, span);
+            let (r, i) = ctx.builder.build_and(pc.value, one, IrType::I32, span);
+            emit_inst(ctx, i);
+            TypedValue::new(r, CType::Int)
+        }
+        "clrsb" => {
+            // clrsb(x) = clz(x ^ (x >> (bits-1))) - 1
+            let shift_amt = emit_int_const(ctx, (op_bits - 1) as i128, op_ir.clone(), span);
+            let (shifted, si) = ctx.builder.build_shr(val, shift_amt, op_ir.clone(), true, span);
+            emit_inst(ctx, si);
+            let (xored, xi) = ctx.builder.build_xor(val, shifted, op_ir.clone(), span);
+            emit_inst(ctx, xi);
+            let clz_tv = lower_clz_inline(ctx, xored, op_bits, &op_ir, span);
+            let one_i32 = emit_int_const(ctx, 1, IrType::I32, span);
+            let (r, i) = ctx.builder.build_sub(clz_tv.value, one_i32, IrType::I32, span);
+            emit_inst(ctx, i);
+            TypedValue::new(r, CType::Int)
+        }
+        _ => {
+            // Fallback: emit a call to the libc name (without __builtin_ prefix)
+            let callee = emit_global_ref(ctx, &format!("__builtin_{}", name), span);
+            let (result, ci) = ctx.builder.build_call(callee, vec![val], IrType::I32, span);
+            emit_inst(ctx, ci);
+            TypedValue::new(result, CType::Int)
+        }
+    }
+}
+
+/// Inline CLZ (count leading zeros) using binary search in IR.
+/// Returns result as I32 (like GCC's __builtin_clz).
+fn lower_clz_inline(
+    ctx: &mut ExprLoweringContext<'_>,
+    val: Value,
+    bits: u32,
+    ir_ty: &IrType,
+    span: Span,
+) -> TypedValue {
+    // CLZ via branchless De Bruijn / bit-manipulation approach.
+    // For 32-bit: Propagate highest set bit rightward, count via popcount.
+    // clz(x) = bits - 1 - floor(log2(x)) for x>0
+    // We use: propagate msb right, then popcount, then bits - popcount.
+    // x |= x >> 1; x |= x >> 2; x |= x >> 4; x |= x >> 8; x |= x >> 16; (x |= x >> 32 for 64-bit)
+    // clz = bits - popcount(x)
+    let mut x = val;
+    let shifts: &[u32] = if bits == 64 {
+        &[1, 2, 4, 8, 16, 32]
+    } else {
+        &[1, 2, 4, 8, 16]
+    };
+    for &sh in shifts {
+        let sc = emit_int_const(ctx, sh as i128, ir_ty.clone(), span);
+        let (shifted, si) = ctx.builder.build_shr(x, sc, ir_ty.clone(), false, span);
+        emit_inst(ctx, si);
+        let (ored, oi) = ctx.builder.build_or(x, shifted, ir_ty.clone(), span);
+        emit_inst(ctx, oi);
+        x = ored;
+    }
+    // popcount(x) gives position of highest bit + number of bits below it
+    // clz = bits - popcount(x)
+    let pop = lower_popcount_inline(ctx, x, bits, ir_ty, span);
+    let bits_c = emit_int_const(ctx, bits as i128, IrType::I32, span);
+    let (result, ri) = ctx.builder.build_sub(bits_c, pop.value, IrType::I32, span);
+    emit_inst(ctx, ri);
     TypedValue::new(result, CType::Int)
+}
+
+/// Inline CTZ (count trailing zeros) using arithmetic in IR.
+fn lower_ctz_inline(
+    ctx: &mut ExprLoweringContext<'_>,
+    val: Value,
+    bits: u32,
+    ir_ty: &IrType,
+    span: Span,
+) -> TypedValue {
+    // CTZ(x) = popcount((x & -x) - 1) for x != 0
+    // (x & -x) isolates the lowest set bit.
+    // Alternatively: CTZ(x) = bits - CLZ(~x & (x-1)) but CLZ calls popcount anyway.
+    // Simplest: CTZ(x) = popcount(~x & (x - 1))
+    // ~x & (x-1) has all bits below the lowest set bit set.
+    let one = emit_int_const(ctx, 1, ir_ty.clone(), span);
+    let (x_minus_1, xm1i) = ctx.builder.build_sub(val, one, ir_ty.clone(), span);
+    emit_inst(ctx, xm1i);
+    let (not_x, nxi) = ctx.builder.build_not(val, ir_ty.clone(), span);
+    emit_inst(ctx, nxi);
+    let (masked, mi) = ctx.builder.build_and(not_x, x_minus_1, ir_ty.clone(), span);
+    emit_inst(ctx, mi);
+    lower_popcount_inline(ctx, masked, bits, ir_ty, span)
+}
+
+/// Inline POPCOUNT using parallel bit-count algorithm in IR.
+fn lower_popcount_inline(
+    ctx: &mut ExprLoweringContext<'_>,
+    val: Value,
+    bits: u32,
+    ir_ty: &IrType,
+    span: Span,
+) -> TypedValue {
+    // Hamming weight (parallel bit count):
+    // x = x - ((x >> 1) & 0x5555...)
+    // x = (x & 0x3333...) + ((x >> 2) & 0x3333...)
+    // x = (x + (x >> 4)) & 0x0F0F...
+    // x = (x * 0x0101...) >> (bits - 8)
+    let (m1, m2, m4, h01) = if bits == 64 {
+        (0x5555555555555555u64 as i128, 0x3333333333333333u64 as i128,
+         0x0F0F0F0F0F0F0F0Fu64 as i128, 0x0101010101010101u64 as i128)
+    } else {
+        (0x55555555i128, 0x33333333i128, 0x0F0F0F0Fi128, 0x01010101i128)
+    };
+
+    let one = emit_int_const(ctx, 1, ir_ty.clone(), span);
+    let (shr1, s1i) = ctx.builder.build_shr(val, one, ir_ty.clone(), false, span);
+    emit_inst(ctx, s1i);
+    let m1c = emit_int_const(ctx, m1, ir_ty.clone(), span);
+    let (and1, a1i) = ctx.builder.build_and(shr1, m1c, ir_ty.clone(), span);
+    emit_inst(ctx, a1i);
+    let (x1, x1i) = ctx.builder.build_sub(val, and1, ir_ty.clone(), span);
+    emit_inst(ctx, x1i);
+
+    let m2c = emit_int_const(ctx, m2, ir_ty.clone(), span);
+    let (lo, loi) = ctx.builder.build_and(x1, m2c, ir_ty.clone(), span);
+    emit_inst(ctx, loi);
+    let two = emit_int_const(ctx, 2, ir_ty.clone(), span);
+    let (shr2, s2i) = ctx.builder.build_shr(x1, two, ir_ty.clone(), false, span);
+    emit_inst(ctx, s2i);
+    let (hi, hii) = ctx.builder.build_and(shr2, m2c, ir_ty.clone(), span);
+    emit_inst(ctx, hii);
+    let (x2, x2i) = ctx.builder.build_add(lo, hi, ir_ty.clone(), span);
+    emit_inst(ctx, x2i);
+
+    let four = emit_int_const(ctx, 4, ir_ty.clone(), span);
+    let (shr4, s4i) = ctx.builder.build_shr(x2, four, ir_ty.clone(), false, span);
+    emit_inst(ctx, s4i);
+    let (add4, a4i) = ctx.builder.build_add(x2, shr4, ir_ty.clone(), span);
+    emit_inst(ctx, a4i);
+    let m4c = emit_int_const(ctx, m4, ir_ty.clone(), span);
+    let (x3, x3i) = ctx.builder.build_and(add4, m4c, ir_ty.clone(), span);
+    emit_inst(ctx, x3i);
+
+    let h01c = emit_int_const(ctx, h01, ir_ty.clone(), span);
+    let (mul, mi) = ctx.builder.build_mul(x3, h01c, ir_ty.clone(), span);
+    emit_inst(ctx, mi);
+    let shift_final = emit_int_const(ctx, (bits - 8) as i128, ir_ty.clone(), span);
+    let (result, ri) = ctx.builder.build_shr(mul, shift_final, ir_ty.clone(), false, span);
+    emit_inst(ctx, ri);
+
+    // Truncate to I32 if 64-bit
+    let result_i32 = if bits > 32 {
+        let (t, ti) = ctx.builder.build_trunc(result, IrType::I32, span);
+        emit_inst(ctx, ti);
+        t
+    } else {
+        result
+    };
+    TypedValue::new(result_i32, CType::Int)
 }
 
 /// Lower a byte-swap builtin.
@@ -5968,7 +6288,6 @@ fn lower_bswap(
         return TypedValue::void();
     };
 
-    let intrinsic_name = format!("__builtin_bswap{}", bits);
     let ret_ty = match bits {
         16 => IrType::I16,
         32 => IrType::I32,
@@ -5981,12 +6300,121 @@ fn lower_bswap(
         64 => CType::ULongLong,
         _ => CType::UInt,
     };
-    let callee = emit_global_ref(ctx, &intrinsic_name, span);
-    let (result, ci) = ctx
-        .builder
-        .build_call(callee, vec![arg.value], ret_ty, span);
-    emit_inst(ctx, ci);
-    TypedValue::new(result, ret_cty)
+    let promote_cty = match bits {
+        16 => CType::UShort,
+        32 => CType::UInt,
+        64 => CType::ULongLong,
+        _ => CType::UInt,
+    };
+    let val = insert_implicit_conversion(ctx, arg.value, &arg.ty, &promote_cty, span);
+
+    // Inline byte-swap using shifts and ORs
+    match bits {
+        16 => {
+            // bswap16(x) = ((x & 0xFF) << 8) | ((x >> 8) & 0xFF)
+            let mask = emit_int_const(ctx, 0xFF, ret_ty.clone(), span);
+            let eight = emit_int_const(ctx, 8, ret_ty.clone(), span);
+            let (lo, li) = ctx.builder.build_and(val, mask, ret_ty.clone(), span);
+            emit_inst(ctx, li);
+            let (lo_s, lsi) = ctx.builder.build_shl(lo, eight, ret_ty.clone(), span);
+            emit_inst(ctx, lsi);
+            let (hi_s, hsi) = ctx.builder.build_shr(val, eight, ret_ty.clone(), false, span);
+            emit_inst(ctx, hsi);
+            let (hi, hii) = ctx.builder.build_and(hi_s, mask, ret_ty.clone(), span);
+            emit_inst(ctx, hii);
+            let (result, ri) = ctx.builder.build_or(lo_s, hi, ret_ty.clone(), span);
+            emit_inst(ctx, ri);
+            TypedValue::new(result, ret_cty)
+        }
+        32 => {
+            // bswap32 using shift-and-or
+            let mut result = {
+                let c24 = emit_int_const(ctx, 24, ret_ty.clone(), span);
+                let (s, si) = ctx.builder.build_shl(val, c24, ret_ty.clone(), span);
+                emit_inst(ctx, si);
+                s
+            };
+            {
+                let m = emit_int_const(ctx, 0x0000FF00i128, ret_ty.clone(), span);
+                let (a, ai) = ctx.builder.build_and(val, m, ret_ty.clone(), span);
+                emit_inst(ctx, ai);
+                let c8 = emit_int_const(ctx, 8, ret_ty.clone(), span);
+                let (s, si) = ctx.builder.build_shl(a, c8, ret_ty.clone(), span);
+                emit_inst(ctx, si);
+                let (o, oi) = ctx.builder.build_or(result, s, ret_ty.clone(), span);
+                emit_inst(ctx, oi);
+                result = o;
+            }
+            {
+                let m = emit_int_const(ctx, 0x00FF0000i128, ret_ty.clone(), span);
+                let (a, ai) = ctx.builder.build_and(val, m, ret_ty.clone(), span);
+                emit_inst(ctx, ai);
+                let c8 = emit_int_const(ctx, 8, ret_ty.clone(), span);
+                let (s, si) = ctx.builder.build_shr(a, c8, ret_ty.clone(), false, span);
+                emit_inst(ctx, si);
+                let (o, oi) = ctx.builder.build_or(result, s, ret_ty.clone(), span);
+                emit_inst(ctx, oi);
+                result = o;
+            }
+            {
+                let c24 = emit_int_const(ctx, 24, ret_ty.clone(), span);
+                let (s, si) = ctx.builder.build_shr(val, c24, ret_ty.clone(), false, span);
+                emit_inst(ctx, si);
+                let (o, oi) = ctx.builder.build_or(result, s, ret_ty.clone(), span);
+                emit_inst(ctx, oi);
+                result = o;
+            }
+            TypedValue::new(result, ret_cty)
+        }
+        64 => {
+            // bswap64: swap bytes pairwise then reverse halves
+            // Inline shift-and-or approach
+            let mut result = {
+                let c56 = emit_int_const(ctx, 56, ret_ty.clone(), span);
+                let (s, si) = ctx.builder.build_shl(val, c56, ret_ty.clone(), span);
+                emit_inst(ctx, si);
+                s
+            };
+            for (mask_val, shift_val, is_left) in [
+                (0x000000000000FF00u64 as i128, 40i128, true),
+                (0x0000000000FF0000u64 as i128, 24i128, true),
+                (0x00000000FF000000u64 as i128, 8i128, true),
+                (0x000000FF00000000u64 as i128, 8i128, false),
+                (0x0000FF0000000000u64 as i128, 24i128, false),
+                (0x00FF000000000000u64 as i128, 40i128, false),
+            ] {
+                let m = emit_int_const(ctx, mask_val, ret_ty.clone(), span);
+                let (a, ai) = ctx.builder.build_and(val, m, ret_ty.clone(), span);
+                emit_inst(ctx, ai);
+                let sc = emit_int_const(ctx, shift_val, ret_ty.clone(), span);
+                let (s, si) = if is_left {
+                    ctx.builder.build_shl(a, sc, ret_ty.clone(), span)
+                } else {
+                    ctx.builder.build_shr(a, sc, ret_ty.clone(), false, span)
+                };
+                emit_inst(ctx, si);
+                let (o, oi) = ctx.builder.build_or(result, s, ret_ty.clone(), span);
+                emit_inst(ctx, oi);
+                result = o;
+            }
+            {
+                let c56 = emit_int_const(ctx, 56, ret_ty.clone(), span);
+                let (s, si) = ctx.builder.build_shr(val, c56, ret_ty.clone(), false, span);
+                emit_inst(ctx, si);
+                let (o, oi) = ctx.builder.build_or(result, s, ret_ty.clone(), span);
+                emit_inst(ctx, oi);
+                result = o;
+            }
+            TypedValue::new(result, ret_cty)
+        }
+        _ => {
+            // Fallback for unknown widths
+            let callee = emit_global_ref(ctx, &format!("__builtin_bswap{}", bits), span);
+            let (result, ci) = ctx.builder.build_call(callee, vec![val], ret_ty, span);
+            emit_inst(ctx, ci);
+            TypedValue::new(result, ret_cty)
+        }
+    }
 }
 
 /// Lower a variadic argument builtin (va_start, va_end, va_arg, va_copy).
@@ -6570,34 +6998,39 @@ fn lower_address_of_label(
     label_sym: u32,
     span: Span,
 ) -> TypedValue {
-    // &&label produces a void* to the label address.
-    // We encode this as the label's BlockId index (1-based to avoid null).
-    // The computed goto dispatch uses a Switch instruction that maps these
-    // indices back to the corresponding basic blocks.
+    // &&label produces a void* pointing to the machine-code address
+    // of the label.  This is used with computed goto (`goto *ptr`).
     //
-    // CRITICAL: label_blocks uses the naming convention "label_{symbol_id}"
-    // (matching collect_label_names in decl_lowering.rs), NOT the human-
-    // readable name from name_table.
+    // label_blocks uses the naming convention "label_{symbol_id}"
+    // (matching collect_label_names in decl_lowering.rs).
     let label_name = format!("label_{}", label_sym);
 
-    // Look up the block ID for this label.
-    let block_index: i128 = ctx
-        .label_blocks
-        .get(&label_name)
-        .map(|bid| bid.index() as i128 + 1) // 1-based to avoid null pointer confusion
-        .unwrap_or(0);
-
-    let val = emit_int_const(ctx, block_index, IrType::I64, span);
-    // IntToPtr to produce a void*
-    let ptr_val = {
-        let (v, inst) = ctx.builder.build_int_to_ptr(val, span);
+    if let Some(&block_id) = ctx.label_blocks.get(&label_name) {
+        // Emit a BlockAddress instruction that materialises the
+        // runtime address of the target basic block.
+        let (val, inst) = ctx.builder.build_block_address(block_id, span);
         emit_inst(ctx, inst);
-        v
-    };
-    TypedValue::new(
-        ptr_val,
-        CType::Pointer(Box::new(CType::Void), TypeQualifiers::default()),
-    )
+        TypedValue::new(
+            val,
+            CType::Pointer(Box::new(CType::Void), TypeQualifiers::default()),
+        )
+    } else {
+        // Label not yet resolved — this may happen if label_blocks was not
+        // populated (e.g. the label is in a different scope, or is a
+        // forward reference in a static initializer).  Fall back to the
+        // index-based encoding used by the old Switch-based dispatch.
+        let block_index: i128 = 0;
+        let val = emit_int_const(ctx, block_index, IrType::I64, span);
+        let ptr_val = {
+            let (v, inst) = ctx.builder.build_int_to_ptr(val, span);
+            emit_inst(ctx, inst);
+            v
+        };
+        TypedValue::new(
+            ptr_val,
+            CType::Pointer(Box::new(CType::Void), TypeQualifiers::default()),
+        )
+    }
 }
 
 // =========================================================================
@@ -7151,39 +7584,61 @@ fn compute_offset_in_type(
         }
         OffsetofDesignator::Field(target_name) => {
             // Struct/union field access: find the field and its offset.
+            // Use the type builder's bitfield-aware layout computation
+            // to get correct byte offsets for bitfield members.
             let unwrapped = unwrap_type(ctype);
-            let fields = match unwrapped {
-                CType::Struct { fields, .. } => fields,
-                CType::Union { fields, .. } => fields,
+            let (fields, packed, explicit_align) = match unwrapped {
+                CType::Struct {
+                    fields,
+                    packed,
+                    aligned,
+                    ..
+                } => (fields, *packed, *aligned),
+                CType::Union {
+                    fields, aligned, ..
+                } => (fields, false, *aligned),
                 _ => return 0,
             };
 
             let is_union = matches!(unwrapped, CType::Union { .. });
-            let mut current_offset: usize = 0;
-            for field in fields {
-                let field_align = type_builder.alignof_type(&field.ty);
-                let align = if field_align == 0 { 1 } else { field_align };
-                current_offset = (current_offset + align - 1) & !(align - 1);
 
-                let field_name = field.name.as_deref().unwrap_or("");
-                if field_name == target_name {
-                    // Found the field.
-                    if member_chain.len() == 1 {
-                        return current_offset;
+            if is_union {
+                // Union: all fields at offset 0.
+                for field in fields {
+                    let field_name = field.name.as_deref().unwrap_or("");
+                    if field_name == target_name {
+                        if member_chain.len() == 1 {
+                            return 0;
+                        }
+                        return compute_offset_in_type(
+                            &field.ty,
+                            &member_chain[1..],
+                            type_builder,
+                        );
                     }
-                    // Recurse for remaining chain (may be nested field or array subscript).
-                    return current_offset
-                        + compute_offset_in_type(&field.ty, &member_chain[1..], type_builder);
                 }
-
-                // For unions, all fields start at offset 0.
-                if !is_union {
-                    current_offset += type_builder.sizeof_type(&field.ty);
+                0
+            } else {
+                // Struct: use bitfield-aware layout computation.
+                let layout =
+                    type_builder.compute_struct_layout_with_fields(fields, packed, explicit_align);
+                for (i, field) in fields.iter().enumerate() {
+                    let field_name = field.name.as_deref().unwrap_or("");
+                    if field_name == target_name {
+                        let field_offset = layout.fields[i].offset;
+                        if member_chain.len() == 1 {
+                            return field_offset;
+                        }
+                        return field_offset
+                            + compute_offset_in_type(
+                                &field.ty,
+                                &member_chain[1..],
+                                type_builder,
+                            );
+                    }
                 }
+                0
             }
-
-            // Field not found — return 0.
-            0
         }
     }
 }

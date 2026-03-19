@@ -443,6 +443,43 @@ pub fn register_predefined_macros(macro_defs: &mut FxHashMap<String, MacroDef>, 
     }
 
     // -------------------------------------------------------------------
+    // 8b. GCC __INT_LEASTn_TYPE__ / __UINT_LEASTn_TYPE__ /
+    //     __INT_FASTn_TYPE__ / __UINT_FASTn_TYPE__ predefined macros.
+    //     These are required by <stdint.h> and many GCC torture tests.
+    // -------------------------------------------------------------------
+    register_object_macro(macro_defs, "__INT_LEAST8_TYPE__", "signed char");
+    register_object_macro(macro_defs, "__UINT_LEAST8_TYPE__", "unsigned char");
+    register_object_macro(macro_defs, "__INT_LEAST16_TYPE__", "short");
+    register_object_macro(macro_defs, "__UINT_LEAST16_TYPE__", "unsigned short");
+    register_object_macro(macro_defs, "__INT_LEAST32_TYPE__", "int");
+    register_object_macro(macro_defs, "__UINT_LEAST32_TYPE__", "unsigned int");
+    register_object_macro(macro_defs, "__INT_FAST8_TYPE__", "signed char");
+    register_object_macro(macro_defs, "__UINT_FAST8_TYPE__", "unsigned char");
+
+    if target.is_64bit() {
+        register_object_macro(macro_defs, "__INT_LEAST64_TYPE__", "long");
+        register_object_macro(macro_defs, "__UINT_LEAST64_TYPE__", "unsigned long");
+        register_object_macro(macro_defs, "__INT_FAST16_TYPE__", "long");
+        register_object_macro(macro_defs, "__UINT_FAST16_TYPE__", "unsigned long");
+        register_object_macro(macro_defs, "__INT_FAST32_TYPE__", "long");
+        register_object_macro(macro_defs, "__UINT_FAST32_TYPE__", "unsigned long");
+        register_object_macro(macro_defs, "__INT_FAST64_TYPE__", "long");
+        register_object_macro(macro_defs, "__UINT_FAST64_TYPE__", "unsigned long");
+    } else {
+        register_object_macro(macro_defs, "__INT_LEAST64_TYPE__", "long long");
+        register_object_macro(macro_defs, "__UINT_LEAST64_TYPE__", "unsigned long long");
+        register_object_macro(macro_defs, "__INT_FAST16_TYPE__", "int");
+        register_object_macro(macro_defs, "__UINT_FAST16_TYPE__", "unsigned int");
+        register_object_macro(macro_defs, "__INT_FAST32_TYPE__", "int");
+        register_object_macro(macro_defs, "__UINT_FAST32_TYPE__", "unsigned int");
+        register_object_macro(macro_defs, "__INT_FAST64_TYPE__", "long long");
+        register_object_macro(macro_defs, "__UINT_FAST64_TYPE__", "unsigned long long");
+    }
+
+    // GCC __SIG_ATOMIC_TYPE__ — used by <signal.h>/<stdatomic.h>
+    register_object_macro(macro_defs, "__SIG_ATOMIC_TYPE__", "int");
+
+    // -------------------------------------------------------------------
     // 9. Architecture-specific macros from Target::predefined_macros()
     //    Registers __x86_64__, __i386__, __aarch64__, __riscv, plus
     //    __linux__, __unix__, __ELF__ and all arch-specific feature macros.

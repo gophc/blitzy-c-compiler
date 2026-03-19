@@ -735,6 +735,54 @@ impl IrBuilder {
         }
     }
 
+    /// Builds an indirect branch (terminator) for GCC computed-goto.
+    ///
+    /// Jumps to the code address contained in `target`.  The `possible_targets`
+    /// list enumerates all blocks that could be reached (for CFG construction /
+    /// phi-node placement).
+    pub fn build_indirect_branch(
+        &mut self,
+        target: Value,
+        possible_targets: Vec<BlockId>,
+        span: Span,
+    ) -> Instruction {
+        Instruction::IndirectBranch {
+            target,
+            possible_targets,
+            span,
+        }
+    }
+
+    /// Builds a block address instruction for computed goto.
+    ///
+    /// Materializes the runtime address of a labeled basic block, producing
+    /// a pointer value that can be stored in a `void *` and later used as
+    /// the target of an `IndirectBranch`.
+    ///
+    /// # Parameters
+    ///
+    /// - `block`: The target basic block whose address is taken.
+    /// - `span`: Source location for diagnostic reporting.
+    ///
+    /// # Returns
+    ///
+    /// A `(Value, Instruction)` pair. The `Value` is a pointer to the block.
+    pub fn build_block_address(
+        &mut self,
+        block: BlockId,
+        span: Span,
+    ) -> (Value, Instruction) {
+        let result = self.fresh_value();
+        (
+            result,
+            Instruction::BlockAddress {
+                result,
+                block,
+                span,
+            },
+        )
+    }
+
     /// Builds a function return (terminator).
     ///
     /// Returns from the current function, optionally with a return value.

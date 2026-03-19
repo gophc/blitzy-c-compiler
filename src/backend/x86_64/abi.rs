@@ -381,8 +381,8 @@ pub fn classify_type(ty: &CType, target: &Target) -> AbiClass {
         // float, double → SSE class
         CType::Float | CType::Double => AbiClass::Sse,
 
-        // long double → X87 class (passed in memory on AMD64)
-        CType::LongDouble => AbiClass::X87,
+        // BCC treats long double as double internally → SSE class
+        CType::LongDouble => AbiClass::Sse,
 
         // Complex types
         CType::Complex(base) => match base.as_ref() {
@@ -757,7 +757,11 @@ fn classify_ir_type_eightbytes(ty: &IrType, target: &Target) -> Vec<AbiClass> {
         }
         IrType::I128 => vec![AbiClass::Integer, AbiClass::Integer],
         IrType::F32 | IrType::F64 => vec![AbiClass::Sse],
-        IrType::F80 => vec![AbiClass::X87, AbiClass::X87Up],
+        // BCC treats long double as double internally (no x87 FPU support).
+        // Classify F80 as SSE so it passes/returns in XMM registers,
+        // matching BCC's internal handling. True x87 precision is not
+        // supported, but the calling convention must be self-consistent.
+        IrType::F80 => vec![AbiClass::Sse],
         IrType::Ptr => vec![AbiClass::Integer],
         IrType::Struct(st) => classify_ir_struct_eightbytes(st, target),
         IrType::Array(elem, count) => {
@@ -784,7 +788,8 @@ fn classify_ir_type_scalar(ty: &IrType, target: &Target) -> AbiClass {
             AbiClass::Integer
         }
         IrType::F32 | IrType::F64 => AbiClass::Sse,
-        IrType::F80 => AbiClass::X87,
+        // BCC treats long double as double → SSE class
+        IrType::F80 => AbiClass::Sse,
         IrType::Ptr => AbiClass::Integer,
         IrType::Struct(st) => {
             let classes = classify_ir_struct_eightbytes(st, target);
@@ -835,9 +840,11 @@ fn classify_ir_struct_eightbytes(st: &StructType, target: &Target) -> Vec<AbiCla
         // Handle special multi-eightbyte scalar types.
         match field {
             IrType::F80 if start_eb < num_eb => {
-                classes[start_eb] = merge_abi_class(classes[start_eb], AbiClass::X87);
+                // BCC treats F80 (long double) as SSE (double) internally
+                classes[start_eb] = merge_abi_class(classes[start_eb], AbiClass::Sse);
                 if start_eb + 1 < num_eb {
-                    classes[start_eb + 1] = merge_abi_class(classes[start_eb + 1], AbiClass::X87Up);
+                    classes[start_eb + 1] =
+                        merge_abi_class(classes[start_eb + 1], AbiClass::NoClass);
                 }
             }
             IrType::I128 if start_eb < num_eb => {
@@ -931,13 +938,15 @@ fn classify_field_into_eightbytes(
         start_eb
     };
 
-    // Special: long double (X87 + X87Up across two eightbytes).
+    // BCC treats long double as double internally → SSE class.
     if matches!(field_ty, CType::LongDouble) && target.long_double_size() == 16 {
         if start_eb < num_eightbytes {
-            classes[start_eb] = merge_abi_class(classes[start_eb], AbiClass::X87);
+            classes[start_eb] = merge_abi_class(classes[start_eb], AbiClass::Sse);
         }
+        // Second eightbyte is padding (NoClass), not X87Up
         if start_eb + 1 < num_eightbytes {
-            classes[start_eb + 1] = merge_abi_class(classes[start_eb + 1], AbiClass::X87Up);
+            classes[start_eb + 1] =
+                merge_abi_class(classes[start_eb + 1], AbiClass::NoClass);
         }
         return;
     }
@@ -1092,7 +1101,8 @@ mod tests {
         assert_eq!(classify_type(&CType::Long, &t), AbiClass::Integer);
         assert_eq!(classify_type(&CType::Float, &t), AbiClass::Sse);
         assert_eq!(classify_type(&CType::Double, &t), AbiClass::Sse);
-        assert_eq!(classify_type(&CType::LongDouble, &t), AbiClass::X87);
+        // BCC treats long double as double internally → SSE
+        assert_eq!(classify_type(&CType::LongDouble, &t), AbiClass::Sse);
         assert_eq!(classify_type(&CType::Bool, &t), AbiClass::Integer);
         assert_eq!(classify_type(&CType::Char, &t), AbiClass::Integer);
     }
@@ -1192,11 +1202,12 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_return_f80_indirect() {
+    fn test_classify_return_f80_sse() {
         let t = Target::X86_64;
+        // BCC treats long double (F80) as double → SSE return in XMM0
         assert!(matches!(
             classify_return(&IrType::F80, &t),
-            RetLocation::Indirect
+            RetLocation::Register(r) if r == registers::XMM0
         ));
     }
 
@@ -1395,12 +1406,14 @@ mod tests {
     }
 
     #[test]
-    fn test_long_double_x87() {
+    fn test_long_double_sse() {
         let t = Target::X86_64;
-        assert_eq!(classify_type(&CType::LongDouble, &t), AbiClass::X87);
+        // BCC treats long double as double → SSE class
+        assert_eq!(classify_type(&CType::LongDouble, &t), AbiClass::Sse);
         let locs = classify_arguments(&[IrType::F80], &t);
         assert_eq!(locs.len(), 1);
-        assert!(matches!(locs[0], ArgLocation::Stack(_)));
+        // Now passes in XMM register (SSE) instead of stack
+        assert!(matches!(locs[0], ArgLocation::Register(_)));
     }
 
     #[test]

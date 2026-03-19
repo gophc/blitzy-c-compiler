@@ -611,6 +611,30 @@ fn parse_unary_expression(parser: &mut Parser<'_>) -> Result<Expression, ()> {
             parse_unary_expression(parser)
         }
 
+        // GCC __real__ / __imag__ — extract real/imaginary part of _Complex.
+        TokenKind::RealPart => {
+            let start = parser.current_span();
+            parser.advance();
+            let operand = parse_cast_expression(parser)?;
+            let span = start.merge(operand.span());
+            Ok(Expression::UnaryOp {
+                op: UnaryOp::RealPart,
+                operand: Box::new(operand),
+                span,
+            })
+        }
+        TokenKind::ImagPart => {
+            let start = parser.current_span();
+            parser.advance();
+            let operand = parse_cast_expression(parser)?;
+            let span = start.merge(operand.span());
+            Ok(Expression::UnaryOp {
+                op: UnaryOp::ImagPart,
+                operand: Box::new(operand),
+                span,
+            })
+        }
+
         // Not a unary operator — parse as postfix expression.
         _ => parse_postfix_expression(parser),
     }
@@ -914,14 +938,21 @@ fn parse_primary_expression(parser: &mut Parser<'_>) -> Result<Expression, ()> {
         TokenKind::IntegerLiteral {
             value,
             suffix,
-            base: _,
+            base,
         } => {
             let val = *value as u128;
             let sfx = convert_integer_suffix(*suffix);
+            let hex_or_oct = matches!(
+                base,
+                crate::frontend::lexer::token::NumericBase::Hexadecimal
+                    | crate::frontend::lexer::token::NumericBase::Octal
+                    | crate::frontend::lexer::token::NumericBase::Binary
+            );
             parser.advance();
             Ok(Expression::IntegerLiteral {
                 value: val,
                 suffix: sfx,
+                is_hex_or_octal: hex_or_oct,
                 span: parser.previous_span(),
             })
         }
@@ -1523,6 +1554,9 @@ fn convert_float_suffix(sfx: token_types::FloatSuffix) -> FloatSuffix {
         token_types::FloatSuffix::None => FloatSuffix::None,
         token_types::FloatSuffix::F => FloatSuffix::F,
         token_types::FloatSuffix::L => FloatSuffix::L,
+        token_types::FloatSuffix::I => FloatSuffix::I,
+        token_types::FloatSuffix::FI => FloatSuffix::FI,
+        token_types::FloatSuffix::LI => FloatSuffix::LI,
     }
 }
 

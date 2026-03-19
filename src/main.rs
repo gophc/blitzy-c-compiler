@@ -1836,10 +1836,35 @@ fn compile_single_file(
 
     run_mem2reg(&mut ir_module);
 
+    if std::env::var("BCC_DEBUG_CFG").is_ok() {
+        for func in ir_module.functions() {
+            if !func.is_definition { continue; }
+            eprintln!("[CFG-AFTER-MEM2REG] func={} blocks={}", func.name, func.block_count());
+            for (i, blk) in func.blocks().iter().enumerate() {
+                eprintln!("  block {} succs={:?} preds={:?} insts={}", i, blk.successors(), blk.predecessors(), blk.instruction_count());
+                if std::env::var("BCC_DEBUG_IR").is_ok() {
+                    for inst in blk.instructions() {
+                        eprintln!("    {}", inst);
+                    }
+                }
+            }
+        }
+    }
+
     // Phase 8: Optimization (constant folding, DCE, CFG simplification)
     // ========================================================================
 
     let _optimized = run_optimization_pipeline(&mut ir_module, ctx.optimization_level);
+
+    if std::env::var("BCC_DEBUG_CFG").is_ok() {
+        for func in ir_module.functions() {
+            if !func.is_definition { continue; }
+            eprintln!("[CFG-AFTER-OPT] func={} blocks={}", func.name, func.block_count());
+            for (i, blk) in func.blocks().iter().enumerate() {
+                eprintln!("  block {} succs={:?} preds={:?} insts={}", i, blk.successors(), blk.predecessors(), blk.instruction_count());
+            }
+        }
+    }
 
     // Phase 9: Phi Elimination (SSA → register-friendly form)
     // ========================================================================
@@ -1847,6 +1872,16 @@ fn compile_single_file(
     for func in ir_module.functions.iter_mut() {
         if func.is_definition {
             eliminate_phi_nodes(func);
+        }
+    }
+
+    if std::env::var("BCC_DEBUG_CFG").is_ok() {
+        for func in ir_module.functions() {
+            if !func.is_definition { continue; }
+            eprintln!("[CFG-AFTER-PHI-ELIM] func={} blocks={}", func.name, func.block_count());
+            for (i, blk) in func.blocks().iter().enumerate() {
+                eprintln!("  block {} succs={:?} preds={:?} insts={}", i, blk.successors(), blk.predecessors(), blk.instruction_count());
+            }
         }
     }
 

@@ -376,6 +376,7 @@ impl<'a> ConstantEvaluator<'a> {
                 value,
                 suffix,
                 span,
+                ..
             } => Ok(self.evaluate_integer_literal(*value, suffix, *span)),
 
             // Floating-point literal: 3.14, 1.0f, 2.0L
@@ -2101,9 +2102,9 @@ impl<'a> ConstantEvaluator<'a> {
         match expr {
             Expression::IntegerLiteral { suffix, .. } => Ok(self.integer_suffix_to_type(suffix)),
             Expression::FloatLiteral { suffix, .. } => match suffix {
-                FloatSuffix::F => Ok(CType::Float),
-                FloatSuffix::L => Ok(CType::LongDouble),
-                FloatSuffix::None => Ok(CType::Double),
+                FloatSuffix::F | FloatSuffix::FI => Ok(CType::Float),
+                FloatSuffix::L | FloatSuffix::LI => Ok(CType::LongDouble),
+                FloatSuffix::None | FloatSuffix::I => Ok(CType::Double),
             },
             Expression::CharLiteral { .. } => Ok(CType::Int),
             Expression::StringLiteral { .. } => {

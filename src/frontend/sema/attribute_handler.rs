@@ -1226,6 +1226,7 @@ mod tests {
         AttributeArg::Expression(Box::new(Expression::IntegerLiteral {
             value: val as u128,
             suffix: IntegerSuffix::None,
+            is_hex_or_octal: false,
             span: Span::dummy(),
         }))
     }

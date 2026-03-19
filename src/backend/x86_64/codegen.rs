@@ -1045,12 +1045,38 @@ impl X86_64CodeGen {
         let mut named_fp_count: usize = 0;
         if func.is_variadic {
             // Count named GPR and FP parameters.
+            // MEMORY-class parameters (structs/arrays > 16 bytes) are
+            // passed entirely on the stack and do NOT consume a register
+            // slot.  They must be excluded from the named register count
+            // so that va_start computes the correct gp_ptr offset.
             for p in &func.params {
+                let param_size = crate::backend::generation::ir_type_size_pub(&p.ty) as usize;
+                let is_memory_class = param_size > 16
+                    && matches!(
+                        &p.ty,
+                        IrType::Struct(_) | IrType::Array(_, _)
+                    );
+                if is_memory_class {
+                    // MEMORY-class: pushed on stack by caller, doesn't
+                    // consume a register.
+                    continue;
+                }
                 let is_fp = matches!(p.ty, IrType::F32 | IrType::F64 | IrType::F80);
                 if is_fp {
                     named_fp_count += 1;
                 } else {
-                    named_gpr_count += 1;
+                    // Struct pairs (9-16 bytes) consume 2 GPR slots.
+                    if param_size > 8
+                        && param_size <= 16
+                        && matches!(
+                            &p.ty,
+                            IrType::Struct(_) | IrType::Array(_, _)
+                        )
+                    {
+                        named_gpr_count += 2;
+                    } else {
+                        named_gpr_count += 1;
+                    }
                 }
             }
             // Reserve 48 bytes for the 6 GPR save slots (RDI..R9).
@@ -1870,14 +1896,90 @@ impl X86_64CodeGen {
                 // We count stack params in order of appearance (both GPR
                 // overflow and SSE overflow share the same stack area).
                 let stack_offset: i64 = 16 + (stack_param_idx as i64) * 8;
-                let mem = MachineOperand::Memory {
-                    base: Some(super::registers::RBP),
-                    index: None,
-                    scale: 1,
-                    displacement: stack_offset,
-                };
-                param_insts.push(Self::mk_inst(X86Opcode::Mov, Some(vreg), &[mem]));
-                stack_param_idx += 1;
+
+                // Multi-eightbyte struct on stack: copy entire struct from
+                // caller's frame into the local alloca using R11 scratch.
+                let eightbytes = (param_size + 7) / 8;
+                if param.ty.is_struct() && eightbytes > 1 {
+                    let mut copied_to_alloca = false;
+                    if let Some(ref frame) = self.frame {
+                        let entry_block = &func.blocks()[0];
+                        for ir_inst in entry_block.instructions() {
+                            if let crate::ir::instructions::Instruction::Store {
+                                value: sv,
+                                ptr: sp,
+                                ..
+                            } = ir_inst
+                            {
+                                if *sv == param.value {
+                                    if let Some(&alloca_off) = frame.alloca_offsets.get(sp) {
+                                        for i in 0..eightbytes {
+                                            let src_mem = MachineOperand::Memory {
+                                                base: Some(RBP),
+                                                index: None,
+                                                scale: 1,
+                                                displacement: stack_offset + (i as i64) * 8,
+                                            };
+                                            let dst_mem = MachineOperand::Memory {
+                                                base: Some(RBP),
+                                                index: None,
+                                                scale: 1,
+                                                displacement: (alloca_off as i64) + (i as i64) * 8,
+                                            };
+                                            param_hi_stores.push(Self::mk_inst(
+                                                X86Opcode::Mov,
+                                                Some(MachineOperand::Register(R11)),
+                                                &[src_mem],
+                                            ));
+                                            let remaining = param_size - i * 8;
+                                            let mut st = Self::mk_inst(
+                                                X86Opcode::Mov,
+                                                None,
+                                                &[dst_mem, MachineOperand::Register(R11)],
+                                            );
+                                            if remaining < 8 && remaining <= 4 {
+                                                st.operand_size = remaining as u8;
+                                            }
+                                            param_hi_stores.push(st);
+                                        }
+                                        self.struct_load_source.insert(
+                                            param.value,
+                                            MachineOperand::Memory {
+                                                base: Some(RBP),
+                                                index: None,
+                                                scale: 1,
+                                                displacement: alloca_off as i64,
+                                            },
+                                        );
+                                        self.memory_class_params.insert(param.value);
+                                        copied_to_alloca = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !copied_to_alloca {
+                        // Fallback: just load first eightbyte
+                        let mem = MachineOperand::Memory {
+                            base: Some(super::registers::RBP),
+                            index: None,
+                            scale: 1,
+                            displacement: stack_offset,
+                        };
+                        param_insts.push(Self::mk_inst(X86Opcode::Mov, Some(vreg), &[mem]));
+                    }
+                    stack_param_idx += eightbytes;
+                } else {
+                    let mem = MachineOperand::Memory {
+                        base: Some(super::registers::RBP),
+                        index: None,
+                        scale: 1,
+                        displacement: stack_offset,
+                    };
+                    param_insts.push(Self::mk_inst(X86Opcode::Mov, Some(vreg), &[mem]));
+                    stack_param_idx += 1;
+                }
             }
         }
 
@@ -1965,6 +2067,9 @@ impl X86_64CodeGen {
                     Instruction::GetElementPtr { result, .. } => {
                         self.value_types.insert(*result, IrType::Ptr);
                     }
+                    Instruction::BlockAddress { result, .. } => {
+                        self.value_types.insert(*result, IrType::Ptr);
+                    }
                     Instruction::InlineAsm {
                         result,
                         operands,
@@ -2015,6 +2120,37 @@ impl X86_64CodeGen {
         mf.num_param_moves = param_insts.len();
         for inst in param_insts {
             mf.blocks[0].push_instruction(inst);
+        }
+
+        // 3.6  Normalize single-float struct types in value_types.
+        //
+        //       A struct containing exactly one float field (e.g. `struct {
+        //       double d; }`) is ABI-classified as SSE and must live in an XMM
+        //       register.  But `IrType::Struct` causes the register allocator
+        //       to pick a GPR, leading to mis-encoded MOVSD instructions
+        //       (GPR operand interpreted as memory address → SIGSEGV).  We
+        //       normalize these to the inner float type so the allocator picks
+        //       an XMM register.
+        {
+            let mut overrides = Vec::new();
+            for (&val, ty) in self.value_types.iter() {
+                if let IrType::Struct(ref st) = ty {
+                    if st.fields.len() == 1 {
+                        match st.fields[0] {
+                            IrType::F64 | IrType::F80 => {
+                                overrides.push((val, IrType::F64));
+                            }
+                            IrType::F32 => {
+                                overrides.push((val, IrType::F32));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            for (val, ty) in overrides {
+                self.value_types.insert(val, ty);
+            }
         }
 
         // 3.7  Pre-allocate virtual registers for ALL instruction results.
@@ -2241,6 +2377,9 @@ impl X86_64CodeGen {
                     // Check if the source pointer is a known alloca — if so,
                     // record the stable Memory operand for the alloca's frame
                     // slot so we can reload at call time without vregs.
+                    // This covers both 1-8 byte structs (needed for SSE
+                    // returns from struct allocas, e.g. struct { double d; })
+                    // and 9-16 byte structs (RegisterPair returns/calls).
                     let mut found_alloca = false;
                     if let Some(ref frame) = self.frame {
                         if let Some(&offset) = frame.alloca_offsets.get(ptr) {
@@ -2288,8 +2427,16 @@ impl X86_64CodeGen {
                                     scale: 1,
                                     displacement: (temp_offset + 8) as i64,
                                 };
+                                // When the pointer is a GlobalSymbol,
+                                // MOV loads the VALUE at that address.  We
+                                // need LEA to get the ADDRESS instead.
+                                let ptr_opc = if matches!(&ptr_vreg, MachineOperand::GlobalSymbol(_)) {
+                                    X86Opcode::Lea
+                                } else {
+                                    X86Opcode::Mov
+                                };
                                 struct_temp_prefix.push(Self::mk_inst(
-                                    X86Opcode::Mov,
+                                    ptr_opc,
                                     Some(MachineOperand::Register(R11)),
                                     std::slice::from_ref(&ptr_vreg),
                                 ));
@@ -2309,7 +2456,7 @@ impl X86_64CodeGen {
                                     &[MachineOperand::Register(R11)],
                                 ));
                                 struct_temp_prefix.push(Self::mk_inst(
-                                    X86Opcode::Mov,
+                                    ptr_opc,
                                     Some(MachineOperand::Register(R11)),
                                     &[ptr_vreg],
                                 ));
@@ -2353,11 +2500,21 @@ impl X86_64CodeGen {
                 let dst = self.new_vreg();
                 self.set_value(*result, dst.clone());
 
+                // Use the normalized type from value_types (step 3.6
+                // converts `Struct([F64])` → `F64`) for opcode
+                // selection so single-float struct loads use
+                // Movsd/Movss instead of integer MOV/LoadInd.
+                let load_ty = self
+                    .value_types
+                    .get(result)
+                    .cloned()
+                    .unwrap_or_else(|| ty.clone());
+
                 // If the pointer is already a Memory or FrameSlot,
                 // use a regular Mov with that operand.
                 let mut load_result = match &src {
                     MachineOperand::Memory { .. } | MachineOperand::FrameSlot(_) => {
-                        let opcode = Self::mov_opcode(ty);
+                        let opcode = Self::mov_opcode(&load_ty);
                         vec![Self::mk_inst(opcode, Some(dst), &[src])]
                     }
                     MachineOperand::GlobalSymbol(name) => {
@@ -2373,13 +2530,13 @@ impl X86_64CodeGen {
                                 Some(r11.clone()),
                                 &[MachineOperand::GlobalSymbol(name.clone())],
                             );
-                            let deref_opcode = if ty.is_float() {
-                                match ty {
+                            let deref_opcode = if load_ty.is_float() {
+                                match load_ty {
                                     IrType::F32 => X86Opcode::Movss,
                                     _ => X86Opcode::Movsd,
                                 }
                             } else {
-                                match ty {
+                                match load_ty {
                                     IrType::I1 | IrType::I8 => X86Opcode::LoadInd8,
                                     IrType::I16 => X86Opcode::LoadInd16,
                                     IrType::I32 => X86Opcode::LoadInd32,
@@ -2393,7 +2550,7 @@ impl X86_64CodeGen {
                             // On x86-64, this becomes `mov dst, [rip + sym]` with
                             // a relocation for the symbol.
                             let mem = MachineOperand::GlobalSymbol(name.clone());
-                            if ty.is_float() {
+                            if load_ty.is_float() {
                                 // Float: LEA R11, [rip+sym] then Movss/Movsd
                                 let r11 = MachineOperand::Register(R11);
                                 let lea = Self::mk_inst(
@@ -2401,7 +2558,7 @@ impl X86_64CodeGen {
                                     Some(r11.clone()),
                                     &[MachineOperand::GlobalSymbol(name.clone())],
                                 );
-                                let fop = match ty {
+                                let fop = match load_ty {
                                     IrType::F32 => X86Opcode::Movss,
                                     _ => X86Opcode::Movsd,
                                 };
@@ -2409,7 +2566,7 @@ impl X86_64CodeGen {
                             } else {
                                 // Integer: set operand_size so encoder uses
                                 // correct width (no REX.W for 32-bit).
-                                let load_size: u8 = match ty {
+                                let load_sz: u8 = match load_ty {
                                     IrType::I1 | IrType::I8 => 1,
                                     IrType::I16 => 2,
                                     IrType::I32 => 4,
@@ -2417,7 +2574,7 @@ impl X86_64CodeGen {
                                 };
                                 let mut load =
                                     Self::mk_inst(X86Opcode::Mov, Some(dst), &[mem]);
-                                load.operand_size = load_size;
+                                load.operand_size = load_sz;
                                 vec![load]
                             }
                         }
@@ -2427,13 +2584,13 @@ impl X86_64CodeGen {
                         // Use size-specific LoadInd to ensure correct memory
                         // access width: I8 → byte load, I16 → word, I32 → dword,
                         // I64/Ptr → qword.
-                        let opcode = if ty.is_float() {
-                            match ty {
+                        let opcode = if load_ty.is_float() {
+                            match load_ty {
                                 IrType::F32 => X86Opcode::Movss,
                                 _ => X86Opcode::Movsd,
                             }
                         } else {
-                            match ty {
+                            match load_ty {
                                 IrType::I1 | IrType::I8 => X86Opcode::LoadInd8,
                                 IrType::I16 => X86Opcode::LoadInd16,
                                 IrType::I32 => X86Opcode::LoadInd32,
@@ -3092,18 +3249,56 @@ impl X86_64CodeGen {
                     let ret_loc = self.abi.classify_return(&func.return_type);
                     match ret_loc {
                         RetLocation::Register(reg) => {
-                            let opcode = if registers::is_sse(reg) {
-                                X86Opcode::Movsd
-                            } else if is_global_addr {
-                                X86Opcode::Lea
+                            if registers::is_sse(reg) {
+                                // For SSE returns, prefer loading from
+                                // struct_load_source (stable memory
+                                // location) to avoid GPR-to-XMM
+                                // issues where MOVSD with a GPR src
+                                // would be encoded as a memory deref.
+                                if let Some(mem) = self.struct_load_source.get(val).cloned() {
+                                    // Determine correct float opcode
+                                    // based on return size.
+                                    let ret_sz = func.return_type.size_bytes(&self.target);
+                                    let fop = if ret_sz <= 4 {
+                                        X86Opcode::Movss
+                                    } else {
+                                        X86Opcode::Movsd
+                                    };
+                                    out.push(Self::mk_inst(
+                                        fop,
+                                        Some(MachineOperand::Register(reg)),
+                                        &[mem],
+                                    ));
+                                } else {
+                                    out.push(Self::mk_inst(
+                                        X86Opcode::Movsd,
+                                        Some(MachineOperand::Register(reg)),
+                                        &[src],
+                                    ));
+                                }
                             } else {
-                                X86Opcode::Mov
+                                let opcode = if is_global_addr {
+                                    X86Opcode::Lea
+                                } else {
+                                    X86Opcode::Mov
+                                };
+                                // For integer returns, also check
+                                // struct_load_source — a ≤8 byte
+                                // struct from a global needs loading.
+                                if let Some(mem) = self.struct_load_source.get(val).cloned() {
+                                    out.push(Self::mk_inst(
+                                        X86Opcode::Mov,
+                                        Some(MachineOperand::Register(reg)),
+                                        &[mem],
+                                    ));
+                                } else {
+                                    out.push(Self::mk_inst(
+                                        opcode,
+                                        Some(MachineOperand::Register(reg)),
+                                        &[src],
+                                    ));
+                                }
                             };
-                            out.push(Self::mk_inst(
-                                opcode,
-                                Some(MachineOperand::Register(reg)),
-                                &[src],
-                            ));
                         }
                         RetLocation::RegisterPair(lo, hi) => {
                             // For struct returns via register pair (e.g.,
@@ -4080,6 +4275,43 @@ impl X86_64CodeGen {
                 let mut all_insts = pre_moves;
                 all_insts.push(inst);
                 all_insts
+            }
+
+            // ---------------------------------------------------------------
+            // IndirectBranch — computed goto: jmp *%reg
+            // ---------------------------------------------------------------
+            Instruction::IndirectBranch { target, .. } => {
+                let target_op = self.get_value(*target);
+                let mut jmp = Self::mk_inst(
+                    X86Opcode::Jmp,
+                    None,
+                    &[target_op],
+                );
+                jmp.is_terminator = true;
+                // Mark as branch so epilogue insertion does NOT insert
+                // leave+ret before this instruction — it's a jump, not a
+                // function return.
+                jmp.is_branch = true;
+                vec![jmp]
+            }
+
+            // ---------------------------------------------------------------
+            // BlockAddress — materialize address of a labeled basic block
+            // ---------------------------------------------------------------
+            Instruction::BlockAddress { result, block, .. } => {
+                let dst = self.new_vreg();
+                self.set_value(*result, dst.clone());
+                // Map IR block → machine block index, then use the assembler's
+                // .L{mach_idx} label which is always defined and resolved
+                // inline (no external relocation needed).
+                let mach_idx = *self.block_map.get(&block.index()).unwrap_or(&0);
+                let block_label = format!(".L{}", mach_idx);
+                let inst = Self::mk_inst(
+                    X86Opcode::Lea,
+                    Some(dst),
+                    &[MachineOperand::GlobalSymbol(block_label)],
+                );
+                vec![inst]
             }
         }
     }
@@ -5684,8 +5916,18 @@ impl X86_64CodeGen {
                             },
                             _ => arg_op.clone(),
                         };
-                        stack_args.push((mem_hi, false));
+                        // Stack args are pushed in REVERSE order of
+                        // stack_args.  The lo eightbyte must end up at
+                        // the lowest stack address ([RBP+16] in callee).
+                        // Push order (last pushed = lowest address):
+                        //   push lo  → at RSP (= callee [RBP+16])  ✓
+                        //   push hi  → at RSP+8 (= callee [RBP+24]) ✓
+                        // Reversed iteration: hi first, lo second →
+                        //   emit push(lo), emit push(hi)
+                        // So in stack_args: lo at higher index (pushed
+                        // first in reverse), hi at lower index.
                         stack_args.push((mem_base, false));
+                        stack_args.push((mem_hi, false));
                         stack_offset += 16;
                     }
                     continue;
@@ -5713,8 +5955,10 @@ impl X86_64CodeGen {
                     reg_arg_setup.push(inst_hi);
                     gpr_idx += 2;
                 } else {
-                    stack_args.push((hi_op, false));
+                    // Same lo-before-hi ordering as struct_load_source path:
+                    // lo at higher index → pushed first in reverse → lowest addr.
                     stack_args.push((arg_op, false));
+                    stack_args.push((hi_op, false));
                     stack_offset += 16;
                 }
                 continue;
@@ -6120,6 +6364,31 @@ impl X86_64CodeGen {
                     Some(dst),
                     &[MachineOperand::Register(reg)],
                 ));
+                // For SSE-class struct returns (e.g. `struct { double d; }`),
+                // the Call return_type is `Struct([F64])` but the value lives
+                // in XMM0.  Override value_types from Struct to the inner float
+                // type so the register allocator assigns an XMM register to the
+                // vreg (not a GPR).  Without this, the allocator picks a GPR,
+                // and the `Movsd gpr, XMM0` instruction gets mis-encoded as a
+                // memory store `movsd [gpr], xmm0` — a GPR doesn't hold a
+                // valid address, causing SIGSEGV.
+                if registers::is_sse(reg) {
+                    if let Some(vty) = self.value_types.get(&result).cloned() {
+                        if let IrType::Struct(ref st) = vty {
+                            if st.fields.len() == 1 {
+                                match &st.fields[0] {
+                                    IrType::F64 | IrType::F80 => {
+                                        self.value_types.insert(result, IrType::F64);
+                                    }
+                                    IrType::F32 => {
+                                        self.value_types.insert(result, IrType::F32);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
             }
             RetLocation::RegisterPair(lo, hi) => {
                 // Spill both eightbytes of the struct return value to

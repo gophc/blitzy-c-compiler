@@ -727,9 +727,9 @@ impl<'a> BuiltinEvaluator<'a> {
             }
         };
 
-        // Resolve the struct fields from the CType.
-        let fields = Self::extract_struct_fields(&struct_type);
-        let (field_types, is_packed, explicit_align) = match fields {
+        // Resolve the struct fields from the CType (with bitfield info preserved).
+        let struct_fields_opt = Self::extract_struct_fields_full(&struct_type);
+        let (struct_fields, is_packed, explicit_align) = match struct_fields_opt {
             Some(f) => f,
             None => {
                 self.diagnostics.emit(Diagnostic::error(
@@ -753,10 +753,12 @@ impl<'a> BuiltinEvaluator<'a> {
             }
         };
 
-        // Compute struct layout.
-        let layout =
-            self.type_builder
-                .compute_struct_layout(&field_types, is_packed, explicit_align);
+        // Compute struct layout using the full field info (preserves bitfield widths).
+        let layout = self.type_builder.compute_struct_layout_with_fields(
+            &struct_fields,
+            is_packed,
+            explicit_align,
+        );
 
         // Compute overall struct size and alignment for diagnostic context.
         let struct_total_size = self.type_builder.sizeof_type(&struct_type);
@@ -1640,6 +1642,7 @@ impl<'a> BuiltinEvaluator<'a> {
     }
 
     /// Extract struct fields, packed flag, and explicit alignment from a CType.
+    #[allow(dead_code)]
     fn extract_struct_fields(ty: &CType) -> Option<(Vec<CType>, bool, Option<usize>)> {
         match Self::strip_qualifiers(ty) {
             CType::Struct {
@@ -1651,6 +1654,22 @@ impl<'a> BuiltinEvaluator<'a> {
                 let field_types: Vec<CType> = fields.iter().map(|f| f.ty.clone()).collect();
                 Some((field_types, *packed, *aligned))
             }
+            _ => None,
+        }
+    }
+
+    /// Extract full [`StructField`] list from a struct type, preserving bitfield
+    /// width information needed for accurate offset computation.
+    fn extract_struct_fields_full(
+        ty: &CType,
+    ) -> Option<(Vec<crate::common::types::StructField>, bool, Option<usize>)> {
+        match Self::strip_qualifiers(ty) {
+            CType::Struct {
+                fields,
+                packed,
+                aligned,
+                ..
+            } => Some((fields.clone(), *packed, *aligned)),
             _ => None,
         }
     }

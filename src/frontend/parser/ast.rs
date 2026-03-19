@@ -653,6 +653,10 @@ pub enum Expression {
     IntegerLiteral {
         value: u128,
         suffix: IntegerSuffix,
+        /// True when the literal was written in hex (0x) or octal (0) notation.
+        /// C11 §6.4.4.1: hex/octal literals may have unsigned types even
+        /// without a `u`/`U` suffix, while decimal literals cannot.
+        is_hex_or_octal: bool,
         span: Span,
     },
     /// Floating-point constant: `3.14`, `1.0f`, `2.0L`.
@@ -853,6 +857,10 @@ pub enum UnaryOp {
     BitwiseNot,
     /// `!` — logical NOT.
     LogicalNot,
+    /// `__real__` — extract real part of `_Complex` (GCC extension).
+    RealPart,
+    /// `__imag__` — extract imaginary part of `_Complex` (GCC extension).
+    ImagPart,
 }
 
 /// Binary operators (arithmetic, bitwise, logical, relational, equality).
@@ -941,6 +949,7 @@ pub enum IntegerSuffix {
 }
 
 /// Floating-point literal suffix.
+/// GCC extension: `i` / `j` suffix for imaginary constants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FloatSuffix {
     /// No suffix — `double`.
@@ -949,6 +958,12 @@ pub enum FloatSuffix {
     F,
     /// `l` or `L` — `long double`.
     L,
+    /// `i` or `j` — `_Complex double` imaginary literal (GCC extension).
+    I,
+    /// `fi` / `if` / `fj` / `jf` — `_Complex float` imaginary literal.
+    FI,
+    /// `li` / `il` / `lj` / `jl` — `_Complex long double` imaginary literal.
+    LI,
 }
 
 /// String literal encoding prefix.

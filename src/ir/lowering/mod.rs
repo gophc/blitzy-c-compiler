@@ -109,9 +109,26 @@ thread_local! {
     // defaulting to `CType::Int`.
     static TYPEDEF_MAP: RefCell<Option<FxHashMap<String, CType>>> = const { RefCell::new(None) };
 
+    /// Enum underlying type map.  Maps enum tag name → underlying CType
+    /// (e.g., `"code"` → `CType::UInt` when all enumerator values ≥ 0).
+    /// Populated during pass 0.5 (enum constant collection) and consumed by
+    /// `map_single_type_specifier_with_names` in `decl_lowering.rs` so that
+    /// struct field types for enum bitfields use the correct signedness.
+    pub(crate) static ENUM_UNDERLYING_TYPES: RefCell<Option<FxHashMap<String, CType>>> = const { RefCell::new(None) };
+
     // Name table (interned-string vector) used by constant expression evaluators
     // that only receive an `ast::Symbol` and need to recover the string.
     static NAME_TABLE: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+
+    // Anonymous globals generated from compound literals in global initializers.
+    // Each entry is (name, ir_type, constant, c_type).  Populated during
+    // `evaluate_constant_expr` when a CompoundLiteral is encountered in a
+    // global initializer context (e.g., `struct A *p = &(struct A){1,2};`).
+    // After Pass 1, these anonymous globals are added to the IR module.
+    pub(super) static COMPOUND_LITERAL_GLOBALS: RefCell<Vec<(String, crate::ir::types::IrType, crate::ir::module::Constant, crate::common::types::CType)>> = const { RefCell::new(Vec::new()) };
+
+    // Counter for generating unique anonymous compound literal global names.
+    pub(super) static COMPOUND_LITERAL_COUNTER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 // ============================================================================
@@ -747,6 +764,21 @@ pub fn lower_translation_unit(
     // this, fields with typedef'd types (e.g., `u8` → `unsigned char`)
     // would fall back to `CType::Int`, corrupting struct layouts.
     //
+    // Populate the thread-local target BEFORE Pass 0.5 so that
+    // `evaluate_const_int_expr` can resolve sizeof/alignof in array
+    // dimension expressions during typedef struct field collection.
+    // Without this, `typedef struct { long r[(19+sizeof(long))/sizeof(long)]; } A;`
+    // would get Array(long, None) because SizeofType handler finds no target.
+    LOWERING_TARGET.with(|t| {
+        *t.borrow_mut() = Some(*target);
+    });
+
+    // Populate NAME_TABLE early so evaluate_const_int_expr can resolve
+    // Symbol → String for sizeof(identifier) lookups during typedef collection.
+    NAME_TABLE.with(|nt| {
+        *nt.borrow_mut() = Some(name_table.to_vec());
+    });
+
     // Initialize the typedef map with builtin typedefs BEFORE scanning
     // user code, so that typedef chains (e.g., typedef __builtin_va_list
     // va_list) can resolve through the map incrementally.
@@ -799,18 +831,10 @@ pub fn lower_translation_unit(
         }
     }
 
-    // Populate the thread-local target BEFORE pass 0 so that
-    // `evaluate_const_int_expr` can resolve sizeof/alignof in array
-    // dimension expressions during struct field collection.
-    LOWERING_TARGET.with(|t| {
-        *t.borrow_mut() = Some(*target);
-    });
-
-    // Populate NAME_TABLE so that evaluate_const_int_expr can resolve
-    // Symbol → String for sizeof(identifier) lookups.
-    NAME_TABLE.with(|nt| {
-        *nt.borrow_mut() = Some(name_table.to_vec());
-    });
+    // LOWERING_TARGET and NAME_TABLE were already initialized before
+    // Pass 0.5 (typedef collection) so that evaluate_const_int_expr can
+    // resolve sizeof/alignof in array dimension expressions during both
+    // typedef struct field collection and struct definition collection.
 
     // ====================================================================
     // Pass 0 — Collect struct/union/enum definitions before global lowering
@@ -899,6 +923,7 @@ pub fn lower_translation_unit(
     // resolvable during global initializer evaluation and expression
     // lowering.  Collect them before Pass 1 so that global variable
     // initializers like `SAC_NoConsole` resolve to their integer values.
+    let mut enum_underlying_map: FxHashMap<String, CType> = FxHashMap::default();
     let enum_constants: FxHashMap<String, i128> = {
         let mut map = FxHashMap::default();
         for ext_decl in &translation_unit.declarations {
@@ -909,12 +934,24 @@ pub fn lower_translation_unit(
                         name_table,
                         &mut map,
                     );
+                    collect_enum_underlying_types(
+                        &decl.specifiers.type_specifiers,
+                        name_table,
+                        &map,
+                        &mut enum_underlying_map,
+                    );
                 }
                 ast::ExternalDeclaration::FunctionDefinition(func_def) => {
                     collect_enum_constants_from_specifiers(
                         &func_def.specifiers.type_specifiers,
                         name_table,
                         &mut map,
+                    );
+                    collect_enum_underlying_types(
+                        &func_def.specifiers.type_specifiers,
+                        name_table,
+                        &map,
+                        &mut enum_underlying_map,
                     );
                     // Also collect block-scope enum constants from
                     // inside the function body (e.g., kernel patterns
@@ -926,6 +963,13 @@ pub fn lower_translation_unit(
         }
         map
     };
+    // Populate the thread-local enum underlying types map so that
+    // struct field type resolution correctly uses UInt for enums
+    // whose values are all non-negative (GCC-compatible bitfield
+    // signedness).
+    ENUM_UNDERLYING_TYPES.with(|m| {
+        *m.borrow_mut() = Some(enum_underlying_map);
+    });
 
     eprintln!(
         "[BCC-TIMING] ir-pass0.5-enums: {:.3}s",
@@ -1011,6 +1055,20 @@ pub fn lower_translation_unit(
         *ctx.borrow_mut() = Some(map);
     });
 
+    // Drain anonymous compound literal globals created during Pass 1 constant evaluation.
+    COMPOUND_LITERAL_GLOBALS.with(|cl| {
+        let globals = cl.borrow_mut().drain(..).collect::<Vec<_>>();
+        for (anon_name, ir_type, initializer, c_type) in globals {
+            let gv = crate::ir::module::GlobalVariable::new(
+                anon_name.clone(),
+                ir_type,
+                Some(initializer),
+            );
+            module.add_global(gv);
+            module.global_c_types.insert(anon_name, c_type);
+        }
+    });
+
     // ====================================================================
     // Pass 2 — Function definitions (alloca-first pattern)
     // ====================================================================
@@ -1078,6 +1136,22 @@ pub fn lower_translation_unit(
         _t2.elapsed().as_secs_f64(),
         _fn_slow_count
     );
+
+    // Drain anonymous compound literal / string globals created during Pass 2
+    // function lowering (e.g. static locals with string-pointer initializers
+    // like `static const char *p = "hello" + 1;`).
+    COMPOUND_LITERAL_GLOBALS.with(|cl| {
+        let globals = cl.borrow_mut().drain(..).collect::<Vec<_>>();
+        for (anon_name, ir_type, initializer, c_type) in globals {
+            let gv = crate::ir::module::GlobalVariable::new(
+                anon_name.clone(),
+                ir_type,
+                Some(initializer),
+            );
+            module.add_global(gv);
+            module.global_c_types.insert(anon_name, c_type);
+        }
+    });
 
     // If any fatal errors were emitted during lowering, report the failure
     // but still return the partially-constructed module (the diagnostic
@@ -1251,6 +1325,91 @@ fn extract_asm_template(asm_stmt: &ast::AsmStatement) -> String {
 /// all enumerator name → integer value mappings into `out`.
 ///
 /// This handles both explicit values (`RED = 5`) and implicit auto-
+/// Collect the underlying CType for each named enum definition.
+/// GCC treats enum bitfields as unsigned when all enumerator values
+/// are non-negative.  This function determines the correct underlying
+/// type by examining the min/max values of each enum's enumerators.
+fn collect_enum_underlying_types(
+    specs: &[ast::TypeSpecifier],
+    name_table: &[String],
+    enum_constants: &FxHashMap<String, i128>,
+    out: &mut FxHashMap<String, CType>,
+) {
+    for spec in specs {
+        match spec {
+            ast::TypeSpecifier::Enum(enum_spec) => {
+                if let (Some(ref tag), Some(ref enumerators)) =
+                    (&enum_spec.tag, &enum_spec.enumerators)
+                {
+                    let tag_idx = tag.as_u32() as usize;
+                    if tag_idx >= name_table.len() {
+                        continue;
+                    }
+                    let tag_name = &name_table[tag_idx];
+                    // Check if __attribute__((packed))
+                    let is_packed = enum_spec.attributes.iter().any(|a| {
+                        let n = decl_lowering::resolve_sym(name_table, &a.name);
+                        n == "packed" || n == "__packed__"
+                    });
+                    // Compute min/max of enumerator values.
+                    let mut min_val: i128 = i128::MAX;
+                    let mut max_val: i128 = i128::MIN;
+                    let mut next_val: i128 = 0;
+                    for enumerator in enumerators {
+                        if let Some(ref val_expr) = enumerator.value {
+                            if let Some(v) =
+                                try_eval_const_int_expr_ctx(val_expr, name_table, enum_constants)
+                            {
+                                next_val = v;
+                            }
+                        }
+                        if next_val < min_val {
+                            min_val = next_val;
+                        }
+                        if next_val > max_val {
+                            max_val = next_val;
+                        }
+                        next_val += 1;
+                    }
+                    let min_val = if min_val == i128::MAX { 0 } else { min_val };
+                    let max_val = if max_val == i128::MIN { 0 } else { max_val };
+                    let underlying = if is_packed {
+                        if min_val >= 0 && max_val <= 255 {
+                            CType::UChar
+                        } else if min_val >= -128 && max_val <= 127 {
+                            CType::SChar
+                        } else if min_val >= 0 && max_val <= 65535 {
+                            CType::UShort
+                        } else if min_val >= -32768 && max_val <= 32767 {
+                            CType::Short
+                        } else {
+                            CType::Int
+                        }
+                    } else if min_val >= 0 {
+                        CType::UInt
+                    } else {
+                        CType::Int
+                    };
+                    out.insert(tag_name.clone(), underlying);
+                }
+            }
+            ast::TypeSpecifier::Struct(su_spec) | ast::TypeSpecifier::Union(su_spec) => {
+                if let Some(ref members) = su_spec.members {
+                    for member in members {
+                        collect_enum_underlying_types(
+                            &member.specifiers.type_specifiers,
+                            name_table,
+                            enum_constants,
+                            out,
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// incrementing values.  If an enumerator has a constant expression,
 /// we attempt simple integer literal evaluation; otherwise we fall
 /// back to sequential assignment.

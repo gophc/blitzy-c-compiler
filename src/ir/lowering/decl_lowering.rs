@@ -261,6 +261,23 @@ pub fn lower_global_variable(
             }
         });
 
+        // Check for __attribute__((alias("target"))) — this variable is
+        // an alias for another symbol. Record the mapping so the ELF writer
+        // can emit both symbols at the same address. The variable is still
+        // added as a non-definition global so that code referencing it
+        // can generate relocations; the ELF writer will emit a defined
+        // symbol at the target's address instead of an undefined one.
+        {
+            let decl_attrs = &init_decl.declarator.attributes;
+            if let Some(alias_target) = extract_alias_attribute(attributes, name_table)
+                .or_else(|| extract_alias_attribute(decl_attrs, name_table))
+            {
+                module
+                    .symbol_aliases
+                    .push((var_name_owned.clone(), alias_target));
+            }
+        }
+
         module.add_global(global);
     }
 }
@@ -489,6 +506,7 @@ pub fn lower_function_definition(
         target,
         &mut local_vars,
         name_table,
+        &knr_param_types,
     );
 
     // --- Seed the typeof resolution context with parameter types ---
@@ -505,7 +523,12 @@ pub fn lower_function_definition(
         for param_decl in &param_declarations {
             let pname = extract_param_name(param_decl, name_table);
             if !pname.is_empty() {
-                let ptype = resolve_param_type(param_decl, target, name_table);
+                // For K&R-style functions, use the K&R type map.
+                let ptype = if let Some(knr_ty) = knr_param_types.get(&pname) {
+                    knr_ty.clone()
+                } else {
+                    resolve_param_type(param_decl, target, name_table)
+                };
                 map.insert(pname, ptype);
             }
         }
@@ -563,6 +586,9 @@ pub fn lower_function_definition(
     let mut param_values: FxHashMap<String, Value> = FxHashMap::default();
     for param_decl in &param_declarations {
         let pname = extract_param_name(param_decl, name_table);
+        if std::env::var("BCC_DEBUG_KNR").is_ok() {
+            eprintln!("[KNR-PARAM-MAP] pname='{}' in_local_vars={}", pname, local_vars.contains_key(&pname));
+        }
         if !pname.is_empty() {
             if let Some(&alloca_val) = local_vars.get(&pname) {
                 param_values.insert(pname, alloca_val);
@@ -690,6 +716,24 @@ pub fn lower_function_definition(
         stmt_lowering::lower_statement(&mut stmt_ctx, &body_stmt);
     }
 
+    // --- DEBUG: Print block info before verify ---
+    if std::env::var("BCC_DEBUG_BLOCKS").is_ok() {
+        let bc = ir_function.block_count();
+        eprintln!("[DEBUG-BLOCKS] Function has {} blocks", bc);
+        for idx in 0..bc {
+            if let Some(block) = ir_function.get_block(idx) {
+                let has_term = block.has_terminator();
+                let inst_count = block.instructions.len();
+                let last_inst = if inst_count > 0 {
+                    format!("{}", block.instructions[inst_count-1])
+                } else {
+                    "EMPTY".to_string()
+                };
+                eprintln!("[DEBUG-BLOCKS]   Block {} (label={:?}): {} insts, terminated={}, succs={:?}, preds={:?}, last_inst={}", 
+                    idx, block.label, inst_count, has_term, block.successors(), block.predecessors(), last_inst);
+            }
+        }
+    }
     // --- Verify function termination ---
     verify_function_termination(&mut ir_function, &return_ir_type, &mut builder, diagnostics);
 
@@ -1202,6 +1246,67 @@ pub(super) fn evaluate_initializer_constant(
     }
 }
 
+/// Create an anonymous global variable for a compound literal used in a global
+/// initializer context (e.g. `struct A *p = &(struct A){10, 20};`).
+/// Returns the anonymous global name, or `None` if the compound literal cannot
+/// be evaluated as a constant.
+fn create_anonymous_compound_literal_global(
+    type_name: &ast::TypeName,
+    initializer: &ast::Initializer,
+    target: &Target,
+    type_builder: &TypeBuilder,
+    diagnostics: &mut DiagnosticEngine,
+    name_table: &[String],
+    enum_constants: &FxHashMap<String, i128>,
+) -> Option<String> {
+    // Resolve the C type from the type-name.
+    let cty_raw = super::resolve_type_name_for_const(type_name, target, type_builder);
+    // Resolve forward-referenced struct/union tags to get full field info.
+    let cty = {
+        let resolved_ref = crate::common::types::resolve_typedef(&cty_raw);
+        let maybe_full: Option<CType> = match resolved_ref {
+            CType::Struct { name: Some(ref tag), ref fields, .. } if fields.is_empty() => {
+                super::SIZEOF_STRUCT_DEFS.with(|defs| {
+                    defs.borrow().as_ref().and_then(|m| m.get(tag.as_str()).cloned())
+                })
+            }
+            CType::Union { name: Some(ref tag), ref fields, .. } if fields.is_empty() => {
+                super::SIZEOF_STRUCT_DEFS.with(|defs| {
+                    defs.borrow().as_ref().and_then(|m| m.get(tag.as_str()).cloned())
+                })
+            }
+            _ => None,
+        };
+        maybe_full.unwrap_or(cty_raw)
+    };
+    let ir_type = IrType::from_ctype(&cty, target);
+
+    // Evaluate the initializer to a compile-time constant.
+    let constant = match initializer {
+        ast::Initializer::Expression(expr) => {
+            evaluate_constant_expr(expr, &cty, target, type_builder, diagnostics, name_table, enum_constants)?
+        }
+        ast::Initializer::List { designators_and_initializers, .. } => {
+            lower_designated_initializer(designators_and_initializers, &cty, target, type_builder, diagnostics, name_table, enum_constants)?
+        }
+    };
+
+    // Generate a unique anonymous global name.
+    let idx = super::COMPOUND_LITERAL_COUNTER.with(|c| {
+        let v = c.get();
+        c.set(v + 1);
+        v
+    });
+    let anon_name = format!("__compound_literal.{}", idx);
+
+    // Push into the thread-local collection for draining after Pass 1.
+    super::COMPOUND_LITERAL_GLOBALS.with(|cl| {
+        cl.borrow_mut().push((anon_name.clone(), ir_type, constant, cty));
+    });
+
+    Some(anon_name)
+}
+
 /// Evaluate a compile-time constant expression for a global variable initializer.
 fn evaluate_constant_expr(
     expr: &ast::Expression,
@@ -1274,6 +1379,26 @@ fn evaluate_constant_expr(
                     }
                     return Some(Constant::GlobalRefOffset(sym, byte_off));
                 }
+                // &(CompoundLiteral) — create anonymous global for the compound literal
+                // and return a GlobalRef to it.
+                if let ast::Expression::CompoundLiteral {
+                    type_name,
+                    initializer,
+                    ..
+                } = operand.as_ref()
+                {
+                    if let Some(anon_name) = create_anonymous_compound_literal_global(
+                        type_name,
+                        initializer,
+                        target,
+                        type_builder,
+                        diagnostics,
+                        name_table,
+                        enum_constants,
+                    ) {
+                        return Some(Constant::GlobalRef(anon_name));
+                    }
+                }
                 Some(Constant::Undefined)
             }
             ast::UnaryOp::Negate => {
@@ -1345,6 +1470,85 @@ fn evaluate_constant_expr(
                 name_table,
                 enum_constants,
             )?;
+            // Handle pointer-arithmetic on string literals and global refs:
+            //   "foo" + 1  → GlobalRefOffset(anon_string, 1)
+            //   &var + N   → GlobalRefOffset(var, N * elem_size)
+            //   GlobalRef + N → GlobalRefOffset(name, N)
+            //   GlobalRefOffset + N → GlobalRefOffset(name, off + N)
+            match op {
+                ast::BinaryOp::Add => {
+                    // String + Integer → anonymous string global + offset
+                    if let (Constant::String(ref bytes), Constant::Integer(off)) = (&lhs, &rhs) {
+                        let anon = create_anonymous_string_global(bytes, target);
+                        if *off == 0 {
+                            return Some(Constant::GlobalRef(anon));
+                        }
+                        return Some(Constant::GlobalRefOffset(anon, *off as i64));
+                    }
+                    if let (Constant::Integer(off), Constant::String(ref bytes)) = (&lhs, &rhs) {
+                        let anon = create_anonymous_string_global(bytes, target);
+                        if *off == 0 {
+                            return Some(Constant::GlobalRef(anon));
+                        }
+                        return Some(Constant::GlobalRefOffset(anon, *off as i64));
+                    }
+                    // GlobalRef + Integer → GlobalRefOffset
+                    if let (Constant::GlobalRef(ref name), Constant::Integer(off)) = (&lhs, &rhs) {
+                        if *off == 0 {
+                            return Some(Constant::GlobalRef(name.clone()));
+                        }
+                        return Some(Constant::GlobalRefOffset(name.clone(), *off as i64));
+                    }
+                    if let (Constant::Integer(off), Constant::GlobalRef(ref name)) = (&lhs, &rhs) {
+                        if *off == 0 {
+                            return Some(Constant::GlobalRef(name.clone()));
+                        }
+                        return Some(Constant::GlobalRefOffset(name.clone(), *off as i64));
+                    }
+                    // GlobalRefOffset + Integer
+                    if let (Constant::GlobalRefOffset(ref name, base_off), Constant::Integer(off)) = (&lhs, &rhs) {
+                        let total = base_off + *off as i64;
+                        if total == 0 {
+                            return Some(Constant::GlobalRef(name.clone()));
+                        }
+                        return Some(Constant::GlobalRefOffset(name.clone(), total));
+                    }
+                    if let (Constant::Integer(off), Constant::GlobalRefOffset(ref name, base_off)) = (&lhs, &rhs) {
+                        let total = base_off + *off as i64;
+                        if total == 0 {
+                            return Some(Constant::GlobalRef(name.clone()));
+                        }
+                        return Some(Constant::GlobalRefOffset(name.clone(), total));
+                    }
+                }
+                ast::BinaryOp::Sub => {
+                    // GlobalRef - Integer → GlobalRefOffset with negative offset
+                    if let (Constant::GlobalRef(ref name), Constant::Integer(off)) = (&lhs, &rhs) {
+                        let neg = -(*off as i64);
+                        if neg == 0 {
+                            return Some(Constant::GlobalRef(name.clone()));
+                        }
+                        return Some(Constant::GlobalRefOffset(name.clone(), neg));
+                    }
+                    if let (Constant::GlobalRefOffset(ref name, base_off), Constant::Integer(off)) = (&lhs, &rhs) {
+                        let total = base_off - *off as i64;
+                        if total == 0 {
+                            return Some(Constant::GlobalRef(name.clone()));
+                        }
+                        return Some(Constant::GlobalRefOffset(name.clone(), total));
+                    }
+                    // String - Integer
+                    if let (Constant::String(ref bytes), Constant::Integer(off)) = (&lhs, &rhs) {
+                        let anon = create_anonymous_string_global(bytes, target);
+                        let neg = -(*off as i64);
+                        if neg == 0 {
+                            return Some(Constant::GlobalRef(anon));
+                        }
+                        return Some(Constant::GlobalRefOffset(anon, neg));
+                    }
+                }
+                _ => {}
+            }
             evaluate_const_binop(op, &lhs, &rhs)
         }
         ast::Expression::Cast {
@@ -1503,17 +1707,36 @@ fn evaluate_constant_expr(
         ast::Expression::MemberAccess { .. } | ast::Expression::PointerMemberAccess { .. } => {
             Some(Constant::Undefined)
         }
-        // AddressOfLabel (GCC &&label) — address constant.
-        ast::Expression::AddressOfLabel { label, .. } => {
-            let label_str = resolve_sym(name_table, label).to_string();
-            Some(Constant::GlobalRef(label_str))
-        }
+        // AddressOfLabel (GCC &&label) — NOT a link-time constant.
+        // Label addresses are function-local code addresses that can only
+        // be resolved at runtime (via LEA of the assembler-local label).
+        // Return None to force runtime initialization for static locals
+        // containing label address initializers.
+        ast::Expression::AddressOfLabel { .. } => None,
         // ArraySubscript — not compile-time constant.
         ast::Expression::ArraySubscript { .. } => Some(Constant::Undefined),
         // Generic (_Generic) — not evaluated here.
         ast::Expression::Generic { .. } => Some(Constant::Undefined),
-        // CompoundLiteral — may be constant in certain cases.
-        ast::Expression::CompoundLiteral { .. } => Some(Constant::Undefined),
+        // CompoundLiteral — create anonymous global and return its value.
+        ast::Expression::CompoundLiteral {
+            type_name,
+            initializer,
+            ..
+        } => {
+            if let Some(anon_name) = create_anonymous_compound_literal_global(
+                type_name,
+                initializer,
+                target,
+                type_builder,
+                diagnostics,
+                name_table,
+                enum_constants,
+            ) {
+                Some(Constant::GlobalRef(anon_name))
+            } else {
+                Some(Constant::Undefined)
+            }
+        }
         _ => {
             diagnostics.emit_error(
                 Span::dummy(),
@@ -1593,6 +1816,27 @@ fn truncate_const_to_ctype(val: i128, cty: &CType, target: &Target) -> i128 {
 }
 
 /// Evaluate a constant binary operation.
+/// Create an anonymous read-only global for a string literal used in
+/// pointer-arithmetic within a global initializer (e.g. `"foo" + 1`).
+/// Returns the generated symbol name.
+fn create_anonymous_string_global(bytes: &[u8], target: &Target) -> String {
+    let idx = super::COMPOUND_LITERAL_COUNTER.with(|c| {
+        let v = c.get();
+        c.set(v + 1);
+        v
+    });
+    let anon_name = format!("__anon_str.{}", idx);
+    let ir_type = IrType::Array(Box::new(IrType::I8), bytes.len());
+    let constant = Constant::String(bytes.to_vec());
+    let cty = CType::Array(Box::new(CType::Char), Some(bytes.len()));
+    super::COMPOUND_LITERAL_GLOBALS.with(|cl| {
+        cl.borrow_mut().push((anon_name.clone(), ir_type, constant, cty));
+    });
+    // Mark read-only so it goes to .rodata.
+    let _ = target;
+    anon_name
+}
+
 fn evaluate_const_binop(op: &ast::BinaryOp, lhs: &Constant, rhs: &Constant) -> Option<Constant> {
     match (lhs, rhs) {
         (Constant::Integer(a), Constant::Integer(b)) => {
@@ -1927,6 +2171,27 @@ fn lower_designated_initializer(
                         // (array/struct) field and there are enough remaining
                         // scalar inits, collect them into a sub-list and
                         // recurse.
+                        //
+                        // Exception: a string literal directly initializing a
+                        // char array field (e.g. `char a[32] = "abc"`) is NOT
+                        // brace elision — the string literal is a complete
+                        // initializer for the array.
+                        let is_string_for_char_array = matches!(
+                            &desig_init.initializer,
+                            ast::Initializer::Expression(expr) if matches!(
+                                expr.as_ref(),
+                                ast::Expression::StringLiteral { .. }
+                            )
+                        ) && matches!(
+                            resolved_ft,
+                            CType::Array(ref elem, _)
+                            if matches!(
+                                elem.as_ref(),
+                                CType::Char | CType::SChar | CType::UChar
+                                    | CType::Short | CType::UShort
+                                    | CType::Int | CType::UInt
+                            )
+                        );
                         let needs_brace_elision = desig_init.designators.is_empty()
                             && matches!(
                                 resolved_ft,
@@ -1935,7 +2200,8 @@ fn lower_designated_initializer(
                             && matches!(
                                 &desig_init.initializer,
                                 ast::Initializer::Expression(_)
-                            );
+                            )
+                            && !is_string_for_char_array;
 
                         if needs_brace_elision {
                             // Count how many scalar elements the aggregate
@@ -2035,6 +2301,7 @@ fn allocate_parameters(
     target: &Target,
     local_vars: &mut FxHashMap<String, Value>,
     name_table: &[String],
+    knr_param_types: &FxHashMap<String, CType>,
 ) {
     for (idx, param_decl) in params.iter().enumerate() {
         let param_name = extract_param_name(param_decl, name_table);
@@ -2042,7 +2309,20 @@ fn allocate_parameters(
             continue;
         }
 
-        let param_c_type = resolve_param_type(param_decl, target, name_table);
+        if std::env::var("BCC_DEBUG_KNR").is_ok() {
+            eprintln!("[KNR-DEBUG] allocate_parameters: idx={} name='{}' knr_types={:?}", idx, param_name, knr_param_types.keys().collect::<Vec<_>>());
+        }
+
+        // For K&R-style functions, use the K&R type map which has the real
+        // parameter types.  Without this, `void f(p) Point p;` where
+        // `Point = {long, long}` would use resolve_param_type which returns
+        // Int (4 bytes) instead of the full struct (16 bytes), causing
+        // stack corruption from overlapping allocas.
+        let param_c_type = if let Some(knr_ty) = knr_param_types.get(&param_name) {
+            knr_ty.clone()
+        } else {
+            resolve_param_type(param_decl, target, name_table)
+        };
         // C11 §6.7.6.3p7: Function parameter type adjustments —
         // "array of T" → "pointer to T", "function returning T" → "pointer to function returning T".
         // Without this, `char bar[]` would produce a 0/1-byte alloca instead
@@ -2063,6 +2343,10 @@ fn allocate_parameters(
         // body) would produce a 0-byte alloca instead of the full union size.
         let param_c_type = resolve_sizeof_struct_ref(param_c_type, target);
         let param_ir_type = IrType::from_ctype(&param_c_type, target);
+
+        if std::env::var("BCC_DEBUG_KNR").is_ok() {
+            eprintln!("[KNR-DEBUG]   param '{}': c_type={:?} ir_type={:?} size={}", param_name, param_c_type, param_ir_type, param_ir_type.size_bytes(target));
+        }
 
         // Round up struct alloca sizes to the next power-of-2 when the
         // natural struct size is not a power-of-2 (e.g. 3, 5, 6, 7 bytes).
@@ -2117,6 +2401,60 @@ fn collect_local_variables(body: &ast::Statement, name_table: &[String]) -> Vec<
 /// Pre-scanning for labels enables forward references in `asm goto`
 /// statements — the label block is created before the function body
 /// is lowered, so `wire_asm_goto_targets` can always find the block.
+/// Checks whether an initializer (recursively) contains any `AddressOfLabel`
+/// expressions (GCC `&&label`). Used to downgrade static local variables to
+/// stack-allocated when they contain label address initializers, since label
+/// addresses are function-local code pointers that cannot be resolved as
+/// link-time constants.
+/// Public accessor for `initializer_contains_label_address`.
+pub fn initializer_contains_label_address_pub(init: &ast::Initializer) -> bool {
+    initializer_contains_label_address(init)
+}
+
+fn initializer_contains_label_address(init: &ast::Initializer) -> bool {
+    match init {
+        ast::Initializer::Expression(expr) => expr_contains_label_address(expr),
+        ast::Initializer::List {
+            designators_and_initializers,
+            ..
+        } => designators_and_initializers
+            .iter()
+            .any(|item| initializer_contains_label_address(&item.initializer)),
+    }
+}
+
+/// Recursively checks if an expression contains `AddressOfLabel`.
+fn expr_contains_label_address(expr: &ast::Expression) -> bool {
+    match expr {
+        ast::Expression::AddressOfLabel { .. } => true,
+        ast::Expression::Parenthesized { inner, .. } => {
+            expr_contains_label_address(inner)
+        }
+        ast::Expression::Cast { operand, .. } => {
+            expr_contains_label_address(operand)
+        }
+        ast::Expression::UnaryOp { operand, .. } => {
+            expr_contains_label_address(operand)
+        }
+        ast::Expression::Binary { left, right, .. } => {
+            expr_contains_label_address(left) || expr_contains_label_address(right)
+        }
+        ast::Expression::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+            ..
+        } => {
+            expr_contains_label_address(condition)
+                || then_expr
+                    .as_ref()
+                    .map_or(false, |e| expr_contains_label_address(e))
+                || expr_contains_label_address(else_expr)
+        }
+        _ => false,
+    }
+}
+
 fn collect_label_names(stmt: &ast::Statement, labels: &mut Vec<String>, name_table: &[String]) {
     match stmt {
         ast::Statement::Labeled {
@@ -2300,8 +2638,23 @@ fn collect_locals_from_declaration(
         return;
     }
 
-    let is_static = matches!(storage_class, Some(ast::StorageClass::Static))
+    let mut is_static = matches!(storage_class, Some(ast::StorageClass::Static))
         || matches!(storage_class, Some(ast::StorageClass::ThreadLocal));
+
+    // If the declaration is static but the initializer contains label addresses
+    // (&&label — GCC computed goto), downgrade to stack-allocated. Label addresses
+    // are function-local code pointers that cannot be resolved at link time as
+    // global initializer constants; they must be materialized at runtime via LEA.
+    if is_static {
+        for init_decl in &decl.declarators {
+            if let Some(ref init) = init_decl.initializer {
+                if initializer_contains_label_address(init) {
+                    is_static = false;
+                    break;
+                }
+            }
+        }
+    }
 
     for init_decl in &decl.declarators {
         let declarator = &init_decl.declarator;
@@ -2658,6 +3011,32 @@ fn extract_section_attribute(
 ) -> Option<String> {
     for attr in attributes {
         if resolve_sym(name_table, &attr.name) == "section" {
+            if let Some(first_arg) = attr.args.first() {
+                match first_arg {
+                    ast::AttributeArg::String(bytes, _) => {
+                        return Some(String::from_utf8_lossy(bytes).into_owned());
+                    }
+                    ast::AttributeArg::Identifier(sym, _) => {
+                        return Some(resolve_sym(name_table, sym).to_string());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Extract the target name from `__attribute__((alias("target")))`.
+///
+/// Returns `Some(target_name)` if the alias attribute is present, `None`
+/// otherwise.
+fn extract_alias_attribute(
+    attributes: &[ast::Attribute],
+    name_table: &[String],
+) -> Option<String> {
+    for attr in attributes {
+        if resolve_sym(name_table, &attr.name) == "alias" {
             if let Some(first_arg) = attr.args.first() {
                 match first_arg {
                     ast::AttributeArg::String(bytes, _) => {
@@ -3249,10 +3628,47 @@ fn map_single_type_specifier_with_names(spec: &ast::TypeSpecifier, name_table: &
                 aligned,
             }
         }
-        ast::TypeSpecifier::Enum(e) => CType::Enum {
-            name: e.tag.as_ref().map(|t| sym_to_string(t, name_table)),
-            underlying_type: Box::new(CType::Int),
-        },
+        ast::TypeSpecifier::Enum(e) => {
+            let tag_name = e.tag.as_ref().map(|t| sym_to_string(t, name_table));
+            // Look up the correct underlying type from the
+            // ENUM_UNDERLYING_TYPES registry (populated in pass 0.5).
+            // GCC treats enum bitfields as unsigned when all values ≥ 0.
+            let underlying = if let Some(ref tn) = tag_name {
+                super::ENUM_UNDERLYING_TYPES.with(|m| {
+                    let borrow = m.borrow();
+                    borrow
+                        .as_ref()
+                        .and_then(|map| map.get(tn).cloned())
+                        .unwrap_or(CType::Int)
+                })
+            } else if let Some(ref enumerators) = e.enumerators {
+                // Anonymous enum — compute underlying from values inline.
+                let mut all_non_negative = true;
+                let mut next_val: i128 = 0;
+                for en in enumerators {
+                    if let Some(ref val_expr) = en.value {
+                        if let Some(v) = evaluate_const_int_expr(val_expr) {
+                            next_val = v as i128;
+                        }
+                    }
+                    if next_val < 0 {
+                        all_non_negative = false;
+                    }
+                    next_val += 1;
+                }
+                if all_non_negative {
+                    CType::UInt
+                } else {
+                    CType::Int
+                }
+            } else {
+                CType::Int
+            };
+            CType::Enum {
+                name: tag_name,
+                underlying_type: Box::new(underlying),
+            }
+        }
         ast::TypeSpecifier::TypedefName(name) => {
             let td_name = sym_to_string(name, name_table);
             // Look up the resolved underlying type from the typedef map
@@ -3939,6 +4355,14 @@ fn compute_struct_field_offset(
             };
 
             let mut bit_offset: usize = 0;
+            if std::env::var("BCC_DEBUG_OFFSETOF").is_ok() {
+                for (fi, f) in fields.iter().enumerate() {
+                    eprintln!(
+                        "[OFFSETOF] field[{}] name={:?} ty={:?} bw={:?}",
+                        fi, f.name, f.ty, f.bit_width
+                    );
+                }
+            }
             for field in fields {
                 // Handle bitfield alignment
                 if let Some(bits) = field.bit_width {
@@ -4093,16 +4517,231 @@ fn evaluate_address_of_subscript(
 /// is a compile-time address constant.
 fn evaluate_address_of_member_chain(
     expr: &ast::Expression,
-    _target: &Target,
+    target: &Target,
     name_table: &[String],
 ) -> Option<(String, i64)> {
-    // Handle &identifier (base case — already handled above, but defensive)
+    // Handle &identifier (base case)
     if let ast::Expression::Identifier { name, .. } = expr {
         let name_str = resolve_sym(name_table, name).to_string();
         return Some((name_str, 0));
     }
-    // For more complex expressions, bail out for now.
+    // Handle parenthesized: &(expr)
+    if let ast::Expression::Parenthesized { inner, .. } = expr {
+        return evaluate_address_of_member_chain(inner, target, name_table);
+    }
+    // Handle cast: &((type)expr) — cast doesn't change address
+    if let ast::Expression::Cast { operand, .. } = expr {
+        return evaluate_address_of_member_chain(operand, target, name_table);
+    }
+    // Handle array subscript: &arr[N]
+    if let ast::Expression::ArraySubscript { base, index, .. } = expr {
+        return evaluate_address_of_subscript(base, index, target, name_table);
+    }
+    // Handle member access: expr.member
+    if let ast::Expression::MemberAccess { object, member, .. } = expr {
+        let member_name = resolve_sym(name_table, member).to_string();
+        let (sym, base_off) =
+            evaluate_address_of_member_chain(object, target, name_table)?;
+        let field_off =
+            evaluate_member_field_offset(&member_name, object, target, name_table);
+        return Some((sym, base_off + field_off.unwrap_or(0)));
+    }
+    // Handle pointer member access: expr->member
+    if let ast::Expression::PointerMemberAccess { object, member, .. } = expr {
+        let member_name = resolve_sym(name_table, member).to_string();
+        let (sym, base_off) =
+            evaluate_address_of_member_chain(object, target, name_table)?;
+        let field_off =
+            evaluate_member_field_offset(&member_name, object, target, name_table);
+        return Some((sym, base_off + field_off.unwrap_or(0)));
+    }
+    // Handle pointer arithmetic: ptr + N or ptr - N
+    if let ast::Expression::Binary { op, left, right, .. } = expr {
+        match op {
+            ast::BinaryOp::Add => {
+                // Try left as pointer, right as integer
+                if let Some((sym, base_off)) =
+                    evaluate_address_of_member_chain(left, target, name_table)
+                {
+                    if let Some(n) = evaluate_const_int_expr(right) {
+                        let elem_sz = infer_element_size_for_ptr_arith(left, target, name_table);
+                        return Some((sym, base_off + (n as i64) * elem_sz));
+                    }
+                }
+                // Try right as pointer, left as integer
+                if let Some((sym, base_off)) =
+                    evaluate_address_of_member_chain(right, target, name_table)
+                {
+                    if let Some(n) = evaluate_const_int_expr(left) {
+                        let elem_sz = infer_element_size_for_ptr_arith(right, target, name_table);
+                        return Some((sym, base_off + (n as i64) * elem_sz));
+                    }
+                }
+            }
+            ast::BinaryOp::Sub => {
+                if let Some((sym, base_off)) =
+                    evaluate_address_of_member_chain(left, target, name_table)
+                {
+                    if let Some(n) = evaluate_const_int_expr(right) {
+                        let elem_sz = infer_element_size_for_ptr_arith(left, target, name_table);
+                        return Some((sym, base_off - (n as i64) * elem_sz));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
     None
+}
+
+/// Infer the element size for pointer arithmetic on a global variable.
+/// E.g., for `items + 1` where items is `struct foo[]`, returns sizeof(struct foo).
+fn infer_element_size_for_ptr_arith(
+    ptr_expr: &ast::Expression,
+    target: &Target,
+    name_table: &[String],
+) -> i64 {
+    let sym_name = match ptr_expr {
+        ast::Expression::Identifier { name, .. } => {
+            Some(resolve_sym(name_table, name).to_string())
+        }
+        ast::Expression::Parenthesized { inner, .. } => match inner.as_ref() {
+            ast::Expression::Identifier { name, .. } => {
+                Some(resolve_sym(name_table, name).to_string())
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some(ref name) = sym_name {
+        let elem_sz = super::TYPEOF_CONTEXT.with(|ctx| {
+            let borrow = ctx.borrow();
+            if let Some(ref map) = *borrow {
+                if let Some(cty) = map.get(name) {
+                    match cty {
+                        CType::Array(elem, _) => {
+                            let resolved = resolve_sizeof_struct_ref(elem.as_ref().clone(), target);
+                            return Some(crate::common::types::sizeof_ctype(&resolved, target) as i64);
+                        }
+                        CType::Pointer(pointee, _) => {
+                            let resolved =
+                                resolve_sizeof_struct_ref(pointee.as_ref().clone(), target);
+                            return Some(
+                                crate::common::types::sizeof_ctype(&resolved, target) as i64,
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            None
+        });
+        if let Some(sz) = elem_sz {
+            return sz;
+        }
+    }
+    // Default to pointer size for unknown types
+    target.pointer_width() as i64
+}
+
+/// Try to evaluate the byte offset of a struct/union member field.
+/// Uses TYPEOF_CONTEXT to look up the struct type from the base expression,
+/// then SIZEOF_STRUCT_DEFS to get the struct layout.
+fn evaluate_member_field_offset(
+    member_name: &str,
+    base_expr: &ast::Expression,
+    target: &Target,
+    name_table: &[String],
+) -> Option<i64> {
+    // Try to find the struct type from the base expression's type in TYPEOF_CONTEXT
+    let struct_type = infer_struct_type_from_expr(base_expr, name_table);
+    if let Some(sty) = struct_type {
+        // Resolve forward references
+        let resolved = resolve_sizeof_struct_ref(sty, target);
+        // Get fields from the resolved type
+        if let CType::Struct { ref fields, packed, .. } = &resolved {
+            let mut offset: i64 = 0;
+            for field in fields {
+                if let Some(ref fname) = field.name {
+                    // Align the offset for non-packed structs
+                    if !packed {
+                        let field_align =
+                            crate::common::types::alignof_ctype(&field.ty, target) as i64;
+                        if field_align > 0 {
+                            offset = (offset + field_align - 1) & !(field_align - 1);
+                        }
+                    }
+                    if fname == member_name {
+                        return Some(offset);
+                    }
+                }
+                let field_sz =
+                    crate::common::types::sizeof_ctype(&field.ty, target) as i64;
+                offset += field_sz;
+            }
+        } else if let CType::Union { .. } = &resolved {
+            // Union members are all at offset 0
+            return Some(0);
+        }
+    }
+    // If we can't determine the offset, return 0 (best-effort for field at start)
+    None
+}
+
+/// Infer the struct/union type that the base expression points to.
+/// E.g. for `items + 1` where items: struct foo[], returns struct foo.
+fn infer_struct_type_from_expr(
+    expr: &ast::Expression,
+    name_table: &[String],
+) -> Option<CType> {
+    match expr {
+        ast::Expression::Identifier { name, .. } => {
+            let sym_name = resolve_sym(name_table, name).to_string();
+            super::TYPEOF_CONTEXT.with(|ctx| {
+                let borrow = ctx.borrow();
+                if let Some(ref map) = *borrow {
+                    if let Some(cty) = map.get(&sym_name) {
+                        match cty {
+                            CType::Array(elem, _) => return Some(elem.as_ref().clone()),
+                            CType::Pointer(pointee, _) => return Some(pointee.as_ref().clone()),
+                            CType::Struct { .. } | CType::Union { .. } => {
+                                return Some(cty.clone())
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                None
+            })
+        }
+        ast::Expression::Parenthesized { inner, .. } => {
+            infer_struct_type_from_expr(inner, name_table)
+        }
+        ast::Expression::Cast { operand, .. } => {
+            infer_struct_type_from_expr(operand, name_table)
+        }
+        ast::Expression::Binary { left, right, .. } => {
+            // For ptr + N, infer from the pointer side
+            infer_struct_type_from_expr(left, name_table)
+                .or_else(|| infer_struct_type_from_expr(right, name_table))
+        }
+        ast::Expression::PointerMemberAccess { object, member, .. }
+        | ast::Expression::MemberAccess { object, member, .. } => {
+            // After member access, the result type is the member's type
+            let struct_ty = infer_struct_type_from_expr(object, name_table)?;
+            let resolved = resolve_sizeof_struct_ref(struct_ty, &crate::common::target::Target::X86_64);
+            if let CType::Struct { ref fields, .. } = resolved {
+                let member_name = resolve_sym(name_table, member).to_string();
+                for f in fields {
+                    if f.name.as_deref() == Some(&member_name) {
+                        return Some(f.ty.clone());
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 /// Evaluate sizeof for a type expression (simplified heuristic).

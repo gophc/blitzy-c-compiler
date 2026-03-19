@@ -862,15 +862,41 @@ impl<'src> Lexer<'src> {
         // Record end of numeric value text (before any suffix character).
         let value_end = self.scanner.offset() as usize;
 
-        // Float suffix: f/F → float, l/L → long double, nothing → double.
+        // Float suffix: f/F → float, l/L → long double, i/j → imaginary, combos.
         let suffix = match self.scanner.peek() {
             Some('f') | Some('F') => {
                 self.scanner.advance();
-                FloatSuffix::F
+                match self.scanner.peek() {
+                    Some('i') | Some('j') | Some('I') | Some('J') => {
+                        self.scanner.advance();
+                        FloatSuffix::FI
+                    }
+                    _ => FloatSuffix::F,
+                }
             }
             Some('l') | Some('L') => {
                 self.scanner.advance();
-                FloatSuffix::L
+                match self.scanner.peek() {
+                    Some('i') | Some('j') | Some('I') | Some('J') => {
+                        self.scanner.advance();
+                        FloatSuffix::LI
+                    }
+                    _ => FloatSuffix::L,
+                }
+            }
+            Some('i') | Some('j') | Some('I') | Some('J') => {
+                self.scanner.advance();
+                match self.scanner.peek() {
+                    Some('f') | Some('F') => {
+                        self.scanner.advance();
+                        FloatSuffix::FI
+                    }
+                    Some('l') | Some('L') => {
+                        self.scanner.advance();
+                        FloatSuffix::LI
+                    }
+                    _ => FloatSuffix::I,
+                }
             }
             _ => FloatSuffix::None,
         };

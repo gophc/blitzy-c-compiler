@@ -426,7 +426,7 @@ impl TypeBuilder {
                     bitfield_info: None,
                 });
 
-                abs_bit = (aligned_byte + field_size) * 8;
+                abs_bit = aligned_byte.wrapping_add(field_size).wrapping_mul(8);
 
                 if field_align > max_field_align {
                     max_field_align = field_align;

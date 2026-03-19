@@ -376,9 +376,10 @@ pub fn sizeof_ctype(ty: &CType, target: &Target) -> usize {
         // -- Pointer — target-dependent (ILP32: 4, LP64: 8)
         CType::Pointer(_, _) => target.pointer_width(),
 
-        // -- Array — element size × count; 0 for incomplete arrays
+        // -- Array — element size × count; 0 for incomplete arrays.
+        // Use wrapping_mul to handle intentionally huge arrays.
         CType::Array(elem, count) => match count {
-            Some(n) => sizeof_ctype(elem, target) * n,
+            Some(n) => sizeof_ctype(elem, target).wrapping_mul(*n),
             None => 0,
         },
 
@@ -530,7 +531,10 @@ fn compute_struct_size(
             let aligned_byte = align_up(byte_offset, field_align);
 
             // Advance past this field.
-            bit_offset = (aligned_byte + field_size) * 8;
+            // Use wrapping_add / wrapping_mul to avoid overflow panics on
+            // intentionally huge structs (e.g. torture test 991014-1 where
+            // `short buf[(1<<62)-256]` is declared).
+            bit_offset = aligned_byte.wrapping_add(field_size).wrapping_mul(8);
 
             if field_align > max_field_align {
                 max_field_align = field_align;
@@ -820,10 +824,10 @@ pub fn sizeof_ctype_resolved(
             ..
         } => compute_union_size_resolved(fields, *packed, *aligned, target, tag_types),
         CType::Array(elem, count) => match count {
-            Some(n) => sizeof_ctype_resolved(elem, target, tag_types) * n,
+            Some(n) => sizeof_ctype_resolved(elem, target, tag_types).wrapping_mul(*n),
             None => 0,
         },
-        CType::Complex(base) => 2 * sizeof_ctype_resolved(base, target, tag_types),
+        CType::Complex(base) => 2_usize.wrapping_mul(sizeof_ctype_resolved(base, target, tag_types)),
         CType::Atomic(inner) => sizeof_ctype_resolved(inner, target, tag_types),
         CType::Typedef { underlying, .. } => sizeof_ctype_resolved(underlying, target, tag_types),
         CType::Qualified(inner, _) => sizeof_ctype_resolved(inner, target, tag_types),
@@ -951,7 +955,7 @@ fn compute_struct_size_resolved(
                 alignof_ctype_resolved(&field.ty, target, tag_types)
             };
             let aligned_byte = align_up(byte_offset, field_align);
-            bit_offset = (aligned_byte + field_size) * 8;
+            bit_offset = aligned_byte.wrapping_add(field_size).wrapping_mul(8);
             if field_align > max_field_align {
                 max_field_align = field_align;
             }
@@ -1075,31 +1079,46 @@ pub fn is_integer(ty: &CType) -> bool {
 
 /// Returns `true` if `ty` is an unsigned integer type.
 pub fn is_unsigned(ty: &CType) -> bool {
-    matches!(
-        resolve_and_strip(ty),
-        CType::Bool
-            | CType::UChar
-            | CType::UShort
-            | CType::UInt
-            | CType::ULong
-            | CType::ULongLong
-            | CType::UInt128
-    )
+    let stripped = resolve_and_strip(ty);
+    match stripped {
+        // Enum delegates to its underlying type (GCC-compatible: enums with
+        // all-non-negative values have underlying_type UInt).
+        CType::Enum {
+            underlying_type, ..
+        } => is_unsigned(underlying_type),
+        _ => matches!(
+            stripped,
+            CType::Bool
+                | CType::UChar
+                | CType::UShort
+                | CType::UInt
+                | CType::ULong
+                | CType::ULongLong
+                | CType::UInt128
+        ),
+    }
 }
 
 /// Returns `true` if `ty` is a signed integer type. `char` is treated as
 /// signed (matching GCC defaults on x86/ARM/RISC-V).
 pub fn is_signed(ty: &CType) -> bool {
-    matches!(
-        resolve_and_strip(ty),
-        CType::Char
-            | CType::SChar
-            | CType::Short
-            | CType::Int
-            | CType::Long
-            | CType::LongLong
-            | CType::Int128
-    )
+    let stripped = resolve_and_strip(ty);
+    match stripped {
+        // Enum delegates to its underlying type.
+        CType::Enum {
+            underlying_type, ..
+        } => is_signed(underlying_type),
+        _ => matches!(
+            stripped,
+            CType::Char
+                | CType::SChar
+                | CType::Short
+                | CType::Int
+                | CType::Long
+                | CType::LongLong
+                | CType::Int128
+        ),
+    }
 }
 
 /// Returns `true` if `ty` is a floating-point type (`float`, `double`, or

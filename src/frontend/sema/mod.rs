@@ -1005,9 +1005,12 @@ impl<'a> SemanticAnalyzer<'a> {
     fn analyze_expression_inner(&mut self, expr: &mut Expression) -> Result<CType, ()> {
         match expr {
             // --- Primary expressions ---
-            Expression::IntegerLiteral { value, suffix, .. } => {
-                Ok(self.integer_literal_type(*value, suffix))
-            }
+            Expression::IntegerLiteral {
+                value,
+                suffix,
+                is_hex_or_octal,
+                ..
+            } => Ok(self.integer_literal_type(*value, suffix, *is_hex_or_octal)),
             Expression::FloatLiteral { suffix, .. } => Ok(self.float_literal_type(suffix)),
             Expression::StringLiteral { prefix, .. } => Ok(self.string_literal_type(prefix)),
             Expression::CharLiteral { prefix, .. } => {
@@ -1831,13 +1834,32 @@ impl<'a> SemanticAnalyzer<'a> {
                 underlying_type
             }
         } else {
-            underlying_type
+            // GCC-compatible: if all values are non-negative, use unsigned int
+            // so that bitfield reads use zero-extension instead of
+            // sign-extension.  This matches GCC's behavior where
+            // `enum { A=0, B=248 }; struct { enum e : 8; }` reads 248
+            // (not -8).
+            let min_val = if this_enum_min == i128::MAX {
+                0
+            } else {
+                this_enum_min
+            };
+            if min_val >= 0 {
+                CType::UInt
+            } else {
+                underlying_type
+            }
         };
 
         let enum_type = CType::Enum {
             name: spec.tag.map(|t| self.interner.resolve(t).to_string()),
-            underlying_type: Box::new(final_underlying),
+            underlying_type: Box::new(final_underlying.clone()),
         };
+
+        if std::env::var("BCC_DEBUG_ENUM").is_ok() {
+            eprintln!("[BCC_ENUM] analyze_enum_definition: name={:?} final_underlying={:?} min={} max={}", 
+                spec.tag.map(|t| self.interner.resolve(t).to_string()), final_underlying, this_enum_min, this_enum_max);
+        }
 
         if let Some(tag_name) = spec.tag {
             let entry = TagEntry {
@@ -2965,7 +2987,14 @@ impl<'a> SemanticAnalyzer<'a> {
     fn resolve_enum_type(&self, spec: &EnumSpecifier) -> CType {
         if let Some(tag_name) = spec.tag {
             if let Some(entry) = self.scopes.lookup_tag(tag_name) {
+                if std::env::var("BCC_DEBUG_ENUM").is_ok() {
+                    let tag_str = self.interner.resolve(tag_name);
+                    eprintln!("[BCC_ENUM] resolve_enum_type: tag={} found entry.ty={:?}", tag_str, entry.ty);
+                }
                 return entry.ty.clone();
+            } else if std::env::var("BCC_DEBUG_ENUM").is_ok() {
+                let tag_str = self.interner.resolve(tag_name);
+                eprintln!("[BCC_ENUM] resolve_enum_type: tag={} NOT FOUND, returning default Int", tag_str);
             }
         }
         CType::Enum {
@@ -4417,58 +4446,107 @@ impl<'a> SemanticAnalyzer<'a> {
                 });
             }
 
-            self.diagnostics
-                .emit_error(span, format!("use of undeclared identifier '{}'", name_str));
-            Err(())
+            // C89/GNU89 implicit function declaration: any undeclared identifier
+            // that appears in a function-call expression is implicitly declared as
+            // `int name(...)`. Emit a warning, not an error.
+            // Check if caller context suggests this is a function call (heuristic:
+            // the resolution is happening for a name that will be called).
+            // We always allow implicit declaration since we cannot distinguish
+            // call context here — the error will surface if used in non-call context.
+            self.diagnostics.emit_warning(
+                span,
+                format!("implicit declaration of function '{}'", name_str),
+            );
+            Ok(CType::Function {
+                return_type: Box::new(CType::Int),
+                params: vec![],
+                variadic: true,
+            })
         }
     }
 
     /// Determine the type of an integer literal based on value and suffix.
-    fn integer_literal_type(&self, value: u128, suffix: &IntegerSuffix) -> CType {
+    fn integer_literal_type(
+        &self,
+        value: u128,
+        suffix: &IntegerSuffix,
+        is_hex_or_octal: bool,
+    ) -> CType {
+        // C11 §6.4.4.1 Table:
+        //   Decimal (no suffix): int → long → long long
+        //   Hex/Octal (no suffix): int → unsigned int → long → unsigned long → long long → unsigned long long
+        //   Suffix U: unsigned int → unsigned long → unsigned long long
+        //   Suffix L (decimal): long → long long
+        //   Suffix L (hex/octal): long → unsigned long → long long → unsigned long long
+        //   Suffix LL (decimal): long long
+        //   Suffix LL (hex/octal): long long → unsigned long long
+        let long_sz = self.target.long_size();
         match suffix {
             IntegerSuffix::None => {
                 if value <= i32::MAX as u128 {
                     CType::Int
+                } else if is_hex_or_octal && value <= u32::MAX as u128 {
+                    CType::UInt
+                } else if long_sz == 8 && value <= i64::MAX as u128 {
+                    CType::Long
+                } else if is_hex_or_octal && long_sz == 8 && value <= u64::MAX as u128 {
+                    CType::ULong
+                } else if long_sz != 8 && value <= i32::MAX as u128 {
+                    // LP32: long == 4 bytes, same range as int
+                    CType::Long
+                } else if is_hex_or_octal && long_sz != 8 && value <= u32::MAX as u128 {
+                    CType::ULong
                 } else if value <= i64::MAX as u128 {
-                    if self.target.long_size() == 8 {
-                        CType::Long
-                    } else {
-                        CType::LongLong
-                    }
-                } else {
                     CType::LongLong
+                } else if is_hex_or_octal && value <= u64::MAX as u128 {
+                    CType::ULongLong
+                } else {
+                    // Values > 2^64 — unsigned long long (best effort)
+                    CType::ULongLong
                 }
             }
             IntegerSuffix::U => {
                 if value <= u32::MAX as u128 {
                     CType::UInt
-                } else if value <= u64::MAX as u128 {
-                    if self.target.long_size() == 8 {
-                        CType::ULong
-                    } else {
-                        CType::ULongLong
-                    }
+                } else if long_sz == 8 && value <= u64::MAX as u128 {
+                    CType::ULong
                 } else {
                     CType::ULongLong
                 }
             }
             IntegerSuffix::L => {
-                if self.target.long_size() == 8 {
+                if long_sz == 8 {
                     if value <= i64::MAX as u128 {
                         CType::Long
+                    } else if is_hex_or_octal && value <= u64::MAX as u128 {
+                        CType::ULong
                     } else {
                         CType::LongLong
                     }
                 } else if value <= i32::MAX as u128 {
                     CType::Long
-                } else {
+                } else if is_hex_or_octal && value <= u32::MAX as u128 {
+                    CType::ULong
+                } else if value <= i64::MAX as u128 {
                     CType::LongLong
+                } else if is_hex_or_octal && value <= u64::MAX as u128 {
+                    CType::ULongLong
+                } else {
+                    CType::ULongLong
                 }
             }
-            IntegerSuffix::UL => CType::ULong,
+            IntegerSuffix::UL => {
+                if long_sz == 8 && value <= u64::MAX as u128 {
+                    CType::ULong
+                } else {
+                    CType::ULongLong
+                }
+            }
             IntegerSuffix::LL => {
                 if value <= i64::MAX as u128 {
                     CType::LongLong
+                } else if is_hex_or_octal && value <= u64::MAX as u128 {
+                    CType::ULongLong
                 } else {
                     CType::ULongLong
                 }
@@ -4478,11 +4556,18 @@ impl<'a> SemanticAnalyzer<'a> {
     }
 
     /// Determine the type of a float literal based on suffix.
+    /// Imaginary suffixes (i/j) produce `_Complex` types for GCC extension.
     fn float_literal_type(&self, suffix: &FloatSuffix) -> CType {
         match suffix {
             FloatSuffix::None => CType::Double,
             FloatSuffix::F => CType::Float,
             FloatSuffix::L => CType::LongDouble,
+            // GCC imaginary constant extension: `1.0i` → `_Complex double`
+            // For the imaginary component, we return the base float type.
+            // The complex lowering handles constructing {0.0, imag}.
+            FloatSuffix::I => CType::Double,
+            FloatSuffix::FI => CType::Float,
+            FloatSuffix::LI => CType::LongDouble,
         }
     }
 
@@ -4724,6 +4809,17 @@ impl<'a> SemanticAnalyzer<'a> {
             }
             UnaryOp::BitwiseNot => Ok(operand_type.clone()),
             UnaryOp::LogicalNot => Ok(CType::Int),
+            // GCC __real__ / __imag__: for non-complex types, acts like identity
+            // (real part) or returns 0 (imaginary part). For _Complex, returns
+            // the component type.
+            UnaryOp::RealPart | UnaryOp::ImagPart => {
+                if let CType::Complex(inner) = operand_type {
+                    Ok(*inner.clone())
+                } else {
+                    // For non-complex, __real__ returns the value, __imag__ returns 0
+                    Ok(operand_type.clone())
+                }
+            }
         }
     }
 
@@ -5040,16 +5136,32 @@ mod tests {
         let interner = Interner::new();
         let sema = SemanticAnalyzer::new(&mut diag, &tb, Target::X86_64, &interner);
 
+        // Decimal 42 → int
         assert_eq!(
-            sema.integer_literal_type(42, &IntegerSuffix::None),
+            sema.integer_literal_type(42, &IntegerSuffix::None, false),
             CType::Int
         );
+        // Hex 42 → int (fits in signed int)
         assert_eq!(
-            sema.integer_literal_type(42, &IntegerSuffix::U),
+            sema.integer_literal_type(42, &IntegerSuffix::None, true),
+            CType::Int
+        );
+        // Decimal 0x83fd4005 (2214019077) → long (decimal skips unsigned int)
+        assert_eq!(
+            sema.integer_literal_type(0x83fd4005, &IntegerSuffix::None, false),
+            CType::Long
+        );
+        // Hex 0x83fd4005 → unsigned int (fits in u32, hex tries unsigned)
+        assert_eq!(
+            sema.integer_literal_type(0x83fd4005, &IntegerSuffix::None, true),
             CType::UInt
         );
         assert_eq!(
-            sema.integer_literal_type(42, &IntegerSuffix::ULL),
+            sema.integer_literal_type(42, &IntegerSuffix::U, false),
+            CType::UInt
+        );
+        assert_eq!(
+            sema.integer_literal_type(42, &IntegerSuffix::ULL, false),
             CType::ULongLong
         );
     }

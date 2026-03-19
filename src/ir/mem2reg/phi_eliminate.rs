@@ -145,6 +145,15 @@ pub fn eliminate_phi_nodes(func: &mut IrFunction) {
     // A critical edge is one where the predecessor has >1 successor AND the
     // phi's block has >1 predecessor. Splitting inserts an intermediate block
     // so copies can be safely placed without affecting other control-flow paths.
+    //
+    // EXCEPTION: Do NOT split critical edges where the predecessor ends with
+    // IndirectBranch (computed goto). IndirectBranch jumps to a runtime-
+    // computed address (from BlockAddress instructions), and splitting would
+    // create trampoline blocks that are unreachable because the runtime target
+    // still points to the original label. Instead, copies for IndirectBranch
+    // predecessors are inserted inline before the terminator. This is safe
+    // because each phi has a unique result value — copies for different target
+    // blocks don't interfere with each other.
     let mut edges_to_split: Vec<(usize, usize)> = Vec::new();
     for (&block_idx, phis) in phi_nodes.iter() {
         for phi in phis {
@@ -152,7 +161,16 @@ pub fn eliminate_phi_nodes(func: &mut IrFunction) {
                 if is_critical_edge(func, pred_idx, block_idx)
                     && !edges_to_split.contains(&(pred_idx, block_idx))
                 {
-                    edges_to_split.push((pred_idx, block_idx));
+                    // Skip splitting if predecessor ends with IndirectBranch.
+                    let pred_is_indirect = func
+                        .get_block(pred_idx)
+                        .and_then(|b| b.terminator())
+                        .map_or(false, |t| {
+                            matches!(t, Instruction::IndirectBranch { .. })
+                        });
+                    if !pred_is_indirect {
+                        edges_to_split.push((pred_idx, block_idx));
+                    }
                 }
             }
         }
@@ -487,6 +505,15 @@ fn retarget_terminator(block: &mut BasicBlock, old_target: usize, new_target: us
                     *default = BlockId(new_target as u32);
                 }
                 for (_, target) in cases.iter_mut() {
+                    if target.index() == old_target {
+                        *target = BlockId(new_target as u32);
+                    }
+                }
+            }
+            Instruction::IndirectBranch {
+                possible_targets, ..
+            } => {
+                for target in possible_targets.iter_mut() {
                     if target.index() == old_target {
                         *target = BlockId(new_target as u32);
                     }

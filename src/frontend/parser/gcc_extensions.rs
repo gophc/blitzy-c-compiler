@@ -914,6 +914,7 @@ mod tests {
         let expr = Expression::IntegerLiteral {
             value: 42,
             suffix: IntegerSuffix::None,
+            is_hex_or_octal: false,
             span,
         };
         assert_eq!(get_expression_span(&expr), span);
@@ -975,11 +976,13 @@ mod tests {
         let left = Expression::IntegerLiteral {
             value: 1,
             suffix: IntegerSuffix::None,
+            is_hex_or_octal: false,
             span: inner_span,
         };
         let right = Expression::IntegerLiteral {
             value: 2,
             suffix: IntegerSuffix::None,
+            is_hex_or_octal: false,
             span: Span::new(1, 6, 10),
         };
         let expr = Expression::Binary {

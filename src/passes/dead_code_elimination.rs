@@ -109,6 +109,7 @@ fn has_side_effects(inst: &Instruction) -> bool {
         Instruction::Branch { .. }
         | Instruction::CondBranch { .. }
         | Instruction::Switch { .. }
+        | Instruction::IndirectBranch { .. }
         | Instruction::Return { .. } => true,
 
         // All other instructions are side-effect-free and can be removed
@@ -127,7 +128,8 @@ fn has_side_effects(inst: &Instruction) -> bool {
         | Instruction::ZExt { .. }
         | Instruction::SExt { .. }
         | Instruction::IntToPtr { .. }
-        | Instruction::PtrToInt { .. } => false,
+        | Instruction::PtrToInt { .. }
+        | Instruction::BlockAddress { .. } => false,
     }
 }
 

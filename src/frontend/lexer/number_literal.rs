@@ -211,16 +211,48 @@ fn parse_integer_suffix(
 ///
 /// - `f` / `F` → [`FloatSuffix::F`] (float)
 /// - `l` / `L` → [`FloatSuffix::L`] (long double)
+/// - `i` / `j` → [`FloatSuffix::I`] (imaginary double, GCC extension)
+/// - `fi` / `if` / `fj` / `jf` → [`FloatSuffix::FI`] (imaginary float)
+/// - `li` / `il` / `lj` / `jl` → [`FloatSuffix::LI`] (imaginary long double)
 /// - (nothing) → [`FloatSuffix::None`] (double)
 fn parse_float_suffix(scanner: &mut Scanner) -> FloatSuffix {
     match scanner.peek() {
         Some('f') | Some('F') => {
             scanner.advance();
-            FloatSuffix::F
+            // Check for trailing imaginary suffix: fi / fj
+            match scanner.peek() {
+                Some('i') | Some('j') | Some('I') | Some('J') => {
+                    scanner.advance();
+                    FloatSuffix::FI
+                }
+                _ => FloatSuffix::F,
+            }
         }
         Some('l') | Some('L') => {
             scanner.advance();
-            FloatSuffix::L
+            // Check for trailing imaginary suffix: li / lj
+            match scanner.peek() {
+                Some('i') | Some('j') | Some('I') | Some('J') => {
+                    scanner.advance();
+                    FloatSuffix::LI
+                }
+                _ => FloatSuffix::L,
+            }
+        }
+        Some('i') | Some('j') | Some('I') | Some('J') => {
+            scanner.advance();
+            // Check for trailing type suffix: if / il
+            match scanner.peek() {
+                Some('f') | Some('F') => {
+                    scanner.advance();
+                    FloatSuffix::FI
+                }
+                Some('l') | Some('L') => {
+                    scanner.advance();
+                    FloatSuffix::LI
+                }
+                _ => FloatSuffix::I,
+            }
         }
         _ => FloatSuffix::None,
     }
@@ -256,6 +288,48 @@ fn check_trailing_invalid_chars(
             let span = Span::new(file_id, bad_start, scanner.offset());
             diagnostics.emit_error(span, "invalid suffix on numeric literal");
         }
+    }
+}
+
+/// GCC extension: Convert an integer literal to a float imaginary literal if
+/// the next character is 'i' or 'j'. For example, `200i` is equivalent to
+/// `200.0i` and represents a `_Complex double` imaginary constant.
+///
+/// Returns the original token unchanged if no imaginary suffix follows.
+fn maybe_convert_to_imaginary(
+    scanner: &mut Scanner,
+    token: TokenKind,
+) -> TokenKind {
+    match scanner.peek() {
+        Some('i') | Some('j') | Some('I') | Some('J') => {
+            // Consume the imaginary suffix
+            scanner.advance();
+            // Check for additional type suffix after i/j: fi/li
+            let suffix = match scanner.peek() {
+                Some('f') | Some('F') => {
+                    scanner.advance();
+                    FloatSuffix::FI
+                }
+                Some('l') | Some('L') => {
+                    scanner.advance();
+                    FloatSuffix::LI
+                }
+                _ => FloatSuffix::I,
+            };
+            // Extract the integer value and convert to float string
+            let value_str = match &token {
+                TokenKind::IntegerLiteral { value, .. } => {
+                    format!("{}.0", value)
+                }
+                _ => "0.0".to_string(),
+            };
+            TokenKind::FloatLiteral {
+                value: value_str,
+                suffix,
+                base: NumericBase::Decimal,
+            }
+        }
+        _ => token,
     }
 }
 
@@ -422,13 +496,14 @@ fn lex_hex_literal(
     }
 
     let suffix = parse_integer_suffix(scanner, diagnostics, file_id);
-    check_trailing_invalid_chars(scanner, diagnostics, file_id, start_offset);
-
-    TokenKind::IntegerLiteral {
+    let int_tok = TokenKind::IntegerLiteral {
         value,
         suffix,
         base: NumericBase::Hexadecimal,
-    }
+    };
+    let tok = maybe_convert_to_imaginary(scanner, int_tok);
+    check_trailing_invalid_chars(scanner, diagnostics, file_id, start_offset);
+    tok
 }
 
 // ---------------------------------------------------------------------------
@@ -564,13 +639,14 @@ fn lex_binary_literal(
     }
 
     let suffix = parse_integer_suffix(scanner, diagnostics, file_id);
-    check_trailing_invalid_chars(scanner, diagnostics, file_id, start_offset);
-
-    TokenKind::IntegerLiteral {
+    let int_tok = TokenKind::IntegerLiteral {
         value,
         suffix,
         base: NumericBase::Binary,
-    }
+    };
+    let tok = maybe_convert_to_imaginary(scanner, int_tok);
+    check_trailing_invalid_chars(scanner, diagnostics, file_id, start_offset);
+    tok
 }
 
 // ===========================================================================
@@ -646,13 +722,14 @@ fn lex_after_leading_zero(
     }
 
     let suffix = parse_integer_suffix(scanner, diagnostics, file_id);
-    check_trailing_invalid_chars(scanner, diagnostics, file_id, start_offset);
-
-    TokenKind::IntegerLiteral {
+    let int_tok = TokenKind::IntegerLiteral {
         value,
         suffix,
         base: NumericBase::Octal,
-    }
+    };
+    let tok = maybe_convert_to_imaginary(scanner, int_tok);
+    check_trailing_invalid_chars(scanner, diagnostics, file_id, start_offset);
+    tok
 }
 
 // ===========================================================================
@@ -698,13 +775,14 @@ fn lex_decimal_literal(
     }
 
     let suffix = parse_integer_suffix(scanner, diagnostics, file_id);
-    check_trailing_invalid_chars(scanner, diagnostics, file_id, start_offset);
-
-    TokenKind::IntegerLiteral {
+    let int_tok = TokenKind::IntegerLiteral {
         value,
         suffix,
         base: NumericBase::Decimal,
-    }
+    };
+    let tok = maybe_convert_to_imaginary(scanner, int_tok);
+    check_trailing_invalid_chars(scanner, diagnostics, file_id, start_offset);
+    tok
 }
 
 // ===========================================================================

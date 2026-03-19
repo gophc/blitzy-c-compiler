@@ -256,7 +256,7 @@ fn reg_class_for_type(ty: &IrType) -> RegClass {
 /// value is a sensible default (`I64`) that will never actually be used
 /// in allocation because those instructions produce no `Value`.
 fn instruction_result_type(inst: &Instruction) -> IrType {
-    match inst {
+    let ty = match inst {
         Instruction::Alloca { .. } => IrType::Ptr,
         Instruction::Load { ty, .. } => ty.clone(),
         Instruction::BinOp { ty, .. } => ty.clone(),
@@ -273,7 +273,28 @@ fn instruction_result_type(inst: &Instruction) -> IrType {
         Instruction::InlineAsm { .. } => IrType::I64,
         // Store, Branch, CondBranch, Switch, Return — no result
         _ => IrType::I64,
+    };
+    // Normalize single-float struct types to the inner float type so the
+    // register allocator assigns XMM registers (SSE class) instead of GPRs.
+    // A `struct { double d; }` is ABI-classified as SSE and must live in XMM.
+    normalize_sse_struct_type(ty)
+}
+
+/// If `ty` is a struct containing exactly one float field, return the inner
+/// float type.  Otherwise return `ty` unchanged.  This ensures SSE-class
+/// struct values are allocated to XMM registers.
+#[inline]
+fn normalize_sse_struct_type(ty: IrType) -> IrType {
+    if let IrType::Struct(ref st) = ty {
+        if st.fields.len() == 1 {
+            match st.fields[0] {
+                IrType::F64 | IrType::F80 => return IrType::F64,
+                IrType::F32 => return IrType::F32,
+                _ => {}
+            }
+        }
     }
+    ty
 }
 
 // ===========================================================================
@@ -298,6 +319,13 @@ fn instruction_result_type(inst: &Instruction) -> IrType {
 /// ready for consumption by [`allocate_registers`].
 pub fn compute_live_intervals(func: &IrFunction) -> Vec<LiveInterval> {
     let rpo = func.reverse_postorder();
+    if std::env::var("BCC_DEBUG_INTERVALS").is_ok() {
+        eprintln!("[RA] RPO for '{}': {:?}  (total blocks={})", func.name, rpo, func.block_count());
+        for (i, blk) in func.blocks.iter().enumerate() {
+            eprintln!("[RA]   block {} succs={:?} preds={:?} insts={}",
+                i, blk.successors(), blk.predecessors(), blk.instruction_count());
+        }
+    }
     if rpo.is_empty() {
         return Vec::new();
     }

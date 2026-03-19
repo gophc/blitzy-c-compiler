@@ -123,52 +123,78 @@ impl<'a> TypeChecker<'a> {
 
     /// Determines the C type for an integer literal based on value and suffix.
     /// Follows C11 §6.4.4.1 integer literal type determination rules.
-    fn integer_literal_type(&self, value: u128, suffix: &IntegerSuffix) -> CType {
+    fn integer_literal_type(
+        &self,
+        value: u128,
+        suffix: &IntegerSuffix,
+        is_hex_or_octal: bool,
+    ) -> CType {
+        // C11 §6.4.4.1: hex/octal unsuffixed literals may have unsigned types.
+        let long_sz = self.target.long_size();
         match suffix {
             IntegerSuffix::None => {
-                // Decimal: int → long → long long
                 if value <= i32::MAX as u128 {
                     CType::Int
+                } else if is_hex_or_octal && value <= u32::MAX as u128 {
+                    CType::UInt
+                } else if long_sz == 8 && value <= i64::MAX as u128 {
+                    CType::Long
+                } else if is_hex_or_octal && long_sz == 8 && value <= u64::MAX as u128 {
+                    CType::ULong
+                } else if long_sz != 8 && value <= i32::MAX as u128 {
+                    CType::Long
+                } else if is_hex_or_octal && long_sz != 8 && value <= u32::MAX as u128 {
+                    CType::ULong
                 } else if value <= i64::MAX as u128 {
-                    if self.target.long_size() == 8 {
-                        CType::Long
-                    } else {
-                        CType::LongLong
-                    }
-                } else {
                     CType::LongLong
+                } else if is_hex_or_octal && value <= u64::MAX as u128 {
+                    CType::ULongLong
+                } else {
+                    CType::ULongLong
                 }
             }
             IntegerSuffix::U => {
                 if value <= u32::MAX as u128 {
                     CType::UInt
-                } else if value <= u64::MAX as u128 {
-                    if self.target.long_size() == 8 {
-                        CType::ULong
-                    } else {
-                        CType::ULongLong
-                    }
+                } else if long_sz == 8 && value <= u64::MAX as u128 {
+                    CType::ULong
                 } else {
                     CType::ULongLong
                 }
             }
             IntegerSuffix::L => {
-                if self.target.long_size() == 8 {
+                if long_sz == 8 {
                     if value <= i64::MAX as u128 {
                         CType::Long
+                    } else if is_hex_or_octal && value <= u64::MAX as u128 {
+                        CType::ULong
                     } else {
                         CType::LongLong
                     }
                 } else if value <= i32::MAX as u128 {
                     CType::Long
-                } else {
+                } else if is_hex_or_octal && value <= u32::MAX as u128 {
+                    CType::ULong
+                } else if value <= i64::MAX as u128 {
                     CType::LongLong
+                } else if is_hex_or_octal && value <= u64::MAX as u128 {
+                    CType::ULongLong
+                } else {
+                    CType::ULongLong
                 }
             }
-            IntegerSuffix::UL => CType::ULong,
+            IntegerSuffix::UL => {
+                if long_sz == 8 && value <= u64::MAX as u128 {
+                    CType::ULong
+                } else {
+                    CType::ULongLong
+                }
+            }
             IntegerSuffix::LL => {
                 if value <= i64::MAX as u128 {
                     CType::LongLong
+                } else if is_hex_or_octal && value <= u64::MAX as u128 {
+                    CType::ULongLong
                 } else {
                     CType::ULongLong
                 }
@@ -178,11 +204,16 @@ impl<'a> TypeChecker<'a> {
     }
 
     /// Determines the C type for a float literal based on suffix.
+    /// Imaginary suffixes (i/j) produce the base float type (complex lowering
+    /// constructs the full {0.0, imag} pair).
     fn float_literal_type(&self, suffix: &FloatSuffix) -> CType {
         match suffix {
             FloatSuffix::None => CType::Double,
             FloatSuffix::F => CType::Float,
             FloatSuffix::L => CType::LongDouble,
+            FloatSuffix::I => CType::Double,
+            FloatSuffix::FI => CType::Float,
+            FloatSuffix::LI => CType::LongDouble,
         }
     }
 
@@ -366,9 +397,12 @@ impl<'a> TypeChecker<'a> {
     pub fn check_expression_type(&mut self, expr: &Expression) -> Result<CType, ()> {
         match expr {
             // ── Literals ────────────────────────────────────────────
-            Expression::IntegerLiteral { value, suffix, .. } => {
-                Ok(self.integer_literal_type(*value, suffix))
-            }
+            Expression::IntegerLiteral {
+                value,
+                suffix,
+                is_hex_or_octal,
+                ..
+            } => Ok(self.integer_literal_type(*value, suffix, *is_hex_or_octal)),
             Expression::FloatLiteral { suffix, .. } => Ok(self.float_literal_type(suffix)),
             Expression::StringLiteral { prefix, .. } => Ok(self.string_literal_type(prefix)),
             Expression::CharLiteral { .. } => {
@@ -913,6 +947,17 @@ impl<'a> TypeChecker<'a> {
                     Err(())
                 }
             }
+
+            // ── GCC __real__/__imag__: extract component of _Complex ──
+            UnaryOp::RealPart | UnaryOp::ImagPart => {
+                if let CType::Complex(inner) = &resolved {
+                    Ok((**inner).clone())
+                } else {
+                    // For non-complex types, __real__ returns the type itself,
+                    // __imag__ returns 0 of the same type.
+                    Ok(operand_ty.clone())
+                }
+            }
         }
     }
 
@@ -1241,6 +1286,12 @@ impl<'a> TypeChecker<'a> {
             Expression::Parenthesized { inner, .. } => Self::is_lvalue(inner),
             // Pre-increment/decrement results are lvalues
             Expression::PreIncrement { .. } | Expression::PreDecrement { .. } => true,
+            // GCC __real__/__imag__ are lvalues if their operand is an lvalue
+            Expression::UnaryOp {
+                op: UnaryOp::RealPart | UnaryOp::ImagPart,
+                operand,
+                ..
+            } => Self::is_lvalue(operand),
             // Everything else is not an lvalue
             _ => false,
         }

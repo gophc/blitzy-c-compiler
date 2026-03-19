@@ -790,11 +790,22 @@ pub fn lower_declaration_initializers(ctx: &mut StmtLoweringContext<'_>, decl: &
         return;
     }
     // Skip static declarations — they were lowered as globals.
+    // Exception: static locals whose initializers contain label addresses
+    // (&&label — computed goto) are downgraded to stack-allocated and need
+    // runtime initialization.
     if matches!(
         decl.specifiers.storage_class,
         Some(ast::StorageClass::Static) | Some(ast::StorageClass::ThreadLocal)
     ) {
-        return;
+        let has_label_addr = decl.declarators.iter().any(|init_decl| {
+            init_decl
+                .initializer
+                .as_ref()
+                .map_or(false, decl_lowering::initializer_contains_label_address_pub)
+        });
+        if !has_label_addr {
+            return;
+        }
     }
     // Skip typedef declarations — but handle VLA typedefs specially.
     if matches!(
@@ -2032,56 +2043,38 @@ fn lower_goto(
 /// Lowers a `goto *expr;` (GCC computed goto extension).
 ///
 /// The expression evaluates to a pointer (address of a label obtained via
-/// `&&label`). We lower this as an indirect branch. Since the set of
-/// possible targets is not known statically from the goto itself, we
-/// collect all label blocks known so far as potential targets.
+/// `&&label`).  We emit an `IndirectBranch` instruction whose target is
+/// the loaded code-address value.  The `possible_targets` list (for CFG
+/// purposes) is the set of all label blocks in the current function.
 fn lower_computed_goto(
     ctx: &mut StmtLoweringContext<'_>,
     target_expr: &ast::Expression,
     span: Span,
 ) -> Option<BlockId> {
+    // Evaluate the target expression — typically `j[i]` where `j` was
+    // initialized with `&&label` values.  This produces a `void*` that
+    // is the actual code address of the target label.
     let addr_val = lower_expr_via_context(ctx, target_expr);
 
-    // The address value is a void* that was produced by &&label.
-    // We encoded each label's address as (BlockId.index() + 1) cast to ptr.
-    // Convert back to integer for the Switch dispatch.
-    let int_val = {
-        let (v, inst) = ctx.builder.build_ptr_to_int(addr_val, IrType::I64, span);
-        emit_instruction_to_current_block(ctx, inst);
-        v
-    };
+    // Collect all known label blocks as possible indirect-branch targets
+    // (for CFG construction and phi-node placement).
+    let possible_targets: Vec<crate::ir::instructions::BlockId> =
+        ctx.label_blocks.values().copied().collect();
 
-    // Collect all known label blocks as possible targets for the indirect
-    // branch. Use 1-based block indices matching lower_address_of_label.
-    let possible_targets: Vec<(i64, BlockId)> = ctx
-        .label_blocks
-        .values()
-        .map(|&block_id| (block_id.index() as i64 + 1, block_id))
-        .collect();
+    // Build the indirect branch instruction.
+    let ibr = ctx
+        .builder
+        .build_indirect_branch(addr_val, possible_targets.clone(), span);
+    emit_instruction_to_current_block(ctx, ibr);
 
-    // Use an unreachable block as the default target.
-    let unreachable_block = create_block(ctx, "computed_goto.unreachable");
-
-    // Build a switch instruction to simulate indirect branch.
-    let switch_inst =
-        ctx.builder
-            .build_switch(int_val, unreachable_block, possible_targets.clone(), span);
-    emit_instruction_to_current_block(ctx, switch_inst);
-
-    // Add CFG edges.
+    // Add CFG edges to all possible targets.
     if let Some(current) = ctx.builder.get_insert_block() {
-        add_cfg_edge(ctx, current.index(), unreachable_block.index());
-        for &(_val, target) in &possible_targets {
+        for &target in &possible_targets {
             add_cfg_edge(ctx, current.index(), target.index());
         }
     }
 
-    // The unreachable block terminates with a return (trap).
-    ctx.builder.set_insert_point(unreachable_block);
-    let trap_ret = ctx.builder.build_return(None, span);
-    emit_instruction_to_current_block(ctx, trap_ret);
-
-    None // Block is terminated (both dispatch and unreachable).
+    None // Block is terminated.
 }
 
 // ===========================================================================

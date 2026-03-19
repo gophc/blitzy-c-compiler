@@ -495,6 +495,36 @@ pub enum Instruction {
         span: Span,
     },
 
+    /// Indirect branch (terminator).
+    ///
+    /// Jumps to the code address contained in `target`.  Used for GCC
+    /// computed-goto (`goto *expr`).  `possible_targets` lists all blocks
+    /// that could be reached — these are the blocks corresponding to labels
+    /// whose address was taken via `&&label`.  The list is used for CFG
+    /// construction only; at runtime the actual branch target is the
+    /// pointer value in `target`.
+    IndirectBranch {
+        /// The code-address value (a `void*` produced by `&&label`).
+        target: Value,
+        /// All basic blocks that could be reached (for CFG / phi edges).
+        possible_targets: Vec<BlockId>,
+        /// Source location.
+        span: Span,
+    },
+
+    /// Produces the runtime address of a basic block as a `void*`.
+    /// Used by the GCC `&&label` extension.  At code-generation time,
+    /// this lowers to a `LEA` of the block's assembly label (RIP-relative
+    /// on x86-64).
+    BlockAddress {
+        /// SSA result value — the address as a pointer.
+        result: Value,
+        /// The target block whose address is taken.
+        block: BlockId,
+        /// Source location.
+        span: Span,
+    },
+
     /// Function call.
     ///
     /// Calls the function referenced by `callee` with the given `args`.
@@ -716,12 +746,14 @@ impl Instruction {
             | Instruction::SExt { result, .. }
             | Instruction::IntToPtr { result, .. }
             | Instruction::PtrToInt { result, .. }
-            | Instruction::InlineAsm { result, .. } => Some(*result),
+            | Instruction::InlineAsm { result, .. }
+            | Instruction::BlockAddress { result, .. } => Some(*result),
 
             Instruction::Store { .. }
             | Instruction::Branch { .. }
             | Instruction::CondBranch { .. }
             | Instruction::Switch { .. }
+            | Instruction::IndirectBranch { .. }
             | Instruction::Return { .. } => None,
         }
     }
@@ -742,6 +774,7 @@ impl Instruction {
             | Instruction::Branch { span, .. }
             | Instruction::CondBranch { span, .. }
             | Instruction::Switch { span, .. }
+            | Instruction::IndirectBranch { span, .. }
             | Instruction::Call { span, .. }
             | Instruction::Return { span, .. }
             | Instruction::Phi { span, .. }
@@ -752,7 +785,8 @@ impl Instruction {
             | Instruction::SExt { span, .. }
             | Instruction::IntToPtr { span, .. }
             | Instruction::PtrToInt { span, .. }
-            | Instruction::InlineAsm { span, .. } => *span,
+            | Instruction::InlineAsm { span, .. }
+            | Instruction::BlockAddress { span, .. } => *span,
         }
     }
 
@@ -769,6 +803,7 @@ impl Instruction {
             Instruction::Branch { .. }
                 | Instruction::CondBranch { .. }
                 | Instruction::Switch { .. }
+                | Instruction::IndirectBranch { .. }
                 | Instruction::Return { .. }
         )
     }
@@ -831,6 +866,8 @@ impl Instruction {
 
             Instruction::Switch { value, .. } => vec![*value],
 
+            Instruction::IndirectBranch { target, .. } => vec![*target],
+
             Instruction::Call { callee, args, .. } => {
                 let mut ops = Vec::with_capacity(1 + args.len());
                 ops.push(*callee);
@@ -857,6 +894,8 @@ impl Instruction {
             | Instruction::PtrToInt { value, .. } => vec![*value],
 
             Instruction::InlineAsm { operands, .. } => operands.clone(),
+
+            Instruction::BlockAddress { .. } => vec![],
         }
     }
 
@@ -885,6 +924,8 @@ impl Instruction {
             Instruction::CondBranch { condition, .. } => vec![condition],
 
             Instruction::Switch { value, .. } => vec![value],
+
+            Instruction::IndirectBranch { target, .. } => vec![target],
 
             Instruction::Call { callee, args, .. } => {
                 let mut ops: Vec<&mut Value> = Vec::with_capacity(1 + args.len());
@@ -916,6 +957,8 @@ impl Instruction {
             | Instruction::PtrToInt { value, .. } => vec![value],
 
             Instruction::InlineAsm { operands, .. } => operands.iter_mut().collect(),
+
+            Instruction::BlockAddress { .. } => vec![],
         }
     }
 
@@ -947,6 +990,10 @@ impl Instruction {
                 }
                 succs
             }
+
+            Instruction::IndirectBranch {
+                possible_targets, ..
+            } => possible_targets.clone(),
 
             Instruction::InlineAsm { goto_targets, .. } if !goto_targets.is_empty() => {
                 goto_targets.clone()
@@ -1079,6 +1126,21 @@ impl fmt::Display for Instruction {
                         write!(f, ", ")?;
                     }
                     write!(f, "{}: {}", case_val, target)?;
+                }
+                write!(f, "]")
+            }
+
+            Instruction::IndirectBranch {
+                target,
+                possible_targets,
+                ..
+            } => {
+                write!(f, "indirectbr {}, [", target)?;
+                for (i, blk) in possible_targets.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", blk)?;
                 }
                 write!(f, "]")
             }
@@ -1249,6 +1311,10 @@ impl fmt::Display for Instruction {
                     write!(f, "]")?;
                 }
                 Ok(())
+            }
+
+            Instruction::BlockAddress { result, block, .. } => {
+                write!(f, "{} = blockaddress({})", result, block)
             }
         }
     }

@@ -628,27 +628,37 @@ fn generate_for_arch<A: ArchCodegen>(
         }
         let mut unresolved = Vec::new();
         for reloc in text_relocations.drain(..) {
-            if let Some(&target_offset) = func_offset_map.get(reloc.symbol.as_str()) {
-                // Intra-module relocation — patch text_section_data directly.
-                // Standard ELF PC-relative formula: S + A - P
-                let s = target_offset as i64;
-                let a = reloc.addend;
-                let p = reloc.offset as i64;
-                let value = s + a - p;
-                let fixup_off = reloc.offset as usize;
-                if fixup_off + 4 <= text_section_data.len() {
-                    patch_intra_module_reloc(
-                        &mut text_section_data,
-                        fixup_off,
-                        value,
-                        reloc.rel_type_id,
-                        &ctx.target,
-                    );
+            // R_386_32 (absolute) relocations must go through the linker,
+            // even when targeting a defined function — e.g. computed-goto
+            // BlockAddress LEAs encode the block offset as an implicit
+            // addend and need the linker to supply the function base.
+            let is_absolute_reloc = match ctx.target {
+                Target::I686 => reloc.rel_type_id == 1, // R_386_32
+                _ => false,
+            };
+            if !is_absolute_reloc {
+                if let Some(&target_offset) = func_offset_map.get(reloc.symbol.as_str()) {
+                    // Intra-module relocation — patch text_section_data directly.
+                    // Standard ELF PC-relative formula: S + A - P
+                    let s = target_offset as i64;
+                    let a = reloc.addend;
+                    let p = reloc.offset as i64;
+                    let value = s + a - p;
+                    let fixup_off = reloc.offset as usize;
+                    if fixup_off + 4 <= text_section_data.len() {
+                        patch_intra_module_reloc(
+                            &mut text_section_data,
+                            fixup_off,
+                            value,
+                            reloc.rel_type_id,
+                            &ctx.target,
+                        );
+                    }
+                    continue;
                 }
-            } else {
-                // External symbol — keep for the linker.
-                unresolved.push(reloc);
             }
+            // External symbol or absolute relocation — keep for the linker.
+            unresolved.push(reloc);
         }
         text_relocations = unresolved;
     }
@@ -1586,6 +1596,39 @@ fn resolve_param_load_conflicts(mf: &mut MachineFunction) {
             continue;
         }
 
+        // Check for scratch-register store: MOV [mem], R11/R10
+        //
+        // When a multi-eightbyte struct parameter is passed on the stack
+        // (all 6 integer ABI registers already consumed), the callee
+        // copies each eightbyte from the caller's frame to a local alloca
+        // using R11 as a scratch register:
+        //   MOV R11, [RBP+16]    (load from caller stack)
+        //   MOV [RBP-16], R11    (store to local alloca)
+        //   MOV R11, [RBP+24]    (load from caller stack)
+        //   MOV [RBP-8], R11     (store to local alloca)
+        //
+        // The load instructions are recognized as is_mem_load (above).
+        // The store instructions use R11 (scratch) as the source, which
+        // is NOT an ABI register, so is_frame_store does not match.
+        // Without this check, the scanner breaks on the store, never
+        // reaching the register-to-register param MOVs that follow,
+        // leaving their cycles (e.g. RSI↔RCX) unresolved.
+        //
+        // These stores are safe pass-through instructions: they write to
+        // memory (no register conflict) from a scratch register that is
+        // not a live incoming parameter value.
+        let is_scratch_store = match (&inst.result, inst.operands.as_slice()) {
+            (None, [MachineOperand::Memory { .. }, MachineOperand::Register(src)]) => {
+                *src == SCRATCH_REG || *src == SCRATCH_REG2
+            }
+            _ => false,
+        };
+        if is_scratch_store {
+            pass_through_insts.push(inst.clone());
+            inst_cursor += 1;
+            continue;
+        }
+
         // Check for memory-to-register load: MOV reg, [mem]
         //
         // These include struct-pair lo-half reloads (e.g., MOV RAX, [RBP-16])
@@ -1608,6 +1651,45 @@ fn resolve_param_load_conflicts(mf: &mut MachineFunction) {
         };
         if is_mem_load {
             if let Some(MachineOperand::Register(dst)) = &inst.result {
+                // Loads into scratch registers (R11/R10) MAY be part of
+                // multi-eightbyte struct copy sequences (load from caller
+                // stack → store to local alloca).  However, R10 is also
+                // allocatable by the register allocator, so a memory load
+                // into R10 might be a legitimate stack parameter load
+                // (register allocator assigned R10 to hold the param).
+                //
+                // Distinction: struct copy sequences always have a matching
+                // scratch store immediately following (MOV [mem], R10/R11).
+                // Legitimate param loads do NOT have a following store.
+                //
+                // R11 is fully reserved (never assigned by register alloc),
+                // so R11 loads are ALWAYS struct copy sequences.
+                // R10 loads require a lookahead check.
+                let is_struct_copy_load = if *dst == SCRATCH_REG {
+                    // R11 is reserved — always a scratch struct copy load
+                    true
+                } else if *dst == SCRATCH_REG2 {
+                    // R10 is allocatable — check if next instruction is a
+                    // matching scratch store (MOV [mem], R10)
+                    let next_idx = inst_cursor + 1;
+                    if next_idx < insts.len() {
+                        let next = &insts[next_idx];
+                        matches!(
+                            (&next.result, next.operands.as_slice()),
+                            (None, [MachineOperand::Memory { .. }, MachineOperand::Register(s)])
+                            if *s == SCRATCH_REG2
+                        )
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if is_struct_copy_load {
+                    pass_through_insts.push(inst.clone());
+                    inst_cursor += 1;
+                    continue;
+                }
                 logical_moves.push(ParamMove::Register {
                     dst: *dst,
                     src: u16::MAX, // sentinel: memory source, no register conflict
@@ -3183,6 +3265,11 @@ fn ir_type_align(ty: &crate::ir::types::IrType) -> u64 {
 
 /// Computes the ABI size of an IR type in bytes, accounting for struct
 /// field alignment padding and tail padding.
+/// Public re-export for use by architecture backends.
+pub(crate) fn ir_type_size_pub(ty: &crate::ir::types::IrType) -> u64 {
+    ir_type_size(ty)
+}
+
 fn ir_type_size(ty: &crate::ir::types::IrType) -> u64 {
     use crate::ir::types::IrType;
     match ty {
@@ -3606,16 +3693,21 @@ fn write_relocatable_object(
     // pointers.  Emitting a GLOBAL UNDEF for an already-LOCAL-defined
     // symbol confuses the linker and causes "undefined reference" errors.
     {
-        let defined_names: crate::common::fx_hash::FxHashSet<&str> = functions
+        let mut defined_names: crate::common::fx_hash::FxHashSet<String> = functions
             .iter()
-            .map(|f| f.name.as_str())
-            .chain(globals.iter().map(|g| g.name.as_str()))
+            .map(|f| f.name.clone())
+            .chain(globals.iter().map(|g| g.name.clone()))
             .collect();
+        // Alias names are defined by the alias emission code — do not
+        // emit them as undefined extern var declarations.
+        for (alias_name, _) in &module.symbol_aliases {
+            defined_names.insert(alias_name.clone());
+        }
         let mut seen_extern_vars: crate::common::fx_hash::FxHashSet<String> =
             crate::common::fx_hash::FxHashSet::default();
         for global in module.globals() {
             if !global.is_definition
-                && !defined_names.contains(global.name.as_str())
+                && !defined_names.contains(&global.name)
                 && seen_extern_vars.insert(global.name.clone())
             {
                 let binding = match global.linkage {
@@ -3632,6 +3724,52 @@ fn write_relocatable_object(
                     section_index: 0, // SHN_UNDEF
                 };
                 writer.add_symbol(sym);
+            }
+        }
+    }
+
+    // --- Symbol aliases: __attribute__((alias("target"))) ---
+    // Emit alias symbols that share the same address as their target.
+    // Both function and variable aliases are supported.
+    for (alias_name, target_name) in &module.symbol_aliases {
+        // Find the target symbol among functions or globals.
+        let mut found = false;
+        for func in functions {
+            if func.name == *target_name {
+                let sym = ElfSymbol {
+                    name: alias_name.clone(),
+                    value: func.offset,
+                    size: func.size,
+                    binding: STB_GLOBAL,
+                    sym_type: STT_FUNC,
+                    visibility: STV_DEFAULT,
+                    section_index: text_section_index,
+                };
+                writer.add_symbol(sym);
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            for gsym in globals {
+                if gsym.name == *target_name {
+                    let section_index = match gsym.section {
+                        SectionPlacement::Data => data_section_index,
+                        SectionPlacement::Rodata => rodata_section_index,
+                        SectionPlacement::Bss => bss_section_index,
+                    };
+                    let sym = ElfSymbol {
+                        name: alias_name.clone(),
+                        value: gsym.offset,
+                        size: gsym.size,
+                        binding: STB_GLOBAL,
+                        sym_type: STT_OBJECT,
+                        visibility: STV_DEFAULT,
+                        section_index,
+                    };
+                    writer.add_symbol(sym);
+                    break;
+                }
             }
         }
     }
@@ -3701,6 +3839,12 @@ fn write_relocatable_object(
                     known.insert(global.name.clone());
                 }
             }
+            // Include alias names — they are emitted as defined symbols
+            // by the alias emission code above, so must not appear as
+            // extra undefined symbols.
+            for (alias_name, _) in &module.symbol_aliases {
+                known.insert(alias_name.clone());
+            }
             for reloc in text_relocs {
                 if !known.contains(&reloc.symbol) {
                     known.insert(reloc.symbol.clone());
@@ -3740,13 +3884,46 @@ fn write_relocatable_object(
             };
             writer.add_symbol(sym);
         }
+        // Build a set of symbols that have CALL/PLT-type relocations so we
+        // can mark them as STT_FUNC instead of STT_NOTYPE.  Without this,
+        // the linker's PLT stub builder (which requires STT_FUNC) may skip
+        // these symbols, causing all BL/CALL offsets to be wrong.
+        //
+        // Call-type relocation IDs per architecture:
+        //   AArch64: CALL26=283, Jump26=282
+        //   x86-64 : PLT32=4
+        //   i686   : PLT32=4
+        //   RISC-V : CALL=18, CALL_PLT=19
+        let call_reloc_symbols: crate::common::fx_hash::FxHashSet<String> = {
+            let mut s = crate::common::fx_hash::FxHashSet::default();
+            for reloc in text_relocs {
+                let is_call = match ctx.target {
+                    crate::common::target::Target::AArch64 => {
+                        reloc.rel_type_id == 283 || reloc.rel_type_id == 282
+                    }
+                    crate::common::target::Target::X86_64
+                    | crate::common::target::Target::I686 => reloc.rel_type_id == 4,
+                    crate::common::target::Target::RiscV64 => {
+                        reloc.rel_type_id == 18 || reloc.rel_type_id == 19
+                    }
+                };
+                if is_call {
+                    s.insert(reloc.symbol.clone());
+                }
+            }
+            s
+        };
         for name in &extra_undef_symbols {
             let sym = ElfSymbol {
                 name: name.clone(),
                 value: 0,
                 size: 0,
                 binding: STB_GLOBAL,
-                sym_type: STT_NOTYPE,
+                sym_type: if call_reloc_symbols.contains(name.as_str()) {
+                    STT_FUNC
+                } else {
+                    STT_NOTYPE
+                },
                 visibility: STV_DEFAULT,
                 section_index: 0, // SHN_UNDEF
             };
@@ -3801,16 +3978,19 @@ fn write_relocatable_object(
         // (the IR may list function-pointer references as non-definition
         // globals, but those already have defined symbol entries).
         {
-            let defined_names_for_extern: crate::common::fx_hash::FxHashSet<&str> = functions
+            let mut defined_names_for_extern: crate::common::fx_hash::FxHashSet<String> = functions
                 .iter()
-                .map(|f| f.name.as_str())
-                .chain(globals.iter().map(|g| g.name.as_str()))
+                .map(|f| f.name.clone())
+                .chain(globals.iter().map(|g| g.name.clone()))
                 .collect();
+            for (alias_name, _) in &module.symbol_aliases {
+                defined_names_for_extern.insert(alias_name.clone());
+            }
             let mut seen_extern_vars: crate::common::fx_hash::FxHashSet<String> =
                 crate::common::fx_hash::FxHashSet::default();
             for global in module.globals() {
                 if !global.is_definition
-                    && !defined_names_for_extern.contains(global.name.as_str())
+                    && !defined_names_for_extern.contains(&global.name)
                     && seen_extern_vars.insert(global.name.clone())
                 {
                     let binding = match global.linkage {
@@ -3823,6 +4003,13 @@ fn write_relocatable_object(
                     });
                 }
             }
+        }
+        // Symbol aliases — added to writer as defined symbols.
+        for (alias_name, _) in &module.symbol_aliases {
+            all_syms.push(SymEntry {
+                name: alias_name.clone(),
+                binding: STB_GLOBAL,
+            });
         }
         // RISC-V PCREL local labels are LOCAL symbols
         for (name, _offset) in &pcrel_local_labels {
@@ -3948,6 +4135,10 @@ fn write_relocatable_object(
                 known_syms.insert(global.name.clone());
             }
         }
+        // Include alias names — defined by alias emission code.
+        for (alias_name, _) in &module.symbol_aliases {
+            known_syms.insert(alias_name.clone());
+        }
         // Add any symbols from text relocs that were already added.
         for reloc in text_relocs {
             known_syms.insert(reloc.symbol.clone());
@@ -4015,16 +4206,19 @@ fn write_relocatable_object(
         // Include extern variable declarations (non-definition globals).
         // Skip names already defined as functions or global variables.
         {
-            let data_defined_names: crate::common::fx_hash::FxHashSet<&str> = functions
+            let mut data_defined_names: crate::common::fx_hash::FxHashSet<String> = functions
                 .iter()
-                .map(|f| f.name.as_str())
-                .chain(globals.iter().map(|g| g.name.as_str()))
+                .map(|f| f.name.clone())
+                .chain(globals.iter().map(|g| g.name.clone()))
                 .collect();
+            for (alias_name, _) in &module.symbol_aliases {
+                data_defined_names.insert(alias_name.clone());
+            }
             let mut seen_extern_vars: crate::common::fx_hash::FxHashSet<String> =
                 crate::common::fx_hash::FxHashSet::default();
             for global in module.globals() {
                 if !global.is_definition
-                    && !data_defined_names.contains(global.name.as_str())
+                    && !data_defined_names.contains(&global.name)
                     && seen_extern_vars.insert(global.name.clone())
                 {
                     let binding = match global.linkage {
@@ -4037,6 +4231,13 @@ fn write_relocatable_object(
                     });
                 }
             }
+        }
+        // Symbol aliases — added to writer as defined symbols.
+        for (alias_name, _) in &module.symbol_aliases {
+            all_syms.push(DataSymEntry {
+                name: alias_name.clone(),
+                binding: STB_GLOBAL,
+            });
         }
         // Include extra undef symbols from text relocs (if any were added).
         {
@@ -4059,6 +4260,10 @@ fn write_relocatable_object(
                 if !global.is_definition {
                     text_extra.insert(global.name.clone());
                 }
+            }
+            // Include alias names.
+            for (alias_name, _) in &module.symbol_aliases {
+                text_extra.insert(alias_name.clone());
             }
             for reloc in text_relocs {
                 if text_extra.insert(reloc.symbol.clone()) {

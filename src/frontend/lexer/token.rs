@@ -89,6 +89,7 @@ pub enum IntegerSuffix {
 // ---------------------------------------------------------------------------
 
 /// Float type suffix on a numeric literal, per C11 §6.4.4.2.
+/// GCC extension: `i` / `j` suffix for imaginary constants (e.g. `1.0i`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FloatSuffix {
     /// No suffix — `double`.
@@ -97,6 +98,12 @@ pub enum FloatSuffix {
     F,
     /// `l` or `L` — `long double`.
     L,
+    /// `i` or `j` — `_Complex double` imaginary literal (GCC extension).
+    I,
+    /// `fi` / `if` / `fj` / `jf` — `_Complex float` imaginary literal.
+    FI,
+    /// `li` / `il` / `lj` / `jl` — `_Complex long double` imaginary literal.
+    LI,
 }
 
 // ---------------------------------------------------------------------------
@@ -276,6 +283,10 @@ pub enum TokenKind {
     AsmVolatile,
     /// `__label__` (local label declaration in GCC)
     Label,
+    /// `__real__` / `__real` — GCC real-part extraction of `_Complex`.
+    RealPart,
+    /// `__imag__` / `__imag` — GCC imaginary-part extraction of `_Complex`.
+    ImagPart,
     /// `__int128` — GCC 128-bit integer type extension.
     Int128Keyword,
     /// `_Float128` / `__float128` — GCC 128-bit floating-point type.
@@ -842,6 +853,8 @@ impl TokenKind {
             TokenKind::Attribute => Some("__attribute__"),
             TokenKind::Typeof => Some("typeof"),
             TokenKind::Extension => Some("__extension__"),
+            TokenKind::RealPart => Some("__real__"),
+            TokenKind::ImagPart => Some("__imag__"),
             TokenKind::Asm => Some("asm"),
             TokenKind::AsmVolatile => Some("__volatile__"),
             TokenKind::Label => Some("__label__"),
@@ -1007,6 +1020,9 @@ impl fmt::Display for TokenKind {
                     FloatSuffix::None => "",
                     FloatSuffix::F => "f",
                     FloatSuffix::L => "L",
+                    FloatSuffix::I => "i",
+                    FloatSuffix::FI => "fi",
+                    FloatSuffix::LI => "Li",
                 };
                 write!(f, "{}{}", value, suffix_str)
             }
@@ -1187,9 +1203,13 @@ pub fn lookup_keyword(s: &str) -> Option<TokenKind> {
         "__typeof" => Some(TokenKind::Typeof),
         "__typeof__" => Some(TokenKind::Typeof),
         "__extension__" => Some(TokenKind::Extension),
+        "__real__" => Some(TokenKind::RealPart),
+        "__real" => Some(TokenKind::RealPart),
+        "__imag__" => Some(TokenKind::ImagPart),
+        "__imag" => Some(TokenKind::ImagPart),
         // `asm` and `__asm__` both map to the same variant.
         "asm" => Some(TokenKind::Asm),
-        "__asm__" => Some(TokenKind::Asm),
+        "__asm__" | "__asm" => Some(TokenKind::Asm),
         // `__volatile__` is the GCC alternate spelling for `volatile`.
         // Treated as the same `Volatile` token so it works both as a type
         // qualifier (`__volatile__ int x;`) and as an asm qualifier

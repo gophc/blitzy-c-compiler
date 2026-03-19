@@ -127,6 +127,15 @@ fn replace_block_reference_in_terminator(
                 }
             }
         }
+        Instruction::IndirectBranch {
+            possible_targets, ..
+        } => {
+            for t in possible_targets.iter_mut() {
+                if *t == old_block {
+                    *t = new_block;
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -229,6 +238,15 @@ fn update_block_ids_in_instruction(inst: &mut Instruction, index_map: &FxHashMap
         }
         Instruction::InlineAsm { goto_targets, .. } => {
             for target in goto_targets.iter_mut() {
+                if let Some(&new_idx) = index_map.get(&target.index()) {
+                    *target = BlockId(new_idx as u32);
+                }
+            }
+        }
+        Instruction::IndirectBranch {
+            possible_targets, ..
+        } => {
+            for target in possible_targets.iter_mut() {
                 if let Some(&new_idx) = index_map.get(&target.index()) {
                     *target = BlockId(new_idx as u32);
                 }
@@ -1185,6 +1203,16 @@ fn recompute_cfg_and_cleanup_phis(func: &mut IrFunction) -> bool {
                     for &(_val, blk) in cases {
                         if !succs.contains(&blk.index()) {
                             succs.push(blk.index());
+                        }
+                    }
+                }
+                Instruction::IndirectBranch {
+                    possible_targets, ..
+                } => {
+                    for target in possible_targets {
+                        let idx = target.index();
+                        if !succs.contains(&idx) {
+                            succs.push(idx);
                         }
                     }
                 }

@@ -727,8 +727,47 @@ impl X86_64Encoder {
             }
             X86Opcode::Imul => self.encode_imul(inst),
             X86Opcode::Push => {
-                let reg = self.extract_register(&inst.operands, 0);
-                self.encode_push_pop(0x50, reg)
+                match inst.operands.first() {
+                    Some(MachineOperand::Memory {
+                        base,
+                        index,
+                        scale,
+                        displacement,
+                    }) => {
+                        // PUSH m64: FF /6 with ModR/M — push 8 bytes from
+                        // a memory location (e.g. frame slot for struct
+                        // eightbytes that must be passed on the stack).
+                        // The /6 extension field is encoded by passing a
+                        // pseudo-register whose hw encoding low 3 bits are
+                        // 110 (= 6).  RSI has hw encoding 6.
+                        // PUSH in 64-bit mode is always 64-bit (no REX.W
+                        // needed), but passing size=8 is harmless.
+                        self.encode_reg_mem_op(
+                            &[0xFF],
+                            RSI, // hw_encoding(RSI) & 7 == 6 == /6
+                            *base,
+                            *index,
+                            *scale,
+                            *displacement,
+                            0, // size 0 → no REX.W (PUSH is implicitly 64-bit)
+                        )
+                    }
+                    Some(MachineOperand::Immediate(imm)) => {
+                        // PUSH imm8: 6A ib / PUSH imm32: 68 id
+                        let v = *imm;
+                        if v >= -128 && v <= 127 {
+                            EncodedInstruction::new(vec![0x6A, v as u8])
+                        } else {
+                            let mut bytes = vec![0x68];
+                            bytes.extend_from_slice(&(v as i32).to_le_bytes());
+                            EncodedInstruction::new(bytes)
+                        }
+                    }
+                    _ => {
+                        let reg = self.extract_register(&inst.operands, 0);
+                        self.encode_push_pop(0x50, reg)
+                    }
+                }
             }
             X86Opcode::Pop => {
                 let reg = self.extract_register(&inst.operands, 0);

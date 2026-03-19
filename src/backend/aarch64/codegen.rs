@@ -1797,6 +1797,35 @@ impl AArch64InstructionSelector {
                 goto_targets,
                 span,
             ),
+
+            // IndirectBranch — computed goto: br %reg
+            Instruction::IndirectBranch { target, .. } => {
+                let rn = target.index().wrapping_add(VREG_BASE);
+                vec![A64Instruction::new(A64Opcode::BR).with_rn(rn)]
+            }
+
+            // BlockAddress — materialize address of a labeled basic block
+            Instruction::BlockAddress { result, block, .. } => {
+                let rd = result.index().wrapping_add(VREG_BASE);
+                // Use the block_labels vector (populated in lower_function)
+                // which maps IR block index → assembler label name.
+                let block_label = if block.index() < self.block_labels.len() {
+                    self.block_labels[block.index()].clone()
+                } else {
+                    format!("label_{}", block.0)
+                };
+                // Use ADRP+ADD pair to load label address (symbol-based)
+                vec![
+                    A64Instruction::new(A64Opcode::ADRP)
+                        .with_rd(rd)
+                        .with_symbol(block_label.clone()),
+                    A64Instruction::new(A64Opcode::ADD_imm)
+                        .with_rd(rd)
+                        .with_rn(rd)
+                        .with_imm(0)
+                        .with_symbol(block_label),
+                ]
+            }
         }
     }
 

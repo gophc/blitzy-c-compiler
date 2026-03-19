@@ -874,6 +874,49 @@ impl ArchCodegen for I686Codegen {
                         Ok(encoded) => {
                             code.extend_from_slice(&encoded.bytes);
                             if let Some(rel) = encoded.relocation {
+                                // Resolve .L local block labels: for
+                                // absolute address LEAs used in computed
+                                // goto (BlockAddress), the label is a
+                                // function-internal block label.  We write
+                                // the known byte offset as the implicit
+                                // addend into the code stream and convert
+                                // the relocation to reference the function
+                                // symbol.  At link time:
+                                //   R_386_32: S + *loc
+                                //   S = absolute address of function
+                                //   *loc = byte offset of block within fn
+                                //   result = absolute address of the block
+                                if rel.symbol.starts_with(".L") {
+                                    if let Some(&lbl_off) =
+                                        label_offsets.get(&rel.symbol)
+                                    {
+                                        let patch_off =
+                                            base_offset + rel.offset_in_instruction;
+                                        let addend_bytes =
+                                            (lbl_off as u32).to_le_bytes();
+                                        // Patch the 4-byte displacement
+                                        // field with the label's byte
+                                        // offset within this function.
+                                        for (i, &b) in
+                                            addend_bytes.iter().enumerate()
+                                        {
+                                            if patch_off + i < code.len() {
+                                                code[patch_off + i] = b;
+                                            }
+                                        }
+                                        relocations.push(
+                                            crate::backend::traits::FunctionRelocation {
+                                                offset: patch_off as u64,
+                                                symbol: mf.name.clone(),
+                                                rel_type_id: rel.rel_type,
+                                                addend: lbl_off as i64,
+                                                section: ".text".to_string(),
+                                            },
+                                        );
+                                        continue;
+                                    }
+                                }
+
                                 relocations.push(crate::backend::traits::FunctionRelocation {
                                     offset: (base_offset + rel.offset_in_instruction) as u64,
                                     symbol: rel.symbol.clone(),
@@ -1628,8 +1671,32 @@ impl I686Codegen {
                 let vreg = vregs.alloc();
                 out.push(MachineInstruction::new(I686_NOP));
                 value_map.insert(result.index(), MachineOperand::VirtualRegister(vreg));
-            } // All instruction variants are handled above; this comment
-              // serves as documentation that the match is exhaustive.
+            }
+
+            // IndirectBranch — computed goto: jmp *%reg
+            Instruction::IndirectBranch { target, .. } => {
+                let target_op = self.resolve_operand(target, &value_map, &alloca_offsets);
+                let mut jmp = MachineInstruction::new(I686_JMP);
+                jmp.operands.push(target_op);
+                jmp.is_terminator = true;
+                // Mark as branch so epilogue insertion does NOT insert
+                // leave+ret before this instruction — it's a jump, not a
+                // function return.
+                jmp.is_branch = true;
+                out.push(jmp);
+            }
+
+            // BlockAddress — materialize address of a labeled basic block
+            Instruction::BlockAddress { result, block, .. } => {
+                let vreg = vregs.alloc();
+                let mach_idx = *block_map.get(&block.index()).unwrap_or(&0);
+                let block_label = format!(".L{}", mach_idx);
+                let mut lea = MachineInstruction::new(I686_LEA);
+                lea.result = Some(MachineOperand::VirtualRegister(vreg));
+                lea.operands.push(MachineOperand::GlobalSymbol(block_label));
+                out.push(lea);
+                value_map.insert(result.index(), MachineOperand::VirtualRegister(vreg));
+            }
         }
 
         out
