@@ -864,6 +864,7 @@ fn x86_opcode_mnemonic(opcode: u32) -> &'static str {
         Some(X86Opcode::Popcnt) => "popcntq",
         Some(X86Opcode::Bswap) => "bswapq",
         Some(X86Opcode::Ud2) => "ud2",
+        Some(X86Opcode::RepMovsq) => "rep movsq",
         Some(X86Opcode::InlineAsm) => "# inline asm",
         None => "ud2",
     }

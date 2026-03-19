@@ -739,7 +739,7 @@ pub fn x86_64_register_info() -> RegisterInfo {
 // ===========================================================================
 
 /// Classify an `IrType` into per-eightbyte ABI classes.
-fn classify_ir_type_eightbytes(ty: &IrType, target: &Target) -> Vec<AbiClass> {
+pub fn classify_ir_type_eightbytes(ty: &IrType, target: &Target) -> Vec<AbiClass> {
     let size = ty.size_bytes(target);
 
     if size > 16 {

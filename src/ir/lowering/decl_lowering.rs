@@ -954,15 +954,69 @@ pub fn lower_local_initializer(
                     }
                 } else {
                     // Rvalue expression returning a struct (function call,
-                    // conditional, statement expression, etc.).  Evaluate the
-                    // expression normally — the backend handles struct copies
-                    // via struct_load_source / struct_pair_hi in the Store
-                    // instruction handler.
+                    // conditional, statement expression, va_arg, etc.).
+                    // Evaluate the expression, spill into a temp alloca,
+                    // then copy chunk-by-chunk to the destination.
+                    // A single Store cannot move >8-byte structs through
+                    // the backend's register-based pipeline correctly.
                     let typed_val = expr_lowering::lower_expression_typed(ctx, expr);
-                    let store_inst =
-                        ctx.builder
-                            .build_store(typed_val.value, var_alloca, Span::dummy());
-                    emit_inst_to_ctx(ctx, store_inst);
+                    let span_dummy = Span::dummy();
+                    let struct_ir_ty =
+                        expr_lowering::ctype_to_ir(&resolved_var_ty, ctx.target);
+                    let (tmp_alloca, tmp_inst) =
+                        ctx.builder.build_alloca(struct_ir_ty.clone(), span_dummy);
+                    emit_inst_to_ctx(ctx, tmp_inst);
+                    let si = ctx
+                        .builder
+                        .build_store(typed_val.value, tmp_alloca, span_dummy);
+                    emit_inst_to_ctx(ctx, si);
+
+                    // Copy chunk-by-chunk from temp alloca to var_alloca.
+                    let mut offset: usize = 0;
+                    while offset < struct_size {
+                        let remaining = struct_size - offset;
+                        let (chunk_sz, chunk_ir) = if remaining >= 8 {
+                            (8, IrType::I64)
+                        } else if remaining >= 4 {
+                            (4, IrType::I32)
+                        } else if remaining >= 2 {
+                            (2, IrType::I16)
+                        } else {
+                            (1, IrType::I8)
+                        };
+                        let src = if offset == 0 {
+                            tmp_alloca
+                        } else {
+                            let off_val = make_index_value(ctx, offset as i64);
+                            let (gep, gi) = ctx.builder.build_gep(
+                                tmp_alloca,
+                                vec![off_val],
+                                chunk_ir.clone(),
+                                span_dummy,
+                            );
+                            emit_inst_to_ctx(ctx, gi);
+                            gep
+                        };
+                        let (loaded, li) =
+                            ctx.builder.build_load(src, chunk_ir.clone(), span_dummy);
+                        emit_inst_to_ctx(ctx, li);
+                        let dst = if offset == 0 {
+                            var_alloca
+                        } else {
+                            let off_val2 = make_index_value(ctx, offset as i64);
+                            let (gep2, gi2) = ctx.builder.build_gep(
+                                var_alloca,
+                                vec![off_val2],
+                                chunk_ir.clone(),
+                                span_dummy,
+                            );
+                            emit_inst_to_ctx(ctx, gi2);
+                            gep2
+                        };
+                        let st = ctx.builder.build_store(loaded, dst, span_dummy);
+                        emit_inst_to_ctx(ctx, st);
+                        offset += chunk_sz;
+                    }
                 }
             } else {
                 // Scalar or small-aggregate (≤8 bytes): lower the expression
@@ -2521,15 +2575,75 @@ fn lower_designated_initializer(
             if let Some(first) = init_list.first() {
                 let field_idx = resolve_field_designator(&first.designators, fields, 0, name_table);
                 if field_idx < fields.len() {
-                    return evaluate_initializer_constant(
-                        &first.initializer,
-                        &fields[field_idx].ty,
-                        target,
-                        type_builder,
-                        diagnostics,
-                        name_table,
-                        enum_constants,
-                    );
+                    let member_ty = &fields[field_idx].ty;
+
+                    // Handle nested designator chains like `.f.d = value`.
+                    // resolve_field_designator only consumes the first
+                    // designator.  If there are remaining designators,
+                    // wrap them into a synthetic InitList so the recursive
+                    // call processes them against the member type.
+                    let member_const = if first.designators.len() > 1 {
+                        let remaining_desig = first.designators[1..].to_vec();
+                        let synthetic_item = ast::DesignatedInitializer {
+                            designators: remaining_desig,
+                            initializer: first.initializer.clone(),
+                            span: first.span.clone(),
+                        };
+                        let synthetic_init = ast::Initializer::List {
+                            designators_and_initializers: vec![synthetic_item],
+                            trailing_comma: false,
+                            span: first.span.clone(),
+                        };
+                        evaluate_initializer_constant(
+                            &synthetic_init,
+                            member_ty,
+                            target,
+                            type_builder,
+                            diagnostics,
+                            name_table,
+                            enum_constants,
+                        )
+                    } else {
+                        evaluate_initializer_constant(
+                            &first.initializer,
+                            member_ty,
+                            target,
+                            type_builder,
+                            diagnostics,
+                            name_table,
+                            enum_constants,
+                        )
+                    };
+
+                    // A union's IR type is Array(I32/I64, N), NOT Struct.
+                    // If the member constant is a Struct/Array, we must
+                    // serialize it to a byte buffer so that
+                    // constant_to_bytes_typed can produce the correct
+                    // output against the union's Array IR type.
+                    if let Some(mc) = member_const {
+                        let needs_serialize = matches!(
+                            mc,
+                            Constant::Struct(..) | Constant::Array(..)
+                        );
+                        if needs_serialize {
+                            let member_size = crate::common::types::sizeof_ctype(
+                                member_ty, target,
+                            );
+                            let union_size = crate::common::types::sizeof_ctype(
+                                target_type, target,
+                            );
+                            let mut bytes = constant_to_le_bytes(
+                                &mc,
+                                member_size,
+                                member_ty,
+                                target,
+                                type_builder,
+                            );
+                            bytes.resize(union_size, 0);
+                            return Some(Constant::String(bytes));
+                        }
+                        return Some(mc);
+                    }
                 }
             }
             Some(Constant::ZeroInit)
