@@ -1292,7 +1292,10 @@ fn extract_pragma_macro_name(tokens: &[PPToken]) -> Option<String> {
         return None;
     }
     // Accept both "name" (quoted) and name (unquoted).
-    let name = if inner[0].text.starts_with('"') && inner[0].text.ends_with('"') && inner[0].text.len() >= 2 {
+    let name = if inner[0].text.starts_with('"')
+        && inner[0].text.ends_with('"')
+        && inner[0].text.len() >= 2
+    {
         inner[0].text[1..inner[0].text.len() - 1].to_string()
     } else {
         inner[0].text.clone()

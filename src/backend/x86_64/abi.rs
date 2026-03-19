@@ -945,8 +945,7 @@ fn classify_field_into_eightbytes(
         }
         // Second eightbyte is padding (NoClass), not X87Up
         if start_eb + 1 < num_eightbytes {
-            classes[start_eb + 1] =
-                merge_abi_class(classes[start_eb + 1], AbiClass::NoClass);
+            classes[start_eb + 1] = merge_abi_class(classes[start_eb + 1], AbiClass::NoClass);
         }
         return;
     }

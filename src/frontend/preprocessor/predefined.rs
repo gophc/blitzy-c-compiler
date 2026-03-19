@@ -358,10 +358,13 @@ pub fn register_predefined_macros(macro_defs: &mut FxHashMap<String, MacroDef>, 
     let ld_sz_str = target.long_double_size().to_string();
     register_object_macro(macro_defs, "__SIZEOF_LONG_DOUBLE__", &ld_sz_str);
 
-    // __int128 support — define __SIZEOF_INT128__ for 64-bit targets
-    if target.is_64bit() {
-        register_object_macro(macro_defs, "__SIZEOF_INT128__", "16");
-    }
+    // __int128 support — do NOT define __SIZEOF_INT128__ because BCC does not
+    // yet fully implement 128-bit integer arithmetic in code generation.
+    // Defining it would cause programs to use __int128 code paths that fail at
+    // runtime.  Un-comment the line below once 128-bit codegen is implemented.
+    // if target.is_64bit() {
+    //     register_object_macro(macro_defs, "__SIZEOF_INT128__", "16");
+    // }
 
     // -------------------------------------------------------------------
     // 7. Numeric limit macros
@@ -507,11 +510,7 @@ pub fn register_predefined_macros(macro_defs: &mut FxHashMap<String, MacroDef>, 
     register_object_macro(macro_defs, "__DBL_HAS_QUIET_NAN__", "1");
     register_object_macro(macro_defs, "__DBL_DENORM_MIN__", "4.9406564584124654e-324");
     // Single-precision (32-bit) constants
-    register_object_macro(
-        macro_defs,
-        "__FLT_EPSILON__",
-        "1.1920928955078125e-07F",
-    );
+    register_object_macro(macro_defs, "__FLT_EPSILON__", "1.1920928955078125e-07F");
     register_object_macro(
         macro_defs,
         "__FLT_MIN__",

@@ -1645,10 +1645,13 @@ fn resolve_param_load_conflicts(mf: &mut MachineFunction) {
         // conflict with any register source.  The topological sort will
         // naturally defer memory loads whose destination register is still
         // needed as a source by a pending register move.
-        let is_mem_load = match (&inst.result, inst.operands.as_slice()) {
-            (Some(MachineOperand::Register(_)), [MachineOperand::Memory { .. }]) => true,
-            _ => false,
-        };
+        let is_mem_load = matches!(
+            (&inst.result, inst.operands.as_slice()),
+            (
+                Some(MachineOperand::Register(_)),
+                [MachineOperand::Memory { .. }]
+            )
+        );
         if is_mem_load {
             if let Some(MachineOperand::Register(dst)) = &inst.result {
                 // Loads into scratch registers (R11/R10) MAY be part of
@@ -1871,13 +1874,15 @@ fn resolve_param_load_conflicts(mf: &mut MachineFunction) {
         // be clobbered by another move's destination.
         let needed_srcs: crate::common::fx_hash::FxHashSet<u16> = pending
             .iter()
-            .filter_map(|&(_, src, _)| {
-                if src != u16::MAX {
-                    Some(src)
-                } else {
-                    None
-                }
-            })
+            .filter_map(
+                |&(_, src, _)| {
+                    if src != u16::MAX {
+                        Some(src)
+                    } else {
+                        None
+                    }
+                },
+            )
             .collect();
 
         let safe_idx = pending
@@ -2625,8 +2630,8 @@ fn resolve_call_arg_conflicts(mf: &mut MachineFunction, target: &Target) {
                             // before the scalar moves at [3]/[4] read them.
                             let mut found_pair = false;
                             // Find the nearest non-consumed instruction after idx.
-                            let nearest_j = ((idx + 1)..setup_insts.len())
-                                .find(|j| !consumed.contains(j));
+                            let nearest_j =
+                                ((idx + 1)..setup_insts.len()).find(|j| !consumed.contains(j));
                             if let Some(j) = nearest_j {
                                 let next_si = &setup_insts[j];
                                 let next_dst = match &next_si.result {
@@ -3901,8 +3906,9 @@ fn write_relocatable_object(
                     crate::common::target::Target::AArch64 => {
                         reloc.rel_type_id == 283 || reloc.rel_type_id == 282
                     }
-                    crate::common::target::Target::X86_64
-                    | crate::common::target::Target::I686 => reloc.rel_type_id == 4,
+                    crate::common::target::Target::X86_64 | crate::common::target::Target::I686 => {
+                        reloc.rel_type_id == 4
+                    }
                     crate::common::target::Target::RiscV64 => {
                         reloc.rel_type_id == 18 || reloc.rel_type_id == 19
                     }
@@ -4506,7 +4512,7 @@ fn link_to_final_output(
                 }
             }
         }
-        if !config.needed_libs.iter().any(|n| *n == final_so) {
+        if !config.needed_libs.contains(&final_so) {
             config.needed_libs.push(final_so);
         }
     }
@@ -4704,23 +4710,38 @@ fn inject_crt_start(input: &mut LinkerInput, target: Target) {
 
     match target {
         Target::X86_64 => {
-            // _start stub (16 bytes):
-            //   xor %ebp, %ebp          ; 31 ed           (2 bytes)
-            //   call main               ; e8 <disp32>     (5 bytes)
-            //   mov %eax, %edi           ; 89 c7           (2 bytes)
-            //   call exit               ; e8 <00 00 00 00> (5 bytes, PLT32 reloc)
-            //   ud2                      ; 0f 0b           (2 bytes, unreachable)
+            // _start stub (24 bytes):
+            //   xor %ebp, %ebp          ; 31 ed           (2 bytes)  offset 0
+            //   pop %rdi                ; 5f              (1 byte)   offset 2  argc
+            //   mov %rsp, %rsi          ; 48 89 e6        (3 bytes)  offset 3  argv
+            //   and $-16, %rsp          ; 48 83 e4 f0     (4 bytes)  offset 6  align
+            //   call main               ; e8 <disp32>     (5 bytes)  offset 10
+            //   mov %eax, %edi           ; 89 c7           (2 bytes)  offset 15
+            //   call exit               ; e8 <00 00 00 00> (5 bytes)  offset 17
+            //   ud2                      ; 0f 0b           (2 bytes)  offset 22
+            //
+            // Linux kernel puts argc at (%rsp) and argv[] starting at
+            // 8(%rsp) on process entry.  We pop argc into %rdi (first
+            // arg) and set %rsi to the remaining stack (argv).  The
+            // stack is 16-byte aligned before the CALL per the SysV ABI.
             //
             // Using `call exit` (libc) instead of raw SYS_exit so that
-            // atexit handlers run and stdio buffers are flushed, which is
-            // required for printf output to appear.
-            let call_main_site = start_offset + 2;
+            // atexit handlers run and stdio buffers are flushed.
+            let call_main_site = start_offset + 10;
             let call_main_next = call_main_site + 5;
             let disp = (main_offset as i64) - (call_main_next as i64);
             let disp_bytes = (disp as i32).to_le_bytes();
             let stub = vec![
                 0x31,
                 0xed, // xor %ebp, %ebp
+                0x5f, // pop %rdi  (argc)
+                0x48,
+                0x89,
+                0xe6, // mov %rsp, %rsi  (argv)
+                0x48,
+                0x83,
+                0xe4,
+                0xf0, // and $-16, %rsp
                 0xe8,
                 disp_bytes[0],
                 disp_bytes[1], // call main
@@ -4737,9 +4758,9 @@ fn inject_crt_start(input: &mut LinkerInput, target: Target) {
                 0x0b, // ud2
             ];
             // Add R_X86_64_PLT32 relocation for the `exit` call.
-            // The displacement bytes start at stub offset 10 (from section
-            // start: start_offset + 10).
-            let exit_reloc_offset = (start_offset + 10) as u64;
+            // The `e8` opcode is at stub byte 17; the 4-byte displacement
+            // field starts at stub byte 18 (start_offset + 18).
+            let exit_reloc_offset = (start_offset + 18) as u64;
             input
                 .relocations
                 .push(crate::backend::linker_common::relocation::Relocation {
@@ -4755,24 +4776,36 @@ fn inject_crt_start(input: &mut LinkerInput, target: Target) {
             input.sections[text_idx].data.extend_from_slice(&stub);
         }
         Target::I686 => {
-            // _start stub for i686 (16 bytes):
-            //   xor %ebp, %ebp          ; 31 ed           (2 bytes)
-            //   call main               ; e8 <disp32>     (5 bytes)
-            //   push %eax               ; 50              (1 byte, exit status arg)
-            //   call exit               ; e8 <00 00 00 00> (5 bytes, PLT32 reloc)
-            //   ud2                      ; 0f 0b           (2 bytes, unreachable)
-            //   nop                      ; 90              (1 byte, alignment pad)
+            // _start stub for i686 (24 bytes):
+            //   xor %ebp, %ebp          ; 31 ed           (2 bytes) offset 0
+            //   pop %ecx                ; 59              (1 byte)  offset 2  argc
+            //   mov %esp, %edx          ; 89 e2           (2 bytes) offset 3  argv
+            //   and $-16, %esp          ; 83 e4 f0        (3 bytes) offset 5  align
+            //   push %edx               ; 52              (1 byte)  offset 8  argv
+            //   push %ecx               ; 51              (1 byte)  offset 9  argc
+            //   call main               ; e8 <disp32>     (5 bytes) offset 10
+            //   push %eax               ; 50              (1 byte)  offset 15
+            //   call exit               ; e8 <00 00 00 00> (5 bytes) offset 16
+            //   ud2                      ; 0f 0b           (2 bytes) offset 21
+            //   nop; nop                ; 90 90           (2 bytes) offset 23
             //
-            // Using `call exit` (libc) instead of raw SYS_exit so that
-            // atexit handlers run and stdio buffers are flushed, which is
-            // required for printf output to appear.
-            let call_site = start_offset + 2;
+            // i686 cdecl: arguments pushed right-to-left on stack.
+            // Push argv then argc so main sees (argc, argv).
+            let call_site = start_offset + 10;
             let call_next = call_site + 5;
             let disp = (main_offset as i64) - (call_next as i64);
             let disp_bytes = (disp as i32).to_le_bytes();
             let stub = vec![
                 0x31,
                 0xed, // xor %ebp, %ebp
+                0x59, // pop %ecx  (argc)
+                0x89,
+                0xe2, // mov %esp, %edx  (argv)
+                0x83,
+                0xe4,
+                0xf0, // and $-16, %esp
+                0x52, // push %edx (argv — second arg, pushed first)
+                0x51, // push %ecx (argc — first arg, pushed second)
                 0xe8,
                 disp_bytes[0],
                 disp_bytes[1], // call main
@@ -4786,12 +4819,13 @@ fn inject_crt_start(input: &mut LinkerInput, target: Target) {
                 0x00, // call exit (PLT32 relocation)
                 0x0f,
                 0x0b, // ud2
+                0x90,
                 0x90, // nop (alignment pad)
             ];
             // Add R_386_PLT32 relocation for the `exit` call.
-            // The displacement bytes start at stub offset 9 (from section
-            // start: start_offset + 9).
-            let exit_reloc_offset = (start_offset + 9) as u64;
+            // The `e8` opcode is at stub byte 16; the 4-byte displacement
+            // field starts at stub byte 17 (start_offset + 17).
+            let exit_reloc_offset = (start_offset + 17) as u64;
             input
                 .relocations
                 .push(crate::backend::linker_common::relocation::Relocation {
@@ -4807,15 +4841,18 @@ fn inject_crt_start(input: &mut LinkerInput, target: Target) {
             input.sections[text_idx].data.extend_from_slice(&stub);
         }
         Target::AArch64 => {
-            // _start stub for AArch64 (16 bytes):
-            //   bl main                ; PC-relative, pre-resolved (4 bytes)
-            //   bl exit                ; via PLT (R_AARCH64_CALL26)  (4 bytes)
-            //   brk #1                 ; unreachable                 (4 bytes)
-            //   nop                    ; alignment pad               (4 bytes)
-            //
-            // Using `bl exit` (libc) instead of raw SVC so that atexit
-            // handlers run and stdio buffers are flushed.
-            let bl_offset = start_offset;
+            // _start stub for AArch64 (28 bytes / 7 instructions):
+            //   ldr x0, [sp]           ; argc            (4 bytes) offset 0
+            //   add x1, sp, #8         ; argv            (4 bytes) offset 4
+            //   nop                    ; pad (AArch64 kernel guarantees 16B-aligned SP)
+            //   bl main                ; call main       (4 bytes) offset 12
+            //   bl exit                ; call exit       (4 bytes) offset 16
+            //   brk #1                 ; unreachable     (4 bytes) offset 20
+            //   nop                    ; pad             (4 bytes) offset 24
+            let ldr_x0_sp = 0xF940_03E0u32; // ldr x0, [sp]
+            let add_x1_sp_8 = 0x9100_23E1u32; // add x1, sp, #8
+            let and_sp_align = 0xD503_201Fu32; // nop — alignment not needed
+            let bl_offset = start_offset + 12;
             let offset_bytes = ((main_offset as i64) - (bl_offset as i64)) / 4;
             let imm26 = (offset_bytes as u32) & 0x03FF_FFFF;
             let bl_main = 0x9400_0000u32 | imm26;
@@ -4823,12 +4860,15 @@ fn inject_crt_start(input: &mut LinkerInput, target: Target) {
             let brk1 = 0xD420_0020u32; // brk #1
             let nop = 0xD503_201Fu32;
             let mut stub = Vec::new();
+            stub.extend_from_slice(&ldr_x0_sp.to_le_bytes());
+            stub.extend_from_slice(&add_x1_sp_8.to_le_bytes());
+            stub.extend_from_slice(&and_sp_align.to_le_bytes());
             stub.extend_from_slice(&bl_main.to_le_bytes());
             stub.extend_from_slice(&bl_exit_placeholder.to_le_bytes());
             stub.extend_from_slice(&brk1.to_le_bytes());
             stub.extend_from_slice(&nop.to_le_bytes());
             // Add R_AARCH64_CALL26 relocation for the `exit` call.
-            let exit_reloc_offset = (start_offset + 4) as u64;
+            let exit_reloc_offset = (start_offset + 16) as u64;
             input
                 .relocations
                 .push(crate::backend::linker_common::relocation::Relocation {
@@ -4844,17 +4884,23 @@ fn inject_crt_start(input: &mut LinkerInput, target: Target) {
             input.sections[text_idx].data.extend_from_slice(&stub);
         }
         Target::RiscV64 => {
-            // _start stub for RISC-V 64 (20 bytes):
-            //   jal ra, main            ; PC-relative, pre-resolved       (4 bytes)
-            //   auipc ra, 0             ; exit call via PLT (CALL_PLT)    (4 bytes)
-            //   jalr ra, ra, 0          ; continuation of CALL_PLT pair   (4 bytes)
-            //   ebreak                  ; unreachable                     (4 bytes)
-            //   nop                     ; alignment pad                   (4 bytes)
-            //
-            // Using AUIPC+JALR pair (R_RISCV_CALL_PLT) for `exit` so the
-            // dynamic linker routes through PLT and atexit handlers +
-            // stdio buffer flushing happen correctly.
-            let jal_offset = start_offset;
+            // _start stub for RISC-V 64 (32 bytes / 8 instructions):
+            //   ld a0, 0(sp)            ; argc                        (4 bytes) offset 0
+            //   addi a1, sp, 8          ; argv                        (4 bytes) offset 4
+            //   andi sp, sp, -16        ; align stack to 16 bytes     (4 bytes) offset 8
+            //   jal ra, main            ; call main                   (4 bytes) offset 12
+            //   auipc ra, 0             ; exit call via PLT           (4 bytes) offset 16
+            //   jalr ra, ra, 0          ; (CALL_PLT pair)             (4 bytes) offset 20
+            //   ebreak                  ; unreachable                 (4 bytes) offset 24
+            //   nop                     ; alignment pad               (4 bytes) offset 28
+            // ld a0, 0(sp): funct3=011 (doubleword), rd=a0(x10), rs1=sp(x2)
+            // Encoding: imm[11:0]=0, rs1=2, funct3=011, rd=10, opcode=0000011
+            let ld_a0_sp = 0x0001_3503u32; // ld a0, 0(sp)
+                                           // addi a1, sp, 8: rd=a1(x11), rs1=sp(x2), imm=8
+            let addi_a1_sp_8 = 0x0081_0593u32; // addi a1, sp, 8
+                                               // andi sp, sp, -16: rd=sp(x2), rs1=sp(x2), imm=-16
+            let andi_sp = 0xFF01_7113u32; // andi sp, sp, -16
+            let jal_offset = start_offset + 12;
             let offset = (main_offset as i64) - (jal_offset as i64);
             let imm = offset as i32;
             let imm20 = ((imm >> 20) & 1) as u32;
@@ -4870,17 +4916,20 @@ fn inject_crt_start(input: &mut LinkerInput, target: Target) {
             // AUIPC ra, 0 — upper 20 bits filled by linker relocation
             let auipc_exit = 0x0000_0097u32; // auipc ra, 0
                                              // JALR ra, ra, 0 — lower 12 bits filled by linker relocation
-            let jalr_exit = 0x000080E7u32; // jalr ra, 0(ra)
+            let jalr_exit = 0x0000_80E7_u32; // jalr ra, 0(ra)
             let ebreak = 0x0010_0073u32;
             let nop = 0x0000_0013u32; // addi x0, x0, 0
             let mut stub = Vec::new();
+            stub.extend_from_slice(&ld_a0_sp.to_le_bytes());
+            stub.extend_from_slice(&addi_a1_sp_8.to_le_bytes());
+            stub.extend_from_slice(&andi_sp.to_le_bytes());
             stub.extend_from_slice(&jal_main.to_le_bytes());
             stub.extend_from_slice(&auipc_exit.to_le_bytes());
             stub.extend_from_slice(&jalr_exit.to_le_bytes());
             stub.extend_from_slice(&ebreak.to_le_bytes());
             stub.extend_from_slice(&nop.to_le_bytes());
             // Add R_RISCV_CALL_PLT relocation for `exit` at the auipc+jalr pair.
-            let exit_reloc_offset = (start_offset + 4) as u64;
+            let exit_reloc_offset = (start_offset + 16) as u64;
             input
                 .relocations
                 .push(crate::backend::linker_common::relocation::Relocation {

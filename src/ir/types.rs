@@ -493,15 +493,47 @@ impl IrType {
                 packed,
                 ..
             } => {
-                let field_types: Vec<IrType> = fields
-                    .iter()
-                    .map(|f| IrType::from_ctype(&f.ty, target))
-                    .collect();
-                IrType::Struct(StructType {
-                    fields: field_types,
-                    packed: *packed,
-                    name: name.clone(),
-                })
+                // For structs with bitfields, the IR field types don't
+                // match the actual byte layout because multiple bitfields
+                // pack into one allocation unit.  Compute the actual sizeof
+                // from the C type system and build an IR struct with the
+                // correct number of allocation-unit-sized fields.  This
+                // preserves `is_struct() == true` for ABI classification
+                // while ensuring `size_bytes()` returns the correct value.
+                let has_bitfield = fields.iter().any(|f| f.bit_width.is_some());
+                if has_bitfield {
+                    let struct_size = sizeof_ctype(ctype, target);
+                    let struct_align = alignof_ctype(ctype, target);
+                    let (unit_ty, unit_size) = if struct_align >= 8 && struct_size % 8 == 0 {
+                        (IrType::I64, 8)
+                    } else if struct_align >= 4 && struct_size % 4 == 0 {
+                        (IrType::I32, 4)
+                    } else if struct_align >= 2 && struct_size % 2 == 0 {
+                        (IrType::I16, 2)
+                    } else {
+                        (IrType::I8, 1)
+                    };
+                    let unit_count = if unit_size > 0 && struct_size > 0 {
+                        struct_size / unit_size
+                    } else {
+                        0
+                    };
+                    IrType::Struct(StructType {
+                        fields: vec![unit_ty; unit_count],
+                        packed: *packed,
+                        name: name.clone(),
+                    })
+                } else {
+                    let field_types: Vec<IrType> = fields
+                        .iter()
+                        .map(|f| IrType::from_ctype(&f.ty, target))
+                        .collect();
+                    IrType::Struct(StructType {
+                        fields: field_types,
+                        packed: *packed,
+                        name: name.clone(),
+                    })
+                }
             }
 
             // ----- Union: represented as array of properly-aligned elements -----

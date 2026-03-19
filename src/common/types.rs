@@ -68,7 +68,29 @@ pub fn clear_tag_type_defs() {
 fn resolve_tag_ref(tag: &str) -> Option<CType> {
     TAG_TYPE_DEFS.with(|cell| {
         let borrow = cell.borrow();
-        borrow.as_ref().and_then(|m| m.get(tag).cloned())
+        borrow.as_ref().and_then(|m| {
+            let resolved = m.get(tag)?;
+            // Guard against infinite recursion: if the resolved type is
+            // also an empty-field struct/union with the same tag name
+            // (e.g., GCC extension `struct g{};` — zero fields but
+            // fully defined), returning it would loop forever because
+            // sizeof_ctype would re-enter resolve_tag_ref.  Break the
+            // cycle by returning None so the caller falls through to
+            // direct size computation.
+            match resolved {
+                CType::Struct {
+                    name: Some(ref n),
+                    fields,
+                    ..
+                }
+                | CType::Union {
+                    name: Some(ref n),
+                    fields,
+                    ..
+                } if n == tag && fields.is_empty() => None,
+                _ => Some(resolved.clone()),
+            }
+        })
     })
 }
 
@@ -827,7 +849,9 @@ pub fn sizeof_ctype_resolved(
             Some(n) => sizeof_ctype_resolved(elem, target, tag_types).wrapping_mul(*n),
             None => 0,
         },
-        CType::Complex(base) => 2_usize.wrapping_mul(sizeof_ctype_resolved(base, target, tag_types)),
+        CType::Complex(base) => {
+            2_usize.wrapping_mul(sizeof_ctype_resolved(base, target, tag_types))
+        }
         CType::Atomic(inner) => sizeof_ctype_resolved(inner, target, tag_types),
         CType::Typedef { underlying, .. } => sizeof_ctype_resolved(underlying, target, tag_types),
         CType::Qualified(inner, _) => sizeof_ctype_resolved(inner, target, tag_types),

@@ -263,8 +263,7 @@ impl X86_64Linker {
         // libraries via DT_NEEDED), allow undefined symbols through — they
         // will be resolved at runtime by the dynamic linker.  We still
         // diagnose them later in Phase 8 if no PLT/GOT entry is created.
-        let allow_undef_for_dynamic =
-            self.config.allow_undefined || self.dynamic_context.is_some();
+        let allow_undef_for_dynamic = self.config.allow_undefined || self.dynamic_context.is_some();
         if let Err(undef_errors) = self
             .symbol_resolver
             .check_undefined(allow_undef_for_dynamic)
@@ -399,8 +398,7 @@ impl X86_64Linker {
             // these are definitely functions (call targets).
             let mut plt32_symbols: FxHashSet<String> = FxHashSet::default();
             for rel in &all_relocs {
-                if rel.rel_type
-                    == crate::backend::x86_64::linker::relocations::R_X86_64_PLT32
+                if rel.rel_type == crate::backend::x86_64::linker::relocations::R_X86_64_PLT32
                     && !rel.symbol_name.is_empty()
                 {
                     plt32_symbols.insert(rel.symbol_name.clone());
@@ -1160,8 +1158,7 @@ impl X86_64Linker {
             // patch_rela_dyn_offsets added got_va, so they're currently
             // wrong.  Set them to the correct .bss.copy address instead.
             {
-                let copy_rel_type =
-                    crate::backend::x86_64::linker::relocations::R_X86_64_COPY;
+                let copy_rel_type = crate::backend::x86_64::linker::relocations::R_X86_64_COPY;
                 for r in ctx.rela.rela_dyn_mut() {
                     if r.rel_type == copy_rel_type {
                         // Find the matching copy symbol by dynsym index.

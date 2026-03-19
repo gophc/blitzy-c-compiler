@@ -1,6 +1,6 @@
 // Suppress result_unit_err: TypeChecker deliberately returns Result<_, ()>
 // because error details flow through DiagnosticEngine, not through the Err variant.
-#![allow(clippy::result_unit_err)]
+#![allow(clippy::result_unit_err, clippy::if_same_then_else)]
 
 //! Type checking engine for Phase 5 (semantic analysis) of the BCC C11 compiler.
 //!

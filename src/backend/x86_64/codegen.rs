@@ -1,3 +1,4 @@
+#![allow(clippy::cloned_ref_to_slice_refs, clippy::collapsible_match)]
 //! # x86-64 Instruction Selection and Emission
 //!
 //! Converts BCC IR instructions into x86-64 machine instructions.  This module
@@ -1006,8 +1007,7 @@ impl X86_64CodeGen {
                 } = inst
                 {
                     let size = ty.size_bytes(target).max(1) as i64;
-                    let align =
-                        alignment.unwrap_or_else(|| ty.align_bytes(target)) as i64;
+                    let align = alignment.unwrap_or_else(|| ty.align_bytes(target)) as i64;
                     // Align the offset downward (stack grows down).
                     current_offset -= size;
                     if align > 1 {
@@ -1051,11 +1051,8 @@ impl X86_64CodeGen {
             // so that va_start computes the correct gp_ptr offset.
             for p in &func.params {
                 let param_size = crate::backend::generation::ir_type_size_pub(&p.ty) as usize;
-                let is_memory_class = param_size > 16
-                    && matches!(
-                        &p.ty,
-                        IrType::Struct(_) | IrType::Array(_, _)
-                    );
+                let is_memory_class =
+                    param_size > 16 && matches!(&p.ty, IrType::Struct(_) | IrType::Array(_, _));
                 if is_memory_class {
                     // MEMORY-class: pushed on stack by caller, doesn't
                     // consume a register.
@@ -1068,10 +1065,7 @@ impl X86_64CodeGen {
                     // Struct pairs (9-16 bytes) consume 2 GPR slots.
                     if param_size > 8
                         && param_size <= 16
-                        && matches!(
-                            &p.ty,
-                            IrType::Struct(_) | IrType::Array(_, _)
-                        )
+                        && matches!(&p.ty, IrType::Struct(_) | IrType::Array(_, _))
                     {
                         named_gpr_count += 2;
                     } else {
@@ -1079,17 +1073,22 @@ impl X86_64CodeGen {
                     }
                 }
             }
-            // Reserve 48 bytes for the 6 GPR save slots (RDI..R9).
-            current_offset -= 48;
-            current_offset &= !7;
+            // Reserve 176 bytes for the ABI-standard contiguous register
+            // save area.  Layout (all offsets from the base):
+            //   [0..47]    6 GPRs: RDI, RSI, RDX, RCX, R8, R9 (8 bytes each)
+            //   [48..175]  8 XMMs: XMM0–XMM7 (16 bytes each, low 8 stored)
+            // Must be 16-byte aligned for XMM stores.
+            current_offset -= 176;
+            current_offset &= !15; // 16-byte alignment
             va_save_area_offset = Some(current_offset as i32);
-            // Reserve 64 bytes for the 8 XMM save slots (XMM0..XMM7).
-            current_offset -= 64;
-            current_offset &= !7;
-            va_fp_save_area_offset = Some(current_offset as i32);
-            // Reserve 40 bytes for the va_control block
-            // (gp_ptr, fp_ptr, gp_end, fp_end, overflow_ptr).
-            current_offset -= 40;
+            va_fp_save_area_offset = Some((current_offset + 48) as i32);
+            // Reserve 24 bytes for the ABI-standard va_list struct.
+            // Layout:
+            //   [0..3]   gp_offset         (u32)
+            //   [4..7]   fp_offset         (u32)
+            //   [8..15]  overflow_arg_area (pointer)
+            //   [16..23] reg_save_area     (pointer)
+            current_offset -= 24;
             current_offset &= !7;
             va_control_offset = Some(current_offset as i32);
         }
@@ -1117,6 +1116,18 @@ impl X86_64CodeGen {
                         // frame offset.
                         if !alloca_offsets.contains_key(ptr) {
                             current_offset -= 16;
+                            current_offset &= !15; // 16-byte alignment
+                            struct_temp_offsets.insert(*result, current_offset as i32);
+                        }
+                    } else if ty.is_struct() && load_size > 16 {
+                        // MEMORY-class (>16 byte) struct load from a
+                        // non-alloca source (global variable, computed GEP,
+                        // etc.).  Allocate a temp frame slot large enough
+                        // for the full struct so the Load handler can copy
+                        // data in and record a stable struct_load_source.
+                        if !alloca_offsets.contains_key(ptr) {
+                            let alloc_size = ((load_size + 7) & !7) as i64;
+                            current_offset -= alloc_size;
                             current_offset &= !15; // 16-byte alignment
                             struct_temp_offsets.insert(*result, current_offset as i32);
                         }
@@ -1325,13 +1336,14 @@ impl X86_64CodeGen {
             }
         }
 
-        // For variadic functions: save XMM0–XMM7 (low 64-bit each) to
-        // the FP save area so va_arg can retrieve floating-point variadic
-        // arguments.  Uses movsd [rbp+offset], xmmN.
-        if let Some(fp_offset) = mf.va_fp_save_area_offset {
+        // For variadic functions: save XMM0–XMM7 to the FP portion of the
+        // contiguous register save area at 16-byte intervals (ABI standard).
+        // Uses movsd [rbp+offset], xmmN (stores low 64-bit).
+        if let Some(va_base) = mf.va_save_area_offset {
             let xmm_regs: [u16; 8] = [XMM0, XMM1, XMM2, XMM3, XMM4, XMM5, XMM6, XMM7];
             for (i, &reg) in xmm_regs.iter().enumerate() {
-                let disp = fp_offset as i64 + (i as i64) * 8;
+                // FP slots start at base+48, each 16 bytes apart
+                let disp = va_base as i64 + 48 + (i as i64) * 16;
                 prologue.push(Self::mk_inst(
                     X86Opcode::Movsd,
                     None,
@@ -1348,32 +1360,20 @@ impl X86_64CodeGen {
             }
         }
 
-        // For variadic functions: initialize the 40-byte va_control block.
+        // For variadic functions: initialize the 24-byte ABI-standard
+        // va_list struct (compatible with libc vprintf, etc.).
         // Layout:
-        //   [+0]  gp_ptr — &gpr_save_area[named_gpr_count]
-        //   [+8]  fp_ptr — &fp_save_area[named_fp_count]
-        //   [+16] gp_end — &gpr_save_area[6] (one past last register slot)
-        //   [+24] fp_end — &fp_save_area[8] (one past last FP save slot)
-        //   [+32] overflow_ptr — RBP + 16 + fixed_stack_bytes
-                if let (Some(ctrl_offset), Some(gpr_offset), Some(fp_offset)) = (
-            mf.va_control_offset,
-            mf.va_save_area_offset,
-            mf.va_fp_save_area_offset,
-        ) {
+        //   [+0]  gp_offset         (u32) = named_gpr_count * 8
+        //   [+4]  fp_offset         (u32) = 48 + named_fp_count * 16
+        //   [+8]  overflow_arg_area (ptr) = RBP + 16 + fixed_stack_bytes
+        //   [+16] reg_save_area     (ptr) = RBP + va_save_area_offset
+        if let (Some(ctrl_offset), Some(reg_save_base)) =
+            (mf.va_control_offset, mf.va_save_area_offset)
+        {
             let rax = MachineOperand::Register(RAX);
-            // [+0] gp_ptr = RBP + gpr_save_offset + named_gpr_count * 8
-            let gp_ptr_disp = gpr_offset as i64 + (mf.named_gpr_count as i64) * 8;
-            prologue.push(Self::mk_inst(
-                X86Opcode::Lea,
-                Some(rax.clone()),
-                &[MachineOperand::Memory {
-                    base: Some(RBP),
-                    index: None,
-                    scale: 1,
-                    displacement: gp_ptr_disp,
-                }],
-            ));
-            prologue.push(Self::mk_inst(
+            // [+0] gp_offset (32-bit) = named_gpr_count * 8
+            let gp_offset_val = (mf.named_gpr_count as i64) * 8;
+            let mut store_gp_off = Self::mk_inst(
                 X86Opcode::Mov,
                 None,
                 &[
@@ -1383,22 +1383,14 @@ impl X86_64CodeGen {
                         scale: 1,
                         displacement: ctrl_offset as i64,
                     },
-                    rax.clone(),
+                    MachineOperand::Immediate(gp_offset_val),
                 ],
-            ));
-            // [+8] fp_ptr = RBP + fp_save_offset + named_fp_count * 8
-            let fp_ptr_disp = fp_offset as i64 + (mf.named_fp_count as i64) * 8;
-            prologue.push(Self::mk_inst(
-                X86Opcode::Lea,
-                Some(rax.clone()),
-                &[MachineOperand::Memory {
-                    base: Some(RBP),
-                    index: None,
-                    scale: 1,
-                    displacement: fp_ptr_disp,
-                }],
-            ));
-            prologue.push(Self::mk_inst(
+            );
+            store_gp_off.operand_size = 4;
+            prologue.push(store_gp_off);
+            // [+4] fp_offset (32-bit) = 48 + named_fp_count * 16
+            let fp_offset_val = 48 + (mf.named_fp_count as i64) * 16;
+            let mut store_fp_off = Self::mk_inst(
                 X86Opcode::Mov,
                 None,
                 &[
@@ -1406,67 +1398,14 @@ impl X86_64CodeGen {
                         base: Some(RBP),
                         index: None,
                         scale: 1,
-                        displacement: ctrl_offset as i64 + 8,
+                        displacement: ctrl_offset as i64 + 4,
                     },
-                    rax.clone(),
+                    MachineOperand::Immediate(fp_offset_val),
                 ],
-            ));
-            // [+16] gp_end = RBP + gpr_save_offset + 6 * 8
-            //        (one past the last GPR register save slot)
-            let gp_end_disp = gpr_offset as i64 + 6 * 8;
-            prologue.push(Self::mk_inst(
-                X86Opcode::Lea,
-                Some(rax.clone()),
-                &[MachineOperand::Memory {
-                    base: Some(RBP),
-                    index: None,
-                    scale: 1,
-                    displacement: gp_end_disp,
-                }],
-            ));
-            prologue.push(Self::mk_inst(
-                X86Opcode::Mov,
-                None,
-                &[
-                    MachineOperand::Memory {
-                        base: Some(RBP),
-                        index: None,
-                        scale: 1,
-                        displacement: ctrl_offset as i64 + 16,
-                    },
-                    rax.clone(),
-                ],
-            ));
-            // [+24] fp_end = RBP + fp_save_offset + 8 * 8
-            //        (one past the last FP register save slot)
-            let fp_end_disp = fp_offset as i64 + 8 * 8;
-            prologue.push(Self::mk_inst(
-                X86Opcode::Lea,
-                Some(rax.clone()),
-                &[MachineOperand::Memory {
-                    base: Some(RBP),
-                    index: None,
-                    scale: 1,
-                    displacement: fp_end_disp,
-                }],
-            ));
-            prologue.push(Self::mk_inst(
-                X86Opcode::Mov,
-                None,
-                &[
-                    MachineOperand::Memory {
-                        base: Some(RBP),
-                        index: None,
-                        scale: 1,
-                        displacement: ctrl_offset as i64 + 24,
-                    },
-                    rax.clone(),
-                ],
-            ));
-            // [+32] overflow_ptr = RBP + 16 + fixed_stack_bytes
-            //        (first VARIADIC stack argument, skipping past any fixed
-            //        parameters that were passed on the stack because the
-            //        register file was full — i.e. >6 GPR or >8 FP args)
+            );
+            store_fp_off.operand_size = 4;
+            prologue.push(store_fp_off);
+            // [+8] overflow_arg_area = RBP + 16 + fixed_stack_bytes
             let gp_stack_fixed = mf.named_gpr_count.saturating_sub(6);
             let fp_stack_fixed = mf.named_fp_count.saturating_sub(8);
             let overflow_disp = 16 + ((gp_stack_fixed + fp_stack_fixed) * 8) as i64;
@@ -1488,7 +1427,31 @@ impl X86_64CodeGen {
                         base: Some(RBP),
                         index: None,
                         scale: 1,
-                        displacement: ctrl_offset as i64 + 32,
+                        displacement: ctrl_offset as i64 + 8,
+                    },
+                    rax.clone(),
+                ],
+            ));
+            // [+16] reg_save_area = RBP + va_save_area_offset
+            prologue.push(Self::mk_inst(
+                X86Opcode::Lea,
+                Some(rax.clone()),
+                &[MachineOperand::Memory {
+                    base: Some(RBP),
+                    index: None,
+                    scale: 1,
+                    displacement: reg_save_base as i64,
+                }],
+            ));
+            prologue.push(Self::mk_inst(
+                X86Opcode::Mov,
+                None,
+                &[
+                    MachineOperand::Memory {
+                        base: Some(RBP),
+                        index: None,
+                        scale: 1,
+                        displacement: ctrl_offset as i64 + 16,
                     },
                     rax,
                 ],
@@ -1644,7 +1607,21 @@ impl X86_64CodeGen {
             self.value_types.insert(param.value, param.ty.clone());
 
             // Determine whether the parameter is floating-point.
-            let is_fp = matches!(param.ty, IrType::F32 | IrType::F64 | IrType::F80);
+            // Check bare scalar floats AND SSE-class structs (e.g.
+            // `struct { double d; }` which is ABI-classified as SSE
+            // and must be passed in an XMM register, not a GPR).
+            let is_fp = matches!(param.ty, IrType::F32 | IrType::F64 | IrType::F80) || {
+                if let IrType::Struct(ref st) = param.ty {
+                    let sz = param.ty.size_bytes(&self.target);
+                    if sz <= 8 && st.fields.len() == 1 {
+                        matches!(st.fields[0], IrType::F32 | IrType::F64 | IrType::F80)
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            };
 
             // Check for 16-byte struct (RegisterPair ABI): struct params
             // with size > 8 and <= 16 are passed in TWO consecutive GPRs
@@ -1826,7 +1803,7 @@ impl X86_64CodeGen {
                                             None,
                                             &[dst_mem, MachineOperand::Register(R11)],
                                         );
-                                        if remaining < 8 && remaining <= 4 {
+                                        if remaining <= 4 {
                                             st.operand_size = remaining as u8;
                                         }
                                         param_hi_stores.push(st);
@@ -1937,7 +1914,7 @@ impl X86_64CodeGen {
                                                 None,
                                                 &[dst_mem, MachineOperand::Register(R11)],
                                             );
-                                            if remaining < 8 && remaining <= 4 {
+                                            if remaining <= 4 {
                                                 st.operand_size = remaining as u8;
                                             }
                                             param_hi_stores.push(st);
@@ -2090,8 +2067,7 @@ impl X86_64CodeGen {
                             })
                             .count();
                         if num_outputs > 0 && !operands.is_empty() {
-                            if let Some(elem_ty) = alloca_elem_types.get(&operands[0])
-                            {
+                            if let Some(elem_ty) = alloca_elem_types.get(&operands[0]) {
                                 self.value_types.insert(*result, elem_ty.clone());
                             } else {
                                 // Fallback: pointer-width integer
@@ -2327,10 +2303,7 @@ impl X86_64CodeGen {
                 let sub_inst = Self::mk_inst(
                     X86Opcode::Sub,
                     Some(MachineOperand::Register(RSP)),
-                    &[
-                        MachineOperand::Register(RSP),
-                        size_op,
-                    ],
+                    &[MachineOperand::Register(RSP), size_op],
                 );
                 out.push(sub_inst);
 
@@ -2346,14 +2319,32 @@ impl X86_64CodeGen {
                 out.push(align_inst);
 
                 // mov result, rsp
-                let mov_inst = Self::mk_inst(
-                    X86Opcode::Mov,
-                    Some(dst),
-                    &[MachineOperand::Register(RSP)],
-                );
+                let mov_inst =
+                    Self::mk_inst(X86Opcode::Mov, Some(dst), &[MachineOperand::Register(RSP)]);
                 out.push(mov_inst);
 
-                return out;
+                out
+            }
+
+            // ---------------------------------------------------------------
+            // StackSave — capture RSP into a virtual register
+            // ---------------------------------------------------------------
+            Instruction::StackSave { result, .. } => {
+                let dst = self.new_vreg();
+                self.set_value(*result, dst.clone());
+                let mov_inst =
+                    Self::mk_inst(X86Opcode::Mov, Some(dst), &[MachineOperand::Register(RSP)]);
+                vec![mov_inst]
+            }
+
+            // ---------------------------------------------------------------
+            // StackRestore — restore RSP from a previously saved value
+            // ---------------------------------------------------------------
+            Instruction::StackRestore { ptr, .. } => {
+                let src = self.get_value(*ptr);
+                let mov_inst =
+                    Self::mk_inst(X86Opcode::Mov, Some(MachineOperand::Register(RSP)), &[src]);
+                vec![mov_inst]
             }
 
             // ---------------------------------------------------------------
@@ -2430,11 +2421,12 @@ impl X86_64CodeGen {
                                 // When the pointer is a GlobalSymbol,
                                 // MOV loads the VALUE at that address.  We
                                 // need LEA to get the ADDRESS instead.
-                                let ptr_opc = if matches!(&ptr_vreg, MachineOperand::GlobalSymbol(_)) {
-                                    X86Opcode::Lea
-                                } else {
-                                    X86Opcode::Mov
-                                };
+                                let ptr_opc =
+                                    if matches!(&ptr_vreg, MachineOperand::GlobalSymbol(_)) {
+                                        X86Opcode::Lea
+                                    } else {
+                                        X86Opcode::Mov
+                                    };
                                 struct_temp_prefix.push(Self::mk_inst(
                                     ptr_opc,
                                     Some(MachineOperand::Register(R11)),
@@ -2490,6 +2482,71 @@ impl X86_64CodeGen {
                                 index: None,
                                 scale: 1,
                                 displacement: offset as i64,
+                            };
+                            self.struct_load_source.insert(*result, mem_op);
+                        } else if let Some(&temp_offset) = frame.struct_temp_offsets.get(result) {
+                            // Non-alloca source (global variable, computed
+                            // GEP, etc.).  Copy the entire struct into the
+                            // pre-allocated temp frame slot so that the
+                            // Return / Call / Store handlers can use
+                            // struct_load_source for the full copy.
+                            let ptr_vreg = self.get_value(*ptr);
+                            let ptr_opc = if matches!(&ptr_vreg, MachineOperand::GlobalSymbol(_)) {
+                                X86Opcode::Lea
+                            } else {
+                                X86Opcode::Mov
+                            };
+                            let eightbytes = (load_size + 7) / 8;
+                            // Load address of source into R11.
+                            // Copy each eightbyte from source to temp slot.
+                            // IMPORTANT: Use only R11 (reserved scratch) for
+                            // all data movement.  Reload the source address
+                            // from ptr_vreg each iteration instead of holding
+                            // it in R11 across iterations, so no allocatable
+                            // register (like RAX) is clobbered.
+                            for i in 0..eightbytes {
+                                // Reload source address into R11.
+                                struct_temp_prefix.push(Self::mk_inst(
+                                    ptr_opc,
+                                    Some(MachineOperand::Register(R11)),
+                                    std::slice::from_ref(&ptr_vreg),
+                                ));
+                                // Load data from source + offset via R11.
+                                let src_off = MachineOperand::Memory {
+                                    base: Some(R11),
+                                    index: None,
+                                    scale: 1,
+                                    displacement: (i as i64) * 8,
+                                };
+                                let remaining = load_size - i * 8;
+                                struct_temp_prefix.push(Self::mk_inst(
+                                    X86Opcode::Mov,
+                                    Some(MachineOperand::Register(R11)),
+                                    &[src_off],
+                                ));
+                                // Store to temp frame slot.
+                                let dst_off = MachineOperand::Memory {
+                                    base: Some(RBP),
+                                    index: None,
+                                    scale: 1,
+                                    displacement: (temp_offset as i64) + (i as i64) * 8,
+                                };
+                                let mut st = Self::mk_inst(
+                                    X86Opcode::Mov,
+                                    Some(dst_off),
+                                    &[MachineOperand::Register(R11)],
+                                );
+                                if remaining <= 4 {
+                                    st.operand_size = remaining as u8;
+                                }
+                                struct_temp_prefix.push(st);
+                            }
+                            // Record temp slot as struct_load_source.
+                            let mem_op = MachineOperand::Memory {
+                                base: Some(RBP),
+                                index: None,
+                                scale: 1,
+                                displacement: temp_offset as i64,
                             };
                             self.struct_load_source.insert(*result, mem_op);
                         }
@@ -2572,8 +2629,7 @@ impl X86_64CodeGen {
                                     IrType::I32 => 4,
                                     _ => 8,
                                 };
-                                let mut load =
-                                    Self::mk_inst(X86Opcode::Mov, Some(dst), &[mem]);
+                                let mut load = Self::mk_inst(X86Opcode::Mov, Some(dst), &[mem]);
                                 load.operand_size = load_sz;
                                 vec![load]
                             }
@@ -2658,7 +2714,11 @@ impl X86_64CodeGen {
                         .get(value)
                         .map(|vty| {
                             let s = vty.size_bytes(&self.target);
-                            if s > 0 { s } else { 16 }
+                            if s > 0 {
+                                s
+                            } else {
+                                16
+                            }
                         })
                         .unwrap_or(16);
 
@@ -2701,26 +2761,14 @@ impl X86_64CodeGen {
                                 _ => src_mem,
                             };
                             let remaining = struct_sz - 8;
-                            out.push(Self::mk_inst(
-                                X86Opcode::Mov,
-                                Some(r10.clone()),
-                                &[src_hi],
-                            ));
-                            out.push(Self::mk_inst(
-                                X86Opcode::Mov,
-                                Some(r11.clone()),
-                                &[dest],
-                            ));
+                            out.push(Self::mk_inst(X86Opcode::Mov, Some(r10.clone()), &[src_hi]));
+                            out.push(Self::mk_inst(X86Opcode::Mov, Some(r11.clone()), &[dest]));
                             out.push(Self::mk_inst(
                                 X86Opcode::Add,
                                 Some(r11.clone()),
                                 &[r11.clone(), MachineOperand::Immediate(8)],
                             ));
-                            let mut st = Self::mk_inst(
-                                X86Opcode::StoreInd,
-                                None,
-                                &[r11, r10],
-                            );
+                            let mut st = Self::mk_inst(X86Opcode::StoreInd, None, &[r11, r10]);
                             if remaining <= 4 {
                                 st.operand_size = remaining as u8;
                             }
@@ -2729,11 +2777,7 @@ impl X86_64CodeGen {
                     } else {
                         // General N-eightbyte path for structs > 16 bytes.
                         // R10 = dest ptr, R11 = scratch for data.
-                        out.push(Self::mk_inst(
-                            X86Opcode::Mov,
-                            Some(r10.clone()),
-                            &[dest],
-                        ));
+                        out.push(Self::mk_inst(X86Opcode::Mov, Some(r10.clone()), &[dest]));
                         for i in 0..num_eightbytes {
                             let offset = (i * 8) as i64;
                             let remaining = struct_sz - i * 8;
@@ -2758,22 +2802,16 @@ impl X86_64CodeGen {
                                 displacement: offset,
                             };
                             // Load from source.
-                            let mut ld = Self::mk_inst(
-                                X86Opcode::Mov,
-                                Some(r11.clone()),
-                                &[src_chunk],
-                            );
-                            if remaining < 8 && remaining <= 4 {
+                            let mut ld =
+                                Self::mk_inst(X86Opcode::Mov, Some(r11.clone()), &[src_chunk]);
+                            if remaining <= 4 {
                                 ld.operand_size = remaining as u8;
                             }
                             out.push(ld);
                             // Store to dest.
-                            let mut st = Self::mk_inst(
-                                X86Opcode::Mov,
-                                None,
-                                &[dst_chunk, r11.clone()],
-                            );
-                            if remaining < 8 && remaining <= 4 {
+                            let mut st =
+                                Self::mk_inst(X86Opcode::Mov, None, &[dst_chunk, r11.clone()]);
+                            if remaining <= 4 {
                                 st.operand_size = remaining as u8;
                             }
                             out.push(st);
@@ -2790,27 +2828,38 @@ impl X86_64CodeGen {
                 // their alloca slots (e.g. a 4-byte struct must NOT
                 // be written with a 64-bit MOV that clobbers adjacent
                 // stack memory).
-                let store_sz: u8 =
-                    if let Some(vty) = self.value_types.get(value) {
-                        match vty {
-                            IrType::I1 | IrType::I8 => 1,
-                            IrType::I16 => 2,
-                            IrType::I32 => 4,
-                            IrType::F32 => 4,
-                            IrType::F64 | IrType::I64 | IrType::Ptr => 8,
-                            IrType::Struct(_) | IrType::Array(_, _) => {
-                                let sz = vty.size_bytes(&self.target);
-                                if sz <= 8 { sz as u8 } else { 8 }
+                let store_sz: u8 = if let Some(vty) = self.value_types.get(value) {
+                    match vty {
+                        IrType::I1 | IrType::I8 => 1,
+                        IrType::I16 => 2,
+                        IrType::I32 => 4,
+                        IrType::F32 => 4,
+                        IrType::F64 | IrType::I64 | IrType::Ptr => 8,
+                        IrType::Struct(_) | IrType::Array(_, _) => {
+                            let sz = vty.size_bytes(&self.target);
+                            if sz <= 8 {
+                                sz as u8
+                            } else {
+                                8
                             }
-                            _ => 8,
                         }
-                    } else {
-                        8
-                    };
-                let is_float_val = matches!(
-                    self.value_types.get(value),
-                    Some(IrType::F32) | Some(IrType::F64)
-                );
+                        _ => 8,
+                    }
+                } else {
+                    8
+                };
+                let is_float_val = match self.value_types.get(value) {
+                    Some(IrType::F32) | Some(IrType::F64) => true,
+                    // SSE-class struct: single-float-field struct ≤8 bytes
+                    // is passed/stored in XMM registers.
+                    Some(IrType::Struct(ref st))
+                        if st.fields.len() == 1
+                            && matches!(st.fields[0], IrType::F32 | IrType::F64) =>
+                    {
+                        true
+                    }
+                    _ => false,
+                };
 
                 // If the pointer is already a Memory or FrameSlot,
                 // use a regular Mov with that operand as destination.
@@ -2824,8 +2873,7 @@ impl X86_64CodeGen {
                             };
                             vec![Self::mk_inst(fop, None, &[dest_ptr, src])]
                         } else {
-                            let mut inst =
-                                Self::mk_inst(X86Opcode::Mov, None, &[dest_ptr, src]);
+                            let mut inst = Self::mk_inst(X86Opcode::Mov, None, &[dest_ptr, src]);
                             inst.operand_size = store_sz;
                             vec![inst]
                         }
@@ -2835,19 +2883,18 @@ impl X86_64CodeGen {
                         // to ensure correct encoding width (avoid 64-bit store
                         // for 32-bit int globals that would overflow into
                         // adjacent variables).
-                        let store_size: u8 =
-                            if let Some(vty) = self.value_types.get(value) {
-                                match vty {
-                                    IrType::I1 | IrType::I8 => 1,
-                                    IrType::I16 => 2,
-                                    IrType::I32 => 4,
-                                    IrType::F32 => 4,
-                                    IrType::F64 => 8,
-                                    _ => 8,
-                                }
-                            } else {
-                                8
-                            };
+                        let store_size: u8 = if let Some(vty) = self.value_types.get(value) {
+                            match vty {
+                                IrType::I1 | IrType::I8 => 1,
+                                IrType::I16 => 2,
+                                IrType::I32 => 4,
+                                IrType::F32 => 4,
+                                IrType::F64 => 8,
+                                _ => 8,
+                            }
+                        } else {
+                            8
+                        };
                         let is_float = matches!(
                             self.value_types.get(value),
                             Some(IrType::F32) | Some(IrType::F64)
@@ -2867,10 +2914,7 @@ impl X86_64CodeGen {
                                 } else {
                                     X86Opcode::Movsd
                                 };
-                                return vec![
-                                    load_got,
-                                    Self::mk_inst(fop, None, &[r11, src]),
-                                ];
+                                return vec![load_got, Self::mk_inst(fop, None, &[r11, src])];
                             }
                             // Materialise immediate into register if needed.
                             let src_reg = match &src {
@@ -2898,10 +2942,7 @@ impl X86_64CodeGen {
                                 4 => X86Opcode::StoreInd32,
                                 _ => X86Opcode::StoreInd,
                             };
-                            vec![
-                                load_got,
-                                Self::mk_inst(store_op, None, &[r11, src_reg]),
-                            ]
+                            vec![load_got, Self::mk_inst(store_op, None, &[r11, src_reg])]
                         } else {
                             // Non-PIC: direct RIP-relative store.
                             if is_float {
@@ -2942,15 +2983,10 @@ impl X86_64CodeGen {
                                     let lea = Self::mk_inst(
                                         X86Opcode::Lea,
                                         Some(r11.clone()),
-                                        &[MachineOperand::GlobalSymbol(
-                                            src_sym.clone(),
-                                        )],
+                                        &[MachineOperand::GlobalSymbol(src_sym.clone())],
                                     );
-                                    let mut store = Self::mk_inst(
-                                        X86Opcode::Mov,
-                                        None,
-                                        &[mem, r11],
-                                    );
+                                    let mut store =
+                                        Self::mk_inst(X86Opcode::Mov, None, &[mem, r11]);
                                     store.operand_size = store_size;
                                     vec![lea, store]
                                 }
@@ -3389,9 +3425,7 @@ impl X86_64CodeGen {
                                 // (stable RBP-relative memory operand), then
                                 // fall back to dereferencing the value as
                                 // a pointer.
-                                if let Some(mem_base) =
-                                    self.struct_load_source.get(val).cloned()
-                                {
+                                if let Some(mem_base) = self.struct_load_source.get(val).cloned() {
                                     // Copy each 8-byte chunk from the source
                                     // memory to the hidden return buffer.
                                     for i in 0..eightbytes {
@@ -3405,8 +3439,7 @@ impl X86_64CodeGen {
                                                 base: *base,
                                                 index: *index,
                                                 scale: *scale,
-                                                displacement: displacement
-                                                    + (i as i64) * 8,
+                                                displacement: displacement + (i as i64) * 8,
                                             },
                                             _ => mem_base.clone(),
                                         };
@@ -3429,7 +3462,7 @@ impl X86_64CodeGen {
                                             None,
                                             &[dst_off, MachineOperand::Register(R11)],
                                         );
-                                        if remaining < 8 && remaining <= 4 {
+                                        if remaining <= 4 {
                                             st.operand_size = remaining as u8;
                                         }
                                         out.push(st);
@@ -3471,7 +3504,7 @@ impl X86_64CodeGen {
                                             None,
                                             &[dst_off, MachineOperand::Register(RAX)],
                                         );
-                                        if remaining < 8 && remaining <= 4 {
+                                        if remaining <= 4 {
                                             st.operand_size = remaining as u8;
                                         }
                                         out.push(st);
@@ -3756,10 +3789,8 @@ impl X86_64CodeGen {
                 } else if from_is_int && to_is_float {
                     // Integer → Float: CVTSI2SD / CVTSI2SS
                     let is_f32 = matches!(to_type, IrType::F32);
-                    let from_is_i64 = matches!(
-                        from_type.as_ref(),
-                        Some(IrType::I64) | Some(IrType::I128)
-                    );
+                    let from_is_i64 =
+                        matches!(from_type.as_ref(), Some(IrType::I64) | Some(IrType::I128));
 
                     if is_unsigned && from_is_i64 {
                         // Unsigned 64-bit → Float.  cvtsi2sd treats reg
@@ -3817,7 +3848,7 @@ impl X86_64CodeGen {
                         //
                         // But for values < 2^63 the signed path is more
                         // precise. Let's use the two-path approach.
-                        // 
+                        //
                         // For simplicity and correctness, we use the
                         // standard GCC pattern with branching:
                         let r11 = MachineOperand::Register(R11);
@@ -3825,17 +3856,19 @@ impl X86_64CodeGen {
                         let mut insts = Vec::new();
 
                         // Move src to r11 (may already be in a vreg)
-                        let mut mov_to_r11 = Self::mk_inst(X86Opcode::Mov, Some(r11.clone()), &[src.clone()]);
+                        let mut mov_to_r11 =
+                            Self::mk_inst(X86Opcode::Mov, Some(r11.clone()), &[src.clone()]);
                         mov_to_r11.operand_size = 8;
                         insts.push(mov_to_r11);
 
                         // test r11, r11 (set SF if bit 63 is set)
-                        let mut test_inst = Self::mk_inst(X86Opcode::Test, None, &[r11.clone(), r11.clone()]);
+                        let mut test_inst =
+                            Self::mk_inst(X86Opcode::Test, None, &[r11.clone(), r11.clone()]);
                         test_inst.operand_size = 8;
                         insts.push(test_inst);
 
                         // js .Lunsigned (jump if SF=1, i.e. bit 63 set)
-                        // For this, we emit: Js forward by N bytes. 
+                        // For this, we emit: Js forward by N bytes.
                         // But we can't easily do labels in our MachineInst.
                         // Instead, use the branchless two-path approach:
                         //
@@ -3890,35 +3923,62 @@ impl X86_64CodeGen {
                         insts.clear();
 
                         // r10 = src & 1
-                        let mut mov_r10 = Self::mk_inst(X86Opcode::Mov, Some(r10.clone()), &[src.clone()]);
+                        let mut mov_r10 =
+                            Self::mk_inst(X86Opcode::Mov, Some(r10.clone()), &[src.clone()]);
                         mov_r10.operand_size = 8;
                         insts.push(mov_r10);
-                        let mut and_r10 = Self::mk_inst(X86Opcode::And, Some(r10.clone()), &[r10.clone(), MachineOperand::Immediate(1)]);
+                        let mut and_r10 = Self::mk_inst(
+                            X86Opcode::And,
+                            Some(r10.clone()),
+                            &[r10.clone(), MachineOperand::Immediate(1)],
+                        );
                         and_r10.operand_size = 8;
                         insts.push(and_r10);
 
                         // r11 = src >> 1
-                        let mut mov_r11 = Self::mk_inst(X86Opcode::Mov, Some(r11.clone()), &[src.clone()]);
+                        let mut mov_r11 =
+                            Self::mk_inst(X86Opcode::Mov, Some(r11.clone()), &[src.clone()]);
                         mov_r11.operand_size = 8;
                         insts.push(mov_r11);
-                        let mut shr_r11 = Self::mk_inst(X86Opcode::Shr, Some(r11.clone()), &[r11.clone(), MachineOperand::Immediate(1)]);
+                        let mut shr_r11 = Self::mk_inst(
+                            X86Opcode::Shr,
+                            Some(r11.clone()),
+                            &[r11.clone(), MachineOperand::Immediate(1)],
+                        );
                         shr_r11.operand_size = 8;
                         insts.push(shr_r11);
 
                         // r11 |= r10
-                        let mut or_r11 = Self::mk_inst(X86Opcode::Or, Some(r11.clone()), &[r11.clone(), r10.clone()]);
+                        let mut or_r11 = Self::mk_inst(
+                            X86Opcode::Or,
+                            Some(r11.clone()),
+                            &[r11.clone(), r10.clone()],
+                        );
                         or_r11.operand_size = 8;
                         insts.push(or_r11);
 
                         // cvtsi2sd r11, dst  (signed conv of halved value, always < 2^63)
-                        let conv_opcode = if is_f32 { X86Opcode::Cvtsi2ss } else { X86Opcode::Cvtsi2sd };
-                        let mut conv = Self::mk_inst(conv_opcode, Some(dst.clone()), &[r11.clone()]);
+                        let conv_opcode = if is_f32 {
+                            X86Opcode::Cvtsi2ss
+                        } else {
+                            X86Opcode::Cvtsi2sd
+                        };
+                        let mut conv =
+                            Self::mk_inst(conv_opcode, Some(dst.clone()), &[r11.clone()]);
                         conv.operand_size = 8; // REX.W for 64-bit source
                         insts.push(conv);
 
                         // addsd dst, dst  (double the result)
-                        let add_opcode = if is_f32 { X86Opcode::Addss } else { X86Opcode::Addsd };
-                        insts.push(Self::mk_inst(add_opcode, Some(dst.clone()), &[dst.clone(), dst.clone()]));
+                        let add_opcode = if is_f32 {
+                            X86Opcode::Addss
+                        } else {
+                            X86Opcode::Addsd
+                        };
+                        insts.push(Self::mk_inst(
+                            add_opcode,
+                            Some(dst.clone()),
+                            &[dst.clone(), dst.clone()],
+                        ));
 
                         // Now handle the case where src < 2^63 (signed
                         // conversion is more precise). We use test+cmov:
@@ -3942,12 +4002,16 @@ impl X86_64CodeGen {
                             X86Opcode::Cvtsi2sd
                         };
                         let mut inst = Self::mk_inst(opcode, Some(dst), &[src]);
-                        // For unsigned 32-bit, zero-extend to 64-bit first
-                        // (the value is already zero-extended in a 64-bit
-                        // register on x86-64, but we need REX.W so cvtsi2sd
-                        // reads the full 64-bit register as signed i64,
-                        // which correctly represents u32 values).
-                        if is_unsigned {
+                        // REX.W control for cvtsi2sd/cvtsi2ss:
+                        // - Unsigned ≤32-bit: need REX.W so the zero-extended
+                        //   64-bit register is read as signed i64 (correctly
+                        //   represents all u32 values).
+                        // - Signed 64-bit: need REX.W for full 64-bit range.
+                        // - Signed ≤32-bit: NO REX.W — cvtsi2sd reads the
+                        //   32-bit register as signed i32, which correctly
+                        //   handles negative values (e.g. -1 in EAX →
+                        //   -1.0, not 4294967295.0).
+                        if is_unsigned || from_is_i64 {
                             inst.operand_size = 8;
                         }
                         vec![inst]
@@ -4009,13 +4073,46 @@ impl X86_64CodeGen {
                 self.set_value(*result, dst.clone());
                 // On x86-64, truncation to 32-bit uses a 32-bit MOV which
                 // implicitly zero-extends the upper 32 bits.  For smaller
-                // widths, use MOVZX from the appropriate sub-register size.
-                let opcode = match to_type {
-                    IrType::I32 => X86Opcode::Mov,
-                    IrType::I16 | IrType::I8 | IrType::I1 => X86Opcode::Mov,
-                    _ => X86Opcode::Mov,
-                };
-                vec![Self::mk_inst(opcode, Some(dst), &[src])]
+                // widths (I8, I16, I1), we must AND with the appropriate
+                // mask so that the upper bits are cleared — otherwise a
+                // later boolean test of the full register would see the
+                // non-zero upper bits and produce wrong results.
+                match to_type {
+                    IrType::I1 => {
+                        let mut insts =
+                            vec![Self::mk_inst(X86Opcode::Mov, Some(dst.clone()), &[src])];
+                        insts.push(Self::mk_inst(
+                            X86Opcode::And,
+                            Some(dst),
+                            &[MachineOperand::Immediate(1)],
+                        ));
+                        insts
+                    }
+                    IrType::I8 => {
+                        let mut insts =
+                            vec![Self::mk_inst(X86Opcode::Mov, Some(dst.clone()), &[src])];
+                        insts.push(Self::mk_inst(
+                            X86Opcode::And,
+                            Some(dst),
+                            &[MachineOperand::Immediate(0xFF)],
+                        ));
+                        insts
+                    }
+                    IrType::I16 => {
+                        let mut insts =
+                            vec![Self::mk_inst(X86Opcode::Mov, Some(dst.clone()), &[src])];
+                        insts.push(Self::mk_inst(
+                            X86Opcode::And,
+                            Some(dst),
+                            &[MachineOperand::Immediate(0xFFFF)],
+                        ));
+                        insts
+                    }
+                    _ => {
+                        // I32: 32-bit MOV zeroes upper 32 bits automatically
+                        vec![Self::mk_inst(X86Opcode::Mov, Some(dst), &[src])]
+                    }
+                }
             }
 
             // ---------------------------------------------------------------
@@ -4231,8 +4328,7 @@ impl X86_64CodeGen {
                             if op_idx < operands.len() {
                                 let src_op = self.get_value(operands[op_idx]);
                                 let target = &output_vregs[ci];
-                                let mut mov =
-                                    MachineInstruction::new(X86Opcode::Mov.as_u32());
+                                let mut mov = MachineInstruction::new(X86Opcode::Mov.as_u32());
                                 mov.result = Some(target.clone());
                                 mov.operands.push(src_op);
                                 pre_moves.push(mov);
@@ -4242,16 +4338,12 @@ impl X86_64CodeGen {
                             // Input constraint — check for digit-tied (e.g. "0")
                             // which means this input uses the same register as
                             // the indicated output operand.
-                            let stripped = t.trim_start_matches(|ch: char| {
-                                ch == '%' || ch == '&'
-                            });
+                            let stripped = t.trim_start_matches(|ch: char| ch == '%' || ch == '&');
                             if let Ok(tied_idx) = stripped.parse::<usize>() {
                                 if tied_idx < num_outputs && ci < operands.len() {
                                     let src_op = self.get_value(operands[ci]);
                                     let target = &output_vregs[tied_idx];
-                                    let mut mov = MachineInstruction::new(
-                                        X86Opcode::Mov.as_u32(),
-                                    );
+                                    let mut mov = MachineInstruction::new(X86Opcode::Mov.as_u32());
                                     mov.result = Some(target.clone());
                                     mov.operands.push(src_op);
                                     pre_moves.push(mov);
@@ -4282,11 +4374,7 @@ impl X86_64CodeGen {
             // ---------------------------------------------------------------
             Instruction::IndirectBranch { target, .. } => {
                 let target_op = self.get_value(*target);
-                let mut jmp = Self::mk_inst(
-                    X86Opcode::Jmp,
-                    None,
-                    &[target_op],
-                );
+                let mut jmp = Self::mk_inst(X86Opcode::Jmp, None, &[target_op]);
                 jmp.is_terminator = true;
                 // Mark as branch so epilogue insertion does NOT insert
                 // leave+ret before this instruction — it's a jump, not a
@@ -4880,10 +4968,7 @@ impl X86_64CodeGen {
         // UCOMISD reads all 64 bits of the XMM register; if the value
         // was produced by CVTSI2SS the upper 32 bits may contain stale
         // data, leading to wrong comparison results.
-        let is_f32 = matches!(
-            self.value_types.get(&lhs),
-            Some(IrType::F32)
-        );
+        let is_f32 = matches!(self.value_types.get(&lhs), Some(IrType::F32));
         let cmp_opcode = if is_f32 {
             X86Opcode::Ucomiss
         } else {
@@ -5302,18 +5387,24 @@ impl X86_64CodeGen {
             // va_control block, dereference to get the value, advance the
             // pointer, and store it back.
             //
-            // va_control block layout (pointed to by va_list value):
-            //   [+0]  gp_ptr       — current position in GPR save area
-            //   [+8]  fp_ptr       — current position in FP save area
-            //   [+16] gp_end       — one past last GPR save slot
-            //   [+24] overflow_ptr — next stack overflow argument
+            // ABI-standard va_list layout (24 bytes, compatible with
+            // libc's vprintf/vfprintf/vsprintf etc.):
+            //   [+0]  gp_offset         (u32) — byte offset into reg_save_area
+            //   [+4]  fp_offset         (u32) — byte offset into reg_save_area
+            //   [+8]  overflow_arg_area (ptr) — next stack overflow argument
+            //   [+16] reg_save_area     (ptr) — base of 176-byte register save
             //
-            // For integer/pointer args: use gp_ptr at [ctrl+0].
-            //   If gp_ptr >= gp_end, the register save area is exhausted
-            //   and we read from overflow_ptr at [ctrl+24] instead.
-            // For floating-point args:  use fp_ptr at [ctrl+8]
-            //   (no overflow check — float overflow is extremely rare in
-            //    practice and not needed for any real-world C project)
+            // Register save area layout (176 bytes):
+            //   [0..47]   6 GPRs (RDI..R9), 8 bytes each
+            //   [48..175] 8 XMMs (XMM0..XMM7), 16 bytes each
+            //
+            // Integer va_arg: if gp_offset < 48, load from
+            //   reg_save_area + gp_offset, advance gp_offset by 8.
+            //   Otherwise load from overflow_arg_area, advance it by 8.
+            // Float va_arg: if fp_offset < 176, load from
+            //   reg_save_area + fp_offset, advance fp_offset by 16.
+            //   Otherwise load from overflow_arg_area, advance it by 8.
+            // Both paths use branchless CMOV sequences.
             "__builtin_va_arg" => {
                 if args.is_empty() {
                     return None;
@@ -5327,42 +5418,41 @@ impl X86_64CodeGen {
                 let r10 = MachineOperand::Register(R10);
                 let r8_op = MachineOperand::Register(R8);
                 let r11_op = MachineOperand::Register(R11);
+                let rdi = MachineOperand::Register(RDI);
 
-                // Step 1: Load va_control pointer: RCX = *ap_slot
-                out.push(va_load_from_slot(&ap_slot, rcx.clone()));
-
-                // Step 2: Save ctrl ptr in R8 for later store-back.
-                out.push(Self::mk_inst(
-                    X86Opcode::Mov,
-                    Some(r8_op.clone()),
-                    std::slice::from_ref(&rcx),
-                ));
+                // Step 1: Load va_list pointer: R8 = *ap_slot
+                out.push(va_load_from_slot(&ap_slot, r8_op.clone()));
 
                 if is_float_arg {
-                    // --- Float path with overflow support ---
-                    // Uses CMOV branch-free sequence:
-                    //   if fp_ptr < fp_end → read from fp_ptr, advance fp_ptr
-                    //   if fp_ptr >= fp_end → read from overflow_ptr, advance overflow_ptr
+                    // --- Float path (ABI-standard offset-based) ---
+                    // Branchless CMOV: compare fp_offset against 176.
+                    // If < 176: load from reg_save_area + fp_offset,
+                    //           advance fp_offset by 16.
+                    // If >= 176: load from overflow_arg_area,
+                    //            advance overflow_arg_area by 8.
                     //
-                    // Registers:
-                    //   R8  = ctrl (saved)
-                    //   RDX = fp_ptr
-                    //   R10 = fp_end
-                    //   R11 = overflow_ptr
-                    //   RCX = scratch (store-back addr)
+                    // Registers used (all caller-saved):
+                    //   R8  = va_list pointer (preserved)
+                    //   RCX = fp_offset (32-bit loaded)
+                    //   R10 = overflow_arg_area
+                    //   RDI = reg_save_area / scratch
+                    //   RDX = computed load address
+                    //   R11 = new fp_offset candidate
 
-                    // Step 3f: RDX = [R8+8] = fp_ptr
-                    out.push(Self::mk_inst(
+                    // ECX = [R8+4] (fp_offset, 32-bit, zero-extends)
+                    let mut ld_fp = Self::mk_inst(
                         X86Opcode::Mov,
-                        Some(rdx.clone()),
+                        Some(rcx.clone()),
                         &[MachineOperand::Memory {
                             base: Some(R8),
                             index: None,
                             scale: 1,
-                            displacement: 8,
+                            displacement: 4,
                         }],
-                    ));
-                    // Step 4f: R10 = [R8+24] = fp_end
+                    );
+                    ld_fp.operand_size = 4;
+                    out.push(ld_fp);
+                    // R10 = [R8+8] (overflow_arg_area)
                     out.push(Self::mk_inst(
                         X86Opcode::Mov,
                         Some(r10.clone()),
@@ -5370,64 +5460,80 @@ impl X86_64CodeGen {
                             base: Some(R8),
                             index: None,
                             scale: 1,
-                            displacement: 24,
+                            displacement: 8,
                         }],
                     ));
-                    // Step 5f: R11 = [R8+32] = overflow_ptr
+                    // RDI = [R8+16] (reg_save_area)
                     out.push(Self::mk_inst(
                         X86Opcode::Mov,
-                        Some(r11_op.clone()),
+                        Some(rdi.clone()),
                         &[MachineOperand::Memory {
                             base: Some(R8),
                             index: None,
                             scale: 1,
-                            displacement: 32,
+                            displacement: 16,
                         }],
                     ));
-                    // Step 6f: CMP RDX, R10 (fp_ptr vs fp_end)
+                    // RDX = LEA [RDI + RCX] (reg addr, no flags)
                     out.push(Self::mk_inst(
+                        X86Opcode::Lea,
+                        Some(rdx.clone()),
+                        &[MachineOperand::Memory {
+                            base: Some(RDI),
+                            index: Some(RCX),
+                            scale: 1,
+                            displacement: 0,
+                        }],
+                    ));
+                    // R11 = LEA [RCX + 16] (new fp_offset, no flags)
+                    out.push(Self::mk_inst(
+                        X86Opcode::Lea,
+                        Some(r11_op.clone()),
+                        &[MachineOperand::Memory {
+                            base: Some(RCX),
+                            index: None,
+                            scale: 1,
+                            displacement: 16,
+                        }],
+                    ));
+                    // CMP ECX, 176 (32-bit compare)
+                    let mut cmp_fp = Self::mk_inst(
                         X86Opcode::Cmp,
                         None,
-                        &[rdx.clone(), r10.clone()],
-                    ));
-                    // Step 7f: CMOVAE RDX, R11
-                    //   If fp_ptr >= fp_end, replace RDX with overflow_ptr.
+                        &[rcx.clone(), MachineOperand::Immediate(176)],
+                    );
+                    cmp_fp.operand_size = 4;
+                    out.push(cmp_fp);
+                    // CMOVAE RDX, R10 (if fp_offset >= 176, use overflow)
                     out.push(Self::mk_inst(
                         X86Opcode::Cmovae,
                         Some(rdx.clone()),
-                        &[rdx.clone(), r11_op.clone()],
+                        &[rdx.clone(), r10.clone()],
                     ));
-                    // Step 8f: Compute store-back address.
-                    //   R11 = &ctrl.fp_ptr       (default: store to fp_ptr slot)
-                    //   RCX = &ctrl.overflow_ptr  (alt: store to overflow_ptr slot)
-                    //   CMOVAE R11, RCX           (if overflow, use overflow slot)
-                    out.push(Self::mk_inst(
-                        X86Opcode::Lea,
-                        Some(r11_op.clone()),
-                        &[MachineOperand::Memory {
-                            base: Some(R8),
-                            index: None,
-                            scale: 1,
-                            displacement: 8, // &ctrl.fp_ptr
-                        }],
-                    ));
-                    out.push(Self::mk_inst(
-                        X86Opcode::Lea,
-                        Some(rcx.clone()),
-                        &[MachineOperand::Memory {
-                            base: Some(R8),
-                            index: None,
-                            scale: 1,
-                            displacement: 32, // &ctrl.overflow_ptr
-                        }],
-                    ));
+                    // CMOVAE R11, RCX (if overflow, keep old fp_offset)
                     out.push(Self::mk_inst(
                         X86Opcode::Cmovae,
                         Some(r11_op.clone()),
                         &[r11_op.clone(), rcx.clone()],
                     ));
-
-                    // Step 9f: Load float value: XMM0 = [RDX]
+                    // RDI = LEA [R10 + 8] (new overflow candidate, no flags)
+                    out.push(Self::mk_inst(
+                        X86Opcode::Lea,
+                        Some(rdi.clone()),
+                        &[MachineOperand::Memory {
+                            base: Some(R10),
+                            index: None,
+                            scale: 1,
+                            displacement: 8,
+                        }],
+                    ));
+                    // CMOVB RDI, R10 (if register path, keep old overflow)
+                    out.push(Self::mk_inst(
+                        X86Opcode::Cmovb,
+                        Some(rdi.clone()),
+                        &[rdi.clone(), r10.clone()],
+                    ));
+                    // Load float value: XMM0 = MOVSD [RDX]
                     let xmm0_op = MachineOperand::Register(XMM0);
                     out.push(Self::mk_inst(
                         X86Opcode::Movsd,
@@ -5439,47 +5545,84 @@ impl X86_64CodeGen {
                             displacement: 0,
                         }],
                     ));
-                    // Step 10f: Advance pointer: RDX += 8
+                    // Store [R8+4] = R11d (new fp_offset, 32-bit)
+                    let mut st_fp = Self::mk_inst(
+                        X86Opcode::Mov,
+                        None,
+                        &[
+                            MachineOperand::Memory {
+                                base: Some(R8),
+                                index: None,
+                                scale: 1,
+                                displacement: 4,
+                            },
+                            r11_op.clone(),
+                        ],
+                    );
+                    st_fp.operand_size = 4;
+                    out.push(st_fp);
+                    // Store [R8+8] = RDI (new overflow_arg_area)
                     out.push(Self::mk_inst(
-                        X86Opcode::Add,
-                        Some(rdx.clone()),
-                        &[rdx.clone(), MachineOperand::Immediate(8)],
+                        X86Opcode::Mov,
+                        None,
+                        &[
+                            MachineOperand::Memory {
+                                base: Some(R8),
+                                index: None,
+                                scale: 1,
+                                displacement: 8,
+                            },
+                            rdi.clone(),
+                        ],
                     ));
-                    // Step 11f: Store back: [R11] = RDX
-                    out.push(Self::mk_inst(X86Opcode::StoreInd, None, &[r11_op, rdx]));
-                    // Step 12f: Copy to virtual register
+                    // Copy to virtual register
                     let dst = self.new_vreg();
                     self.set_value(result, dst.clone());
                     out.push(Self::mk_inst(X86Opcode::Movsd, Some(dst), &[xmm0_op]));
                 } else {
-                    // --- Integer path with overflow support ---
-                    // Uses branch-free CMOV sequence:
-                    //   if gp_ptr < gp_end → read from gp_ptr, store to [ctrl+0]
-                    //   if gp_ptr >= gp_end → read from overflow_ptr, store to [ctrl+24]
+                    // --- Integer/pointer path (ABI-standard offset-based) ---
+                    // Branchless CMOV: compare gp_offset against 48.
+                    // If < 48: load from reg_save_area + gp_offset,
+                    //          advance gp_offset by 8.
+                    // If >= 48: load from overflow_arg_area,
+                    //           advance overflow_arg_area by 8.
                     //
-                    // Registers:
-                    //   R8  = ctrl (saved)
-                    //   RDX = gp_ptr
-                    //   R10 = gp_end
-                    //   R11 = overflow_ptr (then reused as store-back addr)
-                    //   RCX = scratch (store-back addr alt)
-                    //   R10 = loaded value (reused after compare)
+                    // Registers used (all caller-saved):
+                    //   R8  = va_list pointer (preserved)
+                    //   RCX = gp_offset (32-bit loaded, zero-extended)
+                    //   R10 = overflow_arg_area
+                    //   RDI = reg_save_area / scratch
+                    //   RDX = computed load address
+                    //   R11 = new gp_offset candidate
 
-                    // Step 3i: RDX = [R8+0] = gp_ptr
-                    out.push(Self::mk_inst(
+                    // ECX = [R8+0] (gp_offset, 32-bit, zero-extends)
+                    let mut ld_gp = Self::mk_inst(
                         X86Opcode::Mov,
-                        Some(rdx.clone()),
+                        Some(rcx.clone()),
                         &[MachineOperand::Memory {
                             base: Some(R8),
                             index: None,
                             scale: 1,
                             displacement: 0,
                         }],
-                    ));
-                    // Step 4i: R10 = [R8+16] = gp_end
+                    );
+                    ld_gp.operand_size = 4;
+                    out.push(ld_gp);
+                    // R10 = [R8+8] (overflow_arg_area)
                     out.push(Self::mk_inst(
                         X86Opcode::Mov,
                         Some(r10.clone()),
+                        &[MachineOperand::Memory {
+                            base: Some(R8),
+                            index: None,
+                            scale: 1,
+                            displacement: 8,
+                        }],
+                    ));
+                    // RDI = [R8+16] (reg_save_area)
+                    out.push(Self::mk_inst(
+                        X86Opcode::Mov,
+                        Some(rdi.clone()),
                         &[MachineOperand::Memory {
                             base: Some(R8),
                             index: None,
@@ -5487,77 +5630,105 @@ impl X86_64CodeGen {
                             displacement: 16,
                         }],
                     ));
-                    // Step 5i: R11 = [R8+32] = overflow_ptr
-                    out.push(Self::mk_inst(
-                        X86Opcode::Mov,
-                        Some(r11_op.clone()),
-                        &[MachineOperand::Memory {
-                            base: Some(R8),
-                            index: None,
-                            scale: 1,
-                            displacement: 32,
-                        }],
-                    ));
-                    // Step 6i: CMP RDX, R10 (gp_ptr vs gp_end)
-                    out.push(Self::mk_inst(
-                        X86Opcode::Cmp,
-                        None,
-                        &[rdx.clone(), r10.clone()],
-                    ));
-                    // Step 7i: CMOVAE RDX, R11
-                    //   If gp_ptr >= gp_end, replace RDX with overflow_ptr.
-                    out.push(Self::mk_inst(
-                        X86Opcode::Cmovae,
-                        Some(rdx.clone()),
-                        &[rdx.clone(), r11_op.clone()],
-                    ));
-                    // Step 8i: Compute store-back address.
-                    //   R11 = &ctrl.gp_ptr       (default: store to gp_ptr slot)
-                    //   RCX = &ctrl.overflow_ptr  (alt: store to overflow_ptr slot)
-                    //   CMOVAE R11, RCX           (if overflow, use overflow slot)
+                    // RDX = LEA [RDI + RCX] (reg addr, no flags)
                     out.push(Self::mk_inst(
                         X86Opcode::Lea,
-                        Some(r11_op.clone()),
+                        Some(rdx.clone()),
                         &[MachineOperand::Memory {
-                            base: Some(R8),
-                            index: None,
+                            base: Some(RDI),
+                            index: Some(RCX),
                             scale: 1,
                             displacement: 0,
                         }],
                     ));
+                    // R11 = LEA [RCX + 8] (new gp_offset, no flags)
                     out.push(Self::mk_inst(
                         X86Opcode::Lea,
-                        Some(rcx.clone()),
+                        Some(r11_op.clone()),
                         &[MachineOperand::Memory {
-                            base: Some(R8),
+                            base: Some(RCX),
                             index: None,
                             scale: 1,
-                            displacement: 32, // &ctrl.overflow_ptr (at new offset)
+                            displacement: 8,
                         }],
                     ));
+                    // CMP ECX, 48 (32-bit compare; 6 GPRs * 8 = 48)
+                    let mut cmp_gp = Self::mk_inst(
+                        X86Opcode::Cmp,
+                        None,
+                        &[rcx.clone(), MachineOperand::Immediate(48)],
+                    );
+                    cmp_gp.operand_size = 4;
+                    out.push(cmp_gp);
+                    // CMOVAE RDX, R10 (if gp_offset >= 48, use overflow)
+                    out.push(Self::mk_inst(
+                        X86Opcode::Cmovae,
+                        Some(rdx.clone()),
+                        &[rdx.clone(), r10.clone()],
+                    ));
+                    // CMOVAE R11, RCX (if overflow, keep old gp_offset)
                     out.push(Self::mk_inst(
                         X86Opcode::Cmovae,
                         Some(r11_op.clone()),
-                        &[r11_op.clone(), rcx],
+                        &[r11_op.clone(), rcx.clone()],
                     ));
-                    // Step 9i: Load actual value: R10 = [RDX]
+                    // RDI = LEA [R10 + 8] (new overflow candidate, no flags)
+                    out.push(Self::mk_inst(
+                        X86Opcode::Lea,
+                        Some(rdi.clone()),
+                        &[MachineOperand::Memory {
+                            base: Some(R10),
+                            index: None,
+                            scale: 1,
+                            displacement: 8,
+                        }],
+                    ));
+                    // CMOVB RDI, R10 (if register path, keep old overflow)
+                    out.push(Self::mk_inst(
+                        X86Opcode::Cmovb,
+                        Some(rdi.clone()),
+                        &[rdi.clone(), r10.clone()],
+                    ));
+                    // Load value: RCX = [RDX]
                     out.push(Self::mk_inst(
                         X86Opcode::LoadInd,
-                        Some(r10.clone()),
+                        Some(rcx.clone()),
                         std::slice::from_ref(&rdx),
                     ));
-                    // Step 10i: Advance pointer: RDX += 8
+                    // Store [R8+0] = R11d (new gp_offset, 32-bit)
+                    let mut st_gp = Self::mk_inst(
+                        X86Opcode::Mov,
+                        None,
+                        &[
+                            MachineOperand::Memory {
+                                base: Some(R8),
+                                index: None,
+                                scale: 1,
+                                displacement: 0,
+                            },
+                            r11_op.clone(),
+                        ],
+                    );
+                    st_gp.operand_size = 4;
+                    out.push(st_gp);
+                    // Store [R8+8] = RDI (new overflow_arg_area)
                     out.push(Self::mk_inst(
-                        X86Opcode::Add,
-                        Some(rdx.clone()),
-                        &[rdx.clone(), MachineOperand::Immediate(8)],
+                        X86Opcode::Mov,
+                        None,
+                        &[
+                            MachineOperand::Memory {
+                                base: Some(R8),
+                                index: None,
+                                scale: 1,
+                                displacement: 8,
+                            },
+                            rdi.clone(),
+                        ],
                     ));
-                    // Step 11i: Store advanced pointer to correct slot: [R11] = RDX
-                    out.push(Self::mk_inst(X86Opcode::StoreInd, None, &[r11_op, rdx]));
-                    // Step 12i: Copy loaded value to virtual register
+                    // Copy loaded value to virtual register
                     let dst = self.new_vreg();
                     self.set_value(result, dst.clone());
-                    out.push(Self::mk_inst(X86Opcode::Mov, Some(dst), &[r10]));
+                    out.push(Self::mk_inst(X86Opcode::Mov, Some(dst), &[rcx]));
                 }
                 Some(out)
             }
@@ -5583,14 +5754,16 @@ impl X86_64CodeGen {
                 let rcx = MachineOperand::Register(RCX);
                 let rdx = MachineOperand::Register(RDX);
                 let r10 = MachineOperand::Register(R10);
-                let r11_op = MachineOperand::Register(R11);
                 let rsp_op = MachineOperand::Register(RSP);
 
-                // Step 1: Load source va_control pointer: RCX = *src_slot
+                // Step 1: Load source va_list pointer: RCX = *src_slot
                 out.push(va_load_from_slot(&src_slot, rcx.clone()));
 
-                // Step 2: Load all 4 fields from source block
-                // RDX = [RCX+0] (gp_ptr)
+                // Step 2: Load all 3 fields from source (24-byte ABI format):
+                //   [RCX+0..7]   gp_offset(u32) + fp_offset(u32) as one 64-bit read
+                //   [RCX+8..15]  overflow_arg_area (ptr)
+                //   [RCX+16..23] reg_save_area (ptr)
+                // RDX = [RCX+0] (gp_offset + fp_offset as one 64-bit value)
                 out.push(Self::mk_inst(
                     X86Opcode::Mov,
                     Some(rdx.clone()),
@@ -5601,7 +5774,7 @@ impl X86_64CodeGen {
                         displacement: 0,
                     }],
                 ));
-                // R10 = [RCX+8] (fp_ptr)
+                // R10 = [RCX+8] (overflow_arg_area)
                 out.push(Self::mk_inst(
                     X86Opcode::Mov,
                     Some(r10.clone()),
@@ -5613,15 +5786,15 @@ impl X86_64CodeGen {
                     }],
                 ));
 
-                // Step 3: Allocate 40 bytes on stack for the new block
+                // Step 3: Allocate 24 bytes on stack for the new va_list block
                 out.push(Self::mk_inst(
                     X86Opcode::Sub,
                     Some(rsp_op.clone()),
-                    &[rsp_op.clone(), MachineOperand::Immediate(40)],
+                    &[rsp_op.clone(), MachineOperand::Immediate(24)],
                 ));
 
-                // Step 4a: Store gp_ptr and fp_ptr to new block
-                // [RSP+0] = RDX (gp_ptr)
+                // Step 4: Copy all 3 fields to new block
+                // [RSP+0] = RDX (gp_offset + fp_offset)
                 out.push(Self::mk_inst(
                     X86Opcode::Mov,
                     None,
@@ -5635,7 +5808,7 @@ impl X86_64CodeGen {
                         rdx.clone(),
                     ],
                 ));
-                // [RSP+8] = R10 (fp_ptr)
+                // [RSP+8] = R10 (overflow_arg_area)
                 out.push(Self::mk_inst(
                     X86Opcode::Mov,
                     None,
@@ -5646,12 +5819,10 @@ impl X86_64CodeGen {
                             scale: 1,
                             displacement: 8,
                         },
-                        r10.clone(),
+                        r10,
                     ],
                 ));
-
-                // Step 4b: Load gp_end, fp_end, overflow_ptr from source, store to new block
-                // RDX = [RCX+16] (gp_end)
+                // RDX = [RCX+16] (reg_save_area)
                 out.push(Self::mk_inst(
                     X86Opcode::Mov,
                     Some(rdx.clone()),
@@ -5662,7 +5833,7 @@ impl X86_64CodeGen {
                         displacement: 16,
                     }],
                 ));
-                // [RSP+16] = RDX (gp_end)
+                // [RSP+16] = RDX (reg_save_area)
                 out.push(Self::mk_inst(
                     X86Opcode::Mov,
                     None,
@@ -5673,57 +5844,7 @@ impl X86_64CodeGen {
                             scale: 1,
                             displacement: 16,
                         },
-                        rdx.clone(),
-                    ],
-                ));
-                // RDX = [RCX+24] (fp_end)
-                out.push(Self::mk_inst(
-                    X86Opcode::Mov,
-                    Some(rdx.clone()),
-                    &[MachineOperand::Memory {
-                        base: Some(RCX),
-                        index: None,
-                        scale: 1,
-                        displacement: 24,
-                    }],
-                ));
-                // [RSP+24] = RDX (fp_end)
-                out.push(Self::mk_inst(
-                    X86Opcode::Mov,
-                    None,
-                    &[
-                        MachineOperand::Memory {
-                            base: Some(RSP),
-                            index: None,
-                            scale: 1,
-                            displacement: 24,
-                        },
                         rdx,
-                    ],
-                ));
-                // R11 = [RCX+32] (overflow_ptr)
-                out.push(Self::mk_inst(
-                    X86Opcode::Mov,
-                    Some(r11_op.clone()),
-                    &[MachineOperand::Memory {
-                        base: Some(RCX),
-                        index: None,
-                        scale: 1,
-                        displacement: 32,
-                    }],
-                ));
-                // [RSP+32] = R11 (overflow_ptr)
-                out.push(Self::mk_inst(
-                    X86Opcode::Mov,
-                    None,
-                    &[
-                        MachineOperand::Memory {
-                            base: Some(RSP),
-                            index: None,
-                            scale: 1,
-                            displacement: 32,
-                        },
-                        r11_op,
                     ],
                 ));
 
@@ -5772,16 +5893,15 @@ impl X86_64CodeGen {
         // argument in RDI pointing to a buffer for the return value.
         // We use the pre-allocated struct temp slot from the frame layout.
         let ret_loc = self.abi.classify_return(return_type);
-        let indirect_ret_slot: Option<i32> =
-            if matches!(ret_loc, RetLocation::Indirect) {
-                // Use the pre-allocated struct_temp_offsets slot for this
-                // Call result, or fall back to a stack-alloc-like approach.
-                self.frame
-                    .as_ref()
-                    .and_then(|f| f.struct_temp_offsets.get(&result).copied())
-            } else {
-                None
-            };
+        let indirect_ret_slot: Option<i32> = if matches!(ret_loc, RetLocation::Indirect) {
+            // Use the pre-allocated struct_temp_offsets slot for this
+            // Call result, or fall back to a stack-alloc-like approach.
+            self.frame
+                .as_ref()
+                .and_then(|f| f.struct_temp_offsets.get(&result).copied())
+        } else {
+            None
+        };
 
         // 1. Place arguments in registers/stack per System V AMD64 ABI.
         //    Register arguments are collected into `reg_arg_setup`;
@@ -6025,8 +6145,7 @@ impl X86_64CodeGen {
                                     if *load_res == *arg_val {
                                         // Check alloca offsets first.
                                         if let Some(ref frame) = self.frame {
-                                            if let Some(&aoff) =
-                                                frame.alloca_offsets.get(load_ptr)
+                                            if let Some(&aoff) = frame.alloca_offsets.get(load_ptr)
                                             {
                                                 let bm = MachineOperand::Memory {
                                                     base: Some(RBP),
@@ -6046,8 +6165,7 @@ impl X86_64CodeGen {
                                                             base: *b,
                                                             index: *ix,
                                                             scale: *sc,
-                                                            displacement: d
-                                                                + (i as i64) * 8,
+                                                            displacement: d + (i as i64) * 8,
                                                         },
                                                         _ => bm.clone(),
                                                     };
@@ -6061,20 +6179,18 @@ impl X86_64CodeGen {
                                         // Check if load_ptr resolves to a
                                         // GlobalSymbol (global struct variable).
                                         let ptr_op = self.get_value(*load_ptr);
-                                        if let MachineOperand::GlobalSymbol(ref sym) =
-                                            ptr_op
-                                        {
+                                        if let MachineOperand::GlobalSymbol(ref sym) = ptr_op {
                                             let sym_clone = sym.clone();
-                                            memory_class_ptr_load_groups
-                                                .push((MachineOperand::GlobalSymbol(sym_clone), eightbytes));
+                                            memory_class_ptr_load_groups.push((
+                                                MachineOperand::GlobalSymbol(sym_clone),
+                                                eightbytes,
+                                            ));
                                             found_alloca_base = true;
                                             break 'outer_scan;
                                         }
                                         // Also check struct_load_source for
                                         // the ptr value.
-                                        if let Some(mem) =
-                                            self.struct_load_source.get(load_ptr)
-                                        {
+                                        if let Some(mem) = self.struct_load_source.get(load_ptr) {
                                             let base = mem.clone();
                                             let mut grp = Vec::new();
                                             for i in (0..eightbytes).rev() {
@@ -6088,8 +6204,7 @@ impl X86_64CodeGen {
                                                         base: *b,
                                                         index: *ix,
                                                         scale: *sc,
-                                                        displacement: d
-                                                            + (i as i64) * 8,
+                                                        displacement: d + (i as i64) * 8,
                                                     },
                                                     _ => base.clone(),
                                                 };
@@ -6168,11 +6283,8 @@ impl X86_64CodeGen {
                 );
                 ld_inst.is_call_arg_setup = true;
                 out.push(ld_inst);
-                let mut push_inst = Self::mk_inst(
-                    X86Opcode::Push,
-                    None,
-                    &[MachineOperand::Register(R11)],
-                );
+                let mut push_inst =
+                    Self::mk_inst(X86Opcode::Push, None, &[MachineOperand::Register(R11)]);
                 push_inst.is_call_arg_setup = true;
                 out.push(push_inst);
             }
@@ -6184,11 +6296,8 @@ impl X86_64CodeGen {
             } else {
                 X86Opcode::Mov
             };
-            let mut ptr_inst = Self::mk_inst(
-                ptr_opcode,
-                Some(MachineOperand::Register(R10)),
-                &[ptr_op],
-            );
+            let mut ptr_inst =
+                Self::mk_inst(ptr_opcode, Some(MachineOperand::Register(R10)), &[ptr_op]);
             ptr_inst.is_call_arg_setup = true;
             out.push(ptr_inst);
             for i in (0..eightbytes).rev() {
@@ -6205,11 +6314,8 @@ impl X86_64CodeGen {
                 );
                 ld_inst.is_call_arg_setup = true;
                 out.push(ld_inst);
-                let mut push_inst = Self::mk_inst(
-                    X86Opcode::Push,
-                    None,
-                    &[MachineOperand::Register(R11)],
-                );
+                let mut push_inst =
+                    Self::mk_inst(X86Opcode::Push, None, &[MachineOperand::Register(R11)]);
                 push_inst.is_call_arg_setup = true;
                 out.push(push_inst);
             }
@@ -6241,10 +6347,7 @@ impl X86_64CodeGen {
                 let sub_inst = Self::mk_inst(
                     X86Opcode::Sub,
                     Some(MachineOperand::Register(RSP)),
-                    &[
-                        MachineOperand::Register(RSP),
-                        MachineOperand::Immediate(8),
-                    ],
+                    &[MachineOperand::Register(RSP), MachineOperand::Immediate(8)],
                 );
                 out.push(sub_inst);
                 // MOVSD [RSP], xmm (store float to newly allocated stack slot)
@@ -6452,11 +6555,7 @@ impl X86_64CodeGen {
                     self.struct_load_source.insert(result, mem_base.clone());
                     // Map the result to an LEA of the buffer so that
                     // get_value returns a pointer to the struct data.
-                    out.push(Self::mk_inst(
-                        X86Opcode::Lea,
-                        Some(dst),
-                        &[mem_base],
-                    ));
+                    out.push(Self::mk_inst(X86Opcode::Lea, Some(dst), &[mem_base]));
                 }
             }
             RetLocation::Void => {

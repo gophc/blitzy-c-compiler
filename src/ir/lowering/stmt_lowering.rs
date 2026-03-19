@@ -170,6 +170,11 @@ pub struct StmtLoweringContext<'a> {
     /// When sizeof is applied to a VLA variable, this value is emitted
     /// instead of the compile-time sizeof (which would be 8 = pointer size).
     pub vla_sizes: FxHashMap<String, Value>,
+    /// Stack pointer save-point for VLA deallocation.  When a VLA is first
+    /// encountered, the stack pointer is saved here.  Before each subsequent
+    /// VLA allocation in the same scope, the stack is restored to this point
+    /// so that VLAs in loops don't leak stack space.
+    pub vla_stack_save: Option<Value>,
 }
 
 // ===========================================================================
@@ -382,20 +387,15 @@ fn is_label_like(stmt: &ast::Statement) -> bool {
             then_branch,
             else_branch,
             ..
-        } => {
-            is_label_like(then_branch)
-                || else_branch.as_ref().map_or(false, |e| is_label_like(e))
-        }
+        } => is_label_like(then_branch) || else_branch.as_ref().map_or(false, |e| is_label_like(e)),
         ast::Statement::While { body, .. }
         | ast::Statement::DoWhile { body, .. }
         | ast::Statement::For { body, .. } => is_label_like(body),
         ast::Statement::Switch { body, .. } => is_label_like(body),
-        ast::Statement::Compound(compound) => {
-            compound.items.iter().any(|item| match item {
-                ast::BlockItem::Statement(s) => is_label_like(s),
-                _ => false,
-            })
-        }
+        ast::Statement::Compound(compound) => compound.items.iter().any(|item| match item {
+            ast::BlockItem::Statement(s) => is_label_like(s),
+            _ => false,
+        }),
         _ => false,
     }
 }
@@ -495,8 +495,7 @@ fn string_literal_length(expr: &ast::Expression) -> Option<usize> {
                 for seg in segments {
                     raw_bytes.extend_from_slice(&seg.value);
                 }
-                let codepoints =
-                    super::decl_lowering::decode_bytes_to_codepoints(&raw_bytes);
+                let codepoints = super::decl_lowering::decode_bytes_to_codepoints(&raw_bytes);
                 Some(codepoints.len() + 1) // +1 for null terminator
             }
         }
@@ -819,8 +818,7 @@ pub fn lower_declaration_initializers(ctx: &mut StmtLoweringContext<'_>, decl: &
                 Some(n) => n,
                 None => continue,
             };
-            if let Some(vla_expr) =
-                decl_lowering::extract_vla_size_expr_pub(&init_decl.declarator)
+            if let Some(vla_expr) = decl_lowering::extract_vla_size_expr_pub(&init_decl.declarator)
             {
                 // Determine the element type from the declaration specifiers.
                 let elem_ty = {
@@ -834,8 +832,7 @@ pub fn lower_declaration_initializers(ctx: &mut StmtLoweringContext<'_>, decl: &
                     resolve_base_type_from_sqlist(&sqlist)
                 };
                 let span = decl.span;
-                let elem_size =
-                    crate::common::types::sizeof_ctype(&elem_ty, ctx.target) as i64;
+                let elem_size = crate::common::types::sizeof_ctype(&elem_ty, ctx.target) as i64;
                 let ptr_ty = if ctx.target.pointer_width() == 8 {
                     IrType::I64
                 } else {
@@ -865,22 +862,22 @@ pub fn lower_declaration_initializers(ctx: &mut StmtLoweringContext<'_>, decl: &
                     vla_sizes: &ctx.vla_sizes,
                 };
                 // Evaluate the VLA size expression at runtime.
-                let tv =
-                    super::expr_lowering::lower_expression_typed(&mut expr_ctx, &vla_expr);
+                let tv = super::expr_lowering::lower_expression_typed(&mut expr_ctx, &vla_expr);
                 let n_val = tv.value;
                 // ZExt the count to pointer width if needed.
                 let n_wide = {
-                    let (v, inst) = expr_ctx.builder.build_zext_from(
-                        n_val, IrType::I32, ptr_ty.clone(), span,
-                    );
+                    let (v, inst) =
+                        expr_ctx
+                            .builder
+                            .build_zext_from(n_val, IrType::I32, ptr_ty.clone(), span);
                     push_inst_to_block(&mut expr_ctx, inst);
                     v
                 };
                 // Emit element-size constant.
                 let elem_const = {
                     use crate::ir::instructions::BinOp as IrBinOp;
-                    use crate::ir::module::{Constant, GlobalVariable};
                     use crate::ir::module as ir_module;
+                    use crate::ir::module::{Constant, GlobalVariable};
                     let const_id = expr_ctx.module.globals().len();
                     let gname = format!(".Lconst.i.{}", const_id);
                     let mut gv = GlobalVariable::new(
@@ -901,15 +898,11 @@ pub fn lower_declaration_initializers(ctx: &mut StmtLoweringContext<'_>, decl: &
                         span,
                     };
                     push_inst_to_block(&mut expr_ctx, inst);
-                    expr_ctx
-                        .function
-                        .constant_values
-                        .insert(result, elem_size);
+                    expr_ctx.function.constant_values.insert(result, elem_size);
                     result
                 };
-                let (total, mul_inst) = expr_ctx.builder.build_mul(
-                    n_wide, elem_const, ptr_ty, span,
-                );
+                let (total, mul_inst) =
+                    expr_ctx.builder.build_mul(n_wide, elem_const, ptr_ty, span);
                 push_inst_to_block(&mut expr_ctx, mul_inst);
                 drop(expr_ctx);
                 // Store the total byte size in vla_sizes so sizeof(c) works.
@@ -931,9 +924,7 @@ pub fn lower_declaration_initializers(ctx: &mut StmtLoweringContext<'_>, decl: &
         // non-constant array size expression.  We cannot check local_types
         // here because VLA variables were overridden to CType::Pointer
         // during allocate_local_variables.
-        if let Some(vla_expr) =
-            decl_lowering::extract_vla_size_expr_pub(&init_decl.declarator)
-        {
+        if let Some(vla_expr) = decl_lowering::extract_vla_size_expr_pub(&init_decl.declarator) {
             // VLA variable detected — emit runtime stack allocation.
             // Determine the element type from the Pointer type stored in
             // local_types (which was set from the original Array element).
@@ -951,102 +942,119 @@ pub fn lower_declaration_initializers(ctx: &mut StmtLoweringContext<'_>, decl: &
             let elem = elem_from_ptr;
             // Look up the pointer-sized alloca for this VLA.
             if let Some(&alloca_val) = ctx.local_vars.get(&var_name) {
-                    let span = decl.span;
-                    let elem_size =
-                        crate::common::types::sizeof_ctype(&elem, ctx.target) as i64;
-                    // Build an expression context to evaluate the size expression.
-                    let mut expr_ctx = ExprLoweringContext {
-                        builder: ctx.builder,
-                        function: ctx.function,
-                        module: ctx.module,
-                        target: ctx.target,
-                        type_builder: ctx.type_builder,
-                        diagnostics: ctx.diagnostics,
-                        local_vars: ctx.local_vars,
-                        param_values: ctx.param_values,
-                        name_table: ctx.name_table,
-                        local_types: ctx.local_types,
-                        enum_constants: ctx.enum_constants,
-                        static_locals: ctx.static_locals,
-                        struct_defs: ctx.struct_defs,
-                        label_blocks: ctx.label_blocks,
-                        current_function_name: ctx.current_function_name,
-                        enclosing_loop_stack: ctx.loop_stack.clone(),
-                        scope_type_overrides: &ctx.scope_type_overrides,
-                        last_bitfield_info: None,
-                        layout_cache: &mut ctx.layout_cache,
-                        vla_sizes: &ctx.vla_sizes,
-                    };
-                    // Evaluate the VLA size expression at runtime.
-                    let tv =
-                        super::expr_lowering::lower_expression_typed(
-                            &mut expr_ctx, &vla_expr,
-                        );
-                    let n_val = tv.value;
-                    // Compute total byte count: n * elem_size.
-                    let ptr_ty = if ctx.target.pointer_width() == 8 {
-                        IrType::I64
-                    } else {
-                        IrType::I32
-                    };
-                    // ZExt the count to pointer width if needed.
-                    // The VLA size expression is typically int (I32) but
-                    // we need pointer-width (I64) for the multiply.
-                    let n_wide = {
-                        let (v, inst) = expr_ctx.builder.build_zext_from(
-                            n_val, IrType::I32, ptr_ty.clone(), span,
-                        );
-                        push_inst_to_block(&mut expr_ctx, inst);
-                        v
-                    };
-                    // Emit element-size constant using the
-                    // Add-result-UNDEF sentinel pattern (same as
-                    // emit_int_const in expr_lowering).
-                    let elem_const = {
-                        use crate::ir::instructions::BinOp as IrBinOp;
-                        use crate::ir::module::{Constant, GlobalVariable};
-                        use crate::ir::module as ir_module;
-                        let const_id = expr_ctx.module.globals().len();
-                        let gname = format!(".Lconst.i.{}", const_id);
-                        let mut gv = GlobalVariable::new(
-                            gname,
-                            ptr_ty.clone(),
-                            Some(Constant::Integer(elem_size as i128)),
-                        );
-                        gv.linkage = ir_module::Linkage::Internal;
-                        gv.is_constant = true;
-                        expr_ctx.module.add_global(gv);
-                        let result = expr_ctx.builder.fresh_value();
-                        let inst = Instruction::BinOp {
-                            result,
-                            op: IrBinOp::Add,
-                            lhs: result,
-                            rhs: Value::UNDEF,
-                            ty: ptr_ty.clone(),
-                            span,
-                        };
-                        push_inst_to_block(&mut expr_ctx, inst);
+                let span = decl.span;
+                let elem_size = crate::common::types::sizeof_ctype(&elem, ctx.target) as i64;
+                // Build an expression context to evaluate the size expression.
+                let mut expr_ctx = ExprLoweringContext {
+                    builder: ctx.builder,
+                    function: ctx.function,
+                    module: ctx.module,
+                    target: ctx.target,
+                    type_builder: ctx.type_builder,
+                    diagnostics: ctx.diagnostics,
+                    local_vars: ctx.local_vars,
+                    param_values: ctx.param_values,
+                    name_table: ctx.name_table,
+                    local_types: ctx.local_types,
+                    enum_constants: ctx.enum_constants,
+                    static_locals: ctx.static_locals,
+                    struct_defs: ctx.struct_defs,
+                    label_blocks: ctx.label_blocks,
+                    current_function_name: ctx.current_function_name,
+                    enclosing_loop_stack: ctx.loop_stack.clone(),
+                    scope_type_overrides: &ctx.scope_type_overrides,
+                    last_bitfield_info: None,
+                    layout_cache: &mut ctx.layout_cache,
+                    vla_sizes: &ctx.vla_sizes,
+                };
+                // Evaluate the VLA size expression at runtime.
+                let tv = super::expr_lowering::lower_expression_typed(&mut expr_ctx, &vla_expr);
+                let n_val = tv.value;
+                // Compute total byte count: n * elem_size.
+                let ptr_ty = if ctx.target.pointer_width() == 8 {
+                    IrType::I64
+                } else {
+                    IrType::I32
+                };
+                // ZExt the count to pointer width if needed.
+                // The VLA size expression is typically int (I32) but
+                // we need pointer-width (I64) for the multiply.
+                let n_wide = {
+                    let (v, inst) =
                         expr_ctx
-                            .function
-                            .constant_values
-                            .insert(result, elem_size);
-                        result
-                    };
-                    let (total, mul_inst) = expr_ctx.builder.build_mul(
-                        n_wide, elem_const, ptr_ty, span,
+                            .builder
+                            .build_zext_from(n_val, IrType::I32, ptr_ty.clone(), span);
+                    push_inst_to_block(&mut expr_ctx, inst);
+                    v
+                };
+                // Emit element-size constant using the
+                // Add-result-UNDEF sentinel pattern (same as
+                // emit_int_const in expr_lowering).
+                let elem_const = {
+                    use crate::ir::instructions::BinOp as IrBinOp;
+                    use crate::ir::module as ir_module;
+                    use crate::ir::module::{Constant, GlobalVariable};
+                    let const_id = expr_ctx.module.globals().len();
+                    let gname = format!(".Lconst.i.{}", const_id);
+                    let mut gv = GlobalVariable::new(
+                        gname,
+                        ptr_ty.clone(),
+                        Some(Constant::Integer(elem_size as i128)),
                     );
-                    push_inst_to_block(&mut expr_ctx, mul_inst);
-                    // Emit StackAlloc.
-                    let (ptr_val, sa_inst) =
-                        expr_ctx.builder.build_stack_alloc(total, span);
-                    push_inst_to_block(&mut expr_ctx, sa_inst);
-                    // Store the pointer into the alloca.
-                    let store_inst =
-                        expr_ctx.builder.build_store(ptr_val, alloca_val, span);
-                    push_inst_to_block(&mut expr_ctx, store_inst);
-                    // Record the total byte size so that sizeof(vla) works at runtime.
-                    drop(expr_ctx);
-                    ctx.vla_sizes.insert(var_name.clone(), total);
+                    gv.linkage = ir_module::Linkage::Internal;
+                    gv.is_constant = true;
+                    expr_ctx.module.add_global(gv);
+                    let result = expr_ctx.builder.fresh_value();
+                    let inst = Instruction::BinOp {
+                        result,
+                        op: IrBinOp::Add,
+                        lhs: result,
+                        rhs: Value::UNDEF,
+                        ty: ptr_ty.clone(),
+                        span,
+                    };
+                    push_inst_to_block(&mut expr_ctx, inst);
+                    expr_ctx.function.constant_values.insert(result, elem_size);
+                    result
+                };
+                let (total, mul_inst) =
+                    expr_ctx.builder.build_mul(n_wide, elem_const, ptr_ty, span);
+                push_inst_to_block(&mut expr_ctx, mul_inst);
+                // VLA stack management: save/restore RSP so that VLAs
+                // inside loops or goto-loops don't exhaust the stack.
+                //
+                // Strategy: emit StackSave in the ENTRY BLOCK so it
+                // executes exactly once, then emit StackRestore before
+                // every StackAlloc to reclaim previous VLA space.
+                if ctx.vla_stack_save.is_none() {
+                    // Insert StackSave at the END of the entry block
+                    // (block 0), just before its terminator.
+                    let (sp_val, save_inst) = expr_ctx.builder.build_stack_save(span);
+                    // Insert into block 0 (entry block) before
+                    // the terminator.
+                    let entry_block = expr_ctx.function.get_block_mut(0).unwrap();
+                    let insert_pos =
+                        if entry_block.has_terminator() && !entry_block.instructions.is_empty() {
+                            entry_block.instructions.len() - 1
+                        } else {
+                            entry_block.instructions.len()
+                        };
+                    entry_block.instructions.insert(insert_pos, save_inst);
+                    ctx.vla_stack_save = Some(sp_val);
+                }
+                // Restore to the saved stack pointer before allocating.
+                let saved_sp = ctx.vla_stack_save.unwrap();
+                let restore_inst = expr_ctx.builder.build_stack_restore(saved_sp, span);
+                push_inst_to_block(&mut expr_ctx, restore_inst);
+                // Emit StackAlloc.
+                let (ptr_val, sa_inst) = expr_ctx.builder.build_stack_alloc(total, span);
+                push_inst_to_block(&mut expr_ctx, sa_inst);
+                // Store the pointer into the alloca.
+                let store_inst = expr_ctx.builder.build_store(ptr_val, alloca_val, span);
+                push_inst_to_block(&mut expr_ctx, store_inst);
+                // Record the total byte size so that sizeof(vla) works at runtime.
+                drop(expr_ctx);
+                ctx.vla_sizes.insert(var_name.clone(), total);
             }
             continue; // VLA handled, skip normal init path.
         }
@@ -1610,8 +1618,45 @@ fn lower_switch(
 ) -> Option<BlockId> {
     let exit_block = create_block(ctx, "switch.end");
 
-    // Lower the switch value expression.
-    let switch_val = lower_expr_via_context(ctx, condition);
+    // Lower the switch value expression with type information.
+    // Per C11 §6.8.4.2p5, the integer promotions are performed on the
+    // controlling expression.  This matters for signed sub-int types
+    // (signed char, short): `(signed char)(-1)` must promote to int
+    // as -1 (sign-extended), not 255 (zero-extended).
+    let switch_tv = lower_expr_typed_via_context(ctx, condition);
+    let promoted_ctype = crate::common::types::integer_promotion(&switch_tv.ty);
+    let switch_val = if promoted_ctype != switch_tv.ty {
+        // Need to promote: sign-extend or zero-extend based on the
+        // signedness of the *original* type.
+        let from_ir = crate::ir::lowering::expr_lowering::ctype_to_ir(&switch_tv.ty, ctx.target);
+        let to_ir = crate::ir::lowering::expr_lowering::ctype_to_ir(&promoted_ctype, ctx.target);
+        let is_signed = crate::common::types::is_signed(&switch_tv.ty);
+        if is_signed {
+            let (v, inst) = ctx.builder.build_sext(switch_tv.value, to_ir.clone(), span);
+            let mut patched = inst;
+            if let Instruction::SExt {
+                ref mut from_type, ..
+            } = patched
+            {
+                *from_type = from_ir;
+            }
+            emit_instruction_to_current_block(ctx, patched);
+            v
+        } else {
+            let (v, inst) = ctx.builder.build_zext(switch_tv.value, to_ir.clone(), span);
+            let mut patched = inst;
+            if let Instruction::ZExt {
+                ref mut from_type, ..
+            } = patched
+            {
+                *from_type = from_ir;
+            }
+            emit_instruction_to_current_block(ctx, patched);
+            v
+        }
+    } else {
+        switch_tv.value
+    };
 
     // Remember the dispatch block — we will emit the Switch instruction
     // here after processing the body.
@@ -1689,21 +1734,20 @@ fn lower_switch(
         // This works for both signed and unsigned switch values and
         // avoids signed overflow issues when case values exceed i64 max.
         let low_val = emit_switch_range_const(ctx, low as i128, ir_ty.clone(), span);
-        let (sub_val, sub_inst) = ctx.builder.build_sub(
-            switch_val, low_val, ir_ty.clone(), span,
-        );
+        let (sub_val, sub_inst) = ctx
+            .builder
+            .build_sub(switch_val, low_val, ir_ty.clone(), span);
         emit_instruction_to_current_block(ctx, sub_inst);
 
         let range_width = (high as u64).wrapping_sub(low as u64);
-        let range_val = emit_switch_range_const(
-            ctx,
-            range_width as i64 as i128,
-            ir_ty.clone(),
+        let range_val =
+            emit_switch_range_const(ctx, range_width as i64 as i128, ir_ty.clone(), span);
+        let (in_range, cmp_inst) = ctx.builder.build_icmp(
+            crate::ir::instructions::ICmpOp::Ule,
+            sub_val,
+            range_val,
             span,
         );
-        let (in_range, cmp_inst) = ctx
-            .builder
-            .build_icmp(crate::ir::instructions::ICmpOp::Ule, sub_val, range_val, span);
         emit_instruction_to_current_block(ctx, cmp_inst);
 
         // Create a fallthrough block for the next check or the Switch.
@@ -1802,7 +1846,9 @@ fn lower_case_range(
 
     // Register in the switch context.
     if let Some(ref mut sctx) = ctx.switch_ctx {
-        let range_size = (high_val as u64).wrapping_sub(low_val as u64).wrapping_add(1);
+        let range_size = (high_val as u64)
+            .wrapping_sub(low_val as u64)
+            .wrapping_add(1);
         if range_size <= 256 {
             // Small range: enumerate individual values.
             for i in 0..range_size {
@@ -2527,10 +2573,7 @@ fn lower_expr_to_i1(
     // Lower the expression with type information so we can detect float conditions.
     let tv = lower_expr_typed_via_context(ctx, expr);
     let val = tv.value;
-    let is_float = matches!(
-        tv.ty,
-        CType::Float | CType::Double | CType::LongDouble
-    );
+    let is_float = matches!(tv.ty, CType::Float | CType::Double | CType::LongDouble);
 
     if already_i1 {
         // Expression is a comparison/logical op — already produces 0 or 1.

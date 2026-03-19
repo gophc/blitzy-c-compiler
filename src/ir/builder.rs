@@ -274,6 +274,22 @@ impl IrBuilder {
         (result, inst)
     }
 
+    /// Builds an [`Instruction::StackSave`] — captures the current stack
+    /// pointer into an opaque value.  Used with `StackRestore` to
+    /// deallocate VLA stack allocations.
+    pub fn build_stack_save(&mut self, span: Span) -> (Value, Instruction) {
+        let result = self.fresh_value();
+        let inst = Instruction::StackSave { result, span };
+        (result, inst)
+    }
+
+    /// Builds an [`Instruction::StackRestore`] — restores the stack pointer
+    /// to a value previously captured by `StackSave`, deallocating any
+    /// dynamic stack allocations made since the save point.
+    pub fn build_stack_restore(&mut self, ptr: Value, span: Span) -> Instruction {
+        Instruction::StackRestore { ptr, span }
+    }
+
     /// Builds an [`Instruction::Load`] — reads a value from a memory address.
     ///
     /// # Parameters
@@ -767,11 +783,7 @@ impl IrBuilder {
     /// # Returns
     ///
     /// A `(Value, Instruction)` pair. The `Value` is a pointer to the block.
-    pub fn build_block_address(
-        &mut self,
-        block: BlockId,
-        span: Span,
-    ) -> (Value, Instruction) {
+    pub fn build_block_address(&mut self, block: BlockId, span: Span) -> (Value, Instruction) {
         let result = self.fresh_value();
         (
             result,

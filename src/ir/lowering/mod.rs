@@ -1719,8 +1719,14 @@ fn collect_struct_defs_from_specifiers(
                             let n = decl_lowering::resolve_sym(name_table, &a.name);
                             n == "packed" || n == "__packed__"
                         });
-                        let aligned =
+                        let mut aligned =
                             decl_lowering::extract_alignment_attribute(&s.attributes, name_table);
+                        // Propagate field-level aligned to struct alignment.
+                        if let Some(field_align) =
+                            decl_lowering::extract_max_member_alignment(members, name_table)
+                        {
+                            aligned = Some(aligned.map_or(field_align, |a| a.max(field_align)));
+                        }
                         let ctype = CType::Struct {
                             name: Some(tag_name.clone()),
                             fields,
@@ -1760,8 +1766,14 @@ fn collect_struct_defs_from_specifiers(
                             let n = decl_lowering::resolve_sym(name_table, &a.name);
                             n == "packed" || n == "__packed__"
                         });
-                        let aligned =
+                        let mut aligned =
                             decl_lowering::extract_alignment_attribute(&u.attributes, name_table);
+                        // Propagate field-level aligned to union alignment.
+                        if let Some(field_align) =
+                            decl_lowering::extract_max_member_alignment(members, name_table)
+                        {
+                            aligned = Some(aligned.map_or(field_align, |a| a.max(field_align)));
+                        }
                         let ctype = CType::Union {
                             name: Some(tag_name.clone()),
                             fields,

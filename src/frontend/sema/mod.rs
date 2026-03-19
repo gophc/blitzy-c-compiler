@@ -1,6 +1,6 @@
 // Suppress result_unit_err: SemanticAnalyzer deliberately returns Result<_, ()>
 // because error details flow through DiagnosticEngine, not through the Err variant.
-#![allow(clippy::result_unit_err)]
+#![allow(clippy::result_unit_err, clippy::if_same_then_else)]
 
 //! Semantic analysis driver module — Phase 5 entry point for BCC.
 //!
@@ -397,16 +397,13 @@ impl<'a> SemanticAnalyzer<'a> {
         let param_types = if !func.old_style_params.is_empty() {
             // Build name→type mapping from old-style parameter declarations.
             // Each old_style_param is a Declaration like `int *d;` or `char *str;`.
-            let mut knr_type_map =
-                crate::common::fx_hash::FxHashMap::<String, CType>::default();
+            let mut knr_type_map = crate::common::fx_hash::FxHashMap::<String, CType>::default();
             for osp in &func.old_style_params {
                 let osp_base_ty = self.resolve_type_from_specifiers(&osp.specifiers);
                 for init_decl in &osp.declarators {
                     if let Some(pname) = self.extract_declarator_name(&init_decl.declarator) {
-                        let pty = self.apply_declarator_to_type(
-                            osp_base_ty.clone(),
-                            &init_decl.declarator,
-                        );
+                        let pty = self
+                            .apply_declarator_to_type(osp_base_ty.clone(), &init_decl.declarator);
                         let name_str = self.interner.resolve(pname);
                         knr_type_map.insert(name_str.to_string(), pty);
                     }
@@ -422,13 +419,10 @@ impl<'a> SemanticAnalyzer<'a> {
                         new_param_types.push(kty.clone());
                     } else {
                         // Not declared in old_style_params — default to int (C89 rule)
-                        new_param_types.push(
-                            param_types.get(i).cloned().unwrap_or(CType::Int),
-                        );
+                        new_param_types.push(param_types.get(i).cloned().unwrap_or(CType::Int));
                     }
                 } else {
-                    new_param_types
-                        .push(param_types.get(i).cloned().unwrap_or(CType::Int));
+                    new_param_types.push(param_types.get(i).cloned().unwrap_or(CType::Int));
                 }
             }
             new_param_types
@@ -641,9 +635,7 @@ impl<'a> SemanticAnalyzer<'a> {
                             ..
                         } => {
                             if let Some(a) = decl_aligned {
-                                *aligned = Some(
-                                    aligned.map_or(a, |existing| existing.max(a)),
-                                );
+                                *aligned = Some(aligned.map_or(a, |existing| existing.max(a)));
                             }
                             if decl_packed {
                                 *packed = true;
@@ -655,9 +647,7 @@ impl<'a> SemanticAnalyzer<'a> {
                             ..
                         } => {
                             if let Some(a) = decl_aligned {
-                                *aligned = Some(
-                                    aligned.map_or(a, |existing| existing.max(a)),
-                                );
+                                *aligned = Some(aligned.map_or(a, |existing| existing.max(a)));
                             }
                             if decl_packed {
                                 *packed = true;
@@ -1693,6 +1683,54 @@ impl<'a> SemanticAnalyzer<'a> {
             }
         }
 
+        // Propagate field-level __attribute__((aligned(N))) to the struct's
+        // own alignment.  C11 §6.7.2.1: the alignment of a struct is at
+        // least as strict as the alignment of any of its members.  GCC
+        // extends this: an `aligned(N)` attribute on a struct field member
+        // declaration both forces that field to an N-byte boundary AND
+        // raises the struct's overall alignment to at least N.
+        let mut max_field_align: Option<usize> = None;
+        for member in members {
+            // Check specifiers attributes, member-level attributes, and
+            // declarator attributes for aligned(N).
+            let all_attrs: Vec<&Attribute> = member
+                .specifiers
+                .attributes
+                .iter()
+                .chain(member.attributes.iter())
+                .chain(
+                    member
+                        .declarators
+                        .iter()
+                        .filter_map(|d| d.declarator.as_ref())
+                        .flat_map(|d| d.attributes.iter()),
+                )
+                .collect();
+            for attr in &all_attrs {
+                let attr_name = self.interner.resolve(attr.name);
+                if attr_name == "aligned" || attr_name == "__aligned__" {
+                    let val =
+                        if let Some(AttributeArg::Expression(ref boxed_expr)) = attr.args.first() {
+                            self.try_eval_attr_const_expr(boxed_expr)
+                                .map(|v| v as usize)
+                        } else {
+                            Some(self.target.max_align())
+                        };
+                    if let Some(v) = val {
+                        max_field_align = Some(max_field_align.map_or(v, |cur: usize| cur.max(v)));
+                    }
+                }
+            }
+        }
+        // Merge: explicit struct-level aligned takes precedence if larger,
+        // otherwise field-level aligned raises the struct alignment.
+        let aligned = match (aligned, max_field_align) {
+            (Some(s), Some(f)) => Some(s.max(f)),
+            (Some(s), None) => Some(s),
+            (None, Some(f)) => Some(f),
+            (None, None) => None,
+        };
+
         // Build the complete type.
         let complete_type = if is_struct {
             CType::Struct {
@@ -1857,8 +1895,13 @@ impl<'a> SemanticAnalyzer<'a> {
         };
 
         if std::env::var("BCC_DEBUG_ENUM").is_ok() {
-            eprintln!("[BCC_ENUM] analyze_enum_definition: name={:?} final_underlying={:?} min={} max={}", 
-                spec.tag.map(|t| self.interner.resolve(t).to_string()), final_underlying, this_enum_min, this_enum_max);
+            eprintln!(
+                "[BCC_ENUM] analyze_enum_definition: name={:?} final_underlying={:?} min={} max={}",
+                spec.tag.map(|t| self.interner.resolve(t).to_string()),
+                final_underlying,
+                this_enum_min,
+                this_enum_max
+            );
         }
 
         if let Some(tag_name) = spec.tag {
@@ -2989,12 +3032,18 @@ impl<'a> SemanticAnalyzer<'a> {
             if let Some(entry) = self.scopes.lookup_tag(tag_name) {
                 if std::env::var("BCC_DEBUG_ENUM").is_ok() {
                     let tag_str = self.interner.resolve(tag_name);
-                    eprintln!("[BCC_ENUM] resolve_enum_type: tag={} found entry.ty={:?}", tag_str, entry.ty);
+                    eprintln!(
+                        "[BCC_ENUM] resolve_enum_type: tag={} found entry.ty={:?}",
+                        tag_str, entry.ty
+                    );
                 }
                 return entry.ty.clone();
             } else if std::env::var("BCC_DEBUG_ENUM").is_ok() {
                 let tag_str = self.interner.resolve(tag_name);
-                eprintln!("[BCC_ENUM] resolve_enum_type: tag={} NOT FOUND, returning default Int", tag_str);
+                eprintln!(
+                    "[BCC_ENUM] resolve_enum_type: tag={} NOT FOUND, returning default Int",
+                    tag_str
+                );
             }
         }
         CType::Enum {
@@ -4317,7 +4366,12 @@ impl<'a> SemanticAnalyzer<'a> {
                 }),
                 "qsort" => Some(CType::Function {
                     return_type: Box::new(CType::Void),
-                    params: vec![void_ptr.clone(), size_t.clone(), size_t.clone(), void_ptr.clone()],
+                    params: vec![
+                        void_ptr.clone(),
+                        size_t.clone(),
+                        size_t.clone(),
+                        void_ptr.clone(),
+                    ],
                     variadic: false,
                 }),
                 "signal" => Some(CType::Function {
@@ -4373,7 +4427,12 @@ impl<'a> SemanticAnalyzer<'a> {
                 }),
                 "fread" | "fwrite" => Some(CType::Function {
                     return_type: Box::new(size_t.clone()),
-                    params: vec![void_ptr.clone(), size_t.clone(), size_t.clone(), void_ptr.clone()],
+                    params: vec![
+                        void_ptr.clone(),
+                        size_t.clone(),
+                        size_t.clone(),
+                        void_ptr.clone(),
+                    ],
                     variadic: false,
                 }),
                 "sscanf" | "fscanf" | "scanf" => Some(CType::Function {

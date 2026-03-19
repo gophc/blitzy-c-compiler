@@ -242,7 +242,15 @@ fn reg_class_for_type(ty: &IrType) -> RegClass {
     if ty.is_float() {
         RegClass::Float
     } else {
-        RegClass::Integer
+        // SSE-class struct: a struct with exactly one float field
+        // (e.g. `struct { double d; }`) is ABI-classified as SSE and
+        // must be allocated an XMM register.
+        let normalized = normalize_sse_struct_type(ty.clone());
+        if normalized.is_float() {
+            RegClass::Float
+        } else {
+            RegClass::Integer
+        }
     }
 }
 
@@ -320,10 +328,20 @@ fn normalize_sse_struct_type(ty: IrType) -> IrType {
 pub fn compute_live_intervals(func: &IrFunction) -> Vec<LiveInterval> {
     let rpo = func.reverse_postorder();
     if std::env::var("BCC_DEBUG_INTERVALS").is_ok() {
-        eprintln!("[RA] RPO for '{}': {:?}  (total blocks={})", func.name, rpo, func.block_count());
+        eprintln!(
+            "[RA] RPO for '{}': {:?}  (total blocks={})",
+            func.name,
+            rpo,
+            func.block_count()
+        );
         for (i, blk) in func.blocks.iter().enumerate() {
-            eprintln!("[RA]   block {} succs={:?} preds={:?} insts={}",
-                i, blk.successors(), blk.predecessors(), blk.instruction_count());
+            eprintln!(
+                "[RA]   block {} succs={:?} preds={:?} insts={}",
+                i,
+                blk.successors(),
+                blk.predecessors(),
+                blk.instruction_count()
+            );
         }
     }
     if rpo.is_empty() {

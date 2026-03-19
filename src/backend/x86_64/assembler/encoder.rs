@@ -755,7 +755,7 @@ impl X86_64Encoder {
                     Some(MachineOperand::Immediate(imm)) => {
                         // PUSH imm8: 6A ib / PUSH imm32: 68 id
                         let v = *imm;
-                        if v >= -128 && v <= 127 {
+                        if (-128..=127).contains(&v) {
                             EncodedInstruction::new(vec![0x6A, v as u8])
                         } else {
                             let mut bytes = vec![0x68];
@@ -1159,7 +1159,11 @@ impl X86_64Encoder {
                         let need_w = opsz == 8;
                         if opsz == 1 {
                             // MOV byte [rip+disp], r8
-                            if let Some(rex) = compute_rex(false, Some(src), None, None) {
+                            // Must use byte-aware REX to select %sil/%dil/etc.
+                            // instead of %dh/%bh when src is RSP/RBP/RSI/RDI.
+                            if let Some(rex) =
+                                compute_rex_byte_aware(false, Some(src), None, None, &[src])
+                            {
                                 bytes.push(rex);
                             }
                             bytes.push(0x88);
@@ -2067,9 +2071,14 @@ impl X86_64Encoder {
                     scale,
                     displacement,
                 }),
-            ) => self.encode_reg_mem_op(&[0x8B], *reg, *base, *index, *scale, *displacement, opsz),
+            ) => {
+                // Use byte opcode 0x8A for 1-byte loads, 0x8B for wider.
+                let opc: &[u8] = if opsz == 1 { &[0x8A] } else { &[0x8B] };
+                self.encode_reg_mem_op(opc, *reg, *base, *index, *scale, *displacement, opsz)
+            }
             (Some(MachineOperand::Register(reg)), Some(MachineOperand::FrameSlot(offset))) => {
-                self.encode_reg_mem_op(&[0x8B], *reg, Some(RBP), None, 1, *offset as i64, opsz)
+                let opc: &[u8] = if opsz == 1 { &[0x8A] } else { &[0x8B] };
+                self.encode_reg_mem_op(opc, *reg, Some(RBP), None, 1, *offset as i64, opsz)
             }
             (
                 Some(MachineOperand::Memory {
@@ -2079,9 +2088,14 @@ impl X86_64Encoder {
                     displacement,
                 }),
                 Some(MachineOperand::Register(reg)),
-            ) => self.encode_mem_reg_op(&[0x89], *base, *index, *scale, *displacement, *reg, opsz),
+            ) => {
+                // Use byte opcode 0x88 for 1-byte stores, 0x89 for wider.
+                let opc: &[u8] = if opsz == 1 { &[0x88] } else { &[0x89] };
+                self.encode_mem_reg_op(opc, *base, *index, *scale, *displacement, *reg, opsz)
+            }
             (Some(MachineOperand::FrameSlot(offset)), Some(MachineOperand::Register(reg))) => {
-                self.encode_mem_reg_op(&[0x89], Some(RBP), None, 1, *offset as i64, *reg, opsz)
+                let opc: &[u8] = if opsz == 1 { &[0x88] } else { &[0x89] };
+                self.encode_mem_reg_op(opc, Some(RBP), None, 1, *offset as i64, *reg, opsz)
             }
             (
                 Some(MachineOperand::Memory {
@@ -2169,7 +2183,9 @@ impl X86_64Encoder {
                 let need_w = opsz == 8;
                 if opsz == 1 {
                     // 8-bit store: MOV [rip+disp32], r8  (opcode 0x88)
-                    if let Some(rex) = compute_rex(false, Some(reg), None, None) {
+                    // Byte-aware REX for %sil/%dil/%spl/%bpl selection.
+                    if let Some(rex) = compute_rex_byte_aware(false, Some(reg), None, None, &[reg])
+                    {
                         bytes.push(rex);
                     }
                     bytes.push(0x88);
@@ -3642,13 +3658,8 @@ impl X86_64Encoder {
     fn encode_movq_gpr_to_xmm(&self, gpr: u16, xmm: u16) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(5);
         bytes.push(0x66); // mandatory prefix
-        // REX.W (64-bit operand) + register extension bits
-        let rex = rex_byte(
-            true,
-            hw_encoding(xmm) >= 8,
-            false,
-            hw_encoding(gpr) >= 8,
-        );
+                          // REX.W (64-bit operand) + register extension bits
+        let rex = rex_byte(true, hw_encoding(xmm) >= 8, false, hw_encoding(gpr) >= 8);
         bytes.push(rex);
         bytes.push(0x0F);
         bytes.push(0x6E); // MOVQ xmm, r/m64
@@ -3837,6 +3848,11 @@ impl X86_64Encoder {
     }
 
     /// Encode CVTSI2SD (integer to double).
+    ///
+    /// `operand_size` controls REX.W: 8 → 64-bit source, else 32-bit.
+    /// A 32-bit signed int (e.g. -1 in EAX) must be converted WITHOUT
+    /// REX.W so that `cvtsi2sd` reads the 32-bit register and
+    /// sign-extends internally, yielding -1.0 — not 4294967295.0.
     fn encode_cvtsi2sd(&mut self, inst: &MachineInstruction) -> EncodedInstruction {
         let ops = &inst.operands;
         match (ops.first(), ops.get(1)) {
@@ -3845,7 +3861,8 @@ impl X86_64Encoder {
             {
                 let mut bytes = Vec::with_capacity(6);
                 bytes.push(0xF2);
-                if let Some(rex) = compute_rex(true, Some(*xmm), None, Some(*gpr)) {
+                let want_rexw = inst.operand_size == 8;
+                if let Some(rex) = compute_rex(want_rexw, Some(*xmm), None, Some(*gpr)) {
                     bytes.push(rex);
                 }
                 bytes.push(0x0F);
@@ -3907,6 +3924,7 @@ impl X86_64Encoder {
     /// Encode CVTSI2SS — signed-integer-to-float conversion.
     ///
     /// Format: `F3 [REX.W] 0F 2A /r` — XMM ← convert(GPR).
+    /// `operand_size` controls REX.W: 8 → 64-bit source, else 32-bit.
     fn encode_cvtsi2ss(&mut self, inst: &MachineInstruction) -> EncodedInstruction {
         let ops = &inst.operands;
         match (ops.first(), ops.get(1)) {
@@ -3915,7 +3933,8 @@ impl X86_64Encoder {
             {
                 let mut bytes = Vec::with_capacity(6);
                 bytes.push(0xF3);
-                if let Some(rex) = compute_rex(true, Some(*xmm), None, Some(*gpr)) {
+                let want_rexw = inst.operand_size == 8;
+                if let Some(rex) = compute_rex(want_rexw, Some(*xmm), None, Some(*gpr)) {
                     bytes.push(rex);
                 }
                 bytes.push(0x0F);

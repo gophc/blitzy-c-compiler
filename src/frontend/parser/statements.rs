@@ -362,6 +362,15 @@ pub fn parse_compound_statement(parser: &mut Parser<'_>) -> Result<CompoundState
             break;
         }
 
+        // C23 `[[attribute]]` — skip double-bracket attributes before
+        // block items.  These may appear before declarations or statements
+        // and are consumed silently (same as at external declaration level).
+        while parser.check(&TokenKind::LeftBracket)
+            && parser.peek_nth(0).is(&TokenKind::LeftBracket)
+        {
+            parser.skip_c23_attribute();
+        }
+
         // Disambiguate: declaration or statement?
         //
         // GCC extension tokens (detected by is_gcc_extension_start) may

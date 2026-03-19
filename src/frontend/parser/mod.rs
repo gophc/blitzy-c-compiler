@@ -651,6 +651,37 @@ impl<'src> Parser<'src> {
         }
     }
 
+    /// Skip a C23 `[[…]]` double-bracket attribute block.
+    ///
+    /// The parser enters here when `[[` has been detected as the next two
+    /// tokens.  We consume the opening `[[`, then everything inside
+    /// (tracking bracket nesting), until we find the matching `]]`.
+    pub fn skip_c23_attribute(&mut self) {
+        // Consume the first `[`
+        self.advance();
+        // Consume the second `[`
+        self.advance();
+        let mut depth: u32 = 1;
+        while depth > 0 && !self.check(&TokenKind::Eof) {
+            if self.check(&TokenKind::LeftBracket) {
+                // Could be nested `[[`
+                self.advance();
+                if self.check(&TokenKind::LeftBracket) {
+                    depth += 1;
+                    self.advance();
+                }
+            } else if self.check(&TokenKind::RightBracket) {
+                self.advance();
+                if self.check(&TokenKind::RightBracket) {
+                    depth -= 1;
+                    self.advance();
+                }
+            } else {
+                self.advance();
+            }
+        }
+    }
+
     /// Check if the current token is an identifier (any identifier).
     pub fn is_at_identifier(&self) -> bool {
         matches!(self.current.kind, TokenKind::Identifier(_))
@@ -742,6 +773,13 @@ impl<'src> Parser<'src> {
     /// declarator.
     pub fn parse_external_declaration(&mut self) -> Result<ExternalDeclaration, ()> {
         let start_span = self.current_span();
+
+        // C23 `[[attribute]]` — skip double-bracket attribute blocks.
+        // We consume them silently so that GCC torture tests using
+        // `[[gnu::noipa]]`, `[[maybe_unused]]`, etc. do not fail to parse.
+        while self.check(&TokenKind::LeftBracket) && self.peek_nth(0).is(&TokenKind::LeftBracket) {
+            self.skip_c23_attribute();
+        }
 
         // Consume any leading `__extension__` tokens (suppress warnings).
         while self.match_token(&TokenKind::Extension) {}

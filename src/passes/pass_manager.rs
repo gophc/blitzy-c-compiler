@@ -42,9 +42,19 @@
 
 use crate::ir::function::IrFunction;
 use crate::ir::module::IrModule;
+use crate::passes::adce::run_adce;
 use crate::passes::constant_folding::run_constant_folding;
+use crate::passes::copy_propagation::run_copy_propagation;
 use crate::passes::dead_code_elimination::run_dead_code_elimination;
+use crate::passes::gvn::run_gvn;
+use crate::passes::instruction_combining::run_instruction_combining;
+use crate::passes::licm::run_licm;
+use crate::passes::peephole::run_peephole;
+use crate::passes::register_coalescing::run_register_coalescing;
+use crate::passes::sccp::run_sccp;
 use crate::passes::simplify_cfg::run_simplify_cfg;
+use crate::passes::strength_reduction::run_strength_reduction;
+use crate::passes::tail_call::run_tail_call_optimization;
 
 // ===========================================================================
 // Configuration
@@ -126,11 +136,12 @@ impl std::fmt::Display for OptimizationStats {
 // Per-function optimization
 // ===========================================================================
 
-/// Runs the fixed-order optimization pass sequence on a single function
-/// until a fixpoint is reached (no pass reports any changes), or until
-/// the [`MAX_ITERATIONS`] safety limit is hit.
+/// Runs the basic cleanup pass sequence on a single function (used at `-O0`).
 ///
-/// ## Pass Order (Fixed, Non-Configurable)
+/// This minimal pipeline cleans up IR artifacts from lowering and mem2reg
+/// without introducing aggressive optimizations that would impair debugging.
+///
+/// ## Pass Order (Fixed)
 ///
 /// 1. **Constant Folding** — folds compile-time constant arithmetic,
 ///    propagates constants through use-def chains, simplifies conditional
@@ -141,46 +152,90 @@ impl std::fmt::Display for OptimizationStats {
 ///    eliminates empty blocks, simplifies branch chains, removes trivial
 ///    phi nodes.
 ///
-/// ## Fixpoint Iteration
-///
-/// The three passes are run in sequence within each iteration. If ANY pass
-/// in the sequence reports a change (`true`), the entire sequence is re-run
-/// from the beginning. This ensures that optimizations exposed by one pass
-/// are picked up by subsequent passes on the next iteration:
-///
-/// - Constant folding may fold a branch → DCE removes the unreachable path
-///   → CFG simplification merges remaining blocks → which may expose more
-///   constants for the next round.
-///
 /// Iteration stops when a complete round of all three passes produces zero
 /// changes (fixpoint), or when [`MAX_ITERATIONS`] is reached (safety net).
 ///
-/// ## Return Value
-///
-/// Returns `true` if any optimization was applied during any iteration,
-/// `false` if the function was already at a fixpoint on the first attempt.
-///
-/// # Parameters
-///
-/// - `func`: Mutable reference to the IR function to optimize. The function
-///   must be in SSA form (phi nodes present) as produced by mem2reg (Phase 7).
+/// Returns `true` if any optimization was applied during any iteration.
 pub fn optimize_function(func: &mut IrFunction) -> bool {
+    optimize_function_at_level(func, 0)
+}
+
+/// Runs the full optimization pass sequence on a single function at the
+/// given optimization level.
+///
+/// ## Pass Order at `-O1` and above (15 passes total)
+///
+/// 1.  **SCCP** — Sparse Conditional Constant Propagation (stronger than
+///     simple constant folding — evaluates unreachable branches)
+/// 2.  **Constant Folding** — Evaluate compile-time constant operations
+/// 3.  **Copy Propagation** — Replace uses of `x = y` with `y`
+/// 4.  **GVN** — Global Value Numbering (hash-based CSE)
+/// 5.  **Instruction Combining** — Algebraic simplifications, cast chains
+/// 6.  **Strength Reduction** — Replace mul-by-power-of-2 with shift, etc.
+/// 7.  **LICM** — Loop-Invariant Code Motion
+/// 8.  **DCE** — Dead Code Elimination
+/// 9.  **ADCE** — Aggressive Dead Code Elimination (SSA-based)
+/// 10. **CFG Simplification** — Block merging, branch threading
+/// 11. **Tail Call Optimization** — Convert tail calls to jumps
+/// 12. **Peephole** — Store-load forwarding, dead stores, branch folding
+/// 13. **Register Coalescing** — Reduce phi/bitcast copy overhead
+///
+/// At `-O0`, only passes 2 (Constant Folding), 8 (DCE), and 10 (CFG
+/// Simplification) run — this cleans up lowering artifacts without
+/// aggressive transformations.
+pub fn optimize_function_at_level(func: &mut IrFunction, opt_level: u8) -> bool {
     let mut any_changed = false;
 
     for _iteration in 0..MAX_ITERATIONS {
         let mut changed_this_round = false;
 
-        // Step 1: Constant Folding — evaluate compile-time constant operations,
-        // fold branches with known conditions, propagate constants.
+        if opt_level >= 1 {
+            // SCCP: Sparse Conditional Constant Propagation — more powerful
+            // than simple constant folding, evaluates branch reachability.
+            changed_this_round |= run_sccp(func);
+        }
+
+        // Constant Folding — always runs (even at -O0 for cleanup).
         changed_this_round |= run_constant_folding(func);
 
-        // Step 2: Dead Code Elimination — remove unused side-effect-free
-        // instructions and unreachable basic blocks.
+        if opt_level >= 1 {
+            // Copy Propagation — replace trivial copies (phi, bitcast).
+            changed_this_round |= run_copy_propagation(func);
+
+            // GVN — Global Value Numbering / CSE.
+            changed_this_round |= run_gvn(func);
+
+            // Instruction Combining — algebraic simplifications.
+            changed_this_round |= run_instruction_combining(func);
+
+            // Strength Reduction — power-of-2 mul→shl, udiv→lshr.
+            changed_this_round |= run_strength_reduction(func);
+
+            // LICM — Loop-Invariant Code Motion.
+            changed_this_round |= run_licm(func);
+        }
+
+        // DCE — always runs (even at -O0 for cleanup).
         changed_this_round |= run_dead_code_elimination(func);
 
-        // Step 3: CFG Simplification — merge blocks, eliminate empties,
-        // simplify branch chains, remove trivial phi nodes.
+        if opt_level >= 1 {
+            // ADCE — Aggressive Dead Code Elimination (SSA reverse-reach).
+            changed_this_round |= run_adce(func);
+        }
+
+        // CFG Simplification — always runs (even at -O0 for cleanup).
         changed_this_round |= run_simplify_cfg(func);
+
+        if opt_level >= 1 {
+            // Tail Call Optimization — convert tail-position calls to jumps.
+            changed_this_round |= run_tail_call_optimization(func);
+
+            // Peephole — store-load forwarding, dead stores, branch folding.
+            changed_this_round |= run_peephole(func);
+
+            // Register Coalescing — reduce phi/bitcast copy overhead.
+            changed_this_round |= run_register_coalescing(func);
+        }
 
         if !changed_this_round {
             // Fixpoint reached — no pass made any changes this round.
@@ -199,17 +254,34 @@ pub fn optimize_function(func: &mut IrFunction) -> bool {
 /// This is used by [`optimize_module_with_stats`] to collect per-function
 /// iteration counts for the [`OptimizationStats`] aggregate.
 #[allow(dead_code)]
-fn optimize_function_counted(func: &mut IrFunction) -> (bool, usize) {
+fn optimize_function_counted(func: &mut IrFunction, opt_level: u8) -> (bool, usize) {
     let mut any_changed = false;
     let mut iterations_performed: usize = 0;
 
     for _iteration in 0..MAX_ITERATIONS {
         let mut changed_this_round = false;
 
-        // Fixed pass order: constant folding → DCE → CFG simplification.
+        if opt_level >= 1 {
+            changed_this_round |= run_sccp(func);
+        }
         changed_this_round |= run_constant_folding(func);
+        if opt_level >= 1 {
+            changed_this_round |= run_copy_propagation(func);
+            changed_this_round |= run_gvn(func);
+            changed_this_round |= run_instruction_combining(func);
+            changed_this_round |= run_strength_reduction(func);
+            changed_this_round |= run_licm(func);
+        }
         changed_this_round |= run_dead_code_elimination(func);
+        if opt_level >= 1 {
+            changed_this_round |= run_adce(func);
+        }
         changed_this_round |= run_simplify_cfg(func);
+        if opt_level >= 1 {
+            changed_this_round |= run_tail_call_optimization(func);
+            changed_this_round |= run_peephole(func);
+            changed_this_round |= run_register_coalescing(func);
+        }
 
         iterations_performed += 1;
 
@@ -229,7 +301,7 @@ fn optimize_function_counted(func: &mut IrFunction) -> (bool, usize) {
 // ===========================================================================
 
 /// Runs the optimization pass sequence on every function definition in the
-/// module.
+/// module at `-O0` level (basic cleanup only).
 ///
 /// Functions are optimized independently — no inter-procedural optimization
 /// is performed at this level. Function declarations (without bodies) are
@@ -248,6 +320,16 @@ fn optimize_function_counted(func: &mut IrFunction) -> (bool, usize) {
 /// - `module`: Mutable reference to the IR module containing function
 ///   definitions to optimize.
 pub fn optimize_module(module: &mut IrModule) -> bool {
+    optimize_module_at_level(module, 0)
+}
+
+/// Runs the optimization pass sequence on every function definition in the
+/// module at the specified optimization level.
+///
+/// At `-O0` (level 0), only basic cleanup passes run (constant folding,
+/// DCE, CFG simplification). At `-O1` and above (level ≥ 1), all 13
+/// passes run in the full pipeline order.
+pub fn optimize_module_at_level(module: &mut IrModule, opt_level: u8) -> bool {
     let mut any_changed = false;
 
     for func in module.functions.iter_mut() {
@@ -256,7 +338,7 @@ pub fn optimize_module(module: &mut IrModule) -> bool {
             continue;
         }
 
-        any_changed |= optimize_function(func);
+        any_changed |= optimize_function_at_level(func, opt_level);
     }
 
     any_changed
@@ -280,7 +362,7 @@ pub fn optimize_module(module: &mut IrModule) -> bool {
 ///
 /// [`OptimizationStats`] containing iteration counts and function coverage.
 #[allow(dead_code)]
-fn optimize_module_with_stats(module: &mut IrModule) -> OptimizationStats {
+fn optimize_module_with_stats(module: &mut IrModule, opt_level: u8) -> OptimizationStats {
     let mut stats = OptimizationStats::default();
 
     for func in module.functions.iter_mut() {
@@ -291,7 +373,7 @@ fn optimize_module_with_stats(module: &mut IrModule) -> OptimizationStats {
 
         stats.total_functions += 1;
 
-        let (changed, iterations) = optimize_function_counted(func);
+        let (changed, iterations) = optimize_function_counted(func, opt_level);
 
         if changed {
             stats.functions_optimized += 1;
@@ -349,15 +431,9 @@ fn optimize_module_with_stats(module: &mut IrModule) -> OptimizationStats {
 /// - `opt_level`: Optimization level (0–3), corresponding to `-O0` through `-O3`.
 ///   Currently all levels run the same basic pipeline.
 pub fn run_optimization_pipeline(module: &mut IrModule, opt_level: u8) -> bool {
-    // The basic cleanup pipeline runs at all optimization levels, including -O0.
-    // At -O0, this cleans up IR artifacts from lowering and mem2reg without
-    // introducing optimizations that would impair debugging.
-    //
-    // Future enhancement: gate additional passes on opt_level >= 1, >= 2, etc.
-    // For now, all levels are equivalent since only basic passes are implemented.
-    let _ = opt_level; // Acknowledge the parameter — all levels use the same pipeline.
-
-    optimize_module(module)
+    // At -O0: only basic cleanup passes (constant folding, DCE, CFG simplification).
+    // At -O1+: full 13-pass pipeline including SCCP, GVN, LICM, ADCE, etc.
+    optimize_module_at_level(module, opt_level)
 }
 
 // ===========================================================================
@@ -571,7 +647,7 @@ mod tests {
     #[test]
     fn test_optimize_module_with_stats_empty() {
         let mut module = IrModule::new("empty.c".to_string());
-        let stats = optimize_module_with_stats(&mut module);
+        let stats = optimize_module_with_stats(&mut module, 0);
         assert_eq!(stats.total_functions, 0);
         assert_eq!(stats.functions_optimized, 0);
         assert_eq!(stats.iterations, 0);
@@ -590,14 +666,14 @@ mod tests {
         decl.blocks.clear();
         module.functions.push(decl);
 
-        let stats = optimize_module_with_stats(&mut module);
+        let stats = optimize_module_with_stats(&mut module, 0);
         assert_eq!(stats.total_functions, 2, "Should count only definitions");
     }
 
     #[test]
     fn test_optimize_module_with_stats_iterations_nonzero_for_work() {
         let mut module = make_module("test.c", vec![make_two_block_function("main")]);
-        let stats = optimize_module_with_stats(&mut module);
+        let stats = optimize_module_with_stats(&mut module, 0);
         assert_eq!(stats.total_functions, 1);
         // At least 1 iteration should always occur for a function with blocks.
         assert!(stats.iterations >= 1, "Should perform at least 1 iteration");

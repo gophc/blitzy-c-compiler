@@ -1,3 +1,4 @@
+#![allow(clippy::if_same_then_else, clippy::collapsible_match)]
 //! # Expression Lowering
 //!
 //! Converts semantically-analyzed AST expressions into IR instructions.
@@ -546,10 +547,11 @@ pub fn ctype_to_ir(ctype: &CType, target: &Target) -> IrType {
             let elem_ir = ctype_to_ir(elem, target);
             IrType::Array(Box::new(elem_ir), count.unwrap_or(0))
         }
-        CType::Struct { fields, packed, .. } => {
-            let member_irs: Vec<IrType> =
-                fields.iter().map(|f| ctype_to_ir(&f.ty, target)).collect();
-            IrType::Struct(crate::ir::types::StructType::new(member_irs, *packed))
+        CType::Struct { .. } => {
+            // Delegate to IrType::from_ctype which correctly handles
+            // bitfield packing (multiple bitfields may share one
+            // allocation unit, so per-field mapping inflates the size).
+            IrType::from_ctype(resolved, target)
         }
         CType::Union {
             fields: _fields, ..
@@ -782,13 +784,20 @@ fn sizeof_resolved_inner(
 }
 
 /// Determine the C type of an integer literal from its value and suffix.
-fn integer_literal_ctype(value: u128, suffix: &ast::IntegerSuffix) -> CType {
+fn integer_literal_ctype(value: u128, suffix: &ast::IntegerSuffix, is_hex_or_octal: bool) -> CType {
+    // C11 §6.4.4.1 — Type determination for integer constants.
+    // Hex/octal constants try unsigned types before widening, while
+    // decimal constants only try signed types (then long long unsigned).
     match suffix {
         ast::IntegerSuffix::None => {
             if value <= i32::MAX as u128 {
                 CType::Int
+            } else if is_hex_or_octal && value <= u32::MAX as u128 {
+                CType::UInt
             } else if value <= i64::MAX as u128 {
                 CType::Long
+            } else if is_hex_or_octal && value <= u64::MAX as u128 {
+                CType::ULong
             } else {
                 CType::ULongLong
             }
@@ -796,6 +805,8 @@ fn integer_literal_ctype(value: u128, suffix: &ast::IntegerSuffix) -> CType {
         ast::IntegerSuffix::U => {
             if value <= u32::MAX as u128 {
                 CType::UInt
+            } else if value <= u64::MAX as u128 {
+                CType::ULong
             } else {
                 CType::ULongLong
             }
@@ -803,6 +814,8 @@ fn integer_literal_ctype(value: u128, suffix: &ast::IntegerSuffix) -> CType {
         ast::IntegerSuffix::L => {
             if value <= i64::MAX as u128 {
                 CType::Long
+            } else if is_hex_or_octal && value <= u64::MAX as u128 {
+                CType::ULong
             } else {
                 CType::ULongLong
             }
@@ -811,6 +824,8 @@ fn integer_literal_ctype(value: u128, suffix: &ast::IntegerSuffix) -> CType {
         ast::IntegerSuffix::LL => {
             if value <= i64::MAX as u128 {
                 CType::LongLong
+            } else if is_hex_or_octal && value <= u64::MAX as u128 {
+                CType::ULongLong
             } else {
                 CType::ULongLong
             }
@@ -939,9 +954,9 @@ fn lower_expr_inner(ctx: &mut ExprLoweringContext<'_>, expr: &ast::Expression) -
         ast::Expression::IntegerLiteral {
             value,
             suffix,
+            is_hex_or_octal,
             span,
-            ..
-        } => lower_integer_literal(ctx, *value, suffix, *span),
+        } => lower_integer_literal(ctx, *value, suffix, *is_hex_or_octal, *span),
         ast::Expression::FloatLiteral {
             value,
             suffix,
@@ -1222,9 +1237,10 @@ fn lower_integer_literal(
     ctx: &mut ExprLoweringContext<'_>,
     value: u128,
     suffix: &ast::IntegerSuffix,
+    is_hex_or_octal: bool,
     span: Span,
 ) -> TypedValue {
-    let cty = integer_literal_ctype(value, suffix);
+    let cty = integer_literal_ctype(value, suffix, is_hex_or_octal);
     let ir_ty = ctype_to_ir(&cty, ctx.target);
     let val = emit_int_const(ctx, value as i128, ir_ty, span);
     TypedValue::new(val, cty)
@@ -1328,9 +1344,9 @@ fn lower_string_literal(
     // Build pointer-to-element type for the string literal.
     let elem_ctype = match prefix {
         ast::StringPrefix::None | ast::StringPrefix::U8 => CType::Char,
-        ast::StringPrefix::L => CType::Int,   // wchar_t = int on Linux
+        ast::StringPrefix::L => CType::Int, // wchar_t = int on Linux
         ast::StringPrefix::U16 => CType::UShort, // char16_t
-        ast::StringPrefix::U32 => CType::UInt,   // char32_t
+        ast::StringPrefix::U32 => CType::UInt, // char32_t
     };
     let cty = CType::Pointer(
         Box::new(CType::Qualified(
@@ -1455,12 +1471,10 @@ fn lower_identifier(ctx: &mut ExprLoweringContext<'_>, sym_idx: u32, span: Span)
             // IrType::Array in the IR (e.g., `union u { int i; }` →
             // `Array(I32, 1)`).  We must NOT treat those as C-level arrays.
             let resolved_var = types::resolve_typedef(&var_cty);
-            let ctype_is_struct_or_union = matches!(
-                resolved_var,
-                CType::Struct { .. } | CType::Union { .. }
-            );
-            let global_is_array = matches!(&gt, crate::ir::types::IrType::Array(_, _))
-                && !ctype_is_struct_or_union;
+            let ctype_is_struct_or_union =
+                matches!(resolved_var, CType::Struct { .. } | CType::Union { .. });
+            let global_is_array =
+                matches!(&gt, crate::ir::types::IrType::Array(_, _)) && !ctype_is_struct_or_union;
 
             // Arrays decay to pointers: the address of the global IS the
             // pointer to the first element, so return it directly (no load).
@@ -1535,10 +1549,7 @@ fn lower_identifier(ctx: &mut ExprLoweringContext<'_>, sym_idx: u32, span: Span)
             // arrays should return the pointer directly (no load).
             // Exclude struct/union types which also map to IR Array.
             let resolved_svar = types::resolve_typedef(&var_cty);
-            let ctype_is_sou = matches!(
-                resolved_svar,
-                CType::Struct { .. } | CType::Union { .. }
-            );
+            let ctype_is_sou = matches!(resolved_svar, CType::Struct { .. } | CType::Union { .. });
             let global_is_array = matches!(&gt, IrType::Array(_, _)) && !ctype_is_sou;
             if is_array_decay || global_is_array {
                 // Use the accurately-computed decayed type from
@@ -1821,23 +1832,21 @@ fn lower_identifier(ctx: &mut ExprLoweringContext<'_>, sym_idx: u32, span: Span)
             "exit" | "_exit" | "_Exit" => Some((IrType::Void, vec![IrType::I32], false)),
             "malloc" | "calloc" | "realloc" => Some((IrType::Ptr, vec![], true)),
             "free" => Some((IrType::Void, vec![IrType::Ptr], false)),
-            "memcpy" | "memmove" => {
-                Some((IrType::Ptr, vec![IrType::Ptr, IrType::Ptr, IrType::I64], false))
-            }
-            "memset" => {
-                Some((IrType::Ptr, vec![IrType::Ptr, IrType::I32, IrType::I64], false))
-            }
+            "memcpy" | "memmove" => Some((
+                IrType::Ptr,
+                vec![IrType::Ptr, IrType::Ptr, IrType::I64],
+                false,
+            )),
+            "memset" => Some((
+                IrType::Ptr,
+                vec![IrType::Ptr, IrType::I32, IrType::I64],
+                false,
+            )),
             "memcmp" | "strcmp" | "strncmp" => Some((IrType::I32, vec![], true)),
             "strlen" => Some((IrType::I64, vec![IrType::Ptr], false)),
-            "strcpy" | "strncpy" | "strcat" | "strncat" => {
-                Some((IrType::Ptr, vec![], true))
-            }
-            "printf" | "fprintf" | "sprintf" | "snprintf" => {
-                Some((IrType::I32, vec![], true))
-            }
-            "puts" | "fputs" | "putchar" | "putc" | "fputc" => {
-                Some((IrType::I32, vec![], true))
-            }
+            "strcpy" | "strncpy" | "strcat" | "strncat" => Some((IrType::Ptr, vec![], true)),
+            "printf" | "fprintf" | "sprintf" | "snprintf" => Some((IrType::I32, vec![], true)),
+            "puts" | "fputs" | "putchar" | "putc" | "fputc" => Some((IrType::I32, vec![], true)),
             "getchar" | "fgetc" | "getc" => Some((IrType::I32, vec![], true)),
             "fopen" | "fdopen" => Some((IrType::Ptr, vec![], true)),
             "fclose" | "fflush" => Some((IrType::I32, vec![IrType::Ptr], false)),
@@ -1848,15 +1857,11 @@ fn lower_identifier(ctx: &mut ExprLoweringContext<'_>, sym_idx: u32, span: Span)
             "llabs" => Some((IrType::I64, vec![IrType::I64], false)),
             "fabs" => Some((IrType::F64, vec![IrType::F64], false)),
             "fabsf" => Some((IrType::F32, vec![IrType::F32], false)),
-            "sqrt" | "sin" | "cos" | "tan" | "log" | "log2" | "log10" | "exp"
-            | "pow" | "ceil" | "floor" | "round" | "fmod" | "atan2" | "atan"
-            | "asin" | "acos" | "sinh" | "cosh" | "tanh" => {
-                Some((IrType::F64, vec![], true))
-            }
-            "sqrtf" | "sinf" | "cosf" | "tanf" | "logf" | "expf" | "powf"
-            | "ceilf" | "floorf" | "roundf" | "fmodf" => {
-                Some((IrType::F32, vec![], true))
-            }
+            "sqrt" | "sin" | "cos" | "tan" | "log" | "log2" | "log10" | "exp" | "pow" | "ceil"
+            | "floor" | "round" | "fmod" | "atan2" | "atan" | "asin" | "acos" | "sinh" | "cosh"
+            | "tanh" => Some((IrType::F64, vec![], true)),
+            "sqrtf" | "sinf" | "cosf" | "tanf" | "logf" | "expf" | "powf" | "ceilf" | "floorf"
+            | "roundf" | "fmodf" => Some((IrType::F32, vec![], true)),
             "qsort" | "bsearch" => Some((IrType::Void, vec![], true)),
             "signal" => Some((IrType::Ptr, vec![], true)),
             "setjmp" | "_setjmp" | "sigsetjmp" => Some((IrType::I32, vec![IrType::Ptr], false)),
@@ -1868,8 +1873,8 @@ fn lower_identifier(ctx: &mut ExprLoweringContext<'_>, sym_idx: u32, span: Span)
             "perror" => Some((IrType::Void, vec![IrType::Ptr], false)),
             "raise" | "system" | "atexit" => Some((IrType::I32, vec![], true)),
             "getenv" => Some((IrType::Ptr, vec![IrType::Ptr], false)),
-            "isalpha" | "isdigit" | "isalnum" | "isspace" | "isupper" | "islower"
-            | "ispunct" | "isprint" | "iscntrl" | "isxdigit" | "toupper" | "tolower" => {
+            "isalpha" | "isdigit" | "isalnum" | "isspace" | "isupper" | "islower" | "ispunct"
+            | "isprint" | "iscntrl" | "isxdigit" | "toupper" | "tolower" => {
                 Some((IrType::I32, vec![IrType::I32], false))
             }
             _ => None,
@@ -1911,11 +1916,8 @@ fn lower_identifier(ctx: &mut ExprLoweringContext<'_>, sym_idx: u32, span: Span)
         let owned_name = name.to_string();
         // Declare as an extern global variable of type pointer
         if ctx.module.get_global(&owned_name).is_none() {
-            let mut gv = crate::ir::module::GlobalVariable::new(
-                owned_name.clone(),
-                IrType::Ptr,
-                None,
-            );
+            let mut gv =
+                crate::ir::module::GlobalVariable::new(owned_name.clone(), IrType::Ptr, None);
             gv.linkage = crate::ir::module::Linkage::External;
             ctx.module.add_global(gv);
         }
@@ -1929,7 +1931,10 @@ fn lower_identifier(ctx: &mut ExprLoweringContext<'_>, sym_idx: u32, span: Span)
         }
         let (loaded, li) = ctx.builder.build_load(ptr_val, IrType::Ptr, span);
         emit_inst(ctx, li);
-        return TypedValue::new(loaded, CType::Pointer(Box::new(CType::Void), TypeQualifiers::default()));
+        return TypedValue::new(
+            loaded,
+            CType::Pointer(Box::new(CType::Void), TypeQualifiers::default()),
+        );
     }
 
     // C89/GNU89 implicit function declaration: treat undeclared identifiers
@@ -1962,10 +1967,10 @@ fn lower_identifier(ctx: &mut ExprLoweringContext<'_>, sym_idx: u32, span: Span)
             let current_func = &mut *ctx.function;
             current_func.func_ref_map.insert(fptr, owned_name);
         }
-        return TypedValue::new(
+        TypedValue::new(
             fptr,
             CType::Pointer(Box::new(CType::Void), TypeQualifiers::default()),
-        );
+        )
     }
 }
 
@@ -2064,6 +2069,28 @@ fn lower_binary(
     }
     let lhs = lower_expr_inner(ctx, lhs_expr);
     let rhs = lower_expr_inner(ctx, rhs_expr);
+
+    // Apply array-to-pointer decay for operands with array type.
+    // In C, arrays in expression context decay to pointers-to-first-element
+    // (C11 §6.3.2.1p3).  This is critical for expressions like `*(p+i) + j`
+    // where `*(p+i)` yields an array lvalue that must decay to a pointer
+    // before the `+ j` pointer arithmetic is applied.
+    let lhs = if let CType::Array(elem, _) = types::resolve_typedef(&lhs.ty) {
+        TypedValue::new(
+            lhs.value,
+            CType::Pointer(elem.clone(), types::TypeQualifiers::default()),
+        )
+    } else {
+        lhs
+    };
+    let rhs = if let CType::Array(elem, _) = types::resolve_typedef(&rhs.ty) {
+        TypedValue::new(
+            rhs.value,
+            CType::Pointer(elem.clone(), types::TypeQualifiers::default()),
+        )
+    } else {
+        rhs
+    };
 
     if is_pointer_type(&lhs.ty) && is_integer_type(&rhs.ty) {
         // Pointer-integer comparisons: convert integer to pointer and use ptr-ptr comparison.
@@ -2204,7 +2231,9 @@ fn lower_binary(
                 TypedValue::new(v, lhs_promoted)
             }
             ast::BinaryOp::ShiftRight => {
-                let (v, i) = ctx.builder.build_shr(lv, rv_conv, lhs_ir, !lhs_unsigned, span);
+                let (v, i) = ctx
+                    .builder
+                    .build_shr(lv, rv_conv, lhs_ir, !lhs_unsigned, span);
                 emit_inst(ctx, i);
                 TypedValue::new(v, lhs_promoted)
             }
@@ -2495,6 +2524,14 @@ fn lower_unary(
                 // Return the pointer value unchanged with function type.
                 // The call lowering will use this value directly.
                 TypedValue::new(p.value, pt)
+            } else if matches!(&pt, CType::Array(_, _)) {
+                // Dereferencing a pointer-to-array yields an array lvalue
+                // at the same address.  In C, this lvalue decays to a
+                // pointer-to-first-element.  We must NOT emit a Load —
+                // the pointer value IS the address of the array.
+                // Example: `int (*a)[2]; *a` → same address, type int[2].
+                // Array-to-pointer decay will be applied when needed.
+                TypedValue::new(p.value, pt)
             } else {
                 let it = ctype_to_ir(&pt, ctx.target);
                 let (v, li) = ctx.builder.build_load(p.value, it, span);
@@ -2554,8 +2591,8 @@ fn lower_unary(
         ast::UnaryOp::RealPart => {
             // GCC __real__: for non-complex types, acts as identity.
             // For _Complex, would extract real component.
-            let inner = lower_expr_inner(ctx, operand);
-            inner
+
+            lower_expr_inner(ctx, operand)
         }
         ast::UnaryOp::ImagPart => {
             // GCC __imag__: for non-complex types, returns 0.
@@ -2604,6 +2641,13 @@ fn lower_assignment(
             } else {
                 0
             };
+            // GCC extension: zero-sized structs (e.g. `struct g{};`).
+            // Assignment is a no-op — nothing to copy.
+            if is_agg && struct_size == 0 {
+                // Still evaluate RHS for side effects.
+                let _ = lower_expr_inner(ctx, value);
+                return TypedValue::new(lhs.value, lhs.ty);
+            }
             if is_agg && struct_size > 8 {
                 // Get source pointer for the struct copy.
                 // If the RHS is a natural lvalue (variable, array element,
@@ -2625,12 +2669,18 @@ fn lower_assignment(
                     // Store the rvalue into the temporary.
                     let si = ctx.builder.build_store(rhs_val.value, tmp_alloca, span);
                     emit_inst(ctx, si);
-                    TypedValue::new(tmp_alloca, CType::Pointer(Box::new(resolved_lhs_ty.clone()), crate::common::types::TypeQualifiers {
-                        is_const: false,
-                        is_volatile: false,
-                        is_restrict: false,
-                        is_atomic: false,
-                    }))
+                    TypedValue::new(
+                        tmp_alloca,
+                        CType::Pointer(
+                            Box::new(resolved_lhs_ty.clone()),
+                            crate::common::types::TypeQualifiers {
+                                is_const: false,
+                                is_volatile: false,
+                                is_restrict: false,
+                                is_atomic: false,
+                            },
+                        ),
+                    )
                 };
 
                 // Emit individual 8-byte load/store pairs to copy the
@@ -2723,24 +2773,20 @@ fn lower_assignment(
                         };
                         let shift_amt = ir_width - bit_width;
                         if shift_amt > 0 {
-                            let shift_val = emit_int_const(
-                                ctx,
-                                shift_amt as i128,
-                                storage_ir.clone(),
-                                span,
-                            );
-                            let (shl_v, shl_i) = ctx.builder.build_shl(
-                                rhs_val, shift_val, storage_ir.clone(), span,
-                            );
+                            let shift_val =
+                                emit_int_const(ctx, shift_amt as i128, storage_ir.clone(), span);
+                            let (shl_v, shl_i) =
+                                ctx.builder
+                                    .build_shl(rhs_val, shift_val, storage_ir.clone(), span);
                             emit_inst(ctx, shl_i);
-                            let shift_val2 = emit_int_const(
-                                ctx,
-                                shift_amt as i128,
-                                storage_ir.clone(),
-                                span,
-                            );
+                            let shift_val2 =
+                                emit_int_const(ctx, shift_amt as i128, storage_ir.clone(), span);
                             let (ashr_v, ashr_i) = ctx.builder.build_shr(
-                                shl_v, shift_val2, storage_ir.clone(), true, span,
+                                shl_v,
+                                shift_val2,
+                                storage_ir.clone(),
+                                true,
+                                span,
                             );
                             emit_inst(ctx, ashr_i);
                             ashr_v
@@ -2751,11 +2797,10 @@ fn lower_assignment(
                         // Unsigned: mask to bit_width bits.
                         let storage_ir = ctype_to_ir(&lhs.ty, ctx.target);
                         let mask = (1u64 << bit_width).wrapping_sub(1);
-                        let mask_val =
-                            emit_int_const(ctx, mask as i128, storage_ir.clone(), span);
-                        let (and_v, and_i) = ctx.builder.build_and(
-                            rhs_val, mask_val, storage_ir.clone(), span,
-                        );
+                        let mask_val = emit_int_const(ctx, mask as i128, storage_ir.clone(), span);
+                        let (and_v, and_i) =
+                            ctx.builder
+                                .build_and(rhs_val, mask_val, storage_ir.clone(), span);
                         emit_inst(ctx, and_i);
                         and_v
                     } else {
@@ -2846,72 +2891,123 @@ fn lower_assignment(
                         emit_inst(ctx, g);
                         r
                     } else {
-                        let (v, i) = ctx
-                            .builder
-                            .build_add(cur_promoted, rhs_promoted, common_ir.clone(), span);
+                        let (v, i) = ctx.builder.build_add(
+                            cur_promoted,
+                            rhs_promoted,
+                            common_ir.clone(),
+                            span,
+                        );
                         emit_inst(ctx, i);
                         v
                     }
                 }
                 ast::AssignOp::SubAssign => {
-                    let (v, i) = ctx
-                        .builder
-                        .build_sub(cur_promoted, rhs_promoted, common_ir.clone(), span);
-                    emit_inst(ctx, i);
-                    v
+                    if is_pointer_type(&lhs_ptr.ty) {
+                        // Pointer arithmetic: p -= n means p = p - n*sizeof(*p)
+                        let es = pointee_size_resolved(
+                            &lhs_ptr.ty,
+                            ctx.type_builder,
+                            ctx.struct_defs,
+                            ctx.target,
+                        ) as i128;
+                        let si = size_ir_type(ctx.target);
+                        let sc = emit_int_const(ctx, es, si.clone(), span);
+                        let iv = insert_implicit_conversion(
+                            ctx,
+                            rhs.value,
+                            &rhs.ty,
+                            &size_ctype(ctx.target),
+                            span,
+                        );
+                        let (bo, mi) = ctx.builder.build_mul(iv, sc, si.clone(), span);
+                        emit_inst(ctx, mi);
+                        // Negate the offset for subtraction
+                        let (neg, ni) = ctx.builder.build_neg(bo, si, span);
+                        emit_inst(ctx, ni);
+                        let (r, g) = ctx.builder.build_gep(cur_val, vec![neg], IrType::Ptr, span);
+                        emit_inst(ctx, g);
+                        r
+                    } else {
+                        let (v, i) = ctx.builder.build_sub(
+                            cur_promoted,
+                            rhs_promoted,
+                            common_ir.clone(),
+                            span,
+                        );
+                        emit_inst(ctx, i);
+                        v
+                    }
                 }
                 ast::AssignOp::MulAssign => {
-                    let (v, i) = ctx
-                        .builder
-                        .build_mul(cur_promoted, rhs_promoted, common_ir.clone(), span);
+                    let (v, i) =
+                        ctx.builder
+                            .build_mul(cur_promoted, rhs_promoted, common_ir.clone(), span);
                     emit_inst(ctx, i);
                     v
                 }
                 ast::AssignOp::DivAssign => {
-                    let (v, i) =
-                        ctx.builder
-                            .build_div(cur_promoted, rhs_promoted, common_ir.clone(), !uns, span);
+                    let (v, i) = ctx.builder.build_div(
+                        cur_promoted,
+                        rhs_promoted,
+                        common_ir.clone(),
+                        !uns,
+                        span,
+                    );
                     emit_inst(ctx, i);
                     v
                 }
                 ast::AssignOp::ModAssign => {
-                    let (v, i) =
-                        ctx.builder
-                            .build_rem(cur_promoted, rhs_promoted, common_ir.clone(), !uns, span);
+                    let (v, i) = ctx.builder.build_rem(
+                        cur_promoted,
+                        rhs_promoted,
+                        common_ir.clone(),
+                        !uns,
+                        span,
+                    );
                     emit_inst(ctx, i);
                     v
                 }
                 ast::AssignOp::AndAssign => {
-                    let (v, i) = ctx
-                        .builder
-                        .build_and(cur_promoted, rhs_promoted, common_ir.clone(), span);
+                    let (v, i) =
+                        ctx.builder
+                            .build_and(cur_promoted, rhs_promoted, common_ir.clone(), span);
                     emit_inst(ctx, i);
                     v
                 }
                 ast::AssignOp::OrAssign => {
-                    let (v, i) = ctx
-                        .builder
-                        .build_or(cur_promoted, rhs_promoted, common_ir.clone(), span);
+                    let (v, i) =
+                        ctx.builder
+                            .build_or(cur_promoted, rhs_promoted, common_ir.clone(), span);
                     emit_inst(ctx, i);
                     v
                 }
                 ast::AssignOp::XorAssign => {
-                    let (v, i) = ctx
-                        .builder
-                        .build_xor(cur_promoted, rhs_promoted, common_ir.clone(), span);
+                    let (v, i) =
+                        ctx.builder
+                            .build_xor(cur_promoted, rhs_promoted, common_ir.clone(), span);
                     emit_inst(ctx, i);
                     v
                 }
                 ast::AssignOp::ShlAssign => {
                     // C11 §6.5.7: Shift uses the promoted lhs type, not common type
                     let lhs_ir_ty = ctype_to_ir(&lhs_ty_for_arith, ctx.target);
-                    let lv_for_shift =
-                        insert_implicit_conversion(ctx, cur_val, &lhs_ty_for_arith, &lhs_ty_for_arith, span);
-                    let rhs_for_shift =
-                        insert_implicit_conversion(ctx, rhs.value, &rhs.ty, &lhs_ty_for_arith, span);
-                    let (v, i) = ctx
-                        .builder
-                        .build_shl(lv_for_shift, rhs_for_shift, lhs_ir_ty, span);
+                    let lv_for_shift = insert_implicit_conversion(
+                        ctx,
+                        cur_val,
+                        &lhs_ty_for_arith,
+                        &lhs_ty_for_arith,
+                        span,
+                    );
+                    let rhs_for_shift = insert_implicit_conversion(
+                        ctx,
+                        rhs.value,
+                        &rhs.ty,
+                        &lhs_ty_for_arith,
+                        span,
+                    );
+                    let (v, i) =
+                        ctx.builder
+                            .build_shl(lv_for_shift, rhs_for_shift, lhs_ir_ty, span);
                     emit_inst(ctx, i);
                     // Convert back to common type so the downstream store-back logic works
                     insert_implicit_conversion(ctx, v, &lhs_ty_for_arith, &common_ty, span)
@@ -2920,13 +3016,27 @@ fn lower_assignment(
                     // C11 §6.5.7: Shift signedness comes from left operand (lhs), not common type
                     let lhs_ir_ty = ctype_to_ir(&lhs_ty_for_arith, ctx.target);
                     let lhs_uns = is_unsigned(&lhs_ty_for_arith);
-                    let lv_for_shift =
-                        insert_implicit_conversion(ctx, cur_val, &lhs_ty_for_arith, &lhs_ty_for_arith, span);
-                    let rhs_for_shift =
-                        insert_implicit_conversion(ctx, rhs.value, &rhs.ty, &lhs_ty_for_arith, span);
-                    let (v, i) =
-                        ctx.builder
-                            .build_shr(lv_for_shift, rhs_for_shift, lhs_ir_ty, !lhs_uns, span);
+                    let lv_for_shift = insert_implicit_conversion(
+                        ctx,
+                        cur_val,
+                        &lhs_ty_for_arith,
+                        &lhs_ty_for_arith,
+                        span,
+                    );
+                    let rhs_for_shift = insert_implicit_conversion(
+                        ctx,
+                        rhs.value,
+                        &rhs.ty,
+                        &lhs_ty_for_arith,
+                        span,
+                    );
+                    let (v, i) = ctx.builder.build_shr(
+                        lv_for_shift,
+                        rhs_for_shift,
+                        lhs_ir_ty,
+                        !lhs_uns,
+                        span,
+                    );
                     emit_inst(ctx, i);
                     insert_implicit_conversion(ctx, v, &lhs_ty_for_arith, &common_ty, span)
                 }
@@ -2934,8 +3044,7 @@ fn lower_assignment(
             };
 
             // Convert result back from common type to lhs type
-            let new_val =
-                insert_implicit_conversion(ctx, new_val, &common_ty, &lhs_ptr.ty, span);
+            let new_val = insert_implicit_conversion(ctx, new_val, &common_ty, &lhs_ptr.ty, span);
 
             // For bitfields, use read-modify-write to store the computed
             // value back without clobbering adjacent fields.
@@ -3109,6 +3218,58 @@ fn try_lower_builtin_call(
                 ))
             }
         }
+
+        // ── abs/labs/llabs → inline branchless absolute value ──
+        // These MUST be inlined so user-defined replacements don't interfere
+        // with constant-folded calls (GCC torture test 20021127-1).
+        "abs" | "labs" | "llabs" | "__builtin_abs" | "__builtin_labs" | "__builtin_llabs" => {
+            if args.is_empty() {
+                return None;
+            }
+            let (ir_ty, c_ty) = match func_name.as_str() {
+                "abs" | "__builtin_abs" => (IrType::I32, CType::Int),
+                "labs" | "__builtin_labs" => (IrType::I64, CType::Long),
+                "llabs" | "__builtin_llabs" => (IrType::I64, CType::LongLong),
+                _ => unreachable!(),
+            };
+            let arg_tv = lower_expr_inner(ctx, &args[0]);
+            let arg_val = insert_implicit_conversion(ctx, arg_tv.value, &arg_tv.ty, &c_ty, span);
+            // Branchless abs: result = (x ^ (x >> 63)) - (x >> 63)
+            // where 63 for I64 / 31 for I32
+            let shift_amt = if matches!(ir_ty, IrType::I32) {
+                31i128
+            } else {
+                63i128
+            };
+            let sh = emit_int_const(ctx, shift_amt, ir_ty.clone(), span);
+            let (sar_val, sar_inst) = ctx
+                .builder
+                .build_shr(arg_val, sh, ir_ty.clone(), true, span);
+            emit_inst(ctx, sar_inst);
+            let (xor_val, xor_inst) = ctx.builder.build_xor(arg_val, sar_val, ir_ty.clone(), span);
+            emit_inst(ctx, xor_inst);
+            let (sub_val, sub_inst) = ctx.builder.build_sub(xor_val, sar_val, ir_ty.clone(), span);
+            emit_inst(ctx, sub_inst);
+            Some(TypedValue::new(sub_val, c_ty))
+        }
+
+        // ── fabs/fabsf → libc forwarders ──
+        "fabs" | "__builtin_fabs" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "fabs",
+            IrType::F64,
+            CType::Double,
+            span,
+        )),
+        "fabsf" | "__builtin_fabsf" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "fabsf",
+            IrType::F32,
+            CType::Float,
+            span,
+        )),
 
         // ── __atomic_load_n(ptr, order) → *ptr ──
         "__atomic_load_n" => {
@@ -3413,82 +3574,54 @@ fn try_lower_builtin_call(
             Some(TypedValue::new(v, CType::Double))
         }
 
-        // ── __builtin_isnan(x) → x != x ──
-        "__builtin_isnan" => {
+        // ── Float predicates: isinf, isnan, signbit, isfinite ──
+        // All use volatile store+load to type-pun float→int, then bit manipulation.
+        // Float:  int_ty=I32, abs_mask=0x7FFFFFFF, exp_mask=0x7F800000, shift=31
+        // Double: int_ty=I64, abs_mask=0x7FFFFFFFFFFFFFFF, exp_mask=0x7FF0000000000000, shift=63
+        "__builtin_isinf"
+        | "__builtin_isinff"
+        | "__builtin_isinfl"
+        | "isinf"
+        | "isinff"
+        | "__builtin_isinf_sign"
+        | "__builtin_isfinite"
+        | "__builtin_isfinitef"
+        | "__builtin_isfinitel"
+        | "isfinite"
+        | "__isfinite"
+        | "__finitef"
+        | "__finite"
+        | "__builtin_isnan"
+        | "__builtin_isnanf"
+        | "__builtin_isnanl"
+        | "isnan"
+        | "isnanf"
+        | "isnanl"
+        | "__builtin_signbit"
+        | "__builtin_signbitf"
+        | "__builtin_signbitl"
+        | "signbit"
+        | "__signbit"
+        | "__signbitf" => {
             if args.is_empty() {
                 return None;
             }
             let x_tv = lower_expr_inner(ctx, &args[0]);
-            let (cmp, ci) = ctx.builder.build_fcmp(
-                crate::ir::instructions::FCmpOp::Uno,
-                x_tv.value,
-                x_tv.value,
-                span,
-            );
-            emit_inst(ctx, ci);
-            // Zero-extend i1 to i32 for C int result.
-            let (val, zi) = ctx
-                .builder
-                .build_zext_from(cmp, IrType::I1, IrType::I32, span);
-            emit_inst(ctx, zi);
-            Some(TypedValue::new(val, CType::Int))
-        }
-
-        // ── __builtin_isinf(x) → |x| == inf ──
-        "__builtin_isinf" | "__builtin_isinf_sign" => {
-            if args.is_empty() {
-                return None;
-            }
-            // Simplified: emit a function call to isinf from libc as fallback
-            // or return 0 for now.
-            let _x_tv = lower_expr_inner(ctx, &args[0]);
-            let val = emit_int_const(ctx, 0, IrType::I32, span);
-            Some(TypedValue::new(val, CType::Int))
-        }
-
-        // ── __builtin_signbit(x) → store-to-mem + load-as-int + shift ──
-        "__builtin_signbit" | "signbit" | "__signbit" | "__signbitf" => {
-            if args.is_empty() {
-                return None;
-            }
-            let x_tv = lower_expr_inner(ctx, &args[0]);
-            // Type-pun via memory to get exact bit representation.
-            // Store float to a stack slot, then load as integer.
-            // Mark the store as volatile to prevent mem2reg from
-            // promoting this alloca — promotion would replace the
-            // load with the float Value directly, losing the
-            // bit-reinterpretation semantics.
-            let (alloca, ai) = ctx.builder.build_alloca(IrType::I64, span);
-            emit_inst(ctx, ai);
-            let mut si = ctx.builder.build_store(x_tv.value, alloca, span);
-            if let crate::ir::instructions::Instruction::Store {
-                ref mut volatile, ..
-            } = si
-            {
-                *volatile = true;
-            }
-            emit_inst(ctx, si);
-            let (int_val, li) = ctx.builder.build_load(alloca, IrType::I64, span);
-            emit_inst(ctx, li);
-            let shift_amt = emit_int_const(ctx, 63, IrType::I64, span);
-            let (shifted, shi) =
-                ctx.builder
-                    .build_shr(int_val, shift_amt, IrType::I64, false, span);
-            emit_inst(ctx, shi);
-            let (trunc, ti) = ctx.builder.build_trunc(shifted, IrType::I32, span);
-            emit_inst(ctx, ti);
-            Some(TypedValue::new(trunc, CType::Int))
-        }
-
-        // ── __builtin_isfinite(x) → check exponent != all-ones ──
-        "__builtin_isfinite" | "isfinite" | "__isfinite" | "__finitef" | "__finite" => {
-            if args.is_empty() {
-                return None;
-            }
-            let x_tv = lower_expr_inner(ctx, &args[0]);
-            // Type-pun via memory to get exact bit representation.
-            // Mark store volatile to prevent mem2reg promotion (type pun).
-            let (alloca, alloc_i) = ctx.builder.build_alloca(IrType::I64, span);
+            let resolved = crate::common::types::resolve_typedef(&x_tv.ty);
+            let is_float = matches!(resolved, CType::Float);
+            let (int_ty, abs_mask, exp_mask, shift_n) = if is_float {
+                (IrType::I32, 0x7FFF_FFFFi128, 0x7F80_0000i128, 31i128)
+            } else {
+                (
+                    IrType::I64,
+                    0x7FFF_FFFF_FFFF_FFFFi128,
+                    0x7FF0_0000_0000_0000i128,
+                    63i128,
+                )
+            };
+            // Type-pun via volatile store+load (bitcast codegen doesn't
+            // preserve bits for float→int on x86-64, so use memory).
+            let (alloca, alloc_i) = ctx.builder.build_alloca(int_ty.clone(), span);
             emit_inst(ctx, alloc_i);
             let mut si = ctx.builder.build_store(x_tv.value, alloca, span);
             if let crate::ir::instructions::Instruction::Store {
@@ -3498,25 +3631,92 @@ fn try_lower_builtin_call(
                 *volatile = true;
             }
             emit_inst(ctx, si);
-            let (int_val, li) = ctx.builder.build_load(alloca, IrType::I64, span);
+            let (bits, li) = ctx.builder.build_load(alloca, int_ty.clone(), span);
             emit_inst(ctx, li);
-            // Mask out sign bit, shift right 52 to get exponent.
-            let mask = emit_int_const(ctx, 0x7ff0_0000_0000_0000_i64 as i128, IrType::I64, span);
-            let (masked, ai) = ctx.builder.build_and(int_val, mask, IrType::I64, span);
-            emit_inst(ctx, ai);
-            let all_ones = emit_int_const(ctx, 0x7ff0_0000_0000_0000_i64 as i128, IrType::I64, span);
-            let (cmp, ci) = ctx.builder.build_icmp(
-                crate::ir::instructions::ICmpOp::Ne,
-                masked,
-                all_ones,
-                span,
-            );
-            emit_inst(ctx, ci);
-            let (val, zi) = ctx
-                .builder
-                .build_zext_from(cmp, IrType::I1, IrType::I32, span);
-            emit_inst(ctx, zi);
-            Some(TypedValue::new(val, CType::Int))
+
+            let is_isinf = func_name.contains("isinf") && !func_name.contains("sign");
+            let is_isinf_sign = func_name.contains("isinf_sign");
+            let is_isnan = func_name.contains("isnan");
+            let is_signbit = func_name.contains("signbit");
+            // isfinite = everything else
+
+            if is_signbit {
+                let sh = emit_int_const(ctx, shift_n, int_ty.clone(), span);
+                let (shifted, shi) = ctx.builder.build_shr(bits, sh, int_ty.clone(), false, span);
+                emit_inst(ctx, shi);
+                let result = if int_ty != IrType::I32 {
+                    let (tr, tri) = ctx.builder.build_trunc(shifted, IrType::I32, span);
+                    emit_inst(ctx, tri);
+                    tr
+                } else {
+                    shifted
+                };
+                return Some(TypedValue::new(result, CType::Int));
+            }
+
+            // Compute abs_bits = bits & abs_mask
+            let mask_v = emit_int_const(ctx, abs_mask, int_ty.clone(), span);
+            let (abs_bits, abi) = ctx.builder.build_and(bits, mask_v, int_ty.clone(), span);
+            emit_inst(ctx, abi);
+            let exp_v = emit_int_const(ctx, exp_mask, int_ty.clone(), span);
+
+            if is_isinf {
+                // isinf: abs_bits == exp_mask
+                let (cmp, ci) = ctx.builder.build_icmp(ICmpOp::Eq, abs_bits, exp_v, span);
+                emit_inst(ctx, ci);
+                let (val, zi) = ctx
+                    .builder
+                    .build_zext_from(cmp, IrType::I1, IrType::I32, span);
+                emit_inst(ctx, zi);
+                Some(TypedValue::new(val, CType::Int))
+            } else if is_isnan {
+                // isnan: abs_bits > exp_mask
+                let (cmp, ci) = ctx.builder.build_icmp(ICmpOp::Ugt, abs_bits, exp_v, span);
+                emit_inst(ctx, ci);
+                let (val, zi) = ctx
+                    .builder
+                    .build_zext_from(cmp, IrType::I1, IrType::I32, span);
+                emit_inst(ctx, zi);
+                Some(TypedValue::new(val, CType::Int))
+            } else if is_isinf_sign {
+                // isinf_sign: +inf→1, -inf→-1, else→0
+                let (is_inf, ici) = ctx.builder.build_icmp(ICmpOp::Eq, abs_bits, exp_v, span);
+                emit_inst(ctx, ici);
+                let (inf_i32, ie) =
+                    ctx.builder
+                        .build_zext_from(is_inf, IrType::I1, IrType::I32, span);
+                emit_inst(ctx, ie);
+                let sh = emit_int_const(ctx, shift_n, int_ty.clone(), span);
+                let (shifted, shi) = ctx.builder.build_shr(bits, sh, int_ty.clone(), false, span);
+                emit_inst(ctx, shi);
+                let sign_i32 = if int_ty != IrType::I32 {
+                    let (tr, tri) = ctx.builder.build_trunc(shifted, IrType::I32, span);
+                    emit_inst(ctx, tri);
+                    tr
+                } else {
+                    shifted
+                };
+                let one_v = emit_int_const(ctx, 1, IrType::I32, span);
+                let (s_and, sai) = ctx.builder.build_and(sign_i32, one_v, IrType::I32, span);
+                emit_inst(ctx, sai);
+                let two_v = emit_int_const(ctx, 2, IrType::I32, span);
+                let (t2s, t2i) = ctx.builder.build_mul(two_v, s_and, IrType::I32, span);
+                emit_inst(ctx, t2i);
+                let (neg, ni) = ctx.builder.build_mul(inf_i32, t2s, IrType::I32, span);
+                emit_inst(ctx, ni);
+                let (res, ri) = ctx.builder.build_sub(inf_i32, neg, IrType::I32, span);
+                emit_inst(ctx, ri);
+                Some(TypedValue::new(res, CType::Int))
+            } else {
+                // isfinite: abs_bits < exp_mask
+                let (cmp, ci) = ctx.builder.build_icmp(ICmpOp::Ult, abs_bits, exp_v, span);
+                emit_inst(ctx, ci);
+                let (val, zi) = ctx
+                    .builder
+                    .build_zext_from(cmp, IrType::I1, IrType::I32, span);
+                emit_inst(ctx, zi);
+                Some(TypedValue::new(val, CType::Int))
+            }
         }
 
         // ── __builtin_classify_type(x) → integer constant ──
@@ -3533,237 +3733,558 @@ fn try_lower_builtin_call(
         }
 
         // ── __builtin_clrsb / clrsbl / clrsbll → count leading redundant sign bits ──
-        "__builtin_clrsb" | "clrsb" => {
-            Some(lower_bit_builtin(ctx, args, "clrsb", span))
-        }
-        "__builtin_clrsbl" => {
-            Some(lower_bit_builtin(ctx, args, "clrsbl", span))
-        }
-        "__builtin_clrsbll" => {
-            Some(lower_bit_builtin(ctx, args, "clrsbll", span))
-        }
+        "__builtin_clrsb" | "clrsb" => Some(lower_bit_builtin(ctx, args, "clrsb", span)),
+        "__builtin_clrsbl" => Some(lower_bit_builtin(ctx, args, "clrsbl", span)),
+        "__builtin_clrsbll" => Some(lower_bit_builtin(ctx, args, "clrsbll", span)),
 
         // ── __builtin_parity / parityl / parityll → popcount & 1 ──
-        "__builtin_parity" => {
-            Some(lower_bit_builtin(ctx, args, "parity", span))
-        }
-        "__builtin_parityl" => {
-            Some(lower_bit_builtin(ctx, args, "parityl", span))
-        }
-        "__builtin_parityll" => {
-            Some(lower_bit_builtin(ctx, args, "parityll", span))
-        }
+        "__builtin_parity" => Some(lower_bit_builtin(ctx, args, "parity", span)),
+        "__builtin_parityl" => Some(lower_bit_builtin(ctx, args, "parityl", span)),
+        "__builtin_parityll" => Some(lower_bit_builtin(ctx, args, "parityll", span)),
 
         // ── Math builtins → libc forwarders ──
-        "__builtin_copysign" => {
-            return Some(lower_libc_builtin(ctx, args, "copysign", IrType::F64, CType::Double, span));
-        }
-        "__builtin_copysignf" => {
-            return Some(lower_libc_builtin(ctx, args, "copysignf", IrType::F32, CType::Float, span));
-        }
-        "__builtin_copysignl" => {
-            return Some(lower_libc_builtin(ctx, args, "copysignl", IrType::F64, CType::LongDouble, span));
-        }
-        "__builtin_fabs" => {
-            return Some(lower_libc_builtin(ctx, args, "fabs", IrType::F64, CType::Double, span));
-        }
-        "__builtin_fabsf" => {
-            return Some(lower_libc_builtin(ctx, args, "fabsf", IrType::F32, CType::Float, span));
-        }
-        "__builtin_fabsl" => {
-            return Some(lower_libc_builtin(ctx, args, "fabsl", IrType::F64, CType::LongDouble, span));
-        }
-        "__builtin_floor" => {
-            return Some(lower_libc_builtin(ctx, args, "floor", IrType::F64, CType::Double, span));
-        }
-        "__builtin_floorf" => {
-            return Some(lower_libc_builtin(ctx, args, "floorf", IrType::F32, CType::Float, span));
-        }
-        "__builtin_ceil" => {
-            return Some(lower_libc_builtin(ctx, args, "ceil", IrType::F64, CType::Double, span));
-        }
-        "__builtin_ceilf" => {
-            return Some(lower_libc_builtin(ctx, args, "ceilf", IrType::F32, CType::Float, span));
-        }
-        "__builtin_sqrt" => {
-            return Some(lower_libc_builtin(ctx, args, "sqrt", IrType::F64, CType::Double, span));
-        }
-        "__builtin_sqrtf" => {
-            return Some(lower_libc_builtin(ctx, args, "sqrtf", IrType::F32, CType::Float, span));
-        }
-        "__builtin_log" => {
-            return Some(lower_libc_builtin(ctx, args, "log", IrType::F64, CType::Double, span));
-        }
-        "__builtin_logf" => {
-            return Some(lower_libc_builtin(ctx, args, "logf", IrType::F32, CType::Float, span));
-        }
-        "__builtin_log2" => {
-            return Some(lower_libc_builtin(ctx, args, "log2", IrType::F64, CType::Double, span));
-        }
-        "__builtin_log2f" => {
-            return Some(lower_libc_builtin(ctx, args, "log2f", IrType::F32, CType::Float, span));
-        }
-        "__builtin_log10" => {
-            return Some(lower_libc_builtin(ctx, args, "log10", IrType::F64, CType::Double, span));
-        }
-        "__builtin_log10f" => {
-            return Some(lower_libc_builtin(ctx, args, "log10f", IrType::F32, CType::Float, span));
-        }
-        "__builtin_exp" => {
-            return Some(lower_libc_builtin(ctx, args, "exp", IrType::F64, CType::Double, span));
-        }
-        "__builtin_expf" => {
-            return Some(lower_libc_builtin(ctx, args, "expf", IrType::F32, CType::Float, span));
-        }
-        "__builtin_exp2" => {
-            return Some(lower_libc_builtin(ctx, args, "exp2", IrType::F64, CType::Double, span));
-        }
-        "__builtin_exp2f" => {
-            return Some(lower_libc_builtin(ctx, args, "exp2f", IrType::F32, CType::Float, span));
-        }
-        "__builtin_pow" => {
-            return Some(lower_libc_builtin(ctx, args, "pow", IrType::F64, CType::Double, span));
-        }
-        "__builtin_powf" => {
-            return Some(lower_libc_builtin(ctx, args, "powf", IrType::F32, CType::Float, span));
-        }
-        "__builtin_sin" => {
-            return Some(lower_libc_builtin(ctx, args, "sin", IrType::F64, CType::Double, span));
-        }
-        "__builtin_sinf" => {
-            return Some(lower_libc_builtin(ctx, args, "sinf", IrType::F32, CType::Float, span));
-        }
-        "__builtin_cos" => {
-            return Some(lower_libc_builtin(ctx, args, "cos", IrType::F64, CType::Double, span));
-        }
-        "__builtin_cosf" => {
-            return Some(lower_libc_builtin(ctx, args, "cosf", IrType::F32, CType::Float, span));
-        }
-        "__builtin_tan" => {
-            return Some(lower_libc_builtin(ctx, args, "tan", IrType::F64, CType::Double, span));
-        }
-        "__builtin_tanf" => {
-            return Some(lower_libc_builtin(ctx, args, "tanf", IrType::F32, CType::Float, span));
-        }
-        "__builtin_asin" => {
-            return Some(lower_libc_builtin(ctx, args, "asin", IrType::F64, CType::Double, span));
-        }
-        "__builtin_asinf" => {
-            return Some(lower_libc_builtin(ctx, args, "asinf", IrType::F32, CType::Float, span));
-        }
-        "__builtin_acos" => {
-            return Some(lower_libc_builtin(ctx, args, "acos", IrType::F64, CType::Double, span));
-        }
-        "__builtin_acosf" => {
-            return Some(lower_libc_builtin(ctx, args, "acosf", IrType::F32, CType::Float, span));
-        }
-        "__builtin_atan" => {
-            return Some(lower_libc_builtin(ctx, args, "atan", IrType::F64, CType::Double, span));
-        }
-        "__builtin_atanf" => {
-            return Some(lower_libc_builtin(ctx, args, "atanf", IrType::F32, CType::Float, span));
-        }
-        "__builtin_atan2" => {
-            return Some(lower_libc_builtin(ctx, args, "atan2", IrType::F64, CType::Double, span));
-        }
-        "__builtin_atan2f" => {
-            return Some(lower_libc_builtin(ctx, args, "atan2f", IrType::F32, CType::Float, span));
-        }
-        "__builtin_round" => {
-            return Some(lower_libc_builtin(ctx, args, "round", IrType::F64, CType::Double, span));
-        }
-        "__builtin_roundf" => {
-            return Some(lower_libc_builtin(ctx, args, "roundf", IrType::F32, CType::Float, span));
-        }
-        "__builtin_trunc" => {
-            return Some(lower_libc_builtin(ctx, args, "trunc", IrType::F64, CType::Double, span));
-        }
-        "__builtin_truncf" => {
-            return Some(lower_libc_builtin(ctx, args, "truncf", IrType::F32, CType::Float, span));
-        }
-        "__builtin_fmin" => {
-            return Some(lower_libc_builtin(ctx, args, "fmin", IrType::F64, CType::Double, span));
-        }
-        "__builtin_fminf" => {
-            return Some(lower_libc_builtin(ctx, args, "fminf", IrType::F32, CType::Float, span));
-        }
-        "__builtin_fmax" => {
-            return Some(lower_libc_builtin(ctx, args, "fmax", IrType::F64, CType::Double, span));
-        }
-        "__builtin_fmaxf" => {
-            return Some(lower_libc_builtin(ctx, args, "fmaxf", IrType::F32, CType::Float, span));
-        }
-        "__builtin_remainder" => {
-            return Some(lower_libc_builtin(ctx, args, "remainder", IrType::F64, CType::Double, span));
-        }
-        "__builtin_remainderf" => {
-            return Some(lower_libc_builtin(ctx, args, "remainderf", IrType::F32, CType::Float, span));
-        }
-        "__builtin_fmod" => {
-            return Some(lower_libc_builtin(ctx, args, "fmod", IrType::F64, CType::Double, span));
-        }
-        "__builtin_fmodf" => {
-            return Some(lower_libc_builtin(ctx, args, "fmodf", IrType::F32, CType::Float, span));
-        }
-        "__builtin_ldexp" => {
-            return Some(lower_libc_builtin(ctx, args, "ldexp", IrType::F64, CType::Double, span));
-        }
-        "__builtin_ldexpf" => {
-            return Some(lower_libc_builtin(ctx, args, "ldexpf", IrType::F32, CType::Float, span));
-        }
+        "__builtin_copysign" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "copysign",
+            IrType::F64,
+            CType::Double,
+            span,
+        )),
+        "__builtin_copysignf" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "copysignf",
+            IrType::F32,
+            CType::Float,
+            span,
+        )),
+        "__builtin_copysignl" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "copysignl",
+            IrType::F64,
+            CType::LongDouble,
+            span,
+        )),
+        "__builtin_fabsl" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "fabsl",
+            IrType::F64,
+            CType::LongDouble,
+            span,
+        )),
+        "__builtin_floor" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "floor",
+            IrType::F64,
+            CType::Double,
+            span,
+        )),
+        "__builtin_floorf" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "floorf",
+            IrType::F32,
+            CType::Float,
+            span,
+        )),
+        "__builtin_ceil" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "ceil",
+            IrType::F64,
+            CType::Double,
+            span,
+        )),
+        "__builtin_ceilf" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "ceilf",
+            IrType::F32,
+            CType::Float,
+            span,
+        )),
+        "__builtin_sqrt" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "sqrt",
+            IrType::F64,
+            CType::Double,
+            span,
+        )),
+        "__builtin_sqrtf" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "sqrtf",
+            IrType::F32,
+            CType::Float,
+            span,
+        )),
+        "__builtin_log" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "log",
+            IrType::F64,
+            CType::Double,
+            span,
+        )),
+        "__builtin_logf" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "logf",
+            IrType::F32,
+            CType::Float,
+            span,
+        )),
+        "__builtin_log2" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "log2",
+            IrType::F64,
+            CType::Double,
+            span,
+        )),
+        "__builtin_log2f" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "log2f",
+            IrType::F32,
+            CType::Float,
+            span,
+        )),
+        "__builtin_log10" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "log10",
+            IrType::F64,
+            CType::Double,
+            span,
+        )),
+        "__builtin_log10f" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "log10f",
+            IrType::F32,
+            CType::Float,
+            span,
+        )),
+        "__builtin_exp" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "exp",
+            IrType::F64,
+            CType::Double,
+            span,
+        )),
+        "__builtin_expf" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "expf",
+            IrType::F32,
+            CType::Float,
+            span,
+        )),
+        "__builtin_exp2" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "exp2",
+            IrType::F64,
+            CType::Double,
+            span,
+        )),
+        "__builtin_exp2f" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "exp2f",
+            IrType::F32,
+            CType::Float,
+            span,
+        )),
+        "__builtin_pow" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "pow",
+            IrType::F64,
+            CType::Double,
+            span,
+        )),
+        "__builtin_powf" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "powf",
+            IrType::F32,
+            CType::Float,
+            span,
+        )),
+        "__builtin_sin" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "sin",
+            IrType::F64,
+            CType::Double,
+            span,
+        )),
+        "__builtin_sinf" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "sinf",
+            IrType::F32,
+            CType::Float,
+            span,
+        )),
+        "__builtin_cos" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "cos",
+            IrType::F64,
+            CType::Double,
+            span,
+        )),
+        "__builtin_cosf" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "cosf",
+            IrType::F32,
+            CType::Float,
+            span,
+        )),
+        "__builtin_tan" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "tan",
+            IrType::F64,
+            CType::Double,
+            span,
+        )),
+        "__builtin_tanf" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "tanf",
+            IrType::F32,
+            CType::Float,
+            span,
+        )),
+        "__builtin_asin" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "asin",
+            IrType::F64,
+            CType::Double,
+            span,
+        )),
+        "__builtin_asinf" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "asinf",
+            IrType::F32,
+            CType::Float,
+            span,
+        )),
+        "__builtin_acos" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "acos",
+            IrType::F64,
+            CType::Double,
+            span,
+        )),
+        "__builtin_acosf" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "acosf",
+            IrType::F32,
+            CType::Float,
+            span,
+        )),
+        "__builtin_atan" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "atan",
+            IrType::F64,
+            CType::Double,
+            span,
+        )),
+        "__builtin_atanf" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "atanf",
+            IrType::F32,
+            CType::Float,
+            span,
+        )),
+        "__builtin_atan2" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "atan2",
+            IrType::F64,
+            CType::Double,
+            span,
+        )),
+        "__builtin_atan2f" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "atan2f",
+            IrType::F32,
+            CType::Float,
+            span,
+        )),
+        "__builtin_round" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "round",
+            IrType::F64,
+            CType::Double,
+            span,
+        )),
+        "__builtin_roundf" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "roundf",
+            IrType::F32,
+            CType::Float,
+            span,
+        )),
+        "__builtin_trunc" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "trunc",
+            IrType::F64,
+            CType::Double,
+            span,
+        )),
+        "__builtin_truncf" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "truncf",
+            IrType::F32,
+            CType::Float,
+            span,
+        )),
+        "__builtin_fmin" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "fmin",
+            IrType::F64,
+            CType::Double,
+            span,
+        )),
+        "__builtin_fminf" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "fminf",
+            IrType::F32,
+            CType::Float,
+            span,
+        )),
+        "__builtin_fmax" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "fmax",
+            IrType::F64,
+            CType::Double,
+            span,
+        )),
+        "__builtin_fmaxf" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "fmaxf",
+            IrType::F32,
+            CType::Float,
+            span,
+        )),
+        "__builtin_remainder" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "remainder",
+            IrType::F64,
+            CType::Double,
+            span,
+        )),
+        "__builtin_remainderf" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "remainderf",
+            IrType::F32,
+            CType::Float,
+            span,
+        )),
+        "__builtin_fmod" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "fmod",
+            IrType::F64,
+            CType::Double,
+            span,
+        )),
+        "__builtin_fmodf" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "fmodf",
+            IrType::F32,
+            CType::Float,
+            span,
+        )),
+        "__builtin_ldexp" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "ldexp",
+            IrType::F64,
+            CType::Double,
+            span,
+        )),
+        "__builtin_ldexpf" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "ldexpf",
+            IrType::F32,
+            CType::Float,
+            span,
+        )),
         "__builtin_frexp" => {
             // frexp returns double, second arg is int* (unchanged)
-            return Some(lower_libc_builtin(ctx, args, "frexp", IrType::F64, CType::Double, span));
+            Some(lower_libc_builtin(
+                ctx,
+                args,
+                "frexp",
+                IrType::F64,
+                CType::Double,
+                span,
+            ))
         }
-        "__builtin_frexpf" => {
-            return Some(lower_libc_builtin(ctx, args, "frexpf", IrType::F32, CType::Float, span));
-        }
-        "__builtin_modf" => {
-            return Some(lower_libc_builtin(ctx, args, "modf", IrType::F64, CType::Double, span));
-        }
-        "__builtin_modff" => {
-            return Some(lower_libc_builtin(ctx, args, "modff", IrType::F32, CType::Float, span));
-        }
-        "__builtin_nearbyint" => {
-            return Some(lower_libc_builtin(ctx, args, "nearbyint", IrType::F64, CType::Double, span));
-        }
-        "__builtin_nearbyintf" => {
-            return Some(lower_libc_builtin(ctx, args, "nearbyintf", IrType::F32, CType::Float, span));
-        }
-        "__builtin_rint" => {
-            return Some(lower_libc_builtin(ctx, args, "rint", IrType::F64, CType::Double, span));
-        }
-        "__builtin_rintf" => {
-            return Some(lower_libc_builtin(ctx, args, "rintf", IrType::F32, CType::Float, span));
-        }
-        "__builtin_lrint" => {
-            return Some(lower_libc_builtin(ctx, args, "lrint", IrType::I64, CType::Long, span));
-        }
-        "__builtin_lrintf" => {
-            return Some(lower_libc_builtin(ctx, args, "lrintf", IrType::I64, CType::Long, span));
-        }
-        "__builtin_llrint" => {
-            return Some(lower_libc_builtin(ctx, args, "llrint", IrType::I64, CType::LongLong, span));
-        }
-        "__builtin_llrintf" => {
-            return Some(lower_libc_builtin(ctx, args, "llrintf", IrType::I64, CType::LongLong, span));
-        }
-        "__builtin_lround" => {
-            return Some(lower_libc_builtin(ctx, args, "lround", IrType::I64, CType::Long, span));
-        }
-        "__builtin_lroundf" => {
-            return Some(lower_libc_builtin(ctx, args, "lroundf", IrType::I64, CType::Long, span));
-        }
-        "__builtin_llround" => {
-            return Some(lower_libc_builtin(ctx, args, "llround", IrType::I64, CType::LongLong, span));
-        }
-        "__builtin_llroundf" => {
-            return Some(lower_libc_builtin(ctx, args, "llroundf", IrType::I64, CType::LongLong, span));
-        }
+        "__builtin_frexpf" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "frexpf",
+            IrType::F32,
+            CType::Float,
+            span,
+        )),
+        "__builtin_modf" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "modf",
+            IrType::F64,
+            CType::Double,
+            span,
+        )),
+        "__builtin_modff" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "modff",
+            IrType::F32,
+            CType::Float,
+            span,
+        )),
+        "__builtin_nearbyint" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "nearbyint",
+            IrType::F64,
+            CType::Double,
+            span,
+        )),
+        "__builtin_nearbyintf" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "nearbyintf",
+            IrType::F32,
+            CType::Float,
+            span,
+        )),
+        "__builtin_rint" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "rint",
+            IrType::F64,
+            CType::Double,
+            span,
+        )),
+        "__builtin_rintf" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "rintf",
+            IrType::F32,
+            CType::Float,
+            span,
+        )),
+        "__builtin_lrint" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "lrint",
+            IrType::I64,
+            CType::Long,
+            span,
+        )),
+        "__builtin_lrintf" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "lrintf",
+            IrType::I64,
+            CType::Long,
+            span,
+        )),
+        "__builtin_llrint" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "llrint",
+            IrType::I64,
+            CType::LongLong,
+            span,
+        )),
+        "__builtin_llrintf" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "llrintf",
+            IrType::I64,
+            CType::LongLong,
+            span,
+        )),
+        "__builtin_lround" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "lround",
+            IrType::I64,
+            CType::Long,
+            span,
+        )),
+        "__builtin_lroundf" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "lroundf",
+            IrType::I64,
+            CType::Long,
+            span,
+        )),
+        "__builtin_llround" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "llround",
+            IrType::I64,
+            CType::LongLong,
+            span,
+        )),
+        "__builtin_llroundf" => Some(lower_libc_builtin(
+            ctx,
+            args,
+            "llroundf",
+            IrType::I64,
+            CType::LongLong,
+            span,
+        )),
         "__builtin_cabs" | "__builtin_cabsf" | "__builtin_cabsl" => {
             // Complex absolute value — forward to libc cabs/cabsf/cabsl
             let libc_name = func_name.strip_prefix("__builtin_").unwrap_or(&func_name);
-            return Some(lower_libc_builtin(ctx, args, libc_name, IrType::F64, CType::Double, span));
+            Some(lower_libc_builtin(
+                ctx,
+                args,
+                libc_name,
+                IrType::F64,
+                CType::Double,
+                span,
+            ))
         }
 
         // Not a recognized builtin — fall through.
@@ -4015,7 +4536,9 @@ fn lower_cast(
     // Integer → Float.
     if from_ir.is_integer() && to_ir.is_float() {
         let src_unsigned = types::is_unsigned(from);
-        let (v, i) = ctx.builder.build_bitcast_ex(value, to_ir, src_unsigned, span);
+        let (v, i) = ctx
+            .builder
+            .build_bitcast_ex(value, to_ir, src_unsigned, span);
         emit_inst(ctx, i);
         return v;
     }
@@ -4023,7 +4546,9 @@ fn lower_cast(
     // Float → Integer.
     if from_ir.is_float() && to_ir.is_integer() {
         let dst_unsigned = types::is_unsigned(to);
-        let (v, i) = ctx.builder.build_bitcast_ex(value, to_ir, dst_unsigned, span);
+        let (v, i) = ctx
+            .builder
+            .build_bitcast_ex(value, to_ir, dst_unsigned, span);
         emit_inst(ctx, i);
         return v;
     }
@@ -4411,8 +4936,7 @@ fn lower_sizeof_type(
         if let Some(vla_expr) = extract_vla_from_abstract_declarator(abs_decl) {
             // Compute element type (without the VLA array layer).
             let elem_cty = resolve_type_name_without_vla(type_name);
-            let elem_size =
-                crate::common::types::sizeof_ctype(&elem_cty, ctx.target) as i64;
+            let elem_size = crate::common::types::sizeof_ctype(&elem_cty, ctx.target) as i64;
             let ptr_ty = if ctx.target.pointer_width() == 8 {
                 IrType::I64
             } else {
@@ -4422,9 +4946,9 @@ fn lower_sizeof_type(
             let tv = lower_expression_typed(ctx, &vla_expr);
             let n_val = tv.value;
             let n_wide = {
-                let (v, inst) = ctx.builder.build_zext_from(
-                    n_val, IrType::I32, ptr_ty.clone(), span,
-                );
+                let (v, inst) =
+                    ctx.builder
+                        .build_zext_from(n_val, IrType::I32, ptr_ty.clone(), span);
                 emit_inst(ctx, inst);
                 v
             };
@@ -4604,9 +5128,7 @@ fn lower_bitfield_read(
     if std::env::var("BCC_DEBUG_BF").is_ok() {
         eprintln!(
             "[BCC_BF] lower_bitfield_read: field_ty={:?}, is_unsigned={}, bit_width={}",
-            field_ty,
-            effective_unsigned,
-            bit_width,
+            field_ty, effective_unsigned, bit_width,
         );
     }
     let is_signed = !effective_unsigned;
@@ -5008,7 +5530,12 @@ fn find_struct_member(
                 if field.name.as_deref() == Some(name) {
                     let mut result_ty = field.ty.clone();
                     resolve_forward_ref_type(&mut result_ty, struct_defs);
-                    return (0, result_ty, None);
+                    // Bitfield members in unions start at bit offset 0.
+                    let bf_info = field
+                        .bit_width
+                        .filter(|&bw| bw > 0)
+                        .map(|bw| (0usize, bw as usize));
+                    return (0, result_ty, bf_info);
                 }
                 // Anonymous nested.
                 if field.name.is_none() {
@@ -5252,6 +5779,27 @@ fn lower_comma(
 // COMPOUND LITERAL
 // =========================================================================
 
+/// Walk an initializer tree and evaluate all expression nodes for their
+/// side effects.  Used for zero-sized compound literals where we cannot
+/// store a result but must not skip function calls or other effectful
+/// expressions inside the initializer list.
+fn eval_initializer_for_side_effects(ctx: &mut ExprLoweringContext<'_>, init: &ast::Initializer) {
+    match init {
+        ast::Initializer::Expression(expr) => {
+            // Evaluate the expression; discard the result.
+            let _ = lower_expr_inner(ctx, expr);
+        }
+        ast::Initializer::List {
+            designators_and_initializers,
+            ..
+        } => {
+            for di in designators_and_initializers {
+                eval_initializer_for_side_effects(ctx, &di.initializer);
+            }
+        }
+    }
+}
+
 fn lower_compound_literal(
     ctx: &mut ExprLoweringContext<'_>,
     type_name: &ast::TypeName,
@@ -5264,6 +5812,17 @@ fn lower_compound_literal(
     if !type_builder::is_complete_type(&cty) {
         ctx.diagnostics
             .emit_warning(span, "compound literal of incomplete type");
+    }
+
+    // GCC extension: zero-sized types (e.g. `(struct g){}`).
+    // No storage is needed — return a dummy value.  However, we MUST
+    // still evaluate the initializer expressions for their side effects
+    // (e.g., function calls that modify global state).
+    let type_size = crate::common::types::sizeof_ctype(&cty, ctx.target);
+    if type_size == 0 && crate::common::types::is_struct_or_union(&cty) {
+        eval_initializer_for_side_effects(ctx, initializer);
+        let v = ctx.builder.fresh_value();
+        return TypedValue::new(v, cty);
     }
 
     let ir_ty = ctype_to_ir(&cty, ctx.target);
@@ -5286,28 +5845,23 @@ fn lower_compound_literal(
     // A compound literal is an lvalue in C, so the alloca pointer is
     // its canonical representation.  However, when used as an rvalue
     // (e.g., `return (S){1,2}`, `x = (S){1,2}`, or passing to a
-    // function), the caller needs the loaded value for types that fit
-    // in a register.
+    // function), the caller needs the loaded value.
     //
     // - Arrays: decay to pointer (return alloca address)
-    // - Large structs/unions (>8 bytes): returned as pointer; the caller
-    //   (return stmt, assignment) copies chunk-by-chunk
-    // - Scalar + small aggregates (≤8 bytes): load and return the value
+    // - Scalars, small aggregates, and large structs/unions: load and
+    //   return the value so the codegen can correctly handle register
+    //   placement and MEMORY-class stack copying for function calls.
     let resolved = crate::common::types::resolve_typedef(&cty);
     let is_array = matches!(resolved, CType::Array(..));
-    let is_agg = crate::common::types::is_struct_or_union(&resolved);
-    let agg_size = if is_agg {
-        crate::common::types::sizeof_ctype(&resolved, ctx.target)
-    } else {
-        0
-    };
-    if is_array || (is_agg && agg_size > 16) {
-        // Return the alloca address — caller will copy.
+    if is_array {
+        // Arrays decay to pointer — return alloca address.
         TypedValue::new(alloca, cty)
     } else {
-        // Load the scalar / small-aggregate value.
-        // Structs ≤16 bytes are returned in registers (single or RegisterPair),
-        // so load the value from the alloca for proper register placement.
+        // Load the scalar / aggregate value from the alloca.
+        // The codegen handles all sizes correctly:
+        //   ≤8 bytes  → single register
+        //   9-16 bytes → RegisterPair
+        //   >16 bytes  → MEMORY-class stack copy at call site
         let (loaded, li) = ctx.builder.build_load(alloca, ir_ty, span);
         emit_inst(ctx, li);
         TypedValue::new(loaded, cty)
@@ -5328,6 +5882,16 @@ fn lower_compound_literal_lvalue(
     if !type_builder::is_complete_type(&cty) {
         ctx.diagnostics
             .emit_warning(span, "compound literal of incomplete type");
+    }
+
+    // GCC extension: zero-sized types (e.g. `(struct g){}`).
+    // No storage is needed — return a dummy alloca pointer.  Evaluate
+    // initializer expressions for side effects.
+    let type_size = crate::common::types::sizeof_ctype(&cty, ctx.target);
+    if type_size == 0 && crate::common::types::is_struct_or_union(&cty) {
+        eval_initializer_for_side_effects(ctx, initializer);
+        let v = ctx.builder.fresh_value();
+        return TypedValue::new(v, cty);
     }
 
     let ir_ty = ctype_to_ir(&cty, ctx.target);
@@ -5449,6 +6013,7 @@ fn lower_statement_expression(
         return_ctype: None,
         layout_cache: inherited_layout_cache,
         vla_sizes: FxHashMap::default(),
+        vla_stack_save: None,
     };
 
     // Second pass: lower each block item. Track the value of the last
@@ -5754,9 +6319,7 @@ fn lower_builtin(
         ast::BuiltinKind::Abort => {
             // __builtin_abort() — emit a call to abort() then a return.
             let callee = emit_global_ref(ctx, "abort", span);
-            let (_result, ci) = ctx
-                .builder
-                .build_call(callee, vec![], IrType::Void, span);
+            let (_result, ci) = ctx.builder.build_call(callee, vec![], IrType::Void, span);
             emit_inst(ctx, ci);
             let ri = ctx.builder.build_return(None, span);
             emit_inst(ctx, ri);
@@ -5781,18 +6344,33 @@ fn lower_builtin(
         }
 
         // ----- Memory/string builtins -----
-        ast::BuiltinKind::Memcpy => {
-            lower_libc_builtin(ctx, args, "memcpy", IrType::Ptr, CType::Pointer(Box::new(CType::Void), TypeQualifiers::default()), span)
-        }
-        ast::BuiltinKind::Memset => {
-            lower_libc_builtin(ctx, args, "memset", IrType::Ptr, CType::Pointer(Box::new(CType::Void), TypeQualifiers::default()), span)
-        }
+        ast::BuiltinKind::Memcpy => lower_libc_builtin(
+            ctx,
+            args,
+            "memcpy",
+            IrType::Ptr,
+            CType::Pointer(Box::new(CType::Void), TypeQualifiers::default()),
+            span,
+        ),
+        ast::BuiltinKind::Memset => lower_libc_builtin(
+            ctx,
+            args,
+            "memset",
+            IrType::Ptr,
+            CType::Pointer(Box::new(CType::Void), TypeQualifiers::default()),
+            span,
+        ),
         ast::BuiltinKind::Memcmp => {
             lower_libc_builtin(ctx, args, "memcmp", IrType::I32, CType::Int, span)
         }
-        ast::BuiltinKind::Strlen => {
-            lower_libc_builtin(ctx, args, "strlen", size_ir_type(ctx.target), CType::ULong, span)
-        }
+        ast::BuiltinKind::Strlen => lower_libc_builtin(
+            ctx,
+            args,
+            "strlen",
+            size_ir_type(ctx.target),
+            CType::ULong,
+            span,
+        ),
         ast::BuiltinKind::Strcmp => {
             lower_libc_builtin(ctx, args, "strcmp", IrType::I32, CType::Int, span)
         }
@@ -5868,17 +6446,118 @@ fn lower_builtin(
         }
 
         // ----- Float predicates -----
-        ast::BuiltinKind::Signbit | ast::BuiltinKind::Isnan | ast::BuiltinKind::Isinf
-        | ast::BuiltinKind::Isfinite | ast::BuiltinKind::IsinfSign => {
-            let fname = match kind {
-                ast::BuiltinKind::Signbit => "__builtin_signbit",
-                ast::BuiltinKind::Isnan => "__builtin_isnan",
-                ast::BuiltinKind::Isinf => "__builtin_isinf",
-                ast::BuiltinKind::Isfinite => "__builtin_isfinite",
-                ast::BuiltinKind::IsinfSign => "__builtin_isinf_sign",
-                _ => unreachable!(),
-            };
-            lower_libc_builtin(ctx, args, fname, IrType::I32, CType::Int, span)
+        // Handled by try_lower_builtin_call via string matching in the
+        // FunctionCall path. This BuiltinKind path is a fallback that
+        // uses volatile store+load for type-punning (bitcast codegen
+        // does float→int conversion, not bit reinterpretation).
+        ast::BuiltinKind::Signbit
+        | ast::BuiltinKind::Isnan
+        | ast::BuiltinKind::Isinf
+        | ast::BuiltinKind::Isfinite
+        | ast::BuiltinKind::IsinfSign => {
+            if let Some(arg_expr) = args.first() {
+                let tv = lower_expr_inner(ctx, arg_expr);
+                let resolved = crate::common::types::resolve_typedef(&tv.ty);
+                let is_float = matches!(resolved, CType::Float);
+                let (int_ty, abs_mask, exp_mask, shift_n) = if is_float {
+                    (IrType::I32, 0x7FFF_FFFFi128, 0x7F80_0000i128, 31i128)
+                } else {
+                    (
+                        IrType::I64,
+                        0x7FFF_FFFF_FFFF_FFFFi128,
+                        0x7FF0_0000_0000_0000i128,
+                        63i128,
+                    )
+                };
+                // Volatile store+load for type-pun
+                let (alloca, alloc_i) = ctx.builder.build_alloca(int_ty.clone(), span);
+                emit_inst(ctx, alloc_i);
+                let mut si = ctx.builder.build_store(tv.value, alloca, span);
+                if let crate::ir::instructions::Instruction::Store {
+                    ref mut volatile, ..
+                } = si
+                {
+                    *volatile = true;
+                }
+                emit_inst(ctx, si);
+                let (bits, li) = ctx.builder.build_load(alloca, int_ty.clone(), span);
+                emit_inst(ctx, li);
+
+                let result = match kind {
+                    ast::BuiltinKind::Signbit => {
+                        let sh = emit_int_const(ctx, shift_n, int_ty.clone(), span);
+                        let (shifted, shi) =
+                            ctx.builder.build_shr(bits, sh, int_ty.clone(), false, span);
+                        emit_inst(ctx, shi);
+                        if int_ty != IrType::I32 {
+                            let (tr, tri) = ctx.builder.build_trunc(shifted, IrType::I32, span);
+                            emit_inst(ctx, tri);
+                            tr
+                        } else {
+                            shifted
+                        }
+                    }
+                    ast::BuiltinKind::Isnan
+                    | ast::BuiltinKind::Isinf
+                    | ast::BuiltinKind::Isfinite => {
+                        let mask_v = emit_int_const(ctx, abs_mask, int_ty.clone(), span);
+                        let (abs_bits, abi) =
+                            ctx.builder.build_and(bits, mask_v, int_ty.clone(), span);
+                        emit_inst(ctx, abi);
+                        let exp_v = emit_int_const(ctx, exp_mask, int_ty.clone(), span);
+                        let cmp_op = match kind {
+                            ast::BuiltinKind::Isnan => ICmpOp::Ugt,
+                            ast::BuiltinKind::Isinf => ICmpOp::Eq,
+                            _ => ICmpOp::Ult, // Isfinite
+                        };
+                        let (cmp, ci) = ctx.builder.build_icmp(cmp_op, abs_bits, exp_v, span);
+                        emit_inst(ctx, ci);
+                        let (ext, ei) = ctx.builder.build_zext(cmp, IrType::I32, span);
+                        emit_inst(ctx, ei);
+                        ext
+                    }
+                    ast::BuiltinKind::IsinfSign => {
+                        let mask_v = emit_int_const(ctx, abs_mask, int_ty.clone(), span);
+                        let (abs_bits, abi) =
+                            ctx.builder.build_and(bits, mask_v, int_ty.clone(), span);
+                        emit_inst(ctx, abi);
+                        let exp_v = emit_int_const(ctx, exp_mask, int_ty.clone(), span);
+                        let (is_inf, ici) =
+                            ctx.builder.build_icmp(ICmpOp::Eq, abs_bits, exp_v, span);
+                        emit_inst(ctx, ici);
+                        let (inf_i32, ie) = ctx.builder.build_zext(is_inf, IrType::I32, span);
+                        emit_inst(ctx, ie);
+                        let sh = emit_int_const(ctx, shift_n, int_ty.clone(), span);
+                        let (shifted, shi) =
+                            ctx.builder.build_shr(bits, sh, int_ty.clone(), false, span);
+                        emit_inst(ctx, shi);
+                        let sign_i32 = if int_ty != IrType::I32 {
+                            let (tr, tri) = ctx.builder.build_trunc(shifted, IrType::I32, span);
+                            emit_inst(ctx, tri);
+                            tr
+                        } else {
+                            shifted
+                        };
+                        let one_v = emit_int_const(ctx, 1, IrType::I32, span);
+                        let (s_and, sai) =
+                            ctx.builder.build_and(sign_i32, one_v, IrType::I32, span);
+                        emit_inst(ctx, sai);
+                        let two_v = emit_int_const(ctx, 2, IrType::I32, span);
+                        let (t2s, t2i) = ctx.builder.build_mul(two_v, s_and, IrType::I32, span);
+                        emit_inst(ctx, t2i);
+                        let (neg, ni) = ctx.builder.build_mul(inf_i32, t2s, IrType::I32, span);
+                        emit_inst(ctx, ni);
+                        let (res, ri) = ctx.builder.build_sub(inf_i32, neg, IrType::I32, span);
+                        emit_inst(ctx, ri);
+                        res
+                    }
+                    _ => unreachable!(),
+                };
+                TypedValue::new(result, CType::Int)
+            } else {
+                let v = emit_int_const(ctx, 0, IrType::I32, span);
+                TypedValue::new(v, CType::Int)
+            }
         }
 
         // ----- Copysign / fabs -----
@@ -5904,7 +6583,7 @@ fn lower_builtin(
         // ----- classify_type -----
         ast::BuiltinKind::ClassifyType => {
             // GCC __builtin_classify_type:
-            // void=0, integer=1, char=2, enum=3, bool=4, pointer=5, 
+            // void=0, integer=1, char=2, enum=3, bool=4, pointer=5,
             // reference=6, offset=7, real=8, complex=9, function=10, method=11
             // We'll classify based on the argument type.
             if let Some(arg) = args.first() {
@@ -5950,44 +6629,96 @@ fn lower_builtin(
             };
             lower_libc_builtin(ctx, args, fname, ret_ty, ret_cty, span)
         }
-        ast::BuiltinKind::SyncLockRelease => {
-            lower_libc_builtin(ctx, args, "__sync_lock_release", IrType::Void, CType::Void, span)
-        }
-        ast::BuiltinKind::SyncSynchronize => {
-            lower_libc_builtin(ctx, args, "__sync_synchronize", IrType::Void, CType::Void, span)
-        }
+        ast::BuiltinKind::SyncLockRelease => lower_libc_builtin(
+            ctx,
+            args,
+            "__sync_lock_release",
+            IrType::Void,
+            CType::Void,
+            span,
+        ),
+        ast::BuiltinKind::SyncSynchronize => lower_libc_builtin(
+            ctx,
+            args,
+            "__sync_synchronize",
+            IrType::Void,
+            CType::Void,
+            span,
+        ),
 
         // ----- C11 atomics -----
         ast::BuiltinKind::AtomicLoadN => {
             lower_libc_builtin(ctx, args, "__atomic_load_n", IrType::I64, CType::Int, span)
         }
-        ast::BuiltinKind::AtomicStoreN => {
-            lower_libc_builtin(ctx, args, "__atomic_store_n", IrType::Void, CType::Void, span)
-        }
-        ast::BuiltinKind::AtomicExchangeN => {
-            lower_libc_builtin(ctx, args, "__atomic_exchange_n", IrType::I64, CType::Int, span)
-        }
-        ast::BuiltinKind::AtomicCompareExchangeN => {
-            lower_libc_builtin(ctx, args, "__atomic_compare_exchange_n", IrType::I32, CType::Bool, span)
-        }
-        ast::BuiltinKind::AtomicFetchAdd => {
-            lower_libc_builtin(ctx, args, "__atomic_fetch_add", IrType::I64, CType::Int, span)
-        }
-        ast::BuiltinKind::AtomicFetchSub => {
-            lower_libc_builtin(ctx, args, "__atomic_fetch_sub", IrType::I64, CType::Int, span)
-        }
-        ast::BuiltinKind::AtomicFetchAnd => {
-            lower_libc_builtin(ctx, args, "__atomic_fetch_and", IrType::I64, CType::Int, span)
-        }
-        ast::BuiltinKind::AtomicFetchOr => {
-            lower_libc_builtin(ctx, args, "__atomic_fetch_or", IrType::I64, CType::Int, span)
-        }
-        ast::BuiltinKind::AtomicFetchXor => {
-            lower_libc_builtin(ctx, args, "__atomic_fetch_xor", IrType::I64, CType::Int, span)
-        }
+        ast::BuiltinKind::AtomicStoreN => lower_libc_builtin(
+            ctx,
+            args,
+            "__atomic_store_n",
+            IrType::Void,
+            CType::Void,
+            span,
+        ),
+        ast::BuiltinKind::AtomicExchangeN => lower_libc_builtin(
+            ctx,
+            args,
+            "__atomic_exchange_n",
+            IrType::I64,
+            CType::Int,
+            span,
+        ),
+        ast::BuiltinKind::AtomicCompareExchangeN => lower_libc_builtin(
+            ctx,
+            args,
+            "__atomic_compare_exchange_n",
+            IrType::I32,
+            CType::Bool,
+            span,
+        ),
+        ast::BuiltinKind::AtomicFetchAdd => lower_libc_builtin(
+            ctx,
+            args,
+            "__atomic_fetch_add",
+            IrType::I64,
+            CType::Int,
+            span,
+        ),
+        ast::BuiltinKind::AtomicFetchSub => lower_libc_builtin(
+            ctx,
+            args,
+            "__atomic_fetch_sub",
+            IrType::I64,
+            CType::Int,
+            span,
+        ),
+        ast::BuiltinKind::AtomicFetchAnd => lower_libc_builtin(
+            ctx,
+            args,
+            "__atomic_fetch_and",
+            IrType::I64,
+            CType::Int,
+            span,
+        ),
+        ast::BuiltinKind::AtomicFetchOr => lower_libc_builtin(
+            ctx,
+            args,
+            "__atomic_fetch_or",
+            IrType::I64,
+            CType::Int,
+            span,
+        ),
+        ast::BuiltinKind::AtomicFetchXor => lower_libc_builtin(
+            ctx,
+            args,
+            "__atomic_fetch_xor",
+            IrType::I64,
+            CType::Int,
+            span,
+        ),
 
         // ----- Overflow _p variants -----
-        ast::BuiltinKind::AddOverflowP | ast::BuiltinKind::SubOverflowP | ast::BuiltinKind::MulOverflowP => {
+        ast::BuiltinKind::AddOverflowP
+        | ast::BuiltinKind::SubOverflowP
+        | ast::BuiltinKind::MulOverflowP => {
             // _p variants: overflow check without storing result.
             // Semantically same as overflow arithmetic, but result pointer is unused.
             let op = match kind {
@@ -6035,9 +6766,7 @@ fn lower_libc_builtin(
         emit_inst(ctx, ci);
         TypedValue::void()
     } else {
-        let (result, ci) = ctx
-            .builder
-            .build_call(callee, call_args, ret_ir_type, span);
+        let (result, ci) = ctx.builder.build_call(callee, call_args, ret_ir_type, span);
         emit_inst(ctx, ci);
         TypedValue::new(result, ret_c_type)
     }
@@ -6049,8 +6778,14 @@ fn classify_type_for_builtin(ctype: &CType) -> i32 {
         CType::Void => 0,
         CType::Bool => 4,
         CType::Char | CType::SChar | CType::UChar => 2,
-        CType::Short | CType::UShort | CType::Int | CType::UInt
-        | CType::Long | CType::ULong | CType::LongLong | CType::ULongLong => 1,
+        CType::Short
+        | CType::UShort
+        | CType::Int
+        | CType::UInt
+        | CType::Long
+        | CType::ULong
+        | CType::LongLong
+        | CType::ULongLong => 1,
         CType::Float | CType::Double | CType::LongDouble => 8,
         CType::Pointer(..) => 5,
         CType::Function { .. } => 10,
@@ -6078,7 +6813,9 @@ fn lower_bit_builtin(
     match name {
         "ffs" => {
             let callee = emit_global_ref(ctx, "ffs", span);
-            let (result, ci) = ctx.builder.build_call(callee, vec![arg.value], IrType::I32, span);
+            let (result, ci) = ctx
+                .builder
+                .build_call(callee, vec![arg.value], IrType::I32, span);
             emit_inst(ctx, ci);
             return TypedValue::new(result, CType::Int);
         }
@@ -6127,13 +6864,17 @@ fn lower_bit_builtin(
         "clrsb" => {
             // clrsb(x) = clz(x ^ (x >> (bits-1))) - 1
             let shift_amt = emit_int_const(ctx, (op_bits - 1) as i128, op_ir.clone(), span);
-            let (shifted, si) = ctx.builder.build_shr(val, shift_amt, op_ir.clone(), true, span);
+            let (shifted, si) = ctx
+                .builder
+                .build_shr(val, shift_amt, op_ir.clone(), true, span);
             emit_inst(ctx, si);
             let (xored, xi) = ctx.builder.build_xor(val, shifted, op_ir.clone(), span);
             emit_inst(ctx, xi);
             let clz_tv = lower_clz_inline(ctx, xored, op_bits, &op_ir, span);
             let one_i32 = emit_int_const(ctx, 1, IrType::I32, span);
-            let (r, i) = ctx.builder.build_sub(clz_tv.value, one_i32, IrType::I32, span);
+            let (r, i) = ctx
+                .builder
+                .build_sub(clz_tv.value, one_i32, IrType::I32, span);
             emit_inst(ctx, i);
             TypedValue::new(r, CType::Int)
         }
@@ -6222,10 +6963,19 @@ fn lower_popcount_inline(
     // x = (x + (x >> 4)) & 0x0F0F...
     // x = (x * 0x0101...) >> (bits - 8)
     let (m1, m2, m4, h01) = if bits == 64 {
-        (0x5555555555555555u64 as i128, 0x3333333333333333u64 as i128,
-         0x0F0F0F0F0F0F0F0Fu64 as i128, 0x0101010101010101u64 as i128)
+        (
+            0x5555555555555555u64 as i128,
+            0x3333333333333333u64 as i128,
+            0x0F0F0F0F0F0F0F0Fu64 as i128,
+            0x0101010101010101u64 as i128,
+        )
     } else {
-        (0x55555555i128, 0x33333333i128, 0x0F0F0F0Fi128, 0x01010101i128)
+        (
+            0x55555555i128,
+            0x33333333i128,
+            0x0F0F0F0Fi128,
+            0x01010101i128,
+        )
     };
 
     let one = emit_int_const(ctx, 1, ir_ty.clone(), span);
@@ -6261,7 +7011,9 @@ fn lower_popcount_inline(
     let (mul, mi) = ctx.builder.build_mul(x3, h01c, ir_ty.clone(), span);
     emit_inst(ctx, mi);
     let shift_final = emit_int_const(ctx, (bits - 8) as i128, ir_ty.clone(), span);
-    let (result, ri) = ctx.builder.build_shr(mul, shift_final, ir_ty.clone(), false, span);
+    let (result, ri) = ctx
+        .builder
+        .build_shr(mul, shift_final, ir_ty.clone(), false, span);
     emit_inst(ctx, ri);
 
     // Truncate to I32 if 64-bit
@@ -6318,7 +7070,9 @@ fn lower_bswap(
             emit_inst(ctx, li);
             let (lo_s, lsi) = ctx.builder.build_shl(lo, eight, ret_ty.clone(), span);
             emit_inst(ctx, lsi);
-            let (hi_s, hsi) = ctx.builder.build_shr(val, eight, ret_ty.clone(), false, span);
+            let (hi_s, hsi) = ctx
+                .builder
+                .build_shr(val, eight, ret_ty.clone(), false, span);
             emit_inst(ctx, hsi);
             let (hi, hii) = ctx.builder.build_and(hi_s, mask, ret_ty.clone(), span);
             emit_inst(ctx, hii);
@@ -6572,8 +7326,16 @@ fn lower_overflow_arith(
 
     // Determine from_type for each operand based on its actual IR type.
     // After lower_expr_inner, small types may have been promoted to I32.
-    let a_from = if a_bits <= 32 { IrType::I32 } else { IrType::I64 };
-    let b_from = if b_bits <= 32 { IrType::I32 } else { IrType::I64 };
+    let a_from = if a_bits <= 32 {
+        IrType::I32
+    } else {
+        IrType::I64
+    };
+    let b_from = if b_bits <= 32 {
+        IrType::I32
+    } else {
+        IrType::I64
+    };
 
     if max_operand_bits < 64 && res_bits < 64 {
         // --- Common path: all types ≤32 bits, use i64 as wide type ---
@@ -6581,79 +7343,155 @@ fn lower_overflow_arith(
         // Step 1: extend operands to i64 (sign/zero based on C type).
         let a64 = if a_signed {
             let v = ctx.builder.fresh_value();
-            emit_inst(ctx, Instruction::SExt {
-                result: v, value: a.value, to_type: IrType::I64, from_type: a_from, span,
-            });
+            emit_inst(
+                ctx,
+                Instruction::SExt {
+                    result: v,
+                    value: a.value,
+                    to_type: IrType::I64,
+                    from_type: a_from,
+                    span,
+                },
+            );
             v
         } else {
             let v = ctx.builder.fresh_value();
-            emit_inst(ctx, Instruction::ZExt {
-                result: v, value: a.value, to_type: IrType::I64, from_type: a_from, span,
-            });
+            emit_inst(
+                ctx,
+                Instruction::ZExt {
+                    result: v,
+                    value: a.value,
+                    to_type: IrType::I64,
+                    from_type: a_from,
+                    span,
+                },
+            );
             v
         };
         let b64 = if b_signed {
             let v = ctx.builder.fresh_value();
-            emit_inst(ctx, Instruction::SExt {
-                result: v, value: b.value, to_type: IrType::I64, from_type: b_from, span,
-            });
+            emit_inst(
+                ctx,
+                Instruction::SExt {
+                    result: v,
+                    value: b.value,
+                    to_type: IrType::I64,
+                    from_type: b_from,
+                    span,
+                },
+            );
             v
         } else {
             let v = ctx.builder.fresh_value();
-            emit_inst(ctx, Instruction::ZExt {
-                result: v, value: b.value, to_type: IrType::I64, from_type: b_from, span,
-            });
+            emit_inst(
+                ctx,
+                Instruction::ZExt {
+                    result: v,
+                    value: b.value,
+                    to_type: IrType::I64,
+                    from_type: b_from,
+                    span,
+                },
+            );
             v
         };
 
         // Step 2: 64-bit operation.
         let result64 = ctx.builder.fresh_value();
-        emit_inst(ctx, Instruction::BinOp {
-            result: result64, op, lhs: a64, rhs: b64, ty: IrType::I64, span,
-        });
+        emit_inst(
+            ctx,
+            Instruction::BinOp {
+                result: result64,
+                op,
+                lhs: a64,
+                rhs: b64,
+                ty: IrType::I64,
+                span,
+            },
+        );
 
         // Step 3: truncate to the actual result type.
         let result_trunc = if res_bits >= 64 {
             result64
         } else {
             let v = ctx.builder.fresh_value();
-            emit_inst(ctx, Instruction::Trunc {
-                result: v, value: result64, to_type: res_ir.clone(), span,
-            });
+            emit_inst(
+                ctx,
+                Instruction::Trunc {
+                    result: v,
+                    value: result64,
+                    to_type: res_ir.clone(),
+                    span,
+                },
+            );
             v
         };
 
         // Step 4: store through the pointer.
-        emit_inst(ctx, Instruction::Store {
-            value: result_trunc, ptr: result_ptr.value, volatile: false, span,
-        });
+        emit_inst(
+            ctx,
+            Instruction::Store {
+                value: result_trunc,
+                ptr: result_ptr.value,
+                volatile: false,
+                span,
+            },
+        );
 
         // Step 5: extend truncated value back to i64 using RESULT signedness.
         let extended64 = if res_signed {
             let v = ctx.builder.fresh_value();
-            emit_inst(ctx, Instruction::SExt {
-                result: v, value: result_trunc, to_type: IrType::I64, from_type: res_ir, span,
-            });
+            emit_inst(
+                ctx,
+                Instruction::SExt {
+                    result: v,
+                    value: result_trunc,
+                    to_type: IrType::I64,
+                    from_type: res_ir,
+                    span,
+                },
+            );
             v
         } else {
             let v = ctx.builder.fresh_value();
-            emit_inst(ctx, Instruction::ZExt {
-                result: v, value: result_trunc, to_type: IrType::I64, from_type: res_ir, span,
-            });
+            emit_inst(
+                ctx,
+                Instruction::ZExt {
+                    result: v,
+                    value: result_trunc,
+                    to_type: IrType::I64,
+                    from_type: res_ir,
+                    span,
+                },
+            );
             v
         };
 
         // Step 6: compare — if they differ, overflow occurred.
         let overflow_i1 = ctx.builder.fresh_value();
-        emit_inst(ctx, Instruction::ICmp {
-            result: overflow_i1, op: ICmpOp::Ne, lhs: result64, rhs: extended64, span,
-        });
+        emit_inst(
+            ctx,
+            Instruction::ICmp {
+                result: overflow_i1,
+                op: ICmpOp::Ne,
+                lhs: result64,
+                rhs: extended64,
+                span,
+            },
+        );
 
         // Step 7: zero-extend i1 to i32 for the C int return value.
         let overflow_int = ctx.builder.fresh_value();
-        emit_inst(ctx, Instruction::ZExt {
-            result: overflow_int, value: overflow_i1, to_type: IrType::I32, from_type: IrType::I1, span,
-        });
+        emit_inst(
+            ctx,
+            Instruction::ZExt {
+                result: overflow_int,
+                value: overflow_i1,
+                to_type: IrType::I32,
+                from_type: IrType::I1,
+                span,
+            },
+        );
 
         TypedValue::new(overflow_int, CType::Int)
     } else {
@@ -6664,13 +7502,27 @@ fn lower_overflow_arith(
         let a64 = if a_bits < 64 {
             let v = ctx.builder.fresh_value();
             if a_signed {
-                emit_inst(ctx, Instruction::SExt {
-                    result: v, value: a.value, to_type: IrType::I64, from_type: a_from, span,
-                });
+                emit_inst(
+                    ctx,
+                    Instruction::SExt {
+                        result: v,
+                        value: a.value,
+                        to_type: IrType::I64,
+                        from_type: a_from,
+                        span,
+                    },
+                );
             } else {
-                emit_inst(ctx, Instruction::ZExt {
-                    result: v, value: a.value, to_type: IrType::I64, from_type: a_from, span,
-                });
+                emit_inst(
+                    ctx,
+                    Instruction::ZExt {
+                        result: v,
+                        value: a.value,
+                        to_type: IrType::I64,
+                        from_type: a_from,
+                        span,
+                    },
+                );
             }
             v
         } else {
@@ -6679,13 +7531,27 @@ fn lower_overflow_arith(
         let b64 = if b_bits < 64 {
             let v = ctx.builder.fresh_value();
             if b_signed {
-                emit_inst(ctx, Instruction::SExt {
-                    result: v, value: b.value, to_type: IrType::I64, from_type: b_from, span,
-                });
+                emit_inst(
+                    ctx,
+                    Instruction::SExt {
+                        result: v,
+                        value: b.value,
+                        to_type: IrType::I64,
+                        from_type: b_from,
+                        span,
+                    },
+                );
             } else {
-                emit_inst(ctx, Instruction::ZExt {
-                    result: v, value: b.value, to_type: IrType::I64, from_type: b_from, span,
-                });
+                emit_inst(
+                    ctx,
+                    Instruction::ZExt {
+                        result: v,
+                        value: b.value,
+                        to_type: IrType::I64,
+                        from_type: b_from,
+                        span,
+                    },
+                );
             }
             v
         } else {
@@ -6694,48 +7560,96 @@ fn lower_overflow_arith(
 
         // Perform i64 operation.
         let result64 = ctx.builder.fresh_value();
-        emit_inst(ctx, Instruction::BinOp {
-            result: result64, op, lhs: a64, rhs: b64, ty: IrType::I64, span,
-        });
+        emit_inst(
+            ctx,
+            Instruction::BinOp {
+                result: result64,
+                op,
+                lhs: a64,
+                rhs: b64,
+                ty: IrType::I64,
+                span,
+            },
+        );
 
         // Truncate to result type if needed, then store.
         let result_store = if res_bits < 64 {
             let v = ctx.builder.fresh_value();
-            emit_inst(ctx, Instruction::Trunc {
-                result: v, value: result64, to_type: res_ir.clone(), span,
-            });
+            emit_inst(
+                ctx,
+                Instruction::Trunc {
+                    result: v,
+                    value: result64,
+                    to_type: res_ir.clone(),
+                    span,
+                },
+            );
             v
         } else {
             result64
         };
 
-        emit_inst(ctx, Instruction::Store {
-            value: result_store, ptr: result_ptr.value, volatile: false, span,
-        });
+        emit_inst(
+            ctx,
+            Instruction::Store {
+                value: result_store,
+                ptr: result_ptr.value,
+                volatile: false,
+                span,
+            },
+        );
 
         if res_bits < 64 {
             // Result smaller than 64-bit — check via extend-and-compare.
             let extended64 = if res_signed {
                 let v = ctx.builder.fresh_value();
-                emit_inst(ctx, Instruction::SExt {
-                    result: v, value: result_store, to_type: IrType::I64, from_type: res_ir, span,
-                });
+                emit_inst(
+                    ctx,
+                    Instruction::SExt {
+                        result: v,
+                        value: result_store,
+                        to_type: IrType::I64,
+                        from_type: res_ir,
+                        span,
+                    },
+                );
                 v
             } else {
                 let v = ctx.builder.fresh_value();
-                emit_inst(ctx, Instruction::ZExt {
-                    result: v, value: result_store, to_type: IrType::I64, from_type: res_ir, span,
-                });
+                emit_inst(
+                    ctx,
+                    Instruction::ZExt {
+                        result: v,
+                        value: result_store,
+                        to_type: IrType::I64,
+                        from_type: res_ir,
+                        span,
+                    },
+                );
                 v
             };
             let overflow_i1 = ctx.builder.fresh_value();
-            emit_inst(ctx, Instruction::ICmp {
-                result: overflow_i1, op: ICmpOp::Ne, lhs: result64, rhs: extended64, span,
-            });
+            emit_inst(
+                ctx,
+                Instruction::ICmp {
+                    result: overflow_i1,
+                    op: ICmpOp::Ne,
+                    lhs: result64,
+                    rhs: extended64,
+                    span,
+                },
+            );
             let overflow_int = ctx.builder.fresh_value();
-            emit_inst(ctx, Instruction::ZExt {
-                result: overflow_int, value: overflow_i1, to_type: IrType::I32, from_type: IrType::I1, span,
-            });
+            emit_inst(
+                ctx,
+                Instruction::ZExt {
+                    result: overflow_int,
+                    value: overflow_i1,
+                    to_type: IrType::I32,
+                    from_type: IrType::I1,
+                    span,
+                },
+            );
             TypedValue::new(overflow_int, CType::Int)
         } else {
             // 64-bit result: detect overflow using sign/carry analysis.
@@ -6756,45 +7670,105 @@ fn lower_overflow_arith(
                     IrBinOp::Add => {
                         // Signed add overflow: (a64 ^ result64) & (b64 ^ result64) < 0
                         let xor_a = ctx.builder.fresh_value();
-                        emit_inst(ctx, Instruction::BinOp {
-                            result: xor_a, op: IrBinOp::Xor, lhs: a64, rhs: result64, ty: IrType::I64, span,
-                        });
+                        emit_inst(
+                            ctx,
+                            Instruction::BinOp {
+                                result: xor_a,
+                                op: IrBinOp::Xor,
+                                lhs: a64,
+                                rhs: result64,
+                                ty: IrType::I64,
+                                span,
+                            },
+                        );
                         let xor_b = ctx.builder.fresh_value();
-                        emit_inst(ctx, Instruction::BinOp {
-                            result: xor_b, op: IrBinOp::Xor, lhs: b64, rhs: result64, ty: IrType::I64, span,
-                        });
+                        emit_inst(
+                            ctx,
+                            Instruction::BinOp {
+                                result: xor_b,
+                                op: IrBinOp::Xor,
+                                lhs: b64,
+                                rhs: result64,
+                                ty: IrType::I64,
+                                span,
+                            },
+                        );
                         let and_val = ctx.builder.fresh_value();
-                        emit_inst(ctx, Instruction::BinOp {
-                            result: and_val, op: IrBinOp::And, lhs: xor_a, rhs: xor_b, ty: IrType::I64, span,
-                        });
+                        emit_inst(
+                            ctx,
+                            Instruction::BinOp {
+                                result: and_val,
+                                op: IrBinOp::And,
+                                lhs: xor_a,
+                                rhs: xor_b,
+                                ty: IrType::I64,
+                                span,
+                            },
+                        );
                         let zero64 = emit_int_const(ctx, 0, IrType::I64, span);
                         let ov = ctx.builder.fresh_value();
-                        emit_inst(ctx, Instruction::ICmp {
-                            result: ov, op: ICmpOp::Slt, lhs: and_val,
-                            rhs: zero64, span,
-                        });
+                        emit_inst(
+                            ctx,
+                            Instruction::ICmp {
+                                result: ov,
+                                op: ICmpOp::Slt,
+                                lhs: and_val,
+                                rhs: zero64,
+                                span,
+                            },
+                        );
                         ov
                     }
                     IrBinOp::Sub => {
                         // Signed sub overflow: (a64 ^ b64) & (a64 ^ result64) < 0
                         let xor_ab = ctx.builder.fresh_value();
-                        emit_inst(ctx, Instruction::BinOp {
-                            result: xor_ab, op: IrBinOp::Xor, lhs: a64, rhs: b64, ty: IrType::I64, span,
-                        });
+                        emit_inst(
+                            ctx,
+                            Instruction::BinOp {
+                                result: xor_ab,
+                                op: IrBinOp::Xor,
+                                lhs: a64,
+                                rhs: b64,
+                                ty: IrType::I64,
+                                span,
+                            },
+                        );
                         let xor_ar = ctx.builder.fresh_value();
-                        emit_inst(ctx, Instruction::BinOp {
-                            result: xor_ar, op: IrBinOp::Xor, lhs: a64, rhs: result64, ty: IrType::I64, span,
-                        });
+                        emit_inst(
+                            ctx,
+                            Instruction::BinOp {
+                                result: xor_ar,
+                                op: IrBinOp::Xor,
+                                lhs: a64,
+                                rhs: result64,
+                                ty: IrType::I64,
+                                span,
+                            },
+                        );
                         let and_val = ctx.builder.fresh_value();
-                        emit_inst(ctx, Instruction::BinOp {
-                            result: and_val, op: IrBinOp::And, lhs: xor_ab, rhs: xor_ar, ty: IrType::I64, span,
-                        });
+                        emit_inst(
+                            ctx,
+                            Instruction::BinOp {
+                                result: and_val,
+                                op: IrBinOp::And,
+                                lhs: xor_ab,
+                                rhs: xor_ar,
+                                ty: IrType::I64,
+                                span,
+                            },
+                        );
                         let zero64 = emit_int_const(ctx, 0, IrType::I64, span);
                         let ov = ctx.builder.fresh_value();
-                        emit_inst(ctx, Instruction::ICmp {
-                            result: ov, op: ICmpOp::Slt, lhs: and_val,
-                            rhs: zero64, span,
-                        });
+                        emit_inst(
+                            ctx,
+                            Instruction::ICmp {
+                                result: ov,
+                                op: ICmpOp::Slt,
+                                lhs: and_val,
+                                rhs: zero64,
+                                span,
+                            },
+                        );
                         ov
                     }
                     IrBinOp::Mul => {
@@ -6803,26 +7777,54 @@ fn lower_overflow_arith(
                         // Also overflow if a == LONG_MIN && b == -1.
                         let zero = emit_int_const(ctx, 0, IrType::I64, span);
                         let b_nz = ctx.builder.fresh_value();
-                        emit_inst(ctx, Instruction::ICmp {
-                            result: b_nz, op: ICmpOp::Ne, lhs: b64, rhs: zero, span,
-                        });
+                        emit_inst(
+                            ctx,
+                            Instruction::ICmp {
+                                result: b_nz,
+                                op: ICmpOp::Ne,
+                                lhs: b64,
+                                rhs: zero,
+                                span,
+                            },
+                        );
                         let div_back = ctx.builder.fresh_value();
-                        emit_inst(ctx, Instruction::BinOp {
-                            result: div_back, op: IrBinOp::SDiv, lhs: result64, rhs: b64, ty: IrType::I64, span,
-                        });
+                        emit_inst(
+                            ctx,
+                            Instruction::BinOp {
+                                result: div_back,
+                                op: IrBinOp::SDiv,
+                                lhs: result64,
+                                rhs: b64,
+                                ty: IrType::I64,
+                                span,
+                            },
+                        );
                         let ne_a = ctx.builder.fresh_value();
-                        emit_inst(ctx, Instruction::ICmp {
-                            result: ne_a, op: ICmpOp::Ne, lhs: div_back, rhs: a64, span,
-                        });
+                        emit_inst(
+                            ctx,
+                            Instruction::ICmp {
+                                result: ne_a,
+                                op: ICmpOp::Ne,
+                                lhs: div_back,
+                                rhs: a64,
+                                span,
+                            },
+                        );
                         let ov = ctx.builder.fresh_value();
-                        emit_inst(ctx, Instruction::BinOp {
-                            result: ov, op: IrBinOp::And, lhs: b_nz, rhs: ne_a, ty: IrType::I1, span,
-                        });
+                        emit_inst(
+                            ctx,
+                            Instruction::BinOp {
+                                result: ov,
+                                op: IrBinOp::And,
+                                lhs: b_nz,
+                                rhs: ne_a,
+                                ty: IrType::I1,
+                                span,
+                            },
+                        );
                         ov
                     }
-                    _ => {
-                        emit_int_const(ctx, 0, IrType::I1, span)
-                    }
+                    _ => emit_int_const(ctx, 0, IrType::I1, span),
                 }
             } else {
                 // Unsigned result type.
@@ -6830,50 +7832,99 @@ fn lower_overflow_arith(
                     IrBinOp::Add => {
                         // Unsigned add overflow: result < a (or result < b).
                         let ov = ctx.builder.fresh_value();
-                        emit_inst(ctx, Instruction::ICmp {
-                            result: ov, op: ICmpOp::Ult, lhs: result64, rhs: a64, span,
-                        });
+                        emit_inst(
+                            ctx,
+                            Instruction::ICmp {
+                                result: ov,
+                                op: ICmpOp::Ult,
+                                lhs: result64,
+                                rhs: a64,
+                                span,
+                            },
+                        );
                         ov
                     }
                     IrBinOp::Sub => {
                         // Unsigned sub overflow: a < b.
                         let ov = ctx.builder.fresh_value();
-                        emit_inst(ctx, Instruction::ICmp {
-                            result: ov, op: ICmpOp::Ult, lhs: a64, rhs: b64, span,
-                        });
+                        emit_inst(
+                            ctx,
+                            Instruction::ICmp {
+                                result: ov,
+                                op: ICmpOp::Ult,
+                                lhs: a64,
+                                rhs: b64,
+                                span,
+                            },
+                        );
                         ov
                     }
                     IrBinOp::Mul => {
                         // Unsigned mul: result / b != a (when b != 0).
                         let zero = emit_int_const(ctx, 0, IrType::I64, span);
                         let b_nz = ctx.builder.fresh_value();
-                        emit_inst(ctx, Instruction::ICmp {
-                            result: b_nz, op: ICmpOp::Ne, lhs: b64, rhs: zero, span,
-                        });
+                        emit_inst(
+                            ctx,
+                            Instruction::ICmp {
+                                result: b_nz,
+                                op: ICmpOp::Ne,
+                                lhs: b64,
+                                rhs: zero,
+                                span,
+                            },
+                        );
                         let div_back = ctx.builder.fresh_value();
-                        emit_inst(ctx, Instruction::BinOp {
-                            result: div_back, op: IrBinOp::UDiv, lhs: result64, rhs: b64, ty: IrType::I64, span,
-                        });
+                        emit_inst(
+                            ctx,
+                            Instruction::BinOp {
+                                result: div_back,
+                                op: IrBinOp::UDiv,
+                                lhs: result64,
+                                rhs: b64,
+                                ty: IrType::I64,
+                                span,
+                            },
+                        );
                         let ne_a = ctx.builder.fresh_value();
-                        emit_inst(ctx, Instruction::ICmp {
-                            result: ne_a, op: ICmpOp::Ne, lhs: div_back, rhs: a64, span,
-                        });
+                        emit_inst(
+                            ctx,
+                            Instruction::ICmp {
+                                result: ne_a,
+                                op: ICmpOp::Ne,
+                                lhs: div_back,
+                                rhs: a64,
+                                span,
+                            },
+                        );
                         let ov = ctx.builder.fresh_value();
-                        emit_inst(ctx, Instruction::BinOp {
-                            result: ov, op: IrBinOp::And, lhs: b_nz, rhs: ne_a, ty: IrType::I1, span,
-                        });
+                        emit_inst(
+                            ctx,
+                            Instruction::BinOp {
+                                result: ov,
+                                op: IrBinOp::And,
+                                lhs: b_nz,
+                                rhs: ne_a,
+                                ty: IrType::I1,
+                                span,
+                            },
+                        );
                         ov
                     }
-                    _ => {
-                        emit_int_const(ctx, 0, IrType::I1, span)
-                    }
+                    _ => emit_int_const(ctx, 0, IrType::I1, span),
                 }
             };
 
             let overflow_int = ctx.builder.fresh_value();
-            emit_inst(ctx, Instruction::ZExt {
-                result: overflow_int, value: overflow_i1, to_type: IrType::I32, from_type: IrType::I1, span,
-            });
+            emit_inst(
+                ctx,
+                Instruction::ZExt {
+                    result: overflow_int,
+                    value: overflow_i1,
+                    to_type: IrType::I32,
+                    from_type: IrType::I1,
+                    span,
+                },
+            );
             TypedValue::new(overflow_int, CType::Int)
         }
     }
@@ -7140,14 +8191,18 @@ pub fn insert_implicit_conversion(
     if types::is_integer(from) && types::is_floating(to) {
         let to_ir = ctype_to_ir(to, ctx.target);
         let src_unsigned = types::is_unsigned(from);
-        let (v, i) = ctx.builder.build_bitcast_ex(value, to_ir, src_unsigned, span);
+        let (v, i) = ctx
+            .builder
+            .build_bitcast_ex(value, to_ir, src_unsigned, span);
         emit_inst(ctx, i);
         return v;
     }
     if types::is_floating(from) && types::is_integer(to) {
         let to_ir = ctype_to_ir(to, ctx.target);
         let dst_unsigned = types::is_unsigned(to);
-        let (v, i) = ctx.builder.build_bitcast_ex(value, to_ir, dst_unsigned, span);
+        let (v, i) = ctx
+            .builder
+            .build_bitcast_ex(value, to_ir, dst_unsigned, span);
         emit_inst(ctx, i);
         return v;
     }
@@ -7610,11 +8665,7 @@ fn compute_offset_in_type(
                         if member_chain.len() == 1 {
                             return 0;
                         }
-                        return compute_offset_in_type(
-                            &field.ty,
-                            &member_chain[1..],
-                            type_builder,
-                        );
+                        return compute_offset_in_type(&field.ty, &member_chain[1..], type_builder);
                     }
                 }
                 0
@@ -7630,11 +8681,7 @@ fn compute_offset_in_type(
                             return field_offset;
                         }
                         return field_offset
-                            + compute_offset_in_type(
-                                &field.ty,
-                                &member_chain[1..],
-                                type_builder,
-                            );
+                            + compute_offset_in_type(&field.ty, &member_chain[1..], type_builder);
                     }
                 }
                 0

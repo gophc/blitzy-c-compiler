@@ -92,6 +92,10 @@ fn has_side_effects(inst: &Instruction) -> bool {
         // Always side-effectful because it modifies the stack pointer.
         Instruction::StackAlloc { .. } => true,
 
+        // StackSave/StackRestore — always preserved (stack pointer manipulation).
+        Instruction::StackSave { .. } => true,
+        Instruction::StackRestore { .. } => true,
+
         // Volatile load — the hardware memory model considers this observable.
         Instruction::Load { volatile, .. } => *volatile,
 

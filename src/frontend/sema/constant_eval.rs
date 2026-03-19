@@ -1638,14 +1638,12 @@ impl<'a> ConstantEvaluator<'a> {
     /// sizeof, and basic arithmetic needed for `aligned(N)`.
     fn eval_simple_const_expr(expr: &Expression) -> Result<ConstValue, ()> {
         match expr {
-            Expression::IntegerLiteral { value, suffix, .. } => {
-                match suffix {
-                    IntegerSuffix::U | IntegerSuffix::UL | IntegerSuffix::ULL => {
-                        Ok(ConstValue::UnsignedInt(*value))
-                    }
-                    _ => Ok(ConstValue::SignedInt(*value as i128)),
+            Expression::IntegerLiteral { value, suffix, .. } => match suffix {
+                IntegerSuffix::U | IntegerSuffix::UL | IntegerSuffix::ULL => {
+                    Ok(ConstValue::UnsignedInt(*value))
                 }
-            }
+                _ => Ok(ConstValue::SignedInt(*value as i128)),
+            },
             Expression::Parenthesized { inner, .. } => Self::eval_simple_const_expr(inner),
             _ => Err(()),
         }
@@ -1689,9 +1687,10 @@ impl<'a> ConstantEvaluator<'a> {
                     .as_ref()
                     .and_then(|d| self.extract_declarator_name_str(d));
 
-                let bit_width = decl.bit_width.as_ref().map(|bw| {
-                    crate::frontend::sema::eval_bitfield_width(bw)
-                });
+                let bit_width = decl
+                    .bit_width
+                    .as_ref()
+                    .map(|bw| crate::frontend::sema::eval_bitfield_width(bw));
 
                 fields.push(crate::common::types::StructField {
                     name: field_name,
@@ -1720,7 +1719,11 @@ impl<'a> ConstantEvaluator<'a> {
             DirectDeclarator::Parenthesized(inner) => {
                 self.apply_declarator_to_member_type(base, inner)
             }
-            DirectDeclarator::Array { base: inner_base, size, .. } => {
+            DirectDeclarator::Array {
+                base: inner_base,
+                size,
+                ..
+            } => {
                 let elem = self.apply_direct_declarator_to_type(base, inner_base);
                 let array_size = size.as_ref().and_then(|expr| {
                     match self.evaluate_integer_constant(expr, Span::default()) {
@@ -1730,14 +1733,19 @@ impl<'a> ConstantEvaluator<'a> {
                 });
                 CType::Array(Box::new(elem), array_size)
             }
-            DirectDeclarator::Function { base: inner_base, .. } => {
+            DirectDeclarator::Function {
+                base: inner_base, ..
+            } => {
                 // Function pointer member — treat the member as a function type
                 let ret = self.apply_direct_declarator_to_type(base, inner_base);
-                CType::Pointer(Box::new(CType::Function {
-                    return_type: Box::new(ret),
-                    params: vec![],
-                    variadic: false,
-                }), crate::common::types::TypeQualifiers::default())
+                CType::Pointer(
+                    Box::new(CType::Function {
+                        return_type: Box::new(ret),
+                        params: vec![],
+                        variadic: false,
+                    }),
+                    crate::common::types::TypeQualifiers::default(),
+                )
             }
         }
     }
@@ -1750,18 +1758,10 @@ impl<'a> ConstantEvaluator<'a> {
     /// Recursively extract the identifier name from a DirectDeclarator.
     fn extract_direct_decl_name(&self, direct: &DirectDeclarator) -> Option<String> {
         match direct {
-            DirectDeclarator::Identifier(sym, _) => {
-                Some(self.resolve_symbol_name(*sym))
-            }
-            DirectDeclarator::Parenthesized(inner) => {
-                self.extract_declarator_name_str(inner)
-            }
-            DirectDeclarator::Array { base, .. } => {
-                self.extract_direct_decl_name(base)
-            }
-            DirectDeclarator::Function { base, .. } => {
-                self.extract_direct_decl_name(base)
-            }
+            DirectDeclarator::Identifier(sym, _) => Some(self.resolve_symbol_name(*sym)),
+            DirectDeclarator::Parenthesized(inner) => self.extract_declarator_name_str(inner),
+            DirectDeclarator::Array { base, .. } => self.extract_direct_decl_name(base),
+            DirectDeclarator::Function { base, .. } => self.extract_direct_decl_name(base),
         }
     }
 

@@ -296,10 +296,7 @@ fn check_trailing_invalid_chars(
 /// `200.0i` and represents a `_Complex double` imaginary constant.
 ///
 /// Returns the original token unchanged if no imaginary suffix follows.
-fn maybe_convert_to_imaginary(
-    scanner: &mut Scanner,
-    token: TokenKind,
-) -> TokenKind {
+fn maybe_convert_to_imaginary(scanner: &mut Scanner, token: TokenKind) -> TokenKind {
     match scanner.peek() {
         Some('i') | Some('j') | Some('I') | Some('J') => {
             // Consume the imaginary suffix

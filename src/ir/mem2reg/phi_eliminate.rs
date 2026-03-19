@@ -165,9 +165,7 @@ pub fn eliminate_phi_nodes(func: &mut IrFunction) {
                     let pred_is_indirect = func
                         .get_block(pred_idx)
                         .and_then(|b| b.terminator())
-                        .map_or(false, |t| {
-                            matches!(t, Instruction::IndirectBranch { .. })
-                        });
+                        .map_or(false, |t| matches!(t, Instruction::IndirectBranch { .. }));
                     if !pred_is_indirect {
                         edges_to_split.push((pred_idx, block_idx));
                     }

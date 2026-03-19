@@ -1,3 +1,4 @@
+#![allow(clippy::vec_init_then_push)]
 //! # AArch64 Instruction Selection and Emission
 //!
 //! Translates BCC IR instructions into AArch64 (ARM 64-bit) machine instructions.
@@ -1266,8 +1267,7 @@ impl AArch64InstructionSelector {
                     } = inst
                     {
                         let size = ty.size_bytes(&self.target).max(1);
-                        let align =
-                            alignment.unwrap_or_else(|| ty.align_bytes(&self.target));
+                        let align = alignment.unwrap_or_else(|| ty.align_bytes(&self.target));
                         let mask = if align > 0 { align - 1 } else { 0 };
                         alloca_cursor = (alloca_cursor + mask) & !mask;
                         let fp_offset = (16 + vararg_save_size + alloca_cursor) as i64;
@@ -1778,6 +1778,20 @@ impl AArch64InstructionSelector {
                 out
             }
 
+            // StackSave — capture SP into a virtual register
+            Instruction::StackSave { result, .. } => {
+                let rd = result.index().wrapping_add(VREG_BASE);
+                vec![A64Instruction::new(A64Opcode::MOV_reg)
+                    .with_rd(rd)
+                    .with_rn(SP_REG)]
+            }
+            // StackRestore — restore SP from a previously saved value
+            Instruction::StackRestore { ptr, .. } => {
+                let rn = ptr.index().wrapping_add(VREG_BASE);
+                vec![A64Instruction::new(A64Opcode::MOV_reg)
+                    .with_rd(SP_REG)
+                    .with_rn(rn)]
+            }
             Instruction::InlineAsm {
                 result,
                 template,

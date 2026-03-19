@@ -887,19 +887,13 @@ impl ArchCodegen for I686Codegen {
                                 //   *loc = byte offset of block within fn
                                 //   result = absolute address of the block
                                 if rel.symbol.starts_with(".L") {
-                                    if let Some(&lbl_off) =
-                                        label_offsets.get(&rel.symbol)
-                                    {
-                                        let patch_off =
-                                            base_offset + rel.offset_in_instruction;
-                                        let addend_bytes =
-                                            (lbl_off as u32).to_le_bytes();
+                                    if let Some(&lbl_off) = label_offsets.get(&rel.symbol) {
+                                        let patch_off = base_offset + rel.offset_in_instruction;
+                                        let addend_bytes = (lbl_off as u32).to_le_bytes();
                                         // Patch the 4-byte displacement
                                         // field with the label's byte
                                         // offset within this function.
-                                        for (i, &b) in
-                                            addend_bytes.iter().enumerate()
-                                        {
+                                        for (i, &b) in addend_bytes.iter().enumerate() {
                                             if patch_off + i < code.len() {
                                                 code[patch_off + i] = b;
                                             }
@@ -1666,6 +1660,27 @@ impl I686Codegen {
                 value_map.insert(result.index(), MachineOperand::VirtualRegister(vreg));
             }
 
+            // ----- StackSave — capture ESP into a virtual register -----
+            Instruction::StackSave { result, .. } => {
+                let vreg = vregs.alloc();
+                out.push(
+                    MachineInstruction::new(I686_MOV)
+                        .with_operand(MachineOperand::VirtualRegister(vreg))
+                        .with_operand(MachineOperand::Register(registers::ESP)),
+                );
+                value_map.insert(result.index(), MachineOperand::VirtualRegister(vreg));
+            }
+
+            // ----- StackRestore — restore ESP from a previously saved value -----
+            Instruction::StackRestore { ptr, .. } => {
+                let ptr_op = self.resolve_operand(ptr, value_map, alloca_offsets);
+                out.push(
+                    MachineInstruction::new(I686_MOV)
+                        .with_operand(MachineOperand::Register(registers::ESP))
+                        .with_operand(ptr_op),
+                );
+            }
+
             // ----- Inline assembly -----
             Instruction::InlineAsm { result, .. } => {
                 let vreg = vregs.alloc();
@@ -1675,7 +1690,7 @@ impl I686Codegen {
 
             // IndirectBranch — computed goto: jmp *%reg
             Instruction::IndirectBranch { target, .. } => {
-                let target_op = self.resolve_operand(target, &value_map, &alloca_offsets);
+                let target_op = self.resolve_operand(target, value_map, alloca_offsets);
                 let mut jmp = MachineInstruction::new(I686_JMP);
                 jmp.operands.push(target_op);
                 jmp.is_terminator = true;

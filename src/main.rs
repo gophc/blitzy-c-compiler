@@ -1838,10 +1838,22 @@ fn compile_single_file(
 
     if std::env::var("BCC_DEBUG_CFG").is_ok() {
         for func in ir_module.functions() {
-            if !func.is_definition { continue; }
-            eprintln!("[CFG-AFTER-MEM2REG] func={} blocks={}", func.name, func.block_count());
+            if !func.is_definition {
+                continue;
+            }
+            eprintln!(
+                "[CFG-AFTER-MEM2REG] func={} blocks={}",
+                func.name,
+                func.block_count()
+            );
             for (i, blk) in func.blocks().iter().enumerate() {
-                eprintln!("  block {} succs={:?} preds={:?} insts={}", i, blk.successors(), blk.predecessors(), blk.instruction_count());
+                eprintln!(
+                    "  block {} succs={:?} preds={:?} insts={}",
+                    i,
+                    blk.successors(),
+                    blk.predecessors(),
+                    blk.instruction_count()
+                );
                 if std::env::var("BCC_DEBUG_IR").is_ok() {
                     for inst in blk.instructions() {
                         eprintln!("    {}", inst);
@@ -1858,10 +1870,22 @@ fn compile_single_file(
 
     if std::env::var("BCC_DEBUG_CFG").is_ok() {
         for func in ir_module.functions() {
-            if !func.is_definition { continue; }
-            eprintln!("[CFG-AFTER-OPT] func={} blocks={}", func.name, func.block_count());
+            if !func.is_definition {
+                continue;
+            }
+            eprintln!(
+                "[CFG-AFTER-OPT] func={} blocks={}",
+                func.name,
+                func.block_count()
+            );
             for (i, blk) in func.blocks().iter().enumerate() {
-                eprintln!("  block {} succs={:?} preds={:?} insts={}", i, blk.successors(), blk.predecessors(), blk.instruction_count());
+                eprintln!(
+                    "  block {} succs={:?} preds={:?} insts={}",
+                    i,
+                    blk.successors(),
+                    blk.predecessors(),
+                    blk.instruction_count()
+                );
             }
         }
     }
@@ -1877,10 +1901,22 @@ fn compile_single_file(
 
     if std::env::var("BCC_DEBUG_CFG").is_ok() {
         for func in ir_module.functions() {
-            if !func.is_definition { continue; }
-            eprintln!("[CFG-AFTER-PHI-ELIM] func={} blocks={}", func.name, func.block_count());
+            if !func.is_definition {
+                continue;
+            }
+            eprintln!(
+                "[CFG-AFTER-PHI-ELIM] func={} blocks={}",
+                func.name,
+                func.block_count()
+            );
             for (i, blk) in func.blocks().iter().enumerate() {
-                eprintln!("  block {} succs={:?} preds={:?} insts={}", i, blk.successors(), blk.predecessors(), blk.instruction_count());
+                eprintln!(
+                    "  block {} succs={:?} preds={:?} insts={}",
+                    i,
+                    blk.successors(),
+                    blk.predecessors(),
+                    blk.instruction_count()
+                );
             }
         }
     }
@@ -2008,19 +2044,9 @@ fn extract_elf_soname(data: &[u8]) -> Option<String> {
     macro_rules! read_u32 {
         ($off:expr) => {
             if le {
-                u32::from_le_bytes([
-                    data[$off],
-                    data[$off + 1],
-                    data[$off + 2],
-                    data[$off + 3],
-                ])
+                u32::from_le_bytes([data[$off], data[$off + 1], data[$off + 2], data[$off + 3]])
             } else {
-                u32::from_be_bytes([
-                    data[$off],
-                    data[$off + 1],
-                    data[$off + 2],
-                    data[$off + 3],
-                ])
+                u32::from_be_bytes([data[$off], data[$off + 1], data[$off + 2], data[$off + 3]])
             }
         };
     }
@@ -2251,7 +2277,7 @@ fn link_object_files(
         let final_soname = resolved_soname.unwrap_or(base_so);
 
         // Avoid duplicating implicit libs (e.g., libm.so.6 already added).
-        if !config.needed_libs.iter().any(|n| *n == final_soname) {
+        if !config.needed_libs.contains(&final_soname) {
             config.needed_libs.push(final_soname);
         }
     }

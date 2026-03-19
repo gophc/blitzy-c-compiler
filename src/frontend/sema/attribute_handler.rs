@@ -300,7 +300,15 @@ impl<'a> AttributeHandler<'a> {
                 | "retain"
                 | "symver"
                 | "patchable_function_entry"
-                | "warn_unused" => {
+                | "warn_unused"
+                | "noipa"
+                | "no_icf"
+                | "stack_protect"
+                | "zero_call_used_regs"
+                | "fd_arg"
+                | "fd_arg_read"
+                | "fd_arg_write"
+                | "null_terminated_string_arg" => {
                     // Recognized but no semantic action needed in BCC.
                     None
                 }

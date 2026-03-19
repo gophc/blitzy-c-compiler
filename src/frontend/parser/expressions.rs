@@ -440,14 +440,18 @@ fn parse_cast_expression(parser: &mut Parser<'_>) -> Result<Expression, ()> {
         parser.expect(TokenKind::RightParen)?;
 
         // Case 2: `(type-name) { init }` → compound literal (C11).
+        // After parsing the literal, apply any postfix operators so
+        // that e.g. `(int[]){1,2,3}[i]` correctly subscripts the
+        // compound literal.
         if parser.check(&TokenKind::LeftBrace) {
             let initializer = parser.parse_initializer()?;
             let span = parser.make_span(start_span);
-            return Ok(Expression::CompoundLiteral {
+            let lit = Expression::CompoundLiteral {
                 type_name: Box::new(type_name),
                 initializer,
                 span,
-            });
+            };
+            return parse_postfix_tail(parser, lit);
         }
 
         // Case 3: `(type-name) cast-expression` → cast.
@@ -772,8 +776,16 @@ fn parse_alignof_expression(parser: &mut Parser<'_>) -> Result<Expression, ()> {
 ///     postfix-expression '--'
 /// ```
 fn parse_postfix_expression(parser: &mut Parser<'_>) -> Result<Expression, ()> {
-    let mut expr = parse_primary_expression(parser)?;
+    let expr = parse_primary_expression(parser)?;
+    parse_postfix_tail(parser, expr)
+}
 
+/// Apply postfix operators (`[`, `(`, `.`, `->`, `++`, `--`) to an
+/// already-parsed expression.  This is factored out of
+/// `parse_postfix_expression` so that compound literals (which are
+/// parsed in `parse_cast_expression`) can also receive postfix
+/// operators such as subscript (`(int[]){1,2,3}[i]`).
+fn parse_postfix_tail(parser: &mut Parser<'_>, mut expr: Expression) -> Result<Expression, ()> {
     loop {
         match parser.peek() {
             // Array subscript: expr[index]

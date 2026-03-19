@@ -235,7 +235,7 @@ impl<'a> BuiltinEvaluator<'a> {
             | BuiltinKind::Strncmp => {
                 let rt = self.get_builtin_return_type(builtin);
                 Ok(BuiltinResult::RuntimeCall {
-                    builtin: builtin.clone(),
+                    builtin: *builtin,
                     result_type: rt,
                 })
             }
@@ -244,7 +244,7 @@ impl<'a> BuiltinEvaluator<'a> {
             BuiltinKind::Abs | BuiltinKind::Labs | BuiltinKind::Llabs => {
                 let rt = self.get_builtin_return_type(builtin);
                 Ok(BuiltinResult::RuntimeCall {
-                    builtin: builtin.clone(),
+                    builtin: *builtin,
                     result_type: rt,
                 })
             }
@@ -259,9 +259,15 @@ impl<'a> BuiltinEvaluator<'a> {
             }
 
             // -- Floating-point constants (compile-time evaluable) -----------
-            BuiltinKind::Inf | BuiltinKind::HugeVal => Ok(BuiltinResult::ConstantFloat(f64::INFINITY)),
-            BuiltinKind::Inff | BuiltinKind::HugeValf => Ok(BuiltinResult::ConstantFloat(f64::INFINITY)),
-            BuiltinKind::Infl | BuiltinKind::HugeVall => Ok(BuiltinResult::ConstantFloat(f64::INFINITY)),
+            BuiltinKind::Inf | BuiltinKind::HugeVal => {
+                Ok(BuiltinResult::ConstantFloat(f64::INFINITY))
+            }
+            BuiltinKind::Inff | BuiltinKind::HugeValf => {
+                Ok(BuiltinResult::ConstantFloat(f64::INFINITY))
+            }
+            BuiltinKind::Infl | BuiltinKind::HugeVall => {
+                Ok(BuiltinResult::ConstantFloat(f64::INFINITY))
+            }
             BuiltinKind::Nan | BuiltinKind::Nanf | BuiltinKind::Nanl => {
                 Ok(BuiltinResult::ConstantFloat(f64::NAN))
             }
@@ -271,12 +277,10 @@ impl<'a> BuiltinEvaluator<'a> {
             | BuiltinKind::Isnan
             | BuiltinKind::Isinf
             | BuiltinKind::Isfinite
-            | BuiltinKind::IsinfSign => {
-                Ok(BuiltinResult::RuntimeCall {
-                    builtin: builtin.clone(),
-                    result_type: CType::Int,
-                })
-            }
+            | BuiltinKind::IsinfSign => Ok(BuiltinResult::RuntimeCall {
+                builtin: *builtin,
+                result_type: CType::Int,
+            }),
 
             // -- Copysign / fabs (runtime calls) ----------------------------
             BuiltinKind::Copysign
@@ -287,7 +291,7 @@ impl<'a> BuiltinEvaluator<'a> {
             | BuiltinKind::Fabsl => {
                 let rt = self.get_builtin_return_type(builtin);
                 Ok(BuiltinResult::RuntimeCall {
-                    builtin: builtin.clone(),
+                    builtin: *builtin,
                     result_type: rt,
                 })
             }
@@ -316,7 +320,7 @@ impl<'a> BuiltinEvaluator<'a> {
             | BuiltinKind::SyncSynchronize => {
                 let rt = self.get_builtin_return_type(builtin);
                 Ok(BuiltinResult::RuntimeCall {
-                    builtin: builtin.clone(),
+                    builtin: *builtin,
                     result_type: rt,
                 })
             }
@@ -333,7 +337,7 @@ impl<'a> BuiltinEvaluator<'a> {
             | BuiltinKind::AtomicFetchXor => {
                 let rt = self.get_builtin_return_type(builtin);
                 Ok(BuiltinResult::RuntimeCall {
-                    builtin: builtin.clone(),
+                    builtin: *builtin,
                     result_type: rt,
                 })
             }
@@ -341,7 +345,7 @@ impl<'a> BuiltinEvaluator<'a> {
             // -- Overflow _p variants (runtime calls) -----------------------
             BuiltinKind::MulOverflowP | BuiltinKind::AddOverflowP | BuiltinKind::SubOverflowP => {
                 Ok(BuiltinResult::RuntimeCall {
-                    builtin: builtin.clone(),
+                    builtin: *builtin,
                     result_type: CType::Bool,
                 })
             }
@@ -450,9 +454,7 @@ impl<'a> BuiltinEvaluator<'a> {
             BuiltinKind::Llabs => CType::LongLong,
 
             // Alloca returns void *.
-            BuiltinKind::Alloca => {
-                CType::Pointer(Box::new(CType::Void), TypeQualifiers::default())
-            }
+            BuiltinKind::Alloca => CType::Pointer(Box::new(CType::Void), TypeQualifiers::default()),
 
             // Floating-point constants.
             BuiltinKind::Inf | BuiltinKind::HugeVal | BuiltinKind::Nan => CType::Double,
@@ -532,10 +534,10 @@ impl<'a> BuiltinEvaluator<'a> {
         match name {
             n if n.ends_with("abort") => CType::Void,
             n if n.ends_with("exit") => CType::Void,
-            n if n.contains("memcpy") || n.contains("memmove") || n.contains("memset") => {
-                void_ptr
+            n if n.contains("memcpy") || n.contains("memmove") || n.contains("memset") => void_ptr,
+            n if n.contains("memcmp") || n.contains("strcmp") || n.contains("strncmp") => {
+                CType::Int
             }
-            n if n.contains("memcmp") || n.contains("strcmp") || n.contains("strncmp") => CType::Int,
             n if n.contains("strlen") => size_t,
             n if n.contains("alloca") => {
                 CType::Pointer(Box::new(CType::Void), TypeQualifiers::default())
@@ -551,13 +553,25 @@ impl<'a> BuiltinEvaluator<'a> {
             n if n.contains("copysign") || n.contains("fabs") => CType::Double,
             n if n.contains("classify_type") => CType::Int,
             n if n.contains("constant_p") => CType::Int,
-            n if n.contains("clz") || n.contains("ctz") || n.contains("popcount") ||
-                 n.contains("parity") || n.contains("clrsb") || n.contains("ffs") => CType::Int,
+            n if n.contains("clz")
+                || n.contains("ctz")
+                || n.contains("popcount")
+                || n.contains("parity")
+                || n.contains("clrsb")
+                || n.contains("ffs") =>
+            {
+                CType::Int
+            }
             n if n.contains("bswap16") => CType::UShort,
             n if n.contains("bswap32") => CType::UInt,
             n if n.contains("bswap64") => CType::ULongLong,
-            n if n.contains("signbit") || n.contains("isnan") ||
-                 n.contains("isinf") || n.contains("isfinite") => CType::Int,
+            n if n.contains("signbit")
+                || n.contains("isnan")
+                || n.contains("isinf")
+                || n.contains("isfinite") =>
+            {
+                CType::Int
+            }
             n if n.starts_with("__sync_") || n.starts_with("__atomic_") => CType::Int,
             _ => CType::Int, // safe default
         }
@@ -1785,12 +1799,8 @@ impl<'a> BuiltinEvaluator<'a> {
             "__builtin_signbit" | "__builtin_signbitf" | "__builtin_signbitl" => {
                 Some(BuiltinKind::Signbit)
             }
-            "__builtin_isnan" | "__builtin_isnanf" | "__builtin_isnanl" => {
-                Some(BuiltinKind::Isnan)
-            }
-            "__builtin_isinf" | "__builtin_isinff" | "__builtin_isinfl" => {
-                Some(BuiltinKind::Isinf)
-            }
+            "__builtin_isnan" | "__builtin_isnanf" | "__builtin_isnanl" => Some(BuiltinKind::Isnan),
+            "__builtin_isinf" | "__builtin_isinff" | "__builtin_isinfl" => Some(BuiltinKind::Isinf),
             "__builtin_isfinite" => Some(BuiltinKind::Isfinite),
             "__builtin_isinf_sign" => Some(BuiltinKind::IsinfSign),
             "__builtin_copysign" => Some(BuiltinKind::Copysign),

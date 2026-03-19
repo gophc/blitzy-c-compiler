@@ -1,3 +1,9 @@
+#![allow(
+    clippy::needless_range_loop,
+    clippy::only_used_in_recursion,
+    clippy::doc_lazy_continuation,
+    clippy::same_item_push
+)]
 //! # Declaration Lowering
 //!
 //! Handles the conversion of AST declarations into IR constructs:
@@ -245,7 +251,9 @@ pub fn lower_global_variable(
         // Store the original C type so that expression lowering can
         // recover full struct field information (including field names
         // and function pointer signatures) for member access operations.
-        module.global_c_types.insert(var_name_owned.clone(), c_type.clone());
+        module
+            .global_c_types
+            .insert(var_name_owned.clone(), c_type.clone());
 
         // Immediately seed TYPEOF_CONTEXT so that subsequent global
         // declarations can resolve sizeof(prev_global) correctly during
@@ -253,7 +261,8 @@ pub fn lower_global_variable(
         super::TYPEOF_CONTEXT.with(|ctx| {
             let mut map = ctx.borrow_mut();
             if let Some(ref mut m) = *map {
-                m.entry(var_name_owned.clone()).or_insert_with(|| c_type.clone());
+                m.entry(var_name_owned.clone())
+                    .or_insert_with(|| c_type.clone());
             } else {
                 let mut m = crate::common::fx_hash::FxHashMap::default();
                 m.insert(var_name_owned.clone(), c_type.clone());
@@ -408,10 +417,9 @@ pub fn lower_function_definition(
         for decl in &func_def.old_style_params {
             let base = resolve_base_type_fast(&decl.specifiers, name_table);
             for init_decl in &decl.declarators {
-                if let Some(pname) =
-                    extract_declarator_name(&init_decl.declarator, name_table)
-                {
-                    let full_ty = apply_declarator_type(base.clone(), &init_decl.declarator, name_table);
+                if let Some(pname) = extract_declarator_name(&init_decl.declarator, name_table) {
+                    let full_ty =
+                        apply_declarator_type(base.clone(), &init_decl.declarator, name_table);
                     map.insert(pname, full_ty);
                 }
             }
@@ -587,7 +595,11 @@ pub fn lower_function_definition(
     for param_decl in &param_declarations {
         let pname = extract_param_name(param_decl, name_table);
         if std::env::var("BCC_DEBUG_KNR").is_ok() {
-            eprintln!("[KNR-PARAM-MAP] pname='{}' in_local_vars={}", pname, local_vars.contains_key(&pname));
+            eprintln!(
+                "[KNR-PARAM-MAP] pname='{}' in_local_vars={}",
+                pname,
+                local_vars.contains_key(&pname)
+            );
         }
         if !pname.is_empty() {
             if let Some(&alloca_val) = local_vars.get(&pname) {
@@ -712,6 +724,7 @@ pub fn lower_function_definition(
             return_ctype: Some(return_c_type.clone()),
             layout_cache: FxHashMap::default(),
             vla_sizes: FxHashMap::default(),
+            vla_stack_save: None,
         };
         stmt_lowering::lower_statement(&mut stmt_ctx, &body_stmt);
     }
@@ -725,7 +738,7 @@ pub fn lower_function_definition(
                 let has_term = block.has_terminator();
                 let inst_count = block.instructions.len();
                 let last_inst = if inst_count > 0 {
-                    format!("{}", block.instructions[inst_count-1])
+                    format!("{}", block.instructions[inst_count - 1])
                 } else {
                     "EMPTY".to_string()
                 };
@@ -852,7 +865,11 @@ pub fn lower_local_initializer(
                     let elem_bsz = wide_char_elem_size(&elem_ty);
                     let arr_byte_size = arr_size * elem_bsz;
                     lower_char_array_from_string(
-                        var_alloca, &str_bytes, arr_byte_size, &elem_ty, ctx,
+                        var_alloca,
+                        &str_bytes,
+                        arr_byte_size,
+                        &elem_ty,
+                        ctx,
                     );
                     return;
                 }
@@ -900,9 +917,12 @@ pub fn lower_local_initializer(
                             rhs_ptr
                         } else {
                             let off_val = make_index_value(ctx, offset as i64);
-                            let (gep_val, gep_inst) =
-                                ctx.builder
-                                    .build_gep(rhs_ptr, vec![off_val], chunk_ir.clone(), span);
+                            let (gep_val, gep_inst) = ctx.builder.build_gep(
+                                rhs_ptr,
+                                vec![off_val],
+                                chunk_ir.clone(),
+                                span,
+                            );
                             emit_inst_to_ctx(ctx, gep_inst);
                             gep_val
                         };
@@ -939,7 +959,9 @@ pub fn lower_local_initializer(
                     // via struct_load_source / struct_pair_hi in the Store
                     // instruction handler.
                     let typed_val = expr_lowering::lower_expression_typed(ctx, expr);
-                    let store_inst = ctx.builder.build_store(typed_val.value, var_alloca, Span::dummy());
+                    let store_inst =
+                        ctx.builder
+                            .build_store(typed_val.value, var_alloca, Span::dummy());
                     emit_inst_to_ctx(ctx, store_inst);
                 }
             } else {
@@ -1054,11 +1076,43 @@ fn lower_aggregate_local_init(
                 }
             } else {
                 // Normal (non-elision) array init.
-                for (idx, desig_init) in init_list.iter().enumerate() {
-                    if idx >= array_len {
+                let mut current_idx = 0usize;
+                for desig_init in init_list.iter() {
+                    // Handle GCC range designator: [low ... high] = value.
+                    // A single DesignatedInitializer may cover many elements.
+                    if let Some(ast::Designator::IndexRange(ref low_expr, ref high_expr, _)) =
+                        desig_init.designators.first()
+                    {
+                        let low = evaluate_const_int_expr(low_expr).unwrap_or(current_idx);
+                        let high = evaluate_const_int_expr(high_expr).unwrap_or(low);
+                        for arr_idx in low..=high {
+                            if arr_idx >= array_len {
+                                break;
+                            }
+                            let byte_offset = (arr_idx * elem_size) as i64;
+                            let idx_val = make_index_value(ctx, byte_offset);
+                            let (elem_ptr, gep_inst) = ctx.builder.build_gep(
+                                base_alloca,
+                                vec![idx_val],
+                                IrType::Ptr,
+                                span,
+                            );
+                            emit_inst_to_ctx(ctx, gep_inst);
+                            lower_single_init_element(
+                                elem_ptr,
+                                &desig_init.initializer,
+                                element_type,
+                                ctx,
+                            );
+                        }
+                        current_idx = high + 1;
+                        continue;
+                    }
+
+                    let actual_idx = resolve_designator_index(&desig_init.designators, current_idx);
+                    if actual_idx >= array_len {
                         break;
                     }
-                    let actual_idx = resolve_designator_index(&desig_init.designators, idx);
                     let byte_offset = (actual_idx * elem_size) as i64;
                     let idx_val = make_index_value(ctx, byte_offset);
                     let (elem_ptr, gep_inst) =
@@ -1066,6 +1120,7 @@ fn lower_aggregate_local_init(
                             .build_gep(base_alloca, vec![idx_val], IrType::Ptr, span);
                     emit_inst_to_ctx(ctx, gep_inst);
                     lower_single_init_element(elem_ptr, &desig_init.initializer, element_type, ctx);
+                    current_idx = actual_idx + 1;
                 }
             }
         }
@@ -1076,9 +1131,11 @@ fn lower_aggregate_local_init(
             ..
         } => {
             // Compute full struct layout (handles bitfields properly).
-            let layout =
-                ctx.type_builder
-                    .compute_struct_layout_with_fields(fields, *is_packed, *explicit_align);
+            let layout = ctx.type_builder.compute_struct_layout_with_fields(
+                fields,
+                *is_packed,
+                *explicit_align,
+            );
             let field_offsets: Vec<usize> = layout.fields.iter().map(|fl| fl.offset).collect();
 
             // C99 §6.7.9/19: members not explicitly initialized shall
@@ -1120,9 +1177,7 @@ fn lower_aggregate_local_init(
                 }
                 // Use the recursive brace-elision lowering to consume the
                 // correct number of flat initializers per aggregate field.
-                lower_brace_elision_into_aggregate(
-                    base_alloca, init_list, 0, resolved, ctx, span,
-                );
+                lower_brace_elision_into_aggregate(base_alloca, init_list, 0, resolved, ctx, span);
             } else {
                 let needs_zero_init = init_list.len() < fields.len() || has_designators;
                 if needs_zero_init {
@@ -1134,7 +1189,47 @@ fn lower_aggregate_local_init(
 
                 // Now store explicitly initialized fields, handling nested
                 // designators (e.g., `.origin.x = 1`).
-                for (idx, desig_init) in init_list.iter().enumerate() {
+                // Build a mapping from "init index" to "field index" that
+                // skips anonymous bitfields (C11 §6.7.9/9: unnamed members
+                // are not initialized by the initializer list).
+                let named_field_indices: Vec<usize> = fields
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, f)| {
+                        // Skip anonymous bitfields (name is None and it's a bitfield)
+                        !(f.name.is_none() && f.bit_width.is_some())
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+
+                let mut field_cursor = 0usize; // index into named_field_indices
+                for desig_init in init_list.iter() {
+                    // When a designator is present, it names the target
+                    // field explicitly; `default_idx` is irrelevant.
+                    let default_field_idx = if desig_init.designators.is_empty() {
+                        let fi = named_field_indices
+                            .get(field_cursor)
+                            .copied()
+                            .unwrap_or(field_cursor);
+                        field_cursor += 1;
+                        fi
+                    } else {
+                        // Designator will resolve the field — advance
+                        // field_cursor to match.
+                        let resolved_fi = resolve_field_designator(
+                            &desig_init.designators,
+                            fields,
+                            field_cursor,
+                            ctx.name_table,
+                        );
+                        // Advance cursor past this field (and skip anonymous).
+                        if let Some(pos) =
+                            named_field_indices.iter().position(|&i| i == resolved_fi)
+                        {
+                            field_cursor = pos + 1;
+                        }
+                        resolved_fi
+                    };
                     lower_designated_struct_init(
                         base_alloca,
                         &desig_init.designators,
@@ -1143,7 +1238,7 @@ fn lower_aggregate_local_init(
                         &field_offsets,
                         &layout.fields,
                         0, // base byte offset
-                        idx,
+                        default_field_idx,
                         ctx,
                         span,
                     );
@@ -1265,16 +1360,24 @@ fn create_anonymous_compound_literal_global(
     let cty = {
         let resolved_ref = crate::common::types::resolve_typedef(&cty_raw);
         let maybe_full: Option<CType> = match resolved_ref {
-            CType::Struct { name: Some(ref tag), ref fields, .. } if fields.is_empty() => {
-                super::SIZEOF_STRUCT_DEFS.with(|defs| {
-                    defs.borrow().as_ref().and_then(|m| m.get(tag.as_str()).cloned())
-                })
-            }
-            CType::Union { name: Some(ref tag), ref fields, .. } if fields.is_empty() => {
-                super::SIZEOF_STRUCT_DEFS.with(|defs| {
-                    defs.borrow().as_ref().and_then(|m| m.get(tag.as_str()).cloned())
-                })
-            }
+            CType::Struct {
+                name: Some(ref tag),
+                ref fields,
+                ..
+            } if fields.is_empty() => super::SIZEOF_STRUCT_DEFS.with(|defs| {
+                defs.borrow()
+                    .as_ref()
+                    .and_then(|m| m.get(tag.as_str()).cloned())
+            }),
+            CType::Union {
+                name: Some(ref tag),
+                ref fields,
+                ..
+            } if fields.is_empty() => super::SIZEOF_STRUCT_DEFS.with(|defs| {
+                defs.borrow()
+                    .as_ref()
+                    .and_then(|m| m.get(tag.as_str()).cloned())
+            }),
             _ => None,
         };
         maybe_full.unwrap_or(cty_raw)
@@ -1283,12 +1386,27 @@ fn create_anonymous_compound_literal_global(
 
     // Evaluate the initializer to a compile-time constant.
     let constant = match initializer {
-        ast::Initializer::Expression(expr) => {
-            evaluate_constant_expr(expr, &cty, target, type_builder, diagnostics, name_table, enum_constants)?
-        }
-        ast::Initializer::List { designators_and_initializers, .. } => {
-            lower_designated_initializer(designators_and_initializers, &cty, target, type_builder, diagnostics, name_table, enum_constants)?
-        }
+        ast::Initializer::Expression(expr) => evaluate_constant_expr(
+            expr,
+            &cty,
+            target,
+            type_builder,
+            diagnostics,
+            name_table,
+            enum_constants,
+        )?,
+        ast::Initializer::List {
+            designators_and_initializers,
+            ..
+        } => lower_designated_initializer(
+            designators_and_initializers,
+            &cty,
+            target,
+            type_builder,
+            diagnostics,
+            name_table,
+            enum_constants,
+        )?,
     };
 
     // Generate a unique anonymous global name.
@@ -1301,7 +1419,8 @@ fn create_anonymous_compound_literal_global(
 
     // Push into the thread-local collection for draining after Pass 1.
     super::COMPOUND_LITERAL_GLOBALS.with(|cl| {
-        cl.borrow_mut().push((anon_name.clone(), ir_type, constant, cty));
+        cl.borrow_mut()
+            .push((anon_name.clone(), ir_type, constant, cty));
     });
 
     Some(anon_name)
@@ -1310,7 +1429,7 @@ fn create_anonymous_compound_literal_global(
 /// Evaluate a compile-time constant expression for a global variable initializer.
 fn evaluate_constant_expr(
     expr: &ast::Expression,
-    _expected_type: &CType,
+    expected_type: &CType,
     target: &Target,
     type_builder: &TypeBuilder,
     diagnostics: &mut DiagnosticEngine,
@@ -1339,7 +1458,20 @@ fn evaluate_constant_expr(
             for seg in segments {
                 raw_bytes.extend_from_slice(&seg.value);
             }
-            let bytes = expand_string_bytes_for_width(&raw_bytes, char_width);
+            let mut bytes = expand_string_bytes_for_width(&raw_bytes, char_width);
+            // C11 §6.7.9p14: "including the terminating null character if
+            // there is room or if the array is of unknown size".  When the
+            // target is a fixed-size character array and the string
+            // (including null terminator) exceeds the array, truncate to
+            // exactly the array size so the null doesn't overflow into
+            // adjacent storage.
+            let resolved_et = crate::common::types::resolve_typedef(expected_type);
+            if let CType::Array(ref _elem, Some(arr_len)) = resolved_et {
+                let expected_bytes = arr_len * char_width;
+                if bytes.len() > expected_bytes {
+                    bytes.truncate(expected_bytes);
+                }
+            }
             Some(Constant::String(bytes))
         }
         ast::Expression::CharLiteral { value, .. } => Some(Constant::Integer(*value as i128)),
@@ -1404,7 +1536,7 @@ fn evaluate_constant_expr(
             ast::UnaryOp::Negate => {
                 let inner = evaluate_constant_expr(
                     operand,
-                    _expected_type,
+                    expected_type,
                     target,
                     type_builder,
                     diagnostics,
@@ -1420,7 +1552,7 @@ fn evaluate_constant_expr(
             ast::UnaryOp::BitwiseNot => {
                 let inner = evaluate_constant_expr(
                     operand,
-                    _expected_type,
+                    expected_type,
                     target,
                     type_builder,
                     diagnostics,
@@ -1435,7 +1567,7 @@ fn evaluate_constant_expr(
             ast::UnaryOp::LogicalNot => {
                 let inner = evaluate_constant_expr(
                     operand,
-                    _expected_type,
+                    expected_type,
                     target,
                     type_builder,
                     diagnostics,
@@ -1454,7 +1586,7 @@ fn evaluate_constant_expr(
         } => {
             let lhs = evaluate_constant_expr(
                 left,
-                _expected_type,
+                expected_type,
                 target,
                 type_builder,
                 diagnostics,
@@ -1463,7 +1595,7 @@ fn evaluate_constant_expr(
             )?;
             let rhs = evaluate_constant_expr(
                 right,
-                _expected_type,
+                expected_type,
                 target,
                 type_builder,
                 diagnostics,
@@ -1506,14 +1638,18 @@ fn evaluate_constant_expr(
                         return Some(Constant::GlobalRefOffset(name.clone(), *off as i64));
                     }
                     // GlobalRefOffset + Integer
-                    if let (Constant::GlobalRefOffset(ref name, base_off), Constant::Integer(off)) = (&lhs, &rhs) {
+                    if let (Constant::GlobalRefOffset(ref name, base_off), Constant::Integer(off)) =
+                        (&lhs, &rhs)
+                    {
                         let total = base_off + *off as i64;
                         if total == 0 {
                             return Some(Constant::GlobalRef(name.clone()));
                         }
                         return Some(Constant::GlobalRefOffset(name.clone(), total));
                     }
-                    if let (Constant::Integer(off), Constant::GlobalRefOffset(ref name, base_off)) = (&lhs, &rhs) {
+                    if let (Constant::Integer(off), Constant::GlobalRefOffset(ref name, base_off)) =
+                        (&lhs, &rhs)
+                    {
                         let total = base_off + *off as i64;
                         if total == 0 {
                             return Some(Constant::GlobalRef(name.clone()));
@@ -1530,7 +1666,9 @@ fn evaluate_constant_expr(
                         }
                         return Some(Constant::GlobalRefOffset(name.clone(), neg));
                     }
-                    if let (Constant::GlobalRefOffset(ref name, base_off), Constant::Integer(off)) = (&lhs, &rhs) {
+                    if let (Constant::GlobalRefOffset(ref name, base_off), Constant::Integer(off)) =
+                        (&lhs, &rhs)
+                    {
                         let total = base_off - *off as i64;
                         if total == 0 {
                             return Some(Constant::GlobalRef(name.clone()));
@@ -1552,13 +1690,11 @@ fn evaluate_constant_expr(
             evaluate_const_binop(op, &lhs, &rhs)
         }
         ast::Expression::Cast {
-            operand,
-            type_name,
-            ..
+            operand, type_name, ..
         } => {
             let inner = evaluate_constant_expr(
                 operand,
-                _expected_type,
+                expected_type,
                 target,
                 type_builder,
                 diagnostics,
@@ -1585,7 +1721,7 @@ fn evaluate_constant_expr(
         } => {
             let cond = evaluate_constant_expr(
                 condition,
-                _expected_type,
+                expected_type,
                 target,
                 type_builder,
                 diagnostics,
@@ -1597,7 +1733,7 @@ fn evaluate_constant_expr(
                     if let Some(ref te) = then_expr {
                         evaluate_constant_expr(
                             te,
-                            _expected_type,
+                            expected_type,
                             target,
                             type_builder,
                             diagnostics,
@@ -1611,7 +1747,7 @@ fn evaluate_constant_expr(
                 }
                 Constant::Integer(_) => evaluate_constant_expr(
                     else_expr,
-                    _expected_type,
+                    expected_type,
                     target,
                     type_builder,
                     diagnostics,
@@ -1623,7 +1759,7 @@ fn evaluate_constant_expr(
         }
         ast::Expression::Parenthesized { inner, .. } => evaluate_constant_expr(
             inner,
-            _expected_type,
+            expected_type,
             target,
             type_builder,
             diagnostics,
@@ -1637,7 +1773,7 @@ fn evaluate_constant_expr(
             ast::BuiltinKind::ChooseExpr if args.len() >= 3 => {
                 let cond = evaluate_constant_expr(
                     &args[0],
-                    _expected_type,
+                    expected_type,
                     target,
                     type_builder,
                     diagnostics,
@@ -1647,7 +1783,7 @@ fn evaluate_constant_expr(
                 match cond {
                     Some(Constant::Integer(v)) if v != 0 => evaluate_constant_expr(
                         &args[1],
-                        _expected_type,
+                        expected_type,
                         target,
                         type_builder,
                         diagnostics,
@@ -1656,7 +1792,7 @@ fn evaluate_constant_expr(
                     ),
                     _ => evaluate_constant_expr(
                         &args[2],
-                        _expected_type,
+                        expected_type,
                         target,
                         type_builder,
                         diagnostics,
@@ -1668,7 +1804,7 @@ fn evaluate_constant_expr(
             ast::BuiltinKind::TypesCompatibleP => Some(Constant::Integer(0)),
             ast::BuiltinKind::Expect if !args.is_empty() => evaluate_constant_expr(
                 &args[0],
-                _expected_type,
+                expected_type,
                 target,
                 type_builder,
                 diagnostics,
@@ -1682,7 +1818,7 @@ fn evaluate_constant_expr(
             if let Some(last) = exprs.last() {
                 evaluate_constant_expr(
                     last,
-                    _expected_type,
+                    expected_type,
                     target,
                     type_builder,
                     diagnostics,
@@ -1815,7 +1951,109 @@ fn truncate_const_to_ctype(val: i128, cty: &CType, target: &Target) -> i128 {
     }
 }
 
-/// Evaluate a constant binary operation.
+/// Serialize a `Constant` into a little-endian byte buffer of the given
+/// size.  This handles scalars (`Integer`, `Float`, `LongDouble`), raw
+/// byte strings (`String`), aggregate types (`Array`, `Struct`), and
+/// zero-initialization, producing the exact memory representation that
+/// the ELF `.data` section should contain.
+fn constant_to_le_bytes(
+    c: &Constant,
+    expected_size: usize,
+    ctype: &CType,
+    target: &Target,
+    type_builder: &TypeBuilder,
+) -> Vec<u8> {
+    match c {
+        Constant::ZeroInit => vec![0u8; expected_size],
+        Constant::Integer(v) => {
+            let vu = *v as u128;
+            let mut buf = vec![0u8; expected_size];
+            for b in 0..expected_size.min(16) {
+                buf[b] = ((vu >> (b * 8)) & 0xFF) as u8;
+            }
+            buf
+        }
+        Constant::Float(v) => {
+            let bits = v.to_bits();
+            let mut buf = vec![0u8; expected_size];
+            for b in 0..expected_size.min(8) {
+                buf[b] = ((bits >> (b * 8)) & 0xFF) as u8;
+            }
+            buf
+        }
+        Constant::LongDouble(raw) => {
+            let mut buf = vec![0u8; expected_size];
+            for (i, &byte) in raw.iter().enumerate() {
+                if i < buf.len() {
+                    buf[i] = byte;
+                }
+            }
+            buf
+        }
+        Constant::String(data) => {
+            let mut buf = vec![0u8; expected_size];
+            for (i, &byte) in data.iter().enumerate() {
+                if i < buf.len() {
+                    buf[i] = byte;
+                }
+            }
+            buf
+        }
+        Constant::Array(elems) => {
+            let elem_ty = match ctype {
+                CType::Array(et, _) => et.as_ref(),
+                _ => &CType::Char,
+            };
+            let elem_size = type_builder.sizeof_type(elem_ty);
+            let mut buf = vec![0u8; expected_size];
+            for (i, elem) in elems.iter().enumerate() {
+                let elem_bytes =
+                    constant_to_le_bytes(elem, elem_size, elem_ty, target, type_builder);
+                let off = i * elem_size;
+                for (j, &b) in elem_bytes.iter().enumerate() {
+                    if off + j < buf.len() {
+                        buf[off + j] = b;
+                    }
+                }
+            }
+            buf
+        }
+        Constant::Struct(field_constants) => {
+            let mut buf = vec![0u8; expected_size];
+            let fields = match ctype {
+                CType::Struct { fields, .. } => fields,
+                CType::Union { fields, .. } => fields,
+                _ => return buf,
+            };
+            let (is_packed, explicit_align) = match ctype {
+                CType::Struct {
+                    packed, aligned, ..
+                } => (*packed, *aligned),
+                _ => (false, None),
+            };
+            let layout =
+                type_builder.compute_struct_layout_with_fields(fields, is_packed, explicit_align);
+            for (fi, fc) in field_constants.iter().enumerate() {
+                if let Some(fl) = layout.fields.get(fi) {
+                    let ft = if fi < fields.len() {
+                        &fields[fi].ty
+                    } else {
+                        &CType::Int
+                    };
+                    let fb = constant_to_le_bytes(fc, fl.size, ft, target, type_builder);
+                    for (j, &b) in fb.iter().enumerate() {
+                        if fl.offset + j < buf.len() {
+                            buf[fl.offset + j] = b;
+                        }
+                    }
+                }
+            }
+            buf
+        }
+        _ => vec![0u8; expected_size],
+    }
+}
+
 /// Create an anonymous read-only global for a string literal used in
 /// pointer-arithmetic within a global initializer (e.g. `"foo" + 1`).
 /// Returns the generated symbol name.
@@ -1830,7 +2068,8 @@ fn create_anonymous_string_global(bytes: &[u8], target: &Target) -> String {
     let constant = Constant::String(bytes.to_vec());
     let cty = CType::Array(Box::new(CType::Char), Some(bytes.len()));
     super::COMPOUND_LITERAL_GLOBALS.with(|cl| {
-        cl.borrow_mut().push((anon_name.clone(), ir_type, constant, cty));
+        cl.borrow_mut()
+            .push((anon_name.clone(), ir_type, constant, cty));
     });
     // Mark read-only so it goes to .rodata.
     let _ = target;
@@ -1844,8 +2083,7 @@ fn evaluate_const_binop(op: &ast::BinaryOp, lhs: &Constant, rhs: &Constant) -> O
             // C's widest standard integer type is `long long` (64-bit).
             // When both values fit in i64, perform arithmetic in i64
             // to match C overflow/truncation semantics.
-            let fits_i64 =
-                *a == (*a as i64 as i128) && *b == (*b as i64 as i128);
+            let fits_i64 = *a == (*a as i64 as i128) && *b == (*b as i64 as i128);
             let result = match op {
                 ast::BinaryOp::Add => {
                     if fits_i64 {
@@ -2022,6 +2260,30 @@ fn lower_designated_initializer(
             let mut elements = vec![Constant::ZeroInit; array_len];
             let mut current_idx = 0usize;
             for desig_init in init_list {
+                // Handle GCC range designator: [low ... high] = value.
+                if let Some(ast::Designator::IndexRange(ref low_expr, ref high_expr, _)) =
+                    desig_init.designators.first()
+                {
+                    let low = evaluate_const_int_expr(low_expr).unwrap_or(current_idx);
+                    let high = evaluate_const_int_expr(high_expr).unwrap_or(low);
+                    if let Some(c) = evaluate_initializer_constant(
+                        &desig_init.initializer,
+                        element_type,
+                        target,
+                        type_builder,
+                        diagnostics,
+                        name_table,
+                        enum_constants,
+                    ) {
+                        for arr_idx in low..=high {
+                            if arr_idx < array_len {
+                                elements[arr_idx] = c.clone();
+                            }
+                        }
+                    }
+                    current_idx = high + 1;
+                    continue;
+                }
                 current_idx = resolve_designator_index(&desig_init.designators, current_idx);
                 if current_idx < array_len {
                     if let Some(c) = evaluate_initializer_constant(
@@ -2063,7 +2325,7 @@ fn lower_designated_initializer(
 
                 // Evaluate each field value.
                 let field_count = fields.len();
-                let mut field_values: Vec<Option<i128>> = vec![None; field_count];
+                let mut field_constants: Vec<Option<Constant>> = vec![None; field_count];
                 let mut current_idx = 0usize;
                 for desig_init in init_list {
                     current_idx = resolve_field_designator(
@@ -2087,12 +2349,7 @@ fn lower_designated_initializer(
                             name_table,
                             enum_constants,
                         ) {
-                            field_values[current_idx] = match c {
-                                Constant::Integer(v) => Some(v),
-                                Constant::Float(v) => Some(v.to_bits() as i128),
-                                Constant::ZeroInit => Some(0),
-                                _ => None,
-                            };
+                            field_constants[current_idx] = Some(c);
                         }
                     }
                     current_idx += 1;
@@ -2100,15 +2357,21 @@ fn lower_designated_initializer(
 
                 // Pack each field into the byte buffer.
                 for (fi, _field) in fields.iter().enumerate() {
-                    let val = match field_values[fi] {
-                        Some(v) => v,
-                        None => 0, // zero-init
+                    let c = match &field_constants[fi] {
+                        Some(c) => c.clone(),
+                        None => Constant::ZeroInit,
                     };
                     if let Some(fl) = layout.fields.get(fi) {
                         if let Some((bit_offset_in_unit, bit_width)) = fl.bitfield_info {
                             if bit_width == 0 {
                                 continue; // zero-width bitfield
                             }
+                            let val: i128 = match &c {
+                                Constant::Integer(v) => *v,
+                                Constant::Float(v) => v.to_bits() as i128,
+                                Constant::ZeroInit => 0,
+                                _ => 0,
+                            };
                             // Pack into the storage unit at fl.offset
                             let mask = if bit_width >= 128 {
                                 !0u128
@@ -2124,18 +2387,24 @@ fn lower_designated_initializer(
                             for b in 0..unit_bytes {
                                 let byte_idx = fl.offset + b;
                                 if byte_idx < bytes.len() {
-                                    bytes[byte_idx] |=
-                                        ((shifted >> (b * 8)) & 0xFF) as u8;
+                                    bytes[byte_idx] |= ((shifted >> (b * 8)) & 0xFF) as u8;
                                 }
                             }
                         } else {
-                            // Regular (non-bitfield) field — write at byte offset.
-                            let field_size = fl.size;
-                            let v = val as u128;
-                            for b in 0..field_size.min(16) {
+                            // Regular (non-bitfield) field — write at byte
+                            // offset.  Serialize the constant to bytes
+                            // and copy into the buffer.
+                            let field_bytes = constant_to_le_bytes(
+                                &c,
+                                fl.size,
+                                &fields[fi].ty,
+                                target,
+                                type_builder,
+                            );
+                            for (b, &byte) in field_bytes.iter().enumerate() {
                                 let byte_idx = fl.offset + b;
                                 if byte_idx < bytes.len() {
-                                    bytes[byte_idx] = ((v >> (b * 8)) & 0xFF) as u8;
+                                    bytes[byte_idx] = byte;
                                 }
                             }
                         }
@@ -2193,14 +2462,8 @@ fn lower_designated_initializer(
                             )
                         );
                         let needs_brace_elision = desig_init.designators.is_empty()
-                            && matches!(
-                                resolved_ft,
-                                CType::Array(..) | CType::Struct { .. }
-                            )
-                            && matches!(
-                                &desig_init.initializer,
-                                ast::Initializer::Expression(_)
-                            )
+                            && matches!(resolved_ft, CType::Array(..) | CType::Struct { .. })
+                            && matches!(&desig_init.initializer, ast::Initializer::Expression(_))
                             && !is_string_for_char_array;
 
                         if needs_brace_elision {
@@ -2310,7 +2573,12 @@ fn allocate_parameters(
         }
 
         if std::env::var("BCC_DEBUG_KNR").is_ok() {
-            eprintln!("[KNR-DEBUG] allocate_parameters: idx={} name='{}' knr_types={:?}", idx, param_name, knr_param_types.keys().collect::<Vec<_>>());
+            eprintln!(
+                "[KNR-DEBUG] allocate_parameters: idx={} name='{}' knr_types={:?}",
+                idx,
+                param_name,
+                knr_param_types.keys().collect::<Vec<_>>()
+            );
         }
 
         // For K&R-style functions, use the K&R type map which has the real
@@ -2345,7 +2613,13 @@ fn allocate_parameters(
         let param_ir_type = IrType::from_ctype(&param_c_type, target);
 
         if std::env::var("BCC_DEBUG_KNR").is_ok() {
-            eprintln!("[KNR-DEBUG]   param '{}': c_type={:?} ir_type={:?} size={}", param_name, param_c_type, param_ir_type, param_ir_type.size_bytes(target));
+            eprintln!(
+                "[KNR-DEBUG]   param '{}': c_type={:?} ir_type={:?} size={}",
+                param_name,
+                param_c_type,
+                param_ir_type,
+                param_ir_type.size_bytes(target)
+            );
         }
 
         // Round up struct alloca sizes to the next power-of-2 when the
@@ -2427,15 +2701,9 @@ fn initializer_contains_label_address(init: &ast::Initializer) -> bool {
 fn expr_contains_label_address(expr: &ast::Expression) -> bool {
     match expr {
         ast::Expression::AddressOfLabel { .. } => true,
-        ast::Expression::Parenthesized { inner, .. } => {
-            expr_contains_label_address(inner)
-        }
-        ast::Expression::Cast { operand, .. } => {
-            expr_contains_label_address(operand)
-        }
-        ast::Expression::UnaryOp { operand, .. } => {
-            expr_contains_label_address(operand)
-        }
+        ast::Expression::Parenthesized { inner, .. } => expr_contains_label_address(inner),
+        ast::Expression::Cast { operand, .. } => expr_contains_label_address(operand),
+        ast::Expression::UnaryOp { operand, .. } => expr_contains_label_address(operand),
         ast::Expression::Binary { left, right, .. } => {
             expr_contains_label_address(left) || expr_contains_label_address(right)
         }
@@ -2741,9 +3009,7 @@ fn extract_vla_from_direct_decl(dd: &ast::DirectDeclarator) -> Option<Box<ast::E
                 Some(expr.clone())
             }
         }
-        ast::DirectDeclarator::Parenthesized(inner) => {
-            extract_vla_size_expr(inner)
-        }
+        ast::DirectDeclarator::Parenthesized(inner) => extract_vla_size_expr(inner),
         _ => None,
     }
 }
@@ -2764,13 +3030,15 @@ fn allocate_local_variables(
         if local.vla_size_expr.is_some() {
             // Create a pointer-sized alloca to hold the VLA pointer.
             let ptr_ty = IrType::Ptr;
-            let (alloca_val, alloca_inst) =
-                builder.build_alloca(ptr_ty.clone(), local.span);
+            let (alloca_val, alloca_inst) = builder.build_alloca(ptr_ty.clone(), local.span);
             push_inst_to_entry(function, alloca_inst);
             local_vars.insert(local.name.clone(), alloca_val);
 
-            let decl_line =
-                if local.span.start > 0 { local.span.start } else { 1 };
+            let decl_line = if local.span.start > 0 {
+                local.span.start
+            } else {
+                1
+            };
             function
                 .local_var_debug_info
                 .push(crate::ir::function::LocalVarDebugInfo {
@@ -2869,7 +3137,7 @@ fn lower_static_local(
     // Infer array size from initializer when declaration uses [].
     let c_type = match (c_type, &constant) {
         (CType::Array(elem, None), Some(Constant::String(bytes))) => {
-            let elem_byte_size = wide_char_elem_size(&elem);
+            let elem_byte_size = wide_char_elem_size(elem);
             CType::Array(elem.clone(), Some(bytes.len() / elem_byte_size))
         }
         (CType::Array(elem, None), Some(Constant::Array(elems))) => {
@@ -3031,10 +3299,7 @@ fn extract_section_attribute(
 ///
 /// Returns `Some(target_name)` if the alias attribute is present, `None`
 /// otherwise.
-fn extract_alias_attribute(
-    attributes: &[ast::Attribute],
-    name_table: &[String],
-) -> Option<String> {
+fn extract_alias_attribute(attributes: &[ast::Attribute], name_table: &[String]) -> Option<String> {
     for attr in attributes {
         if resolve_sym(name_table, &attr.name) == "alias" {
             if let Some(first_arg) = attr.args.first() {
@@ -3252,6 +3517,37 @@ pub(super) fn extract_alignment_attribute(
     None
 }
 
+/// Extract the maximum field-level `__attribute__((aligned(N)))` from all
+/// members of a struct/union.  Per C11 + GCC extension, the alignment of a
+/// struct is at least as strict as the alignment of any of its members.
+/// When a member declaration carries `aligned(N)`, the struct's overall
+/// alignment must be raised to at least N.
+pub(super) fn extract_max_member_alignment(
+    members: &[ast::StructMember],
+    name_table: &[String],
+) -> Option<usize> {
+    let mut max_align: Option<usize> = None;
+    for member in members {
+        // Scan specifier-qualifier attributes (e.g. `int __attribute__((aligned(8))) a;`)
+        if let Some(a) = extract_alignment_attribute(&member.specifiers.attributes, name_table) {
+            max_align = Some(max_align.map_or(a, |cur: usize| cur.max(a)));
+        }
+        // Scan member-level attributes (after declarator list)
+        if let Some(a) = extract_alignment_attribute(&member.attributes, name_table) {
+            max_align = Some(max_align.map_or(a, |cur: usize| cur.max(a)));
+        }
+        // Scan declarator-level attributes
+        for decl in &member.declarators {
+            if let Some(ref d) = decl.declarator {
+                if let Some(a) = extract_alignment_attribute(&d.attributes, name_table) {
+                    max_align = Some(max_align.map_or(a, |cur: usize| cur.max(a)));
+                }
+            }
+        }
+    }
+    max_align
+}
+
 fn collect_all_attributes(
     specifiers: &ast::DeclarationSpecifiers,
     func_attrs: &[ast::Attribute],
@@ -3326,11 +3622,8 @@ fn apply_mode_attribute(
                         | CType::UInt128
                         | CType::Bool
                 );
-                let is_float = matches!(
-                    base,
-                    CType::Float | CType::Double | CType::LongDouble
-                );
-                return match &*mode_name {
+                let is_float = matches!(base, CType::Float | CType::Double | CType::LongDouble);
+                return match mode_name {
                     "QI" | "__QI__" | "byte" | "__byte__" => {
                         if is_unsigned {
                             CType::UChar
@@ -3606,7 +3899,14 @@ fn map_single_type_specifier_with_names(spec: &ast::TypeSpecifier, name_table: &
                 let n = resolve_sym(name_table, &a.name);
                 n == "packed" || n == "__packed__"
             });
-            let aligned = extract_alignment_attribute(&s.attributes, name_table);
+            let mut aligned = extract_alignment_attribute(&s.attributes, name_table);
+            // Also propagate field-level __attribute__((aligned(N))) to the
+            // struct's overall alignment (C11 + GCC extension).
+            if let Some(ref members) = s.members {
+                if let Some(field_align) = extract_max_member_alignment(members, name_table) {
+                    aligned = Some(aligned.map_or(field_align, |a| a.max(field_align)));
+                }
+            }
             CType::Struct {
                 name: s.tag.as_ref().map(|t| sym_to_string(t, name_table)),
                 fields,
@@ -3620,7 +3920,13 @@ fn map_single_type_specifier_with_names(spec: &ast::TypeSpecifier, name_table: &
                 let n = resolve_sym(name_table, &a.name);
                 n == "packed" || n == "__packed__"
             });
-            let aligned = extract_alignment_attribute(&u.attributes, name_table);
+            let mut aligned = extract_alignment_attribute(&u.attributes, name_table);
+            // Also propagate field-level aligned to union alignment.
+            if let Some(ref members) = u.members {
+                if let Some(field_align) = extract_max_member_alignment(members, name_table) {
+                    aligned = Some(aligned.map_or(field_align, |a| a.max(field_align)));
+                }
+            }
             CType::Union {
                 name: u.tag.as_ref().map(|t| sym_to_string(t, name_table)),
                 fields,
@@ -4136,9 +4442,9 @@ fn evaluate_const_int_expr(expr: &ast::Expression) -> Option<usize> {
                                 });
                                 if let Some(name_s) = name_str {
                                     if let Some(cty) = map.get(&name_s) {
-                                        return Some(
-                                            crate::common::types::sizeof_ctype(cty, target),
-                                        );
+                                        return Some(crate::common::types::sizeof_ctype(
+                                            cty, target,
+                                        ));
                                     }
                                 }
                             }
@@ -4508,6 +4814,28 @@ fn evaluate_address_of_subscript(
             // Default to 1 for byte arrays.
             Some((sym, inner_off + idx_val))
         }
+        ast::Expression::StringLiteral {
+            segments, prefix, ..
+        } => {
+            // &("X"[0]) — create an anonymous string global and return
+            // a reference to it at the computed byte offset.
+            let char_width: usize = match prefix {
+                ast::StringPrefix::None | ast::StringPrefix::U8 => 1,
+                ast::StringPrefix::L | ast::StringPrefix::U32 => 4,
+                ast::StringPrefix::U16 => 2,
+            };
+            let mut raw_bytes = Vec::new();
+            for seg in segments {
+                raw_bytes.extend_from_slice(&seg.value);
+            }
+            let bytes = super::decl_lowering::expand_string_bytes_for_width(&raw_bytes, char_width);
+            let anon_name = create_anonymous_string_global(&bytes, target);
+            Some((anon_name, idx_val * char_width as i64))
+        }
+        ast::Expression::Parenthesized { inner, .. } => {
+            // &(("X")[0]) — unwrap parentheses and recurse.
+            evaluate_address_of_subscript(inner, index, target, name_table)
+        }
         _ => None,
     }
 }
@@ -4540,23 +4868,22 @@ fn evaluate_address_of_member_chain(
     // Handle member access: expr.member
     if let ast::Expression::MemberAccess { object, member, .. } = expr {
         let member_name = resolve_sym(name_table, member).to_string();
-        let (sym, base_off) =
-            evaluate_address_of_member_chain(object, target, name_table)?;
-        let field_off =
-            evaluate_member_field_offset(&member_name, object, target, name_table);
+        let (sym, base_off) = evaluate_address_of_member_chain(object, target, name_table)?;
+        let field_off = evaluate_member_field_offset(&member_name, object, target, name_table);
         return Some((sym, base_off + field_off.unwrap_or(0)));
     }
     // Handle pointer member access: expr->member
     if let ast::Expression::PointerMemberAccess { object, member, .. } = expr {
         let member_name = resolve_sym(name_table, member).to_string();
-        let (sym, base_off) =
-            evaluate_address_of_member_chain(object, target, name_table)?;
-        let field_off =
-            evaluate_member_field_offset(&member_name, object, target, name_table);
+        let (sym, base_off) = evaluate_address_of_member_chain(object, target, name_table)?;
+        let field_off = evaluate_member_field_offset(&member_name, object, target, name_table);
         return Some((sym, base_off + field_off.unwrap_or(0)));
     }
     // Handle pointer arithmetic: ptr + N or ptr - N
-    if let ast::Expression::Binary { op, left, right, .. } = expr {
+    if let ast::Expression::Binary {
+        op, left, right, ..
+    } = expr
+    {
         match op {
             ast::BinaryOp::Add => {
                 // Try left as pointer, right as integer
@@ -4602,9 +4929,7 @@ fn infer_element_size_for_ptr_arith(
     name_table: &[String],
 ) -> i64 {
     let sym_name = match ptr_expr {
-        ast::Expression::Identifier { name, .. } => {
-            Some(resolve_sym(name_table, name).to_string())
-        }
+        ast::Expression::Identifier { name, .. } => Some(resolve_sym(name_table, name).to_string()),
         ast::Expression::Parenthesized { inner, .. } => match inner.as_ref() {
             ast::Expression::Identifier { name, .. } => {
                 Some(resolve_sym(name_table, name).to_string())
@@ -4621,13 +4946,15 @@ fn infer_element_size_for_ptr_arith(
                     match cty {
                         CType::Array(elem, _) => {
                             let resolved = resolve_sizeof_struct_ref(elem.as_ref().clone(), target);
-                            return Some(crate::common::types::sizeof_ctype(&resolved, target) as i64);
+                            return Some(
+                                crate::common::types::sizeof_ctype(&resolved, target) as i64
+                            );
                         }
                         CType::Pointer(pointee, _) => {
                             let resolved =
                                 resolve_sizeof_struct_ref(pointee.as_ref().clone(), target);
                             return Some(
-                                crate::common::types::sizeof_ctype(&resolved, target) as i64,
+                                crate::common::types::sizeof_ctype(&resolved, target) as i64
                             );
                         }
                         _ => {}
@@ -4659,7 +4986,10 @@ fn evaluate_member_field_offset(
         // Resolve forward references
         let resolved = resolve_sizeof_struct_ref(sty, target);
         // Get fields from the resolved type
-        if let CType::Struct { ref fields, packed, .. } = &resolved {
+        if let CType::Struct {
+            ref fields, packed, ..
+        } = &resolved
+        {
             let mut offset: i64 = 0;
             for field in fields {
                 if let Some(ref fname) = field.name {
@@ -4675,8 +5005,7 @@ fn evaluate_member_field_offset(
                         return Some(offset);
                     }
                 }
-                let field_sz =
-                    crate::common::types::sizeof_ctype(&field.ty, target) as i64;
+                let field_sz = crate::common::types::sizeof_ctype(&field.ty, target) as i64;
                 offset += field_sz;
             }
         } else if let CType::Union { .. } = &resolved {
@@ -4690,10 +5019,7 @@ fn evaluate_member_field_offset(
 
 /// Infer the struct/union type that the base expression points to.
 /// E.g. for `items + 1` where items: struct foo[], returns struct foo.
-fn infer_struct_type_from_expr(
-    expr: &ast::Expression,
-    name_table: &[String],
-) -> Option<CType> {
+fn infer_struct_type_from_expr(expr: &ast::Expression, name_table: &[String]) -> Option<CType> {
     match expr {
         ast::Expression::Identifier { name, .. } => {
             let sym_name = resolve_sym(name_table, name).to_string();
@@ -4704,9 +5030,7 @@ fn infer_struct_type_from_expr(
                         match cty {
                             CType::Array(elem, _) => return Some(elem.as_ref().clone()),
                             CType::Pointer(pointee, _) => return Some(pointee.as_ref().clone()),
-                            CType::Struct { .. } | CType::Union { .. } => {
-                                return Some(cty.clone())
-                            }
+                            CType::Struct { .. } | CType::Union { .. } => return Some(cty.clone()),
                             _ => {}
                         }
                     }
@@ -4717,9 +5041,7 @@ fn infer_struct_type_from_expr(
         ast::Expression::Parenthesized { inner, .. } => {
             infer_struct_type_from_expr(inner, name_table)
         }
-        ast::Expression::Cast { operand, .. } => {
-            infer_struct_type_from_expr(operand, name_table)
-        }
+        ast::Expression::Cast { operand, .. } => infer_struct_type_from_expr(operand, name_table),
         ast::Expression::Binary { left, right, .. } => {
             // For ptr + N, infer from the pointer side
             infer_struct_type_from_expr(left, name_table)
@@ -4729,7 +5051,8 @@ fn infer_struct_type_from_expr(
         | ast::Expression::MemberAccess { object, member, .. } => {
             // After member access, the result type is the member's type
             let struct_ty = infer_struct_type_from_expr(object, name_table)?;
-            let resolved = resolve_sizeof_struct_ref(struct_ty, &crate::common::target::Target::X86_64);
+            let resolved =
+                resolve_sizeof_struct_ref(struct_ty, &crate::common::target::Target::X86_64);
             if let CType::Struct { ref fields, .. } = resolved {
                 let member_name = resolve_sym(name_table, member).to_string();
                 for f in fields {
@@ -5005,10 +5328,7 @@ fn lower_brace_elision_into_aggregate(
                                 if let ast::Initializer::Expression(expr) = &first.initializer {
                                     expr_lowering::lower_expression(ctx, expr)
                                 } else {
-                                    expr_lowering::emit_int_const_for_zero(
-                                        ctx,
-                                        IrType::I32,
-                                    )
+                                    expr_lowering::emit_int_const_for_zero(ctx, IrType::I32)
                                 }
                             } else {
                                 expr_lowering::emit_int_const_for_zero(ctx, IrType::I32)
@@ -5116,11 +5436,51 @@ fn zero_init_field(
 ) {
     let resolved = crate::common::types::resolve_typedef(field_ty);
     match resolved {
-        CType::Struct { ref fields, .. } => {
-            let sub_offsets = compute_struct_field_offsets(fields, ctx.type_builder);
+        CType::Struct {
+            ref fields,
+            packed,
+            aligned,
+            ..
+        } => {
+            // Use the full layout computation that correctly handles
+            // bitfield packing (multiple bitfields share one storage
+            // unit at the same byte offset).  The old
+            // `compute_struct_field_offsets` assigned sequential offsets
+            // per field ignoring bitfields, causing buffer overflows
+            // when zero-initialising bitfield structs.
+            let layout = ctx
+                .type_builder
+                .compute_struct_layout_with_fields(fields, *packed, *aligned);
+            // Track which storage-unit byte offsets we have already
+            // zeroed so we don't emit redundant stores (many bitfield
+            // fields may share offset 0 in the same allocation unit).
+            let mut zeroed_offsets = std::collections::HashSet::<i64>::new();
             for (i, sub_field) in fields.iter().enumerate() {
-                let sub_off = byte_offset + sub_offsets.get(i).copied().unwrap_or(0) as i64;
-                zero_init_field(base_alloca, sub_off, &sub_field.ty, ctx, span);
+                let fl = &layout.fields[i];
+                let sub_off = byte_offset + fl.offset as i64;
+                // For bitfield fields, zero the storage unit exactly
+                // once instead of once per bitfield member.
+                if sub_field.bit_width.is_some() {
+                    if fl.size == 0 {
+                        // Zero-width padding bitfield — nothing to store.
+                        continue;
+                    }
+                    if zeroed_offsets.insert(sub_off) {
+                        // First bitfield at this offset — zero the
+                        // storage unit.
+                        let idx_val = make_index_value(ctx, sub_off);
+                        let (ptr, gep_inst) =
+                            ctx.builder
+                                .build_gep(base_alloca, vec![idx_val], IrType::Ptr, span);
+                        emit_inst_to_ctx(ctx, gep_inst);
+                        let ir_ty = expr_lowering::ctype_to_ir(&sub_field.ty, ctx.target);
+                        let zero_val = expr_lowering::emit_int_const_for_zero(ctx, ir_ty);
+                        let store_inst = ctx.builder.build_store(zero_val, ptr, span);
+                        emit_inst_to_ctx(ctx, store_inst);
+                    }
+                } else {
+                    zero_init_field(base_alloca, sub_off, &sub_field.ty, ctx, span);
+                }
             }
         }
         CType::Union { ref fields, .. } => {
@@ -5199,8 +5559,7 @@ fn lower_designated_struct_init(
                 *sub_packed,
                 *sub_aligned,
             );
-            let inner_offsets: Vec<usize> =
-                sub_layout.fields.iter().map(|fl| fl.offset).collect();
+            let inner_offsets: Vec<usize> = sub_layout.fields.iter().map(|fl| fl.offset).collect();
             lower_designated_struct_init(
                 base_alloca,
                 remaining_designators,
@@ -5220,9 +5579,7 @@ fn lower_designated_struct_init(
     }
 
     // Check if this field is a bitfield — if so, use read-modify-write.
-    let bf_info = field_layouts
-        .get(field_idx)
-        .and_then(|fl| fl.bitfield_info);
+    let bf_info = field_layouts.get(field_idx).and_then(|fl| fl.bitfield_info);
     if let Some((bit_offset, bit_width)) = bf_info {
         if bit_width > 0 {
             // Bitfield field — GEP to the storage unit offset and use
@@ -5235,9 +5592,7 @@ fn lower_designated_struct_init(
 
             // Lower the initializer to a value.
             let val = match initializer {
-                ast::Initializer::Expression(expr) => {
-                    expr_lowering::lower_expression(ctx, expr)
-                }
+                ast::Initializer::Expression(expr) => expr_lowering::lower_expression(ctx, expr),
                 ast::Initializer::List {
                     designators_and_initializers,
                     ..
@@ -5458,11 +5813,13 @@ fn is_char_array_type(ty: &CType) -> Option<(CType, usize)> {
         CType::Array(elem, Some(size)) => {
             let stripped = crate::common::types::resolve_typedef(elem.as_ref());
             match stripped {
-                CType::Char | CType::SChar | CType::UChar
-                | CType::Int | CType::UInt
-                | CType::Short | CType::UShort => {
-                    Some((stripped.clone(), *size))
-                }
+                CType::Char
+                | CType::SChar
+                | CType::UChar
+                | CType::Int
+                | CType::UInt
+                | CType::Short
+                | CType::UShort => Some((stripped.clone(), *size)),
                 _ => None,
             }
         }
@@ -5598,20 +5955,7 @@ fn make_index_value(ctx: &mut expr_lowering::ExprLoweringContext<'_>, byte_offse
     expr_lowering::emit_int_const_for_index(ctx, byte_offset)
 }
 
-/// Compute byte offsets for each field in a struct.
-fn compute_struct_field_offsets(
-    fields: &[crate::common::types::StructField],
-    type_builder: &crate::common::type_builder::TypeBuilder,
-) -> Vec<usize> {
-    let mut offsets = Vec::with_capacity(fields.len());
-    let mut current_offset: usize = 0;
-    for field in fields {
-        let field_align = type_builder.alignof_type(&field.ty);
-        let align = if field_align == 0 { 1 } else { field_align };
-        // Align current offset to field alignment.
-        current_offset = (current_offset + align - 1) & !(align - 1);
-        offsets.push(current_offset);
-        current_offset += type_builder.sizeof_type(&field.ty);
-    }
-    offsets
-}
+// NOTE: compute_struct_field_offsets removed — it did not handle
+// bitfield packing and caused buffer-overflow zeroing in
+// zero_init_field.  All callers now use
+// TypeBuilder::compute_struct_layout_with_fields instead.

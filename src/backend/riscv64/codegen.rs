@@ -3153,6 +3153,20 @@ impl RiscV64InstructionSelector {
                 self.emit_i(RvOpcode::ADDI, rd, SP, 0);
             }
 
+            // StackSave — capture SP into a virtual register
+            Instruction::StackSave { result, .. } => {
+                let rd = self.vmap.alloc_gpr(*result);
+                // MV rd, SP (encoded as ADDI rd, sp, 0)
+                self.emit_i(RvOpcode::ADDI, rd, SP, 0);
+            }
+
+            // StackRestore — restore SP from a previously saved value
+            Instruction::StackRestore { ptr, .. } => {
+                let rs = self.src_reg(*ptr);
+                // MV sp, rs (encoded as ADDI sp, rs, 0)
+                self.emit_i(RvOpcode::ADDI, SP, rs, 0);
+            }
+
             Instruction::InlineAsm {
                 result: _,
                 template,

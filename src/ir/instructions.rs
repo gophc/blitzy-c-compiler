@@ -364,6 +364,25 @@ pub enum Instruction {
         span: Span,
     },
 
+    /// Save the current stack pointer.  Used before VLA allocations so that
+    /// the stack can be restored when the VLA goes out of scope or when a
+    /// backwards goto re-enters the VLA's scope.
+    StackSave {
+        /// SSA result value (opaque pointer representing saved SP).
+        result: Value,
+        /// Source location.
+        span: Span,
+    },
+
+    /// Restore the stack pointer to a previously saved value.  Deallocates
+    /// any stack allocations made after the corresponding `StackSave`.
+    StackRestore {
+        /// The value returned by a prior `StackSave`.
+        ptr: Value,
+        /// Source location.
+        span: Span,
+    },
+
     /// Load a value from a memory address.
     ///
     /// Reads `ty`-sized data from the pointer `ptr`.  When `volatile` is
@@ -733,6 +752,7 @@ impl Instruction {
         match self {
             Instruction::Alloca { result, .. }
             | Instruction::StackAlloc { result, .. }
+            | Instruction::StackSave { result, .. }
             | Instruction::Load { result, .. }
             | Instruction::BinOp { result, .. }
             | Instruction::ICmp { result, .. }
@@ -754,6 +774,7 @@ impl Instruction {
             | Instruction::CondBranch { .. }
             | Instruction::Switch { .. }
             | Instruction::IndirectBranch { .. }
+            | Instruction::StackRestore { .. }
             | Instruction::Return { .. } => None,
         }
     }
@@ -766,6 +787,8 @@ impl Instruction {
         match self {
             Instruction::Alloca { span, .. }
             | Instruction::StackAlloc { span, .. }
+            | Instruction::StackSave { span, .. }
+            | Instruction::StackRestore { span, .. }
             | Instruction::Load { span, .. }
             | Instruction::Store { span, .. }
             | Instruction::BinOp { span, .. }
@@ -849,6 +872,8 @@ impl Instruction {
         match self {
             Instruction::Alloca { .. } => vec![],
             Instruction::StackAlloc { size, .. } => vec![*size],
+            Instruction::StackSave { .. } => vec![],
+            Instruction::StackRestore { ptr, .. } => vec![*ptr],
 
             Instruction::Load { ptr, .. } => vec![*ptr],
 
@@ -908,6 +933,8 @@ impl Instruction {
         match self {
             Instruction::Alloca { .. } => vec![],
             Instruction::StackAlloc { size, .. } => vec![size],
+            Instruction::StackSave { .. } => vec![],
+            Instruction::StackRestore { ptr, .. } => vec![ptr],
 
             Instruction::Load { ptr, .. } => vec![ptr],
 
@@ -1041,6 +1068,14 @@ impl fmt::Display for Instruction {
 
             Instruction::StackAlloc { result, size, .. } => {
                 write!(f, "{} = stackalloc {}", result, size)
+            }
+
+            Instruction::StackSave { result, .. } => {
+                write!(f, "{} = stacksave", result)
+            }
+
+            Instruction::StackRestore { ptr, .. } => {
+                write!(f, "stackrestore {}", ptr)
             }
 
             Instruction::Load {
