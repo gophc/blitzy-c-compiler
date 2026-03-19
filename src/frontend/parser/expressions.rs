@@ -1114,6 +1114,9 @@ fn parse_primary_expression(parser: &mut Parser<'_>) -> Result<Expression, ()> {
         TokenKind::BuiltinAddOverflow => parse_builtin_simple(parser, BuiltinKind::AddOverflow),
         TokenKind::BuiltinSubOverflow => parse_builtin_simple(parser, BuiltinKind::SubOverflow),
         TokenKind::BuiltinMulOverflow => parse_builtin_simple(parser, BuiltinKind::MulOverflow),
+        TokenKind::BuiltinAddOverflowP => parse_builtin_simple(parser, BuiltinKind::AddOverflowP),
+        TokenKind::BuiltinSubOverflowP => parse_builtin_simple(parser, BuiltinKind::SubOverflowP),
+        TokenKind::BuiltinMulOverflowP => parse_builtin_simple(parser, BuiltinKind::MulOverflowP),
         TokenKind::BuiltinObjectSize => parse_builtin_simple(parser, BuiltinKind::ObjectSize),
         TokenKind::BuiltinPrefetch => parse_builtin_simple(parser, BuiltinKind::PrefetchData),
 

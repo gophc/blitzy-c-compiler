@@ -6278,9 +6278,9 @@ fn lower_builtin(
         }
 
         // ----- Overflow-checking arithmetic -----
-        ast::BuiltinKind::AddOverflow => lower_overflow_arith(ctx, args, IrBinOp::Add, span),
-        ast::BuiltinKind::SubOverflow => lower_overflow_arith(ctx, args, IrBinOp::Sub, span),
-        ast::BuiltinKind::MulOverflow => lower_overflow_arith(ctx, args, IrBinOp::Mul, span),
+        ast::BuiltinKind::AddOverflow => lower_overflow_arith(ctx, args, IrBinOp::Add, span, false),
+        ast::BuiltinKind::SubOverflow => lower_overflow_arith(ctx, args, IrBinOp::Sub, span, false),
+        ast::BuiltinKind::MulOverflow => lower_overflow_arith(ctx, args, IrBinOp::Mul, span, false),
 
         // ----- Prefetch -----
         ast::BuiltinKind::PrefetchData => {
@@ -6727,7 +6727,7 @@ fn lower_builtin(
                 ast::BuiltinKind::MulOverflowP => IrBinOp::Mul,
                 _ => unreachable!(),
             };
-            lower_overflow_arith(ctx, args, op, span)
+            lower_overflow_arith(ctx, args, op, span, true)
         }
 
         // ----- BuiltinConstantP alias -----
@@ -7293,6 +7293,7 @@ fn lower_overflow_arith(
     args: &[ast::Expression],
     op: IrBinOp,
     span: Span,
+    predicate_only: bool,
 ) -> TypedValue {
     if args.len() < 3 {
         ctx.diagnostics
@@ -7308,14 +7309,24 @@ fn lower_overflow_arith(
     // destination pointee type, and return whether the mathematical result
     // fits in the destination type.
     //
+    // For _p variants (predicate_only=true), the third argument is a
+    // type-expression (like `(int)0`) whose TYPE determines the result type
+    // for the overflow check, but no store is performed.
+    //
     // For operands and result types ≤32 bits, i64 is a sufficient "wide"
     // type.  For 64-bit operands/results, we use special per-operation
     // overflow detection since BCC's codegen does not fully support i128.
 
-    // Determine result pointee type from the third argument's pointer type.
-    let result_ctype = match &result_ptr.ty {
-        CType::Pointer(inner, _) => (**inner).clone(),
-        _ => CType::Int,
+    // Determine result type from the third argument.
+    // For non-_p variants, it's a pointer — use the pointee type.
+    // For _p variants, use the expression's type directly.
+    let result_ctype = if predicate_only {
+        result_ptr.ty.clone()
+    } else {
+        match &result_ptr.ty {
+            CType::Pointer(inner, _) => (**inner).clone(),
+            _ => CType::Int,
+        }
     };
 
     let (_a_ir, a_signed, a_bits) = overflow_ctype_info(&a.ty);
@@ -7427,16 +7438,18 @@ fn lower_overflow_arith(
             v
         };
 
-        // Step 4: store through the pointer.
-        emit_inst(
-            ctx,
-            Instruction::Store {
-                value: result_trunc,
-                ptr: result_ptr.value,
-                volatile: false,
-                span,
-            },
-        );
+        // Step 4: store through the pointer (skip for _p variants).
+        if !predicate_only {
+            emit_inst(
+                ctx,
+                Instruction::Store {
+                    value: result_trunc,
+                    ptr: result_ptr.value,
+                    volatile: false,
+                    span,
+                },
+            );
+        }
 
         // Step 5: extend truncated value back to i64 using RESULT signedness.
         let extended64 = if res_signed {
@@ -7589,15 +7602,17 @@ fn lower_overflow_arith(
             result64
         };
 
-        emit_inst(
-            ctx,
-            Instruction::Store {
-                value: result_store,
-                ptr: result_ptr.value,
-                volatile: false,
-                span,
-            },
-        );
+        if !predicate_only {
+            emit_inst(
+                ctx,
+                Instruction::Store {
+                    value: result_store,
+                    ptr: result_ptr.value,
+                    volatile: false,
+                    span,
+                },
+            );
+        }
 
         if res_bits < 64 {
             // Result smaller than 64-bit — check via extend-and-compare.
@@ -7774,8 +7789,21 @@ fn lower_overflow_arith(
                     IrBinOp::Mul => {
                         // Signed mul overflow: compute via dividing back.
                         // If b != 0 && (result / b != a), overflow.
-                        // Also overflow if a == LONG_MIN && b == -1.
+                        // Guard division with safe_b = b | (b==0) to avoid SIGFPE.
+                        // When b==0: safe_b = 0|1 = 1 (safe divisor).
+                        // When b!=0: safe_b = b|0 = b (unchanged).
                         let zero = emit_int_const(ctx, 0, IrType::I64, span);
+                        let b_eq_zero_i1 = ctx.builder.fresh_value();
+                        emit_inst(
+                            ctx,
+                            Instruction::ICmp {
+                                result: b_eq_zero_i1,
+                                op: ICmpOp::Eq,
+                                lhs: b64,
+                                rhs: zero,
+                                span,
+                            },
+                        );
                         let b_nz = ctx.builder.fresh_value();
                         emit_inst(
                             ctx,
@@ -7787,6 +7815,29 @@ fn lower_overflow_arith(
                                 span,
                             },
                         );
+                        let b_eq_zero_i64 = ctx.builder.fresh_value();
+                        emit_inst(
+                            ctx,
+                            Instruction::ZExt {
+                                result: b_eq_zero_i64,
+                                value: b_eq_zero_i1,
+                                to_type: IrType::I64,
+                                from_type: IrType::I1,
+                                span,
+                            },
+                        );
+                        let safe_b = ctx.builder.fresh_value();
+                        emit_inst(
+                            ctx,
+                            Instruction::BinOp {
+                                result: safe_b,
+                                op: IrBinOp::Or,
+                                lhs: b64,
+                                rhs: b_eq_zero_i64,
+                                ty: IrType::I64,
+                                span,
+                            },
+                        );
                         let div_back = ctx.builder.fresh_value();
                         emit_inst(
                             ctx,
@@ -7794,7 +7845,7 @@ fn lower_overflow_arith(
                                 result: div_back,
                                 op: IrBinOp::SDiv,
                                 lhs: result64,
-                                rhs: b64,
+                                rhs: safe_b,
                                 ty: IrType::I64,
                                 span,
                             },
@@ -7861,7 +7912,19 @@ fn lower_overflow_arith(
                     }
                     IrBinOp::Mul => {
                         // Unsigned mul: result / b != a (when b != 0).
+                        // Guard division with safe_b = b | (b==0) to avoid SIGFPE.
                         let zero = emit_int_const(ctx, 0, IrType::I64, span);
+                        let b_eq_zero_i1 = ctx.builder.fresh_value();
+                        emit_inst(
+                            ctx,
+                            Instruction::ICmp {
+                                result: b_eq_zero_i1,
+                                op: ICmpOp::Eq,
+                                lhs: b64,
+                                rhs: zero,
+                                span,
+                            },
+                        );
                         let b_nz = ctx.builder.fresh_value();
                         emit_inst(
                             ctx,
@@ -7873,6 +7936,29 @@ fn lower_overflow_arith(
                                 span,
                             },
                         );
+                        let b_eq_zero_i64 = ctx.builder.fresh_value();
+                        emit_inst(
+                            ctx,
+                            Instruction::ZExt {
+                                result: b_eq_zero_i64,
+                                value: b_eq_zero_i1,
+                                to_type: IrType::I64,
+                                from_type: IrType::I1,
+                                span,
+                            },
+                        );
+                        let safe_b = ctx.builder.fresh_value();
+                        emit_inst(
+                            ctx,
+                            Instruction::BinOp {
+                                result: safe_b,
+                                op: IrBinOp::Or,
+                                lhs: b64,
+                                rhs: b_eq_zero_i64,
+                                ty: IrType::I64,
+                                span,
+                            },
+                        );
                         let div_back = ctx.builder.fresh_value();
                         emit_inst(
                             ctx,
@@ -7880,7 +7966,7 @@ fn lower_overflow_arith(
                                 result: div_back,
                                 op: IrBinOp::UDiv,
                                 lhs: result64,
-                                rhs: b64,
+                                rhs: safe_b,
                                 ty: IrType::I64,
                                 span,
                             },

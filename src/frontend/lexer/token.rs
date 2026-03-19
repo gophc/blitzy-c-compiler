@@ -365,6 +365,12 @@ pub enum TokenKind {
     BuiltinSubOverflow,
     /// `__builtin_mul_overflow`
     BuiltinMulOverflow,
+    /// `__builtin_add_overflow_p`
+    BuiltinAddOverflowP,
+    /// `__builtin_sub_overflow_p`
+    BuiltinSubOverflowP,
+    /// `__builtin_mul_overflow_p`
+    BuiltinMulOverflowP,
     /// `__builtin_object_size`
     BuiltinObjectSize,
     /// `__builtin_extract_return_addr`
@@ -675,6 +681,9 @@ impl TokenKind {
             | TokenKind::BuiltinAddOverflow
             | TokenKind::BuiltinSubOverflow
             | TokenKind::BuiltinMulOverflow
+            | TokenKind::BuiltinAddOverflowP
+            | TokenKind::BuiltinSubOverflowP
+            | TokenKind::BuiltinMulOverflowP
             | TokenKind::BuiltinObjectSize
             | TokenKind::BuiltinExtractReturnAddr
             | TokenKind::BuiltinPrefetch
@@ -896,6 +905,9 @@ impl TokenKind {
             TokenKind::BuiltinAddOverflow => Some("__builtin_add_overflow"),
             TokenKind::BuiltinSubOverflow => Some("__builtin_sub_overflow"),
             TokenKind::BuiltinMulOverflow => Some("__builtin_mul_overflow"),
+            TokenKind::BuiltinAddOverflowP => Some("__builtin_add_overflow_p"),
+            TokenKind::BuiltinSubOverflowP => Some("__builtin_sub_overflow_p"),
+            TokenKind::BuiltinMulOverflowP => Some("__builtin_mul_overflow_p"),
             TokenKind::BuiltinObjectSize => Some("__builtin_object_size"),
             TokenKind::BuiltinExtractReturnAddr => Some("__builtin_extract_return_addr"),
             TokenKind::BuiltinPrefetch => Some("__builtin_prefetch"),
@@ -1271,6 +1283,9 @@ pub fn lookup_keyword(s: &str) -> Option<TokenKind> {
         "__builtin_add_overflow" => Some(TokenKind::BuiltinAddOverflow),
         "__builtin_sub_overflow" => Some(TokenKind::BuiltinSubOverflow),
         "__builtin_mul_overflow" => Some(TokenKind::BuiltinMulOverflow),
+        "__builtin_add_overflow_p" => Some(TokenKind::BuiltinAddOverflowP),
+        "__builtin_sub_overflow_p" => Some(TokenKind::BuiltinSubOverflowP),
+        "__builtin_mul_overflow_p" => Some(TokenKind::BuiltinMulOverflowP),
         "__builtin_object_size" => Some(TokenKind::BuiltinObjectSize),
         "__builtin_extract_return_addr" => Some(TokenKind::BuiltinExtractReturnAddr),
         "__builtin_prefetch" => Some(TokenKind::BuiltinPrefetch),
