@@ -583,8 +583,30 @@ pub fn parse_function_definition(
         func_attrs.extend(attributes::parse_attribute_specifier(parser)?);
     }
 
+    // Shadow any parameter names that collide with typedef names.
+    //
+    // In C, a parameter declaration like `void f(list *list)` — where
+    // `list` is both a typedef name and the parameter name — causes the
+    // parameter name to shadow the typedef for the entire function body.
+    // We must remove these names from the typedef set *before* parsing
+    // the compound statement, otherwise the parser will treat every use
+    // of the parameter name as a type specifier and fail to parse member
+    // access expressions (`list->head`).
+    //
+    // We push a typedef scope here so that the shadowed names are restored
+    // when we leave this function definition (the compound statement
+    // pushes its *own* nested scope internally).
+    parser.push_typedef_scope();
+    shadow_function_parameter_typedefs(parser, &declarator);
+
     // Parse the function body (compound statement).
-    let body = statements::parse_compound_statement(parser)?;
+    let body = statements::parse_compound_statement(parser);
+
+    // Pop the function-level typedef shadow scope, restoring any names
+    // that were shadowed by parameter declarations.
+    parser.pop_typedef_scope();
+
+    let body = body?;
 
     let span = parser.make_span(start_span);
     Ok(FunctionDefinition {
@@ -2116,6 +2138,48 @@ fn extract_declarator_name(direct: &DirectDeclarator) -> Option<Symbol> {
         DirectDeclarator::Parenthesized(inner) => extract_declarator_name(&inner.direct),
         DirectDeclarator::Array { base, .. } => extract_declarator_name(base),
         DirectDeclarator::Function { base, .. } => extract_declarator_name(base),
+    }
+}
+
+/// Shadow typedef names that collide with function parameter names.
+///
+/// In C, a parameter name is allowed to shadow a typedef name in the same
+/// scope:
+///
+/// ```c
+/// typedef struct list { ... } list;
+/// void foo(list *list) {   // parameter "list" shadows typedef "list"
+///     list->head = ...;    // "list" here is the variable, not the type
+/// }
+/// ```
+///
+/// This function walks the function declarator to find the parameter list,
+/// extracts each parameter's name, and calls `shadow_typedef` for any
+/// name that currently matches a typedef.  This must be called *before*
+/// the function body is parsed so that the parser treats these names as
+/// ordinary identifiers inside the body.
+fn shadow_function_parameter_typedefs(parser: &mut Parser<'_>, declarator: &Declarator) {
+    // Walk through the direct declarator to find the Function variant.
+    fn find_params(direct: &DirectDeclarator) -> Option<&Vec<ParameterDeclaration>> {
+        match direct {
+            DirectDeclarator::Function { params, .. } => Some(params),
+            DirectDeclarator::Parenthesized(inner) => find_params(&inner.direct),
+            DirectDeclarator::Array { base, .. } => find_params(base),
+            DirectDeclarator::Identifier(..) => None,
+        }
+    }
+
+    if let Some(params) = find_params(&declarator.direct) {
+        for param in params {
+            // Extract the parameter name from its declarator (if named).
+            if let Some(ref decl) = param.declarator {
+                if let Some(sym) = extract_declarator_name(&decl.direct) {
+                    if parser.is_typedef_name(sym) {
+                        parser.shadow_typedef(sym);
+                    }
+                }
+            }
+        }
     }
 }
 

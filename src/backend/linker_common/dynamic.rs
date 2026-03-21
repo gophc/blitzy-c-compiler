@@ -116,6 +116,13 @@ pub struct ImportedSymbol {
     pub binding: u8,
     pub sym_type: u8,
     pub needs_plt: bool,
+    /// If true, this is a data symbol requiring `R_*_COPY` relocation
+    /// rather than GOT/PLT entries. The linker allocates space in
+    /// `.bss.copy` and the dynamic linker copies the initial value
+    /// from the shared library at load time.
+    pub needs_copy: bool,
+    /// Size in bytes for copy-relocated data symbols.
+    pub copy_size: u64,
 }
 
 // ===========================================================================
@@ -1301,8 +1308,16 @@ pub fn build_dynamic_sections(
         ctx.dynsym.add_symbol(ds);
     }
 
-    // Add all imported (undefined) symbols — give them GOT/PLT entries as needed
+    // Add all imported (undefined) symbols — give them GOT/PLT entries as needed.
+    // Data symbols that need copy relocations are handled separately below.
     for sym in imported_symbols {
+        // Copy-relocated data symbols (stderr, stdout, stdin, etc.) are
+        // handled after the main imported-symbol loop — they need
+        // R_*_COPY in .rela.dyn and no PLT/GOT.PLT entries.
+        if sym.needs_copy {
+            continue;
+        }
+
         // Trust the needs_plt flag computed from relocation types — do NOT
         // re-filter on sym_type because GCC .o files mark external
         // functions as STT_NOTYPE rather than STT_FUNC.
@@ -1368,6 +1383,45 @@ pub fn build_dynamic_sections(
         }
     }
 
+    // Add copy-relocated data symbols (stderr, stdout, stdin, environ, etc.).
+    // These symbols are placed in .bss.copy in the executable and the dynamic
+    // linker copies their initial values from the shared library at load time
+    // via R_*_COPY relocations. They do NOT get PLT/GOT.PLT entries.
+    let copy_reloc_type = default_copy_reloc(*target);
+    for sym in imported_symbols {
+        if !sym.needs_copy {
+            continue;
+        }
+
+        // Data symbols are added to .dynsym as STT_OBJECT with a
+        // placeholder value of 0. The caller (linker_common::link) will
+        // patch the value to the .bss.copy VA after layout.
+        let ds = DynamicSymbol {
+            name: sym.name.clone(),
+            value: 0,              // patched to .bss.copy VA later
+            size: sym.copy_size,
+            binding: sym.binding,
+            sym_type: STT_OBJECT,
+            visibility: STV_DEFAULT,
+            section_index: 0, // will be patched to .bss.copy shndx later
+            is_defined: false, // UND — ld.so resolves from shared lib
+            is_plt_entry: false,
+            got_offset: None,
+            plt_index: None,
+        };
+
+        let sym_idx = ctx.dynsym.add_symbol(ds);
+
+        // Emit R_*_COPY in .rela.dyn. The r_offset is 0 here — the
+        // caller patches it to the .bss.copy VA after layout.
+        ctx.rela.add_rela_dyn(DynamicRelocation {
+            offset: 0, // patched by linker_common::link
+            sym_index: sym_idx,
+            rel_type: copy_reloc_type,
+            addend: 0,
+        });
+    }
+
     // Finalise (builds .gnu.hash and .dynamic from accumulated state)
     ctx.finalize();
 
@@ -1409,6 +1463,19 @@ pub fn default_jump_slot_reloc(target: Target) -> u32 {
         Target::I686 => 7,       // R_386_JMP_SLOT
         Target::AArch64 => 1026, // R_AARCH64_JUMP_SLOT
         Target::RiscV64 => 5,    // R_RISCV_JUMP_SLOT
+    }
+}
+
+/// Returns the `R_*_COPY` relocation type for the given target.
+/// Copy relocations instruct the dynamic linker to copy the initial
+/// value of a data symbol from a shared library into the executable's
+/// `.bss.copy` segment at load time.
+pub fn default_copy_reloc(target: Target) -> u32 {
+    match target {
+        Target::X86_64 => 5,     // R_X86_64_COPY
+        Target::I686 => 5,       // R_386_COPY
+        Target::AArch64 => 1024, // R_AARCH64_COPY
+        Target::RiscV64 => 4,    // R_RISCV_COPY
     }
 }
 

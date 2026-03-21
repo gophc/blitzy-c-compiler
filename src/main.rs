@@ -1090,6 +1090,8 @@ fn run_compilation(args: CliArgs) -> Result<(), String> {
         TempDir::new().map_err(|e| format!("failed to create temporary directory: {}", e))?;
 
     let mut object_files: Vec<PathBuf> = Vec::new();
+    // Track which .o files BCC created (temps) vs user-provided (keep).
+    let mut temp_object_files: Vec<PathBuf> = Vec::new();
 
     for input in &args.input_files {
         // If the input is already an object file or archive, pass it
@@ -1113,7 +1115,8 @@ fn run_compilation(args: CliArgs) -> Result<(), String> {
             &ctx,
         )?;
 
-        object_files.push(obj_path);
+        object_files.push(obj_path.clone());
+        temp_object_files.push(obj_path);
         // Keep the temp file alive (don't drop it yet)
         temp_obj.keep();
     }
@@ -1122,8 +1125,9 @@ fn run_compilation(args: CliArgs) -> Result<(), String> {
     let final_output = output_path.as_deref().unwrap_or("a.out");
     link_object_files(&object_files, final_output, &ctx)?;
 
-    // Clean up temporary .o files
-    for obj_path in &object_files {
+    // Clean up ONLY temporary .o files created by BCC — never delete
+    // user-provided .o files or archives.
+    for obj_path in &temp_object_files {
         let _ = fs::remove_file(obj_path);
     }
 
@@ -1377,6 +1381,90 @@ fn is_object_or_archive(path: &str) -> bool {
         }
     }
     false
+}
+
+/// Parse a Unix `ar` archive (`.a` file) and extract individual ELF
+/// object members.  Returns a list of `(member_name, member_data)` pairs.
+///
+/// The archive format consists of:
+///   - 8-byte global header: `!<arch>\n`
+///   - Per-member headers (60 bytes each): name(16), date(12), uid(6),
+///     gid(6), mode(8), size(10), fmag(2="`\n"`)
+///   - Member data padded to 2-byte alignment
+///
+/// Special members like `//` (extended name table) and `/` (symbol table)
+/// are handled or skipped appropriately.
+fn parse_ar_archive(data: &[u8], archive_name: &str) -> Vec<(String, Vec<u8>)> {
+    let mut members = Vec::new();
+    let mut offset = 8; // skip "!<arch>\n"
+    let mut extended_names: &[u8] = &[];
+
+    while offset + 60 <= data.len() {
+        let header = &data[offset..offset + 60];
+        // Validate fmag bytes "`\n" at offset 58-59
+        if header[58] != b'`' || header[59] != b'\n' {
+            break; // corrupt header
+        }
+
+        // Parse name field (16 bytes)
+        let name_raw = &header[0..16];
+        // Parse size field (10 bytes, ASCII decimal)
+        let size_str = std::str::from_utf8(&header[48..58])
+            .unwrap_or("0")
+            .trim();
+        let member_size: usize = size_str.parse().unwrap_or(0);
+        let member_start = offset + 60;
+        let member_end = (member_start + member_size).min(data.len());
+
+        // Determine the member name.
+        let name_trimmed = std::str::from_utf8(name_raw)
+            .unwrap_or("")
+            .trim_end();
+
+        if name_trimmed == "/" || name_trimmed == "/SYM64/" {
+            // Symbol table — skip.
+        } else if name_trimmed == "//" {
+            // Extended name table — store for lookups.
+            extended_names = &data[member_start..member_end];
+        } else {
+            // Regular member or extended-name reference.
+            let member_name = if name_trimmed.starts_with('/') {
+                // Extended name: "/NN" where NN is offset into extended names table.
+                let ext_offset: usize = name_trimmed[1..].trim().parse().unwrap_or(0);
+                if ext_offset < extended_names.len() {
+                    // Name ends at '/' or '\n' within the extended names table.
+                    let end = extended_names[ext_offset..]
+                        .iter()
+                        .position(|&b| b == b'/' || b == b'\n')
+                        .map(|p| ext_offset + p)
+                        .unwrap_or(extended_names.len());
+                    std::str::from_utf8(&extended_names[ext_offset..end])
+                        .unwrap_or("member.o")
+                        .to_string()
+                } else {
+                    format!("{}:member_{}", archive_name, members.len())
+                }
+            } else {
+                // Short name: strip trailing '/'.
+                name_trimmed.trim_end_matches('/').to_string()
+            };
+
+            let member_data = data[member_start..member_end].to_vec();
+
+            // Only include ELF members (skip any non-ELF data).
+            if member_data.len() >= 4 && &member_data[..4] == b"\x7fELF" {
+                members.push((member_name, member_data));
+            }
+        }
+
+        // Advance to next member (2-byte aligned).
+        offset = member_start + member_size;
+        if offset % 2 != 0 {
+            offset += 1;
+        }
+    }
+
+    members
 }
 
 /// Compile an assembly source file (.S) by preprocessing with BCC's
@@ -2201,7 +2289,9 @@ fn link_object_files(
     output: &str,
     ctx: &CompilationContext,
 ) -> Result<(), String> {
-    use bcc::backend::generation::{create_relocation_handler, parse_elf_object_to_linker_input};
+    use bcc::backend::generation::{
+        create_relocation_handler, parse_elf_object_to_linker_input_uniquified,
+    };
     use bcc::backend::linker_common::{link, LinkerConfig, OutputType};
 
     // Determine output type based on compilation flags.
@@ -2294,17 +2384,35 @@ fn link_object_files(
         config.needed_libs.push("libc.so.6".to_string());
     }
 
-    // Parse each object file into a LinkerInput.
+    // Parse each object file (or archive) into LinkerInput(s).
     let mut inputs = Vec::with_capacity(object_files.len());
-    for (idx, obj_path) in object_files.iter().enumerate() {
+    let mut input_idx: u32 = 0;
+    for obj_path in object_files.iter() {
         let data = fs::read(obj_path)
             .map_err(|e| format!("failed to read object file '{}': {}", obj_path.display(), e))?;
         let filename = obj_path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("input.o");
-        let linker_input = parse_elf_object_to_linker_input(idx as u32, filename, &data);
-        inputs.push(linker_input);
+
+        // Check if this is a static archive (.a file) by looking for
+        // the "!<arch>\n" magic header.
+        if data.len() >= 8 && &data[..8] == b"!<arch>\n" {
+            // Parse archive members and add each .o member as a
+            // separate LinkerInput.
+            let members = parse_ar_archive(&data, filename);
+            for (member_name, member_data) in &members {
+                let li =
+                    parse_elf_object_to_linker_input_uniquified(input_idx, member_name, member_data);
+                inputs.push(li);
+                input_idx += 1;
+            }
+        } else {
+            let linker_input =
+                parse_elf_object_to_linker_input_uniquified(input_idx, filename, &data);
+            inputs.push(linker_input);
+            input_idx += 1;
+        }
     }
 
     // Create the architecture-specific relocation handler.

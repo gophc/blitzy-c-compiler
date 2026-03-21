@@ -2239,39 +2239,71 @@ fn resolve_div_conflicts(mf: &mut MachineFunction) {
 ///   SHL  dst, CL
 /// ```
 ///
-/// If the register allocator assigns `dst` to RCX, the second MOV
-/// clobbers `lhs` before the shift executes, producing:
+/// **Problem 1 (CASE 1):** If the register allocator assigns `dst = RCX`,
+/// the `MOV RCX, rhs` clobbers the lhs.  Spill-code insertion may also
+/// interleave instructions between the setup MOVs and the shift, so we
+/// cannot assume the three instructions are contiguous.
+///
+/// **Problem 2 (CASE 2):** If `dst ≠ RCX` but the allocator has placed a
+/// live value in RCX, the `MOV RCX, rhs` clobbers it.
+///
+/// **Robust fix for both cases:**
+///
+/// *CASE 1 (dst = RCX):* Search backward from the shift for the
+/// `MOV RCX, rhs` (shift-amount setup).  Insert `PUSH RCX` before it
+/// (saving the lhs that's currently in RCX), then after the `MOV RCX,
+/// rhs`, pop the saved lhs into a scratch register, execute the shift
+/// on the scratch, and move the result back to RCX:
 ///
 /// ```text
-///   MOV  RCX, lhs        ; RCX = lhs
-///   MOV  RCX, rhs        ; RCX = rhs  ← overwrites lhs!
-///   SHL  RCX, CL         ; rhs << rhs  ← WRONG
+///   PUSH RCX             ; save lhs (currently in RCX)
+///   MOV  RCX, rhs        ; load shift amount into CL
+///   POP  R11             ; R11 = saved lhs (R11 is reserved spill scratch)
+///   SHL  R11, CL         ; shift on scratch
+///   MOV  RCX, R11        ; result → RCX
 /// ```
 ///
-/// This pass detects the pattern and rewrites it to use a scratch register:
-///
-/// ```text
-///   MOV  scratch, lhs    ; scratch = lhs
-///   MOV  RCX, rhs        ; CL = rhs
-///   SHL  scratch, CL     ; scratch = lhs << rhs
-///   MOV  RCX, scratch    ; result back in RCX
-/// ```
+/// *CASE 2 (dst ≠ RCX):* PUSH RCX before the shift-count setup,
+/// execute the shift, then POP RCX to restore the live value.
 fn resolve_shift_conflicts(mf: &mut MachineFunction) {
     const MOV_OP: u32 = 0; // X86Opcode::Mov
     const SHL_OP: u32 = 19; // X86Opcode::Shl
     const SHR_OP: u32 = 20; // X86Opcode::Shr
     const SAR_OP: u32 = 21; // X86Opcode::Sar
+    const PUSH_OP: u32 = 4; // X86Opcode::Push
+    const POP_OP: u32 = 5; // X86Opcode::Pop
     const RCX: u16 = 1;
+    // R11 is the dedicated spill scratch register — NEVER allocated by
+    // the register allocator, so it is always safe to use as temporary.
+    // R10 is in ALLOCATABLE_GPRS and may hold live values — do NOT use.
     const R11: u16 = 11;
-    const R10: u16 = 10;
 
     fn is_shift(opcode: u32) -> bool {
         opcode == SHL_OP || opcode == SHR_OP || opcode == SAR_OP
     }
 
+    /// Search backward from position `before` in `insts` for a
+    /// `MOV RCX, <src>` instruction.  Returns the index, or `None` if
+    /// a shift or block boundary is reached first.
+    fn find_mov_rcx_backward(insts: &[MachineInstruction], before: usize) -> Option<usize> {
+        for j in (0..before).rev() {
+            if insts[j].opcode == MOV_OP
+                && matches!(insts[j].result, Some(MachineOperand::Register(r)) if r == RCX)
+            {
+                return Some(j);
+            }
+            // Stop searching past other shifts — we don't want to cross
+            // into the setup region of a previous shift instruction.
+            if is_shift(insts[j].opcode) {
+                break;
+            }
+        }
+        None
+    }
+
     for block in &mut mf.blocks {
         let mut new_insts: Vec<MachineInstruction> =
-            Vec::with_capacity(block.instructions.len() + 8);
+            Vec::with_capacity(block.instructions.len() + 16);
         let old_insts = std::mem::take(&mut block.instructions);
         let len = old_insts.len();
 
@@ -2283,98 +2315,80 @@ fn resolve_shift_conflicts(mf: &mut MachineFunction) {
                 continue;
             }
 
+            // Check if the shift destination is RCX (register 1).
             let shift_dst_is_rcx =
-                matches!(old_insts[i].result, Some(MachineOperand::Register(RCX)));
+                matches!(old_insts[i].result, Some(MachineOperand::Register(r)) if r == RCX);
 
             if shift_dst_is_rcx {
                 // ── CASE 1: SHL/SHR/SAR RCX, CL ──
-                // The destination is RCX.  The codegen setup is:
-                //   MOV RCX, <lhs>    (value to shift)
-                //   MOV RCX, <rhs>    (shift amount → CL)
-                //   SHL RCX, CL       <-- we're here
-                // The first MOV is clobbered by the second.  Fix by
-                // redirecting lhs and the shift to a scratch register.
-
-                let ni_len = new_insts.len();
-                if ni_len < 2 {
-                    new_insts.push(old_insts[i].clone());
-                    i += 1;
-                    continue;
-                }
-
-                let mov_rhs_idx = ni_len - 1;
-                let mov_lhs_idx = ni_len - 2;
-
-                let rhs_is_mov_rcx = new_insts[mov_rhs_idx].opcode == MOV_OP
-                    && matches!(
-                        new_insts[mov_rhs_idx].result,
-                        Some(MachineOperand::Register(RCX))
-                    );
-                let lhs_is_mov_rcx = new_insts[mov_lhs_idx].opcode == MOV_OP
-                    && matches!(
-                        new_insts[mov_lhs_idx].result,
-                        Some(MachineOperand::Register(RCX))
-                    );
-
-                if !(rhs_is_mov_rcx && lhs_is_mov_rcx) {
-                    new_insts.push(old_insts[i].clone());
-                    i += 1;
-                    continue;
-                }
-
-                let rhs_src = new_insts[mov_rhs_idx].operands.first().cloned();
-                let rhs_reg = match &rhs_src {
-                    Some(MachineOperand::Register(r)) => Some(*r),
-                    _ => None,
-                };
-                let scratch = if rhs_reg != Some(R11) { R11 } else { R10 };
-
-                new_insts[mov_lhs_idx].result = Some(MachineOperand::Register(scratch));
-
-                let mut shift_inst = old_insts[i].clone();
-                shift_inst.result = Some(MachineOperand::Register(scratch));
-                new_insts.push(shift_inst);
-
-                let mut restore = MachineInstruction::new(MOV_OP);
-                restore.result = Some(MachineOperand::Register(RCX));
-                restore.operands.push(MachineOperand::Register(scratch));
-                new_insts.push(restore);
-            } else {
-                // ── CASE 2: SHL/SHR/SAR <dst>, CL  where dst ≠ RCX ──
-                // The codegen loads the shift count into RCX, which
-                // clobbers whatever the register allocator placed there.
-                // We save/restore RCX via PUSH/POP (stack-safe, no
-                // scratch register clobbering) around the MOV+SHL.
                 //
-                // Rewrite:
-                //   ... MOV RCX, <shift_count> ...
-                //   SHL <dst>, CL
-                // Into:
-                //   PUSH RCX                   (save previous RCX)
-                //   MOV RCX, <shift_count>     (load shift count)
-                //   SHL <dst>, CL              (shift)
-                //   POP RCX                    (restore previous RCX)
-
-                const PUSH_OP: u32 = 4; // X86Opcode::Push
-                const POP_OP: u32 = 5; // X86Opcode::Pop
-
-                // Find the MOV RCX, <shift_count> in the preceding
-                // new_insts that sets up CL.
-                let mut mov_rcx_idx = None;
-                for j in (0..new_insts.len()).rev() {
-                    if new_insts[j].opcode == MOV_OP
-                        && matches!(new_insts[j].result, Some(MachineOperand::Register(RCX)))
-                    {
-                        mov_rcx_idx = Some(j);
-                        break;
-                    }
-                    if is_shift(new_insts[j].opcode) {
-                        break;
-                    }
-                }
+                // The lhs is in RCX (as allocated by regalloc).  The
+                // `MOV RCX, rhs` that loads the shift amount will clobber
+                // the lhs.  There may be spill reloads between the MOV
+                // that placed the lhs in RCX and the MOV that loads rhs.
+                //
+                // Strategy: find the MOV RCX, <shift_amount> in the
+                // already-emitted new_insts.  Insert PUSH RCX before it
+                // to save the lhs.  After the MOV RCX (which loads the
+                // shift amount), pop the saved lhs into R11 (the
+                // dedicated spill scratch — never allocated), shift R11,
+                // then MOV RCX ← R11.
+                let mov_rcx_idx = find_mov_rcx_backward(&new_insts, new_insts.len());
 
                 if let Some(mcx_idx) = mov_rcx_idx {
-                    // Insert: PUSH RCX (save) BEFORE the MOV RCX
+                    // Insert PUSH RCX before the MOV RCX, <shift_amount>
+                    let mut save_inst = MachineInstruction::new(PUSH_OP);
+                    save_inst.operands.push(MachineOperand::Register(RCX));
+                    new_insts.insert(mcx_idx, save_inst);
+                    // mcx_idx+1 is now the MOV RCX, <shift_amount>
+
+                    // POP R11 — restore saved lhs into the dedicated
+                    // scratch register.  R11 is NEVER allocated by the
+                    // register allocator, so we cannot clobber any live
+                    // value.  (R10 IS allocatable and was causing segfaults
+                    // when the allocator had assigned a live pointer to it.)
+                    let mut pop_lhs = MachineInstruction::new(POP_OP);
+                    pop_lhs.result = Some(MachineOperand::Register(R11));
+                    new_insts.push(pop_lhs);
+
+                    // SHL R11, CL — execute the shift on the scratch.
+                    //
+                    // The shift instruction after regalloc has:
+                    //   result = Some(Register(RCX))   ← destination
+                    //   operands = [Register(RCX)]     ← shift count (CL)
+                    //
+                    // The encoder normalises result→operands[0], so it
+                    // becomes [dst, count].  We ONLY change the result
+                    // (destination) to R11.  The operands[0] must REMAIN
+                    // as Register(RCX) because that IS the shift count
+                    // (CL register).  Replacing it with R11 would break
+                    // the encoder pattern match (it checks *cl == RCX).
+                    let mut shift_inst = old_insts[i].clone();
+                    shift_inst.result = Some(MachineOperand::Register(R11));
+                    // Do NOT modify operands — operands[0] is the CL
+                    // shift count and must stay as Register(RCX).
+                    new_insts.push(shift_inst);
+
+                    // MOV RCX, R11 — result back to the destination.
+                    let mut restore = MachineInstruction::new(MOV_OP);
+                    restore.result = Some(MachineOperand::Register(RCX));
+                    restore.operands.push(MachineOperand::Register(R11));
+                    new_insts.push(restore);
+                } else {
+                    // Could not find the MOV RCX setup — emit as-is
+                    // (this shouldn't happen in practice).
+                    new_insts.push(old_insts[i].clone());
+                }
+            } else {
+                // ── CASE 2: SHL/SHR/SAR <dst>, CL  where dst ≠ RCX ──
+                //
+                // The codegen loaded the shift count into RCX, which may
+                // clobber the allocator's live value in RCX.  We bracket
+                // the shift-count setup + shift with PUSH/POP RCX.
+                let mov_rcx_idx = find_mov_rcx_backward(&new_insts, new_insts.len());
+
+                if let Some(mcx_idx) = mov_rcx_idx {
+                    // Insert PUSH RCX before the MOV RCX, <shift_count>
                     let mut save_inst = MachineInstruction::new(PUSH_OP);
                     save_inst.operands.push(MachineOperand::Register(RCX));
                     new_insts.insert(mcx_idx, save_inst);
@@ -2382,7 +2396,7 @@ fn resolve_shift_conflicts(mf: &mut MachineFunction) {
                     // Push the shift instruction
                     new_insts.push(old_insts[i].clone());
 
-                    // Insert: POP RCX (restore) AFTER the shift
+                    // POP RCX — restore the allocator's live value.
                     let mut restore_inst = MachineInstruction::new(POP_OP);
                     restore_inst.result = Some(MachineOperand::Register(RCX));
                     new_insts.push(restore_inst);
@@ -5021,6 +5035,27 @@ pub fn parse_elf_object_to_linker_input(
     filename: &str,
     data: &[u8],
 ) -> LinkerInput {
+    parse_elf_object_to_linker_input_impl(object_id, filename, data, false)
+}
+
+/// Parse an ELF relocatable object with optional LOCAL symbol uniquification.
+/// When `uniquify_locals` is true, non-section LOCAL symbols get an `__obj<id>`
+/// suffix to prevent name collisions across different object files during
+/// multi-object linking.
+pub fn parse_elf_object_to_linker_input_uniquified(
+    object_id: u32,
+    filename: &str,
+    data: &[u8],
+) -> LinkerInput {
+    parse_elf_object_to_linker_input_impl(object_id, filename, data, true)
+}
+
+fn parse_elf_object_to_linker_input_impl(
+    object_id: u32,
+    filename: &str,
+    data: &[u8],
+    uniquify_locals: bool,
+) -> LinkerInput {
     use crate::backend::linker_common::section_merger::InputSection;
     use crate::backend::linker_common::symbol_resolver::{
         InputSymbol, STB_GLOBAL, STB_LOCAL, STB_WEAK, STT_FUNC, STT_NOTYPE, STT_OBJECT, STV_DEFAULT,
@@ -5299,6 +5334,20 @@ pub fn parse_elf_object_to_linker_input(
                 }
             }
 
+            // Uniquify non-section LOCAL symbols by appending the object ID.
+            // Different .o files may have identically-named local symbols
+            // (e.g. `.str.0`, `.L.str.0`, static helper functions) that
+            // must not collide in the linker's symbol address map.
+            // Only applied when linking multiple object files together.
+            if uniquify_locals
+                && binding == 0
+                && !name.is_empty()
+                && sym_type != 3
+                && !name.starts_with("__secsym_")
+            {
+                name = format!("{}__obj{}", name, object_id);
+            }
+
             input.symbols.push(InputSymbol {
                 name,
                 value: st_value,
@@ -5388,6 +5437,10 @@ pub fn parse_elf_object_to_linker_input(
         // relocation sym_index values can index directly.
         let mut elf_sym_names: Vec<String> = Vec::new();
         let mut elf_sym_sec_idx: Vec<u16> = Vec::new();
+        // Track binding and type for each ELF symbol so relocation
+        // processing can uniquify local symbol references consistently.
+        let mut elf_sym_bindings: Vec<u8> = Vec::new();
+        let mut elf_sym_types: Vec<u8> = Vec::new();
 
         if let Some(si) = symtab_idx {
             let sym_sh = &shdrs[si];
@@ -5432,15 +5485,19 @@ pub fn parse_elf_object_to_linker_input(
                 if sym_off + sym_entry_size > data.len() {
                     elf_sym_names.push(String::new());
                     elf_sym_sec_idx.push(0);
+                    elf_sym_bindings.push(1); // default global
+                    elf_sym_types.push(0);
                     continue;
                 }
-                let (st_name_val, st_shndx_val) = if is_64bit {
-                    (read_u32(sym_off), read_u16(sym_off + 6))
+                let (st_name_val, st_shndx_val, st_info_val) = if is_64bit {
+                    (read_u32(sym_off), read_u16(sym_off + 6), data[sym_off + 4])
                 } else {
-                    (read_u32(sym_off), read_u16(sym_off + 14))
+                    (read_u32(sym_off), read_u16(sym_off + 14), data[sym_off + 12])
                 };
                 elf_sym_names.push(sym_name_local(st_name_val));
                 elf_sym_sec_idx.push(st_shndx_val);
+                elf_sym_bindings.push(st_info_val >> 4);
+                elf_sym_types.push(st_info_val & 0xf);
             }
         }
 
@@ -5472,12 +5529,12 @@ pub fn parse_elf_object_to_linker_input(
             if !sec_idx_map.contains_key(&target_sec_idx) {
                 continue;
             }
-            let target_sec_name = sec_name_map
+            let _target_sec_name = sec_name_map
                 .get(&target_sec_idx)
                 .cloned()
                 .unwrap_or_default();
             // Determine the input.sections position (for section_index).
-            let sec_input_pos = sec_idx_map.get(&target_sec_idx).copied();
+            let _sec_input_pos = sec_idx_map.get(&target_sec_idx).copied();
 
             let is_rela = sh.sh_type == 4;
             let entry_size = if sh.sh_entsize > 0 {
@@ -5573,14 +5630,43 @@ pub fn parse_elf_object_to_linker_input(
                     symbol_name
                 };
 
-                // Use the original section index in the ELF file as
-                // section_index. The linker uses output_section_name to
-                // find the right output section.
-                let section_index = if let Some(pos) = sec_input_pos {
-                    (pos + 1) as u32 // 1-based (section 0 = null)
+                // Uniquify non-section LOCAL symbol references by
+                // appending the object ID — must match the uniquification
+                // applied in the input.symbols loop above so that
+                // relocations resolve to the correct per-object symbol.
+                // Only applied during multi-object linking.
+                let symbol_name = if uniquify_locals {
+                    let sym_binding_val = elf_sym_bindings
+                        .get(sym_index as usize)
+                        .copied()
+                        .unwrap_or(1);
+                    let sym_type_val = elf_sym_types
+                        .get(sym_index as usize)
+                        .copied()
+                        .unwrap_or(0);
+                    if sym_binding_val == 0
+                        && !symbol_name.is_empty()
+                        && sym_type_val != 3
+                        && !symbol_name.starts_with("__secsym_")
+                    {
+                        format!("{}__obj{}", symbol_name, object_id)
+                    } else {
+                        symbol_name
+                    }
                 } else {
-                    target_sec_idx
+                    symbol_name
                 };
+
+                // Use the original ELF section header index as
+                // section_index so it matches the fragment map key
+                // (InputSection::original_index).  Do NOT pre-set
+                // output_section_name — let annotate_relocations both
+                // set the name AND adjust the offset by the fragment's
+                // offset_in_output.  Pre-setting the name would cause
+                // annotate_relocations to skip offset adjustment,
+                // leading to relocations applied at wrong positions
+                // in the merged output section.
+                let section_index = target_sec_idx;
 
                 // Push into the top-level relocations that the common
                 // linker's Phase 5 collects.
@@ -5594,11 +5680,7 @@ pub fn parse_elf_object_to_linker_input(
                         addend: r_addend,
                         object_id,
                         section_index,
-                        output_section_name: if target_sec_name.is_empty() {
-                            None
-                        } else {
-                            Some(target_sec_name.clone())
-                        },
+                        output_section_name: None,
                     });
             }
         }

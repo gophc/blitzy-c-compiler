@@ -417,6 +417,9 @@ pub fn register_predefined_macros(macro_defs: &mut FxHashMap<String, MacroDef>, 
     register_object_macro(macro_defs, "__CHAR_UNSIGNED__", "0");
     register_object_macro(macro_defs, "__WCHAR_TYPE__", "int");
     register_object_macro(macro_defs, "__WINT_TYPE__", "unsigned int");
+    // C11 char16_t/char32_t underlying types (used by <stdatomic.h>)
+    register_object_macro(macro_defs, "__CHAR16_TYPE__", "unsigned short");
+    register_object_macro(macro_defs, "__CHAR32_TYPE__", "unsigned int");
     register_object_macro(macro_defs, "__INT8_TYPE__", "signed char");
     register_object_macro(macro_defs, "__INT16_TYPE__", "short");
     register_object_macro(macro_defs, "__INT32_TYPE__", "int");

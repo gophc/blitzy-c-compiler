@@ -734,9 +734,9 @@ pub fn link(
 
         // Second pass: for any undefined symbol referenced by non-PLT
         // relocations, also add it to the PLT set so it gets a dynamic
-        // resolution stub. This covers cases like:
-        //  - close/read/write referenced via R_X86_64_64
-        //  - stdout/stderr/stdin referenced via R_X86_64_PC32
+        // resolution stub. Known data symbols (stderr, stdout, stdin, etc.)
+        // are excluded from PLT and collected separately for copy relocation.
+        let mut copy_symbols: Vec<(String, usize)> = Vec::new();
         {
             let defined_names: FxHashSet<String> = sym_table
                 .symbols
@@ -750,7 +750,16 @@ pub fn link(
                         && !defined_names.contains(&reloc.symbol_name)
                         && !plt_needed_symbols.contains(&reloc.symbol_name)
                     {
-                        plt_needed_symbols.insert(reloc.symbol_name.clone());
+                        // Check if this is a known data symbol — if so, it
+                        // needs a copy relocation instead of a PLT entry.
+                        if is_known_data_symbol(&reloc.symbol_name) {
+                            if !copy_symbols.iter().any(|(n, _)| *n == reloc.symbol_name) {
+                                let sz = known_data_symbol_size(&reloc.symbol_name);
+                                copy_symbols.push((reloc.symbol_name.clone(), sz));
+                            }
+                        } else {
+                            plt_needed_symbols.insert(reloc.symbol_name.clone());
+                        }
                     }
                 }
             }
@@ -768,8 +777,21 @@ pub fn link(
             &address_map,
             &referenced_symbols,
             &plt_needed_symbols,
+            &copy_symbols,
             diagnostics,
         );
+
+        // Create .bss.copy section for copy-relocated data symbols.
+        // This section holds space that the dynamic linker fills at load
+        // time via R_*_COPY relocations (e.g. stderr, stdout, stdin).
+        let copy_total_size: u64 = copy_symbols.iter().map(|(_, sz)| *sz as u64).sum();
+        if copy_total_size > 0 {
+            // .bss.copy is NOBITS — we store an empty Vec to represent it;
+            // the actual size is tracked via copy_total_size. However, for
+            // section_data_map we store zeros so the ELF writer allocates
+            // the right amount of space in the file layout.
+            section_data_map.insert(".bss.copy".to_string(), vec![0u8; copy_total_size as usize]);
+        }
 
         // Pre-compute virtual addresses for dynamic sections using the same
         // algorithm as write_elf_output. This ensures consistency between
@@ -785,6 +807,7 @@ pub fn link(
             ".plt",
             ".rela.dyn",
             ".rela.plt",
+            ".bss.copy",
         ];
 
         let mut dyn_vaddr_cursor: u64 = 0;
@@ -903,6 +926,119 @@ pub fn link(
                 if let Some(sym) = symbol_address_map.get_mut(name) {
                     sym.final_address = *addr;
                     sym.is_defined = true;
+                }
+            }
+        }
+
+        // Resolve copy-relocated data symbols: assign .bss.copy addresses
+        // to the symbol address map and patch the R_*_COPY entries in
+        // .rela.dyn with the correct r_offset values.
+        if !copy_symbols.is_empty() {
+            if let Some(&(bss_copy_va, _bss_copy_fo)) = dyn_section_addresses.get(".bss.copy") {
+                let is64 = config.target.is_64bit();
+                let mut offset: u64 = 0;
+                for (sym_name, sym_size) in &copy_symbols {
+                    let addr = bss_copy_va + offset;
+                    // Update symbol_address_map so R_X86_64_PC32 / R_X86_64_64
+                    // relocations to this data symbol resolve to .bss.copy.
+                    if let Some(sym) = symbol_address_map.get_mut(sym_name) {
+                        sym.final_address = addr;
+                        sym.is_defined = true;
+                        sym.section_name = ".bss.copy".to_string();
+                    }
+                    offset += *sym_size as u64;
+                }
+
+                // Patch R_*_COPY entries in .rela.dyn — their r_offset was 0
+                // when generated and must now point to .bss.copy VA + offset.
+                let copy_reloc_type = dynamic::default_copy_reloc(config.target);
+                if let Some(rela_data) = section_data_map.get_mut(".rela.dyn") {
+                    let entry_size = if is64 { 24usize } else { 12usize };
+                    let num_entries = rela_data.len() / entry_size;
+                    let mut copy_idx: usize = 0;
+                    let mut copy_offset: u64 = 0;
+                    for i in 0..num_entries {
+                        let base = i * entry_size;
+                        if is64 {
+                            // Read r_info to check relocation type
+                            let r_info = u64::from_le_bytes(
+                                rela_data[base + 8..base + 16].try_into().unwrap(),
+                            );
+                            let rtype = (r_info & 0xFFFF_FFFF) as u32;
+                            if rtype == copy_reloc_type {
+                                if copy_idx < copy_symbols.len() {
+                                    let addr = bss_copy_va + copy_offset;
+                                    // Patch r_offset
+                                    rela_data[base..base + 8]
+                                        .copy_from_slice(&addr.to_le_bytes());
+                                    copy_offset += copy_symbols[copy_idx].1 as u64;
+                                    copy_idx += 1;
+                                }
+                            }
+                        } else {
+                            let r_info = u32::from_le_bytes(
+                                rela_data[base + 4..base + 8].try_into().unwrap(),
+                            );
+                            let rtype = r_info & 0xFF;
+                            if rtype == copy_reloc_type {
+                                if copy_idx < copy_symbols.len() {
+                                    let addr = (bss_copy_va + copy_offset) as u32;
+                                    rela_data[base..base + 4]
+                                        .copy_from_slice(&addr.to_le_bytes());
+                                    copy_offset += copy_symbols[copy_idx].1 as u64;
+                                    copy_idx += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Also patch the .dynsym entries for copy symbols to have the
+                // correct st_value (pointing to .bss.copy) and st_size.
+                // Clone .dynstr first to avoid borrow conflict.
+                let dynstr_data = section_data_map.get(".dynstr").cloned();
+                if let Some(dynsym_data) = section_data_map.get_mut(".dynsym") {
+                    let sym_entry_size = if is64 { 24usize } else { 16usize };
+                    let num_syms = dynsym_data.len() / sym_entry_size;
+                    let mut copy_offset_patch: u64 = 0;
+
+                    for (copy_name, copy_size) in &copy_symbols {
+                        let target_addr = bss_copy_va + copy_offset_patch;
+                        // Find the dynsym entry by matching name via .dynstr
+                        for si in 0..num_syms {
+                            let base = si * sym_entry_size;
+                            if is64 {
+                                let st_name = u32::from_le_bytes(
+                                    dynsym_data[base..base + 4].try_into().unwrap(),
+                                );
+                                // Look up name in dynstr
+                                if let Some(ref dynstr) = dynstr_data {
+                                    let name_start = st_name as usize;
+                                    if name_start < dynstr.len() {
+                                        let name_end = dynstr[name_start..]
+                                            .iter()
+                                            .position(|&b| b == 0)
+                                            .map(|p| name_start + p)
+                                            .unwrap_or(dynstr.len());
+                                        let name =
+                                            std::str::from_utf8(&dynstr[name_start..name_end])
+                                                .unwrap_or("");
+                                        if name == copy_name {
+                                            // Patch st_value (offset 8 in Elf64_Sym)
+                                            dynsym_data[base + 8..base + 16]
+                                                .copy_from_slice(&target_addr.to_le_bytes());
+                                            // Patch st_size (offset 16 in Elf64_Sym)
+                                            dynsym_data[base + 16..base + 24].copy_from_slice(
+                                                &(*copy_size as u64).to_le_bytes(),
+                                            );
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        copy_offset_patch += *copy_size as u64;
+                    }
                 }
             }
         }
@@ -1101,17 +1237,35 @@ pub fn link(
         // section.
         let entry_size: usize = if config.target.is_64bit() { 24 } else { 8 };
 
+        let copy_reloc_type_val = dynamic::default_copy_reloc(config.target);
         if let Some(&(got_va, _)) = dyn_section_addresses.get(".got") {
             if let Some(rela_dyn_data) = section_data_map.get_mut(".rela.dyn") {
                 let num_entries = rela_dyn_data.len() / entry_size;
                 for i in 0..num_entries {
                     let base = i * entry_size;
                     if config.target.is_64bit() {
+                        // Skip R_*_COPY entries — they already have absolute
+                        // .bss.copy VA addresses set by the copy-relocation
+                        // patching pass above.
+                        let r_info = u64::from_le_bytes(
+                            rela_dyn_data[base + 8..base + 16].try_into().unwrap(),
+                        );
+                        let rtype = (r_info & 0xFFFF_FFFF) as u32;
+                        if rtype == copy_reloc_type_val {
+                            continue;
+                        }
                         let old_off =
                             u64::from_le_bytes(rela_dyn_data[base..base + 8].try_into().unwrap());
                         let new_off = old_off + got_va;
                         rela_dyn_data[base..base + 8].copy_from_slice(&new_off.to_le_bytes());
                     } else {
+                        let r_info = u32::from_le_bytes(
+                            rela_dyn_data[base + 4..base + 8].try_into().unwrap(),
+                        );
+                        let rtype = r_info & 0xFF;
+                        if rtype == copy_reloc_type_val {
+                            continue;
+                        }
                         let old_off =
                             u32::from_le_bytes(rela_dyn_data[base..base + 4].try_into().unwrap());
                         let new_off = old_off + got_va as u32;
@@ -1751,6 +1905,7 @@ fn generate_dynamic_sections(
     _address_map: &section_merger::AddressMap,
     referenced_symbols: &FxHashSet<String>,
     plt_needed_symbols: &FxHashSet<String>,
+    copy_symbols: &[(String, usize)],
     _diagnostics: &mut DiagnosticEngine,
 ) {
     // Build lists of exported and imported symbols for the dynamic linker.
@@ -1787,14 +1942,28 @@ fn generate_dynamic_sections(
             // (e.g. from stdio.h) must NOT appear in .dynsym, otherwise
             // the dynamic linker will try and fail to resolve them.
             if is_executable && !referenced_symbols.contains(&sym.name) {
-                continue;
+                // However, copy symbols still need .dynsym entries even
+                // if they are not in referenced_symbols from PLT relocs.
+                if !copy_symbols.iter().any(|(n, _)| *n == sym.name) {
+                    continue;
+                }
             }
+            // Check if this symbol is a copy-relocated data symbol.
+            let is_copy = copy_symbols.iter().any(|(n, _)| *n == sym.name);
+            let copy_sz = copy_symbols
+                .iter()
+                .find(|(n, _)| *n == sym.name)
+                .map(|(_, sz)| *sz as u64)
+                .unwrap_or(0);
             imported.push(dynamic::ImportedSymbol {
                 name: sym.name.clone(),
                 binding: sym.binding,
                 sym_type: sym.sym_type,
-                needs_plt: sym.sym_type == symbol_resolver::STT_FUNC
-                    || plt_needed_symbols.contains(&sym.name),
+                needs_plt: !is_copy
+                    && (sym.sym_type == symbol_resolver::STT_FUNC
+                        || plt_needed_symbols.contains(&sym.name)),
+                needs_copy: is_copy,
+                copy_size: copy_sz,
             });
         }
     }
@@ -2311,7 +2480,54 @@ fn dynamic_section_attributes(name: &str, config: &LinkerConfig) -> (u32, u64, u
                 (section_merger::SHT_REL, section_merger::SHF_ALLOC, 8)
             }
         }
+        ".bss.copy" => (
+            section_merger::SHT_NOBITS,
+            section_merger::SHF_ALLOC | section_merger::SHF_WRITE,
+            0,
+        ),
         _ => (section_merger::SHT_PROGBITS, section_merger::SHF_ALLOC, 0),
+    }
+}
+
+// ============================================================================
+// Copy Relocation Helpers
+// ============================================================================
+
+/// Returns `true` if `name` is a known libc **data** symbol that requires a
+/// copy relocation (`R_*_COPY`) rather than a PLT entry. Data symbols need
+/// their *value* accessible at a fixed address in the executable's `.bss`
+/// segment; a PLT stub is only suitable for *function* symbols.
+fn is_known_data_symbol(name: &str) -> bool {
+    matches!(
+        name,
+        "stdout"
+            | "stderr"
+            | "stdin"
+            | "environ"
+            | "__environ"
+            | "optarg"
+            | "optind"
+            | "opterr"
+            | "optopt"
+            | "program_invocation_name"
+            | "program_invocation_short_name"
+            | "daylight"
+            | "timezone"
+            | "tzname"
+            | "sys_nerr"
+            | "sys_errlist"
+            | "__progname"
+            | "__progname_full"
+    )
+}
+
+/// Returns the size in bytes for a known libc data symbol. Most are 8-byte
+/// pointers; a few small integers are 4 bytes.
+fn known_data_symbol_size(name: &str) -> usize {
+    match name {
+        "optind" | "opterr" | "optopt" | "daylight" | "sys_nerr" => 4,
+        "tzname" => 16, // char *[2]
+        _ => 8,         // pointer or long
     }
 }
 

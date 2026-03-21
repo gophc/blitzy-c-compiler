@@ -982,6 +982,12 @@ impl<'src> Parser<'src> {
 
         // Parse additional comma-separated init-declarators.
         while self.match_token(&TokenKind::Comma) {
+            // Skip optional __attribute__ between comma and the next
+            // declarator.  GCC allows per-declarator attributes such as
+            //   `__attribute__((deprecated))` before each init-declarator:
+            //   static const T A = {…}, __attribute__((deprecated)) B = {…};
+            self.skip_trailing_attributes();
+
             let decl_start = self.current_span();
             let decl = declarations::parse_declarator(self)?;
 

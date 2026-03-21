@@ -471,6 +471,8 @@ impl RiscV64Linker {
                         binding: sym.binding,
                         sym_type: sym.sym_type,
                         needs_plt: plt_symbols.contains(&sym.name),
+                        needs_copy: false,
+                        copy_size: 0,
                     });
                 }
             }

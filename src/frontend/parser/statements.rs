@@ -377,6 +377,28 @@ pub fn parse_compound_statement(parser: &mut Parser<'_>) -> Result<CompoundState
         // precede either declarations or statements. The declaration check
         // handles __extension__ as a declaration prefix; remaining GCC
         // extensions (like __label__) are handled as statements.
+        //
+        // Special case: `__extension__ ({ ... })` is a statement expression,
+        // NOT a declaration.  We must detect this before the generic
+        // `is_declaration_start` check which returns `true` for
+        // `__extension__` (since it can also prefix declarations).
+        if parser.check(&TokenKind::Extension)
+            && parser.peek_nth(0).is(&TokenKind::LeftParen)
+            && parser.peek_nth(1).is(&TokenKind::LeftBrace)
+        {
+            // Route through statement parser → parse_extension_block →
+            // parse_statement_expression.
+            match parse_statement(parser) {
+                Ok(stmt) => {
+                    items.push(BlockItem::Statement(stmt));
+                    continue;
+                }
+                Err(()) => {
+                    parser.synchronize();
+                    continue;
+                }
+            }
+        }
         if is_declaration_start(parser) {
             match parse_block_declaration(parser) {
                 Ok(decl) => items.push(BlockItem::Declaration(Box::new(decl))),
@@ -1288,6 +1310,13 @@ fn parse_block_declaration(parser: &mut Parser<'_>) -> Result<Declaration, ()> {
         if !parser.match_token(&TokenKind::Comma) {
             break;
         }
+
+        // Skip optional __attribute__ between comma and the next
+        // declarator.  GCC allows attributes such as
+        //   `__attribute__((deprecated))` to appear before each
+        // init-declarator in a multi-variable declaration:
+        //   static const T A = {…}, __attribute__((deprecated)) B = {…};
+        declarations::skip_trailing_attributes(parser);
     }
 
     // Expect trailing semicolon.

@@ -3040,7 +3040,10 @@ impl<'a> SemanticAnalyzer<'a> {
                     fields.push(crate::common::types::StructField {
                         name: field_name,
                         ty: field_type,
-                        bit_width: decl.bit_width.as_ref().map(|_| 0u32),
+                        bit_width: decl
+                            .bit_width
+                            .as_ref()
+                            .map(|bw| eval_bitfield_width(bw)),
                     });
                 }
             }
