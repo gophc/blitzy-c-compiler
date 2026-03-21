@@ -1166,20 +1166,56 @@ fn lower_lvalue_inner(ctx: &mut ExprLoweringContext<'_>, expr: &ast::Expression)
         // Conditional expression can be an lvalue in GCC mode.
         ast::Expression::Conditional { .. } => lower_expr_inner(ctx, expr),
         // GCC __real__/__imag__ as lvalue: __real__ z = 1.0
-        // For non-complex, __real__ is identity lvalue, __imag__ degrades.
+        // For _Complex types, returns pointer to the component.
+        // For non-complex, __real__ is identity lvalue.
         ast::Expression::UnaryOp {
             op: ast::UnaryOp::RealPart,
             operand,
+            span,
             ..
-        } => lower_lvalue_inner(ctx, operand),
+        } => {
+            let inner = lower_lvalue_inner(ctx, operand);
+            let resolved = types::resolve_typedef(&inner.ty);
+            if let CType::Complex(base) = resolved {
+                let elem_ctype = base.as_ref().clone();
+                // Real part is at offset 0 from the complex alloca.
+                let zero_idx = emit_int_const_for_index(ctx, 0);
+                let (real_ptr, gep) =
+                    ctx.builder
+                        .build_gep(inner.value, vec![zero_idx], IrType::Ptr, *span);
+                emit_inst(ctx, gep);
+                TypedValue::new(real_ptr, elem_ctype)
+            } else {
+                inner
+            }
+        }
         ast::Expression::UnaryOp {
             op: ast::UnaryOp::ImagPart,
             operand,
+            span,
             ..
         } => {
-            // For non-complex, __imag__ as lvalue is degenerate.
-            // Fall through to value lowering.
-            lower_lvalue_inner(ctx, operand)
+            let inner = lower_lvalue_inner(ctx, operand);
+            let resolved = types::resolve_typedef(&inner.ty);
+            if let CType::Complex(base) = resolved {
+                let elem_ctype = base.as_ref().clone();
+                let elem_ir = ctype_to_ir(&elem_ctype, ctx.target);
+                let elem_size: i64 = match &elem_ir {
+                    IrType::F32 => 4,
+                    IrType::F64 => 8,
+                    IrType::F80 => 16,
+                    _ => 8,
+                };
+                // Imaginary part at offset elem_size from the complex alloca.
+                let off_idx = emit_int_const_for_index(ctx, elem_size);
+                let (imag_ptr, gep) =
+                    ctx.builder
+                        .build_gep(inner.value, vec![off_idx], IrType::Ptr, *span);
+                emit_inst(ctx, gep);
+                TypedValue::new(imag_ptr, elem_ctype)
+            } else {
+                inner
+            }
         }
         other => {
             // Fallback: try lowering as a value. Many kernel macro
@@ -1252,6 +1288,54 @@ fn lower_float_literal(
     suffix: &ast::FloatSuffix,
     span: Span,
 ) -> TypedValue {
+    // GCC imaginary suffix: `2.0i` produces `_Complex double` with
+    // real=0.0, imag=2.0.  Create an alloca, store zero in the real
+    // component and `value` in the imaginary component.
+    let is_imaginary = matches!(
+        suffix,
+        ast::FloatSuffix::I | ast::FloatSuffix::FI | ast::FloatSuffix::LI
+    );
+    if is_imaginary {
+        let base_cty = float_literal_ctype(suffix);
+        let elem_ir = ctype_to_ir(&base_cty, ctx.target);
+        let complex_cty = CType::Complex(Box::new(base_cty));
+        let elem_count: usize = 2;
+        let array_ir = IrType::Array(Box::new(elem_ir.clone()), elem_count);
+        let (alloca_val, alloca_inst) = ctx.builder.build_alloca(array_ir.clone(), span);
+        emit_inst(ctx, alloca_inst);
+
+        // Real part (offset 0) = 0.0
+        let zero_val = emit_float_const(ctx, 0.0, elem_ir.clone(), span);
+        let zero_idx = emit_int_const_for_index(ctx, 0);
+        let (real_ptr, gep_r) =
+            ctx.builder
+                .build_gep(alloca_val, vec![zero_idx], IrType::Ptr, span);
+        emit_inst(ctx, gep_r);
+        let store_r = ctx.builder.build_store(zero_val, real_ptr, span);
+        emit_inst(ctx, store_r);
+
+        // Imaginary part (offset elem_size) = value
+        let imag_val = emit_float_const(ctx, value, elem_ir.clone(), span);
+        let elem_size: i64 = match &elem_ir {
+            IrType::F32 => 4,
+            IrType::F64 => 8,
+            IrType::F80 => 16,
+            _ => 8,
+        };
+        let off_idx = emit_int_const_for_index(ctx, elem_size);
+        let (imag_ptr, gep_i) = ctx
+            .builder
+            .build_gep(alloca_val, vec![off_idx], IrType::Ptr, span);
+        emit_inst(ctx, gep_i);
+        let store_i = ctx.builder.build_store(imag_val, imag_ptr, span);
+        emit_inst(ctx, store_i);
+
+        // Load the whole complex value from the alloca
+        let (loaded, load_inst) = ctx.builder.build_load(alloca_val, array_ir, span);
+        emit_inst(ctx, load_inst);
+        return TypedValue::new(loaded, complex_cty);
+    }
+
     let cty = float_literal_ctype(suffix);
     let ir_ty = ctype_to_ir(&cty, ctx.target);
     let val = emit_float_const(ctx, value, ir_ty, span);
@@ -1473,8 +1557,10 @@ fn lower_identifier(ctx: &mut ExprLoweringContext<'_>, sym_idx: u32, span: Span)
             let resolved_var = types::resolve_typedef(&var_cty);
             let ctype_is_struct_or_union =
                 matches!(resolved_var, CType::Struct { .. } | CType::Union { .. });
-            let global_is_array =
-                matches!(&gt, crate::ir::types::IrType::Array(_, _)) && !ctype_is_struct_or_union;
+            let ctype_is_complex = matches!(resolved_var, CType::Complex(_));
+            let global_is_array = matches!(&gt, crate::ir::types::IrType::Array(_, _))
+                && !ctype_is_struct_or_union
+                && !ctype_is_complex;
 
             // Arrays decay to pointers: the address of the global IS the
             // pointer to the first element, so return it directly (no load).
@@ -1550,7 +1636,9 @@ fn lower_identifier(ctx: &mut ExprLoweringContext<'_>, sym_idx: u32, span: Span)
             // Exclude struct/union types which also map to IR Array.
             let resolved_svar = types::resolve_typedef(&var_cty);
             let ctype_is_sou = matches!(resolved_svar, CType::Struct { .. } | CType::Union { .. });
-            let global_is_array = matches!(&gt, IrType::Array(_, _)) && !ctype_is_sou;
+            let ctype_is_complex_s = matches!(resolved_svar, CType::Complex(_));
+            let global_is_array =
+                matches!(&gt, IrType::Array(_, _)) && !ctype_is_sou && !ctype_is_complex_s;
             if is_array_decay || global_is_array {
                 // Use the accurately-computed decayed type from
                 // lookup_var_type (which reads global_c_types) when
@@ -2092,6 +2180,17 @@ fn lower_binary(
         rhs
     };
 
+    // ---- _Complex type arithmetic ----
+    // Decompose complex operations into component-wise floating-point ops.
+    {
+        let lhs_resolved = types::resolve_typedef(&lhs.ty);
+        let rhs_resolved = types::resolve_typedef(&rhs.ty);
+        if matches!(lhs_resolved, CType::Complex(..)) || matches!(rhs_resolved, CType::Complex(..))
+        {
+            return lower_complex_binary(ctx, op, lhs_expr, rhs_expr, &lhs, &rhs, span);
+        }
+    }
+
     if is_pointer_type(&lhs.ty) && is_integer_type(&rhs.ty) {
         // Pointer-integer comparisons: convert integer to pointer and use ptr-ptr comparison.
         match op {
@@ -2355,6 +2454,332 @@ fn emit_cmp(
     }
 }
 
+// =========================================================================
+// _COMPLEX ARITHMETIC  (component-wise FP decomposition)
+// =========================================================================
+
+/// Determine the scalar element type for a `_Complex` C type.
+/// Returns `None` if `ty` is not `_Complex`.
+fn complex_element_ctype(ty: &CType) -> Option<&CType> {
+    match types::resolve_typedef(ty) {
+        CType::Complex(base) => Some(base.as_ref()),
+        _ => None,
+    }
+}
+
+/// Helper: given the lvalue (pointer) of a `_Complex` variable, load the
+/// real part (offset 0) and imaginary part (offset `elem_size`) as separate
+/// scalar float values.
+fn load_complex_parts(
+    ctx: &mut ExprLoweringContext<'_>,
+    complex_ptr: Value,
+    elem_ir: &IrType,
+    elem_size: i64,
+    span: Span,
+) -> (Value, Value) {
+    // Real part: GEP base+0 → load
+    let zero_idx = emit_int_const_for_index(ctx, 0);
+    let (real_ptr, gep_r) = ctx
+        .builder
+        .build_gep(complex_ptr, vec![zero_idx], IrType::Ptr, span);
+    emit_inst(ctx, gep_r);
+    let (real_val, ld_r) = ctx.builder.build_load(real_ptr, elem_ir.clone(), span);
+    emit_inst(ctx, ld_r);
+
+    // Imaginary part: GEP base+elem_size → load
+    let off_idx = emit_int_const_for_index(ctx, elem_size);
+    let (imag_ptr, gep_i) = ctx
+        .builder
+        .build_gep(complex_ptr, vec![off_idx], IrType::Ptr, span);
+    emit_inst(ctx, gep_i);
+    let (imag_val, ld_i) = ctx.builder.build_load(imag_ptr, elem_ir.clone(), span);
+    emit_inst(ctx, ld_i);
+
+    (real_val, imag_val)
+}
+
+/// Helper: store real and imaginary parts into a freshly allocated `_Complex`
+/// alloca and return the alloca pointer.
+fn store_complex_result(
+    ctx: &mut ExprLoweringContext<'_>,
+    real_val: Value,
+    imag_val: Value,
+    complex_ir: &IrType,
+    elem_size: i64,
+    span: Span,
+) -> Value {
+    let (alloca, ai) = ctx.builder.build_alloca(complex_ir.clone(), span);
+    emit_inst(ctx, ai);
+
+    // Store real at offset 0
+    let zero_idx = emit_int_const_for_index(ctx, 0);
+    let (real_ptr, gep_r) = ctx
+        .builder
+        .build_gep(alloca, vec![zero_idx], IrType::Ptr, span);
+    emit_inst(ctx, gep_r);
+    let st_r = ctx.builder.build_store(real_val, real_ptr, span);
+    emit_inst(ctx, st_r);
+
+    // Store imag at offset elem_size
+    let off_idx = emit_int_const_for_index(ctx, elem_size);
+    let (imag_ptr, gep_i) = ctx
+        .builder
+        .build_gep(alloca, vec![off_idx], IrType::Ptr, span);
+    emit_inst(ctx, gep_i);
+    let st_i = ctx.builder.build_store(imag_val, imag_ptr, span);
+    emit_inst(ctx, st_i);
+
+    alloca
+}
+
+/// Lower a `_Complex` expression and extract its real/imaginary parts.
+/// If the expression is an lvalue (variable/array element), we use the
+/// existing pointer.  Otherwise (e.g. imaginary literal, function call
+/// result), we materialise a temporary alloca and load parts from that.
+fn lower_complex_operand_parts(
+    ctx: &mut ExprLoweringContext<'_>,
+    expr: &ast::Expression,
+    complex_ir: &IrType,
+    elem_ir: &IrType,
+    elem_size: i64,
+    span: Span,
+) -> (Value, Value) {
+    // Try lowering as lvalue first (zero-cost for variables).
+    // If that yields a non-pointer / causes issues, fall back to rvalue path.
+    let tv = lower_expr_inner(ctx, expr);
+    // Materialise into a temp alloca so we can GEP into it.
+    let (alloca, ai) = ctx.builder.build_alloca(complex_ir.clone(), span);
+    emit_inst(ctx, ai);
+    let st = ctx.builder.build_store(tv.value, alloca, span);
+    emit_inst(ctx, st);
+    load_complex_parts(ctx, alloca, elem_ir, elem_size, span)
+}
+
+/// Convert a scalar value to the target floating-point element type
+/// of a `_Complex`.  Delegates to `lower_cast` for the actual
+/// instruction emission (int→fp, fp→fp, etc.).
+fn ensure_fp_type(
+    ctx: &mut ExprLoweringContext<'_>,
+    val: Value,
+    src_ctype: &CType,
+    target_ir: &IrType,
+    span: Span,
+) -> Value {
+    let resolved = types::resolve_typedef(src_ctype);
+    let src_ir = ctype_to_ir(resolved, ctx.target);
+    if src_ir == *target_ir {
+        return val;
+    }
+    // Map the target IR type back to a CType for lower_cast.
+    let target_ctype = match target_ir {
+        IrType::F32 => CType::Float,
+        IrType::F64 => CType::Double,
+        IrType::F80 => CType::LongDouble,
+        _ => CType::Double,
+    };
+    lower_cast(ctx, val, resolved, &target_ctype, span)
+}
+
+/// Lower a binary operation on `_Complex` types by decomposing into
+/// component-wise floating-point operations on real/imaginary parts.
+#[allow(clippy::too_many_arguments)]
+fn lower_complex_binary(
+    ctx: &mut ExprLoweringContext<'_>,
+    op: &ast::BinaryOp,
+    lhs_expr: &ast::Expression,
+    rhs_expr: &ast::Expression,
+    _lhs_tv: &TypedValue,
+    _rhs_tv: &TypedValue,
+    span: Span,
+) -> TypedValue {
+    // Determine the complex element type (Float, Double, LongDouble).
+    let lhs_resolved = types::resolve_typedef(&_lhs_tv.ty);
+    let rhs_resolved = types::resolve_typedef(&_rhs_tv.ty);
+
+    let complex_ctype: CType;
+    let elem_ctype: CType;
+    if let Some(elem) = complex_element_ctype(lhs_resolved) {
+        elem_ctype = elem.clone();
+        complex_ctype = lhs_resolved.clone();
+    } else if let Some(elem) = complex_element_ctype(rhs_resolved) {
+        elem_ctype = elem.clone();
+        complex_ctype = rhs_resolved.clone();
+    } else {
+        unreachable!("lower_complex_binary called without _Complex type");
+    }
+
+    let elem_ir = ctype_to_ir(&elem_ctype, ctx.target);
+    let complex_ir = ctype_to_ir(&complex_ctype, ctx.target);
+    let elem_size = match &elem_ir {
+        IrType::F32 => 4i64,
+        IrType::F64 => 8i64,
+        IrType::F80 => 16i64, // 80-bit extended padded to 16 bytes
+        _ => 8i64,
+    };
+
+    // Load real/imaginary parts from both operands.  If one operand is a
+    // plain real scalar (not _Complex), promote it to complex by treating
+    // its value as the real component with imaginary = 0.0.
+    let lhs_is_complex = matches!(types::resolve_typedef(&_lhs_tv.ty), CType::Complex(..));
+    let rhs_is_complex = matches!(types::resolve_typedef(&_rhs_tv.ty), CType::Complex(..));
+
+    let (lr, li) = if lhs_is_complex {
+        lower_complex_operand_parts(ctx, lhs_expr, &complex_ir, &elem_ir, elem_size, span)
+    } else {
+        // Scalar: real = scalar value, imag = 0.0
+        let scalar = lower_expr_inner(ctx, lhs_expr);
+        let real_val = ensure_fp_type(ctx, scalar.value, &scalar.ty, &elem_ir, span);
+        let zero = emit_float_const(ctx, 0.0, elem_ir.clone(), span);
+        (real_val, zero)
+    };
+    let (rr, ri) = if rhs_is_complex {
+        lower_complex_operand_parts(ctx, rhs_expr, &complex_ir, &elem_ir, elem_size, span)
+    } else {
+        let scalar = lower_expr_inner(ctx, rhs_expr);
+        let real_val = ensure_fp_type(ctx, scalar.value, &scalar.ty, &elem_ir, span);
+        let zero = emit_float_const(ctx, 0.0, elem_ir.clone(), span);
+        (real_val, zero)
+    };
+
+    match op {
+        ast::BinaryOp::Add => {
+            // (a+bi) + (c+di) = (a+c) + (b+d)i
+            let (res_r, inst_r) = ctx.builder.build_add(lr, rr, elem_ir.clone(), span);
+            emit_inst(ctx, inst_r);
+            let (res_i, inst_i) = ctx.builder.build_add(li, ri, elem_ir.clone(), span);
+            emit_inst(ctx, inst_i);
+            let result = store_complex_result(ctx, res_r, res_i, &complex_ir, elem_size, span);
+            let (loaded, ld) = ctx.builder.build_load(result, complex_ir, span);
+            emit_inst(ctx, ld);
+            TypedValue::new(loaded, complex_ctype)
+        }
+        ast::BinaryOp::Sub => {
+            // (a+bi) - (c+di) = (a-c) + (b-d)i
+            let (res_r, inst_r) = ctx.builder.build_sub(lr, rr, elem_ir.clone(), span);
+            emit_inst(ctx, inst_r);
+            let (res_i, inst_i) = ctx.builder.build_sub(li, ri, elem_ir.clone(), span);
+            emit_inst(ctx, inst_i);
+            let result = store_complex_result(ctx, res_r, res_i, &complex_ir, elem_size, span);
+            let (loaded, ld) = ctx.builder.build_load(result, complex_ir, span);
+            emit_inst(ctx, ld);
+            TypedValue::new(loaded, complex_ctype)
+        }
+        ast::BinaryOp::Mul => {
+            // (a+bi) * (c+di) = (ac-bd) + (ad+bc)i
+            let (ac, i1) = ctx.builder.build_mul(lr, rr, elem_ir.clone(), span);
+            emit_inst(ctx, i1);
+            let (bd, i2) = ctx.builder.build_mul(li, ri, elem_ir.clone(), span);
+            emit_inst(ctx, i2);
+            let (ad, i3) = ctx.builder.build_mul(lr, ri, elem_ir.clone(), span);
+            emit_inst(ctx, i3);
+            let (bc, i4) = ctx.builder.build_mul(li, rr, elem_ir.clone(), span);
+            emit_inst(ctx, i4);
+            let (res_r, i5) = ctx.builder.build_sub(ac, bd, elem_ir.clone(), span);
+            emit_inst(ctx, i5);
+            let (res_i, i6) = ctx.builder.build_add(ad, bc, elem_ir.clone(), span);
+            emit_inst(ctx, i6);
+            let result = store_complex_result(ctx, res_r, res_i, &complex_ir, elem_size, span);
+            let (loaded, ld) = ctx.builder.build_load(result, complex_ir, span);
+            emit_inst(ctx, ld);
+            TypedValue::new(loaded, complex_ctype)
+        }
+        ast::BinaryOp::Div => {
+            // (a+bi) / (c+di) = ((ac+bd)/(c²+d²)) + ((bc-ad)/(c²+d²))i
+            let (ac, i1) = ctx.builder.build_mul(lr, rr, elem_ir.clone(), span);
+            emit_inst(ctx, i1);
+            let (bd, i2) = ctx.builder.build_mul(li, ri, elem_ir.clone(), span);
+            emit_inst(ctx, i2);
+            let (bc, i3) = ctx.builder.build_mul(li, rr, elem_ir.clone(), span);
+            emit_inst(ctx, i3);
+            let (ad, i4) = ctx.builder.build_mul(lr, ri, elem_ir.clone(), span);
+            emit_inst(ctx, i4);
+            let (cc, i5) = ctx.builder.build_mul(rr, rr, elem_ir.clone(), span);
+            emit_inst(ctx, i5);
+            let (dd, i6) = ctx.builder.build_mul(ri, ri, elem_ir.clone(), span);
+            emit_inst(ctx, i6);
+            let (denom, i7) = ctx.builder.build_add(cc, dd, elem_ir.clone(), span);
+            emit_inst(ctx, i7);
+            let (num_r, i8) = ctx.builder.build_add(ac, bd, elem_ir.clone(), span);
+            emit_inst(ctx, i8);
+            let (num_i, i9) = ctx.builder.build_sub(bc, ad, elem_ir.clone(), span);
+            emit_inst(ctx, i9);
+            let (res_r, i10) = ctx
+                .builder
+                .build_div(num_r, denom, elem_ir.clone(), true, span);
+            emit_inst(ctx, i10);
+            let (res_i, i11) = ctx
+                .builder
+                .build_div(num_i, denom, elem_ir.clone(), true, span);
+            emit_inst(ctx, i11);
+            let result = store_complex_result(ctx, res_r, res_i, &complex_ir, elem_size, span);
+            let (loaded, ld) = ctx.builder.build_load(result, complex_ir, span);
+            emit_inst(ctx, ld);
+            TypedValue::new(loaded, complex_ctype)
+        }
+        ast::BinaryOp::Equal | ast::BinaryOp::NotEqual => {
+            // Complex equality: both real and imag must be equal.
+            let cmp_real = if matches!(elem_ir, IrType::F32 | IrType::F64 | IrType::F80) {
+                let cmp_op = if matches!(op, ast::BinaryOp::Equal) {
+                    FCmpOp::Oeq
+                } else {
+                    FCmpOp::One
+                };
+                let (v, i) = ctx.builder.build_fcmp(cmp_op, lr, rr, span);
+                emit_inst(ctx, i);
+                v
+            } else {
+                let cmp_op = if matches!(op, ast::BinaryOp::Equal) {
+                    ICmpOp::Eq
+                } else {
+                    ICmpOp::Ne
+                };
+                let (v, i) = ctx.builder.build_icmp(cmp_op, lr, rr, span);
+                emit_inst(ctx, i);
+                v
+            };
+            let cmp_imag = if matches!(elem_ir, IrType::F32 | IrType::F64 | IrType::F80) {
+                let cmp_op = if matches!(op, ast::BinaryOp::Equal) {
+                    FCmpOp::Oeq
+                } else {
+                    FCmpOp::One
+                };
+                let (v, i) = ctx.builder.build_fcmp(cmp_op, li, ri, span);
+                emit_inst(ctx, i);
+                v
+            } else {
+                let cmp_op = if matches!(op, ast::BinaryOp::Equal) {
+                    ICmpOp::Eq
+                } else {
+                    ICmpOp::Ne
+                };
+                let (v, i) = ctx.builder.build_icmp(cmp_op, li, ri, span);
+                emit_inst(ctx, i);
+                v
+            };
+            // For ==: both must be true (AND).  For !=: either can be true (OR).
+            let (result, combine_inst) = if matches!(op, ast::BinaryOp::Equal) {
+                ctx.builder.build_and(cmp_real, cmp_imag, IrType::I1, span)
+            } else {
+                ctx.builder.build_or(cmp_real, cmp_imag, IrType::I1, span)
+            };
+            emit_inst(ctx, combine_inst);
+            TypedValue::new(result, CType::Bool)
+        }
+        _ => {
+            // Other operations (bitwise, shift, etc.) are not valid on _Complex.
+            // Fall back to the non-complex path (will likely produce incorrect
+            // results but avoids a panic; sema should have caught this).
+            let common = type_builder::usual_arithmetic_conversion(&_lhs_tv.ty, &_rhs_tv.ty);
+            let ci = ctype_to_ir(&common, ctx.target);
+            let lv = insert_implicit_conversion(ctx, _lhs_tv.value, &_lhs_tv.ty, &common, span);
+            let rv = insert_implicit_conversion(ctx, _rhs_tv.value, &_rhs_tv.ty, &common, span);
+            let (v, i) = ctx.builder.build_add(lv, rv, ci, span);
+            emit_inst(ctx, i);
+            TypedValue::new(v, common)
+        }
+    }
+}
+
 fn lower_logical_and(
     ctx: &mut ExprLoweringContext<'_>,
     le: &ast::Expression,
@@ -2573,6 +2998,74 @@ fn lower_unary(
         }
         ast::UnaryOp::BitwiseNot => {
             let inner = lower_expr_inner(ctx, operand);
+            let resolved_ty = types::resolve_typedef(&inner.ty);
+            // GCC extension: ~(complex) is complex conjugate — negate
+            // the imaginary part, leave real part unchanged.
+            if let CType::Complex(ref base) = resolved_ty {
+                let elem_ir = ctype_to_ir(base.as_ref(), ctx.target);
+                let complex_ir = ctype_to_ir(resolved_ty, ctx.target);
+                let elem_sz: i64 = match &elem_ir {
+                    IrType::F32 => 4,
+                    IrType::F64 => 8,
+                    IrType::F80 => 16,
+                    _ => 8,
+                };
+
+                // Store complex value to alloca.
+                let (alloca_val, alloca_inst) = ctx.builder.build_alloca(complex_ir.clone(), span);
+                emit_inst(ctx, alloca_inst);
+                let st = ctx.builder.build_store(inner.value, alloca_val, span);
+                emit_inst(ctx, st);
+
+                // Load real part at offset 0 (unchanged).
+                let zero_idx = emit_int_const_for_index(ctx, 0);
+                let (real_ptr, gep_r) =
+                    ctx.builder
+                        .build_gep(alloca_val, vec![zero_idx], IrType::Ptr, span);
+                emit_inst(ctx, gep_r);
+                let (real_val, ld_r) = ctx.builder.build_load(real_ptr, elem_ir.clone(), span);
+                emit_inst(ctx, ld_r);
+
+                // Load imaginary part at offset elem_sz.
+                let imag_idx = emit_int_const_for_index(ctx, elem_sz);
+                let (imag_ptr, gep_i) =
+                    ctx.builder
+                        .build_gep(alloca_val, vec![imag_idx], IrType::Ptr, span);
+                emit_inst(ctx, gep_i);
+                let (imag_val, ld_i) = ctx.builder.build_load(imag_ptr, elem_ir.clone(), span);
+                emit_inst(ctx, ld_i);
+
+                // Negate imaginary part (build_neg handles both int
+                // and float via 0 - operand / 0.0 - operand).
+                let (neg_imag, neg_inst) = ctx.builder.build_neg(imag_val, elem_ir.clone(), span);
+                emit_inst(ctx, neg_inst);
+
+                // Build result: store {real, -imag} into a new alloca.
+                let (res_val, res_inst) = ctx.builder.build_alloca(complex_ir.clone(), span);
+                emit_inst(ctx, res_inst);
+
+                let r_idx = emit_int_const_for_index(ctx, 0);
+                let (r_ptr, gep_rr) =
+                    ctx.builder
+                        .build_gep(res_val, vec![r_idx], IrType::Ptr, span);
+                emit_inst(ctx, gep_rr);
+                let st_r = ctx.builder.build_store(real_val, r_ptr, span);
+                emit_inst(ctx, st_r);
+
+                let i_idx = emit_int_const_for_index(ctx, elem_sz);
+                let (i_ptr, gep_ii) =
+                    ctx.builder
+                        .build_gep(res_val, vec![i_idx], IrType::Ptr, span);
+                emit_inst(ctx, gep_ii);
+                let st_i = ctx.builder.build_store(neg_imag, i_ptr, span);
+                emit_inst(ctx, st_i);
+
+                let (result, load_inst) = ctx.builder.build_load(res_val, complex_ir, span);
+                emit_inst(ctx, load_inst);
+                return TypedValue::new(result, resolved_ty.clone());
+            }
+
+            // Non-complex bitwise NOT
             let prom = types::integer_promotion(&inner.ty);
             let it = ctype_to_ir(&prom, ctx.target);
             let v = insert_implicit_conversion(ctx, inner.value, &inner.ty, &prom, span);
@@ -2589,22 +3082,60 @@ fn lower_unary(
             TypedValue::new(r, CType::Bool)
         }
         ast::UnaryOp::RealPart => {
-            // GCC __real__: for non-complex types, acts as identity.
-            // For _Complex, would extract real component.
-
-            lower_expr_inner(ctx, operand)
+            // GCC __real__: extract real component from _Complex, or
+            // identity for non-complex scalar types.
+            let inner = lower_expr_inner(ctx, operand);
+            let resolved = types::resolve_typedef(&inner.ty);
+            if let CType::Complex(base) = resolved {
+                let elem_ctype = base.as_ref().clone();
+                let elem_ir = ctype_to_ir(&elem_ctype, ctx.target);
+                // Get pointer to the complex value's storage.
+                let ptr = lower_lvalue(ctx, operand);
+                // Real part is at offset 0.
+                let zero_idx = emit_int_const_for_index(ctx, 0);
+                let (real_ptr, gep) = ctx
+                    .builder
+                    .build_gep(ptr, vec![zero_idx], IrType::Ptr, span);
+                emit_inst(ctx, gep);
+                let (real_val, ld) = ctx.builder.build_load(real_ptr, elem_ir, span);
+                emit_inst(ctx, ld);
+                TypedValue::new(real_val, elem_ctype)
+            } else {
+                inner
+            }
         }
         ast::UnaryOp::ImagPart => {
-            // GCC __imag__: for non-complex types, returns 0.
-            // For _Complex, would extract imaginary component.
+            // GCC __imag__: extract imaginary component from _Complex, or
+            // return 0 for non-complex scalar types.
             let inner = lower_expr_inner(ctx, operand);
-            let ir_ty = ctype_to_ir(&inner.ty, ctx.target);
-            if matches!(ir_ty, IrType::F32 | IrType::F64 | IrType::F80) {
-                let val = emit_float_const(ctx, 0.0, ir_ty, span);
-                TypedValue::new(val, inner.ty)
+            let resolved = types::resolve_typedef(&inner.ty);
+            if let CType::Complex(base) = resolved {
+                let elem_ctype = base.as_ref().clone();
+                let elem_ir = ctype_to_ir(&elem_ctype, ctx.target);
+                let elem_size: i64 = match &elem_ir {
+                    IrType::F32 => 4,
+                    IrType::F64 => 8,
+                    IrType::F80 => 16,
+                    _ => 8,
+                };
+                // Get pointer to the complex value's storage.
+                let ptr = lower_lvalue(ctx, operand);
+                // Imaginary part is at offset elem_size.
+                let off_idx = emit_int_const_for_index(ctx, elem_size);
+                let (imag_ptr, gep) = ctx.builder.build_gep(ptr, vec![off_idx], IrType::Ptr, span);
+                emit_inst(ctx, gep);
+                let (imag_val, ld) = ctx.builder.build_load(imag_ptr, elem_ir, span);
+                emit_inst(ctx, ld);
+                TypedValue::new(imag_val, elem_ctype)
             } else {
-                let val = emit_int_const(ctx, 0, ir_ty, span);
-                TypedValue::new(val, inner.ty)
+                let ir_ty = ctype_to_ir(&inner.ty, ctx.target);
+                if matches!(ir_ty, IrType::F32 | IrType::F64 | IrType::F80) {
+                    let val = emit_float_const(ctx, 0.0, ir_ty, span);
+                    TypedValue::new(val, inner.ty)
+                } else {
+                    let val = emit_int_const(ctx, 0, ir_ty, span);
+                    TypedValue::new(val, inner.ty)
+                }
             }
         }
     }
@@ -2851,6 +3382,167 @@ fn lower_assignment(
                 emit_inst(ctx, li);
                 v
             };
+
+            // _Complex compound assignment: x += y, x -= y, x *= y, x /= y
+            // must be done component-wise.
+            let resolved_lhs_cty = types::resolve_typedef(&lhs_ptr.ty);
+            let resolved_rhs_cty = types::resolve_typedef(&rhs.ty);
+            let lhs_is_complex = matches!(resolved_lhs_cty, CType::Complex(_));
+            let rhs_is_complex = matches!(resolved_rhs_cty, CType::Complex(_));
+            if lhs_is_complex || rhs_is_complex {
+                // Determine the element FP type
+                let elem_ctype = if let CType::Complex(ref base) = resolved_lhs_cty {
+                    base.as_ref().clone()
+                } else if let CType::Complex(ref base) = resolved_rhs_cty {
+                    base.as_ref().clone()
+                } else {
+                    CType::Double
+                };
+                let elem_ir = ctype_to_ir(&elem_ctype, ctx.target);
+                let elem_size: i64 = match &elem_ir {
+                    IrType::F32 => 4,
+                    IrType::F64 => 8,
+                    IrType::F80 => 16,
+                    _ => 8,
+                };
+
+                // Load LHS real/imag from the lvalue pointer
+                let zero_idx = emit_int_const_for_index(ctx, 0);
+                let (lr_ptr, g1) =
+                    ctx.builder
+                        .build_gep(lhs_ptr.value, vec![zero_idx], IrType::Ptr, span);
+                emit_inst(ctx, g1);
+                let (lr, l1) = ctx.builder.build_load(lr_ptr, elem_ir.clone(), span);
+                emit_inst(ctx, l1);
+                let off_idx = emit_int_const_for_index(ctx, elem_size);
+                let (li_ptr, g2) =
+                    ctx.builder
+                        .build_gep(lhs_ptr.value, vec![off_idx], IrType::Ptr, span);
+                emit_inst(ctx, g2);
+                let (li_val, l2) = ctx.builder.build_load(li_ptr, elem_ir.clone(), span);
+                emit_inst(ctx, l2);
+
+                // Get RHS real/imag
+                let (rr, ri) = if rhs_is_complex {
+                    // Store rhs aggregate to temp, then load parts
+                    let complex_ir = IrType::from_ctype(resolved_rhs_cty, ctx.target);
+                    let (tmp_alloca, ai) = ctx.builder.build_alloca(complex_ir, span);
+                    emit_inst(ctx, ai);
+                    let si = ctx.builder.build_store(rhs.value, tmp_alloca, span);
+                    emit_inst(ctx, si);
+                    let z2 = emit_int_const_for_index(ctx, 0);
+                    let (rr_ptr, rg1) =
+                        ctx.builder
+                            .build_gep(tmp_alloca, vec![z2], IrType::Ptr, span);
+                    emit_inst(ctx, rg1);
+                    let (rr_v, rl1) = ctx.builder.build_load(rr_ptr, elem_ir.clone(), span);
+                    emit_inst(ctx, rl1);
+                    let o2 = emit_int_const_for_index(ctx, elem_size);
+                    let (ri_ptr, rg2) =
+                        ctx.builder
+                            .build_gep(tmp_alloca, vec![o2], IrType::Ptr, span);
+                    emit_inst(ctx, rg2);
+                    let (ri_v, rl2) = ctx.builder.build_load(ri_ptr, elem_ir.clone(), span);
+                    emit_inst(ctx, rl2);
+                    (rr_v, ri_v)
+                } else {
+                    // Scalar RHS: promote to FP, imag = 0.0
+                    let rv = insert_implicit_conversion(ctx, rhs.value, &rhs.ty, &elem_ctype, span);
+                    let zero = emit_float_const(ctx, 0.0, elem_ir.clone(), span);
+                    (rv, zero)
+                };
+
+                // Perform component-wise operation
+                let (res_r, res_i) = match op {
+                    ast::AssignOp::AddAssign => {
+                        let (r, i1) = ctx.builder.build_add(lr, rr, elem_ir.clone(), span);
+                        emit_inst(ctx, i1);
+                        let (i, i2) = ctx.builder.build_add(li_val, ri, elem_ir.clone(), span);
+                        emit_inst(ctx, i2);
+                        (r, i)
+                    }
+                    ast::AssignOp::SubAssign => {
+                        let (r, i1) = ctx.builder.build_sub(lr, rr, elem_ir.clone(), span);
+                        emit_inst(ctx, i1);
+                        let (i, i2) = ctx.builder.build_sub(li_val, ri, elem_ir.clone(), span);
+                        emit_inst(ctx, i2);
+                        (r, i)
+                    }
+                    ast::AssignOp::MulAssign => {
+                        // (a+bi)(c+di) = (ac-bd) + (ad+bc)i
+                        let (ac, m1) = ctx.builder.build_mul(lr, rr, elem_ir.clone(), span);
+                        emit_inst(ctx, m1);
+                        let (bd, m2) = ctx.builder.build_mul(li_val, ri, elem_ir.clone(), span);
+                        emit_inst(ctx, m2);
+                        let (ad, m3) = ctx.builder.build_mul(lr, ri, elem_ir.clone(), span);
+                        emit_inst(ctx, m3);
+                        let (bc, m4) = ctx.builder.build_mul(li_val, rr, elem_ir.clone(), span);
+                        emit_inst(ctx, m4);
+                        let (r, s1) = ctx.builder.build_sub(ac, bd, elem_ir.clone(), span);
+                        emit_inst(ctx, s1);
+                        let (i, a1) = ctx.builder.build_add(ad, bc, elem_ir.clone(), span);
+                        emit_inst(ctx, a1);
+                        (r, i)
+                    }
+                    ast::AssignOp::DivAssign => {
+                        // (a+bi)/(c+di) = ((ac+bd)/(c²+d²)) + ((bc-ad)/(c²+d²))i
+                        let (cc, m1) = ctx.builder.build_mul(rr, rr, elem_ir.clone(), span);
+                        emit_inst(ctx, m1);
+                        let (dd, m2) = ctx.builder.build_mul(ri, ri, elem_ir.clone(), span);
+                        emit_inst(ctx, m2);
+                        let (denom, a1) = ctx.builder.build_add(cc, dd, elem_ir.clone(), span);
+                        emit_inst(ctx, a1);
+                        let (ac, m3) = ctx.builder.build_mul(lr, rr, elem_ir.clone(), span);
+                        emit_inst(ctx, m3);
+                        let (bd, m4) = ctx.builder.build_mul(li_val, ri, elem_ir.clone(), span);
+                        emit_inst(ctx, m4);
+                        let (numer_r, a2) = ctx.builder.build_add(ac, bd, elem_ir.clone(), span);
+                        emit_inst(ctx, a2);
+                        let (bc, m5) = ctx.builder.build_mul(li_val, rr, elem_ir.clone(), span);
+                        emit_inst(ctx, m5);
+                        let (ad, m6) = ctx.builder.build_mul(lr, ri, elem_ir.clone(), span);
+                        emit_inst(ctx, m6);
+                        let (numer_i, s1) = ctx.builder.build_sub(bc, ad, elem_ir.clone(), span);
+                        emit_inst(ctx, s1);
+                        let (r, d1) =
+                            ctx.builder
+                                .build_div(numer_r, denom, elem_ir.clone(), true, span);
+                        emit_inst(ctx, d1);
+                        let (i, d2) =
+                            ctx.builder
+                                .build_div(numer_i, denom, elem_ir.clone(), true, span);
+                        emit_inst(ctx, d2);
+                        (r, i)
+                    }
+                    _ => {
+                        // Other compound ops on complex: fall through to scalar
+                        let (r, _) = ctx.builder.build_add(lr, rr, elem_ir.clone(), span);
+                        (r, li_val)
+                    }
+                };
+
+                // Store real and imag back to lvalue
+                let z3 = emit_int_const_for_index(ctx, 0);
+                let (wr_ptr, wg1) =
+                    ctx.builder
+                        .build_gep(lhs_ptr.value, vec![z3], IrType::Ptr, span);
+                emit_inst(ctx, wg1);
+                let ws1 = ctx.builder.build_store(res_r, wr_ptr, span);
+                emit_inst(ctx, ws1);
+                let o3 = emit_int_const_for_index(ctx, elem_size);
+                let (wi_ptr, wg2) =
+                    ctx.builder
+                        .build_gep(lhs_ptr.value, vec![o3], IrType::Ptr, span);
+                emit_inst(ctx, wg2);
+                let ws2 = ctx.builder.build_store(res_i, wi_ptr, span);
+                emit_inst(ctx, ws2);
+
+                // Load the full complex back as return value
+                let complex_ir = IrType::from_ctype(&lhs_ptr.ty, ctx.target);
+                let (result, rl) = ctx.builder.build_load(lhs_ptr.value, complex_ir, span);
+                emit_inst(ctx, rl);
+                return TypedValue::new(result, lhs_ptr.ty);
+            }
 
             // C11 §6.5.16.2: Compound assignment  E1 op= E2  is equivalent to
             //   E1 = (typeof(E1))(E1 op E2)
@@ -4596,6 +5288,74 @@ fn lower_cast(
         let (v, i) = ctx.builder.build_bitcast(value, to_ir, span);
         emit_inst(ctx, i);
         return v;
+    }
+
+    // Scalar → Complex: promote a real/integer scalar to _Complex by
+    // setting real = scalar, imag = 0.  C11 §6.3.1.7: "When a value of
+    // real type is converted to a complex type, the real part of the
+    // complex result value is determined by the rules of conversion to
+    // the corresponding real type and the imaginary part of the complex
+    // result value is a positive zero or an unsigned zero."
+    if let CType::Complex(ref base) = to {
+        let elem_ir = ctype_to_ir(base.as_ref(), ctx.target);
+        // Cast the scalar value to the element type if needed.
+        let real_val = if from_ir != elem_ir {
+            lower_cast(ctx, value, from_cty, base.as_ref(), span)
+        } else {
+            value
+        };
+        // Build the complex value {real, 0.0} via alloca+store.
+        let (alloca_val, alloca_inst) = ctx.builder.build_alloca(to_ir.clone(), span);
+        emit_inst(ctx, alloca_inst);
+        // Store real part at offset 0.
+        let zero_idx = emit_int_const_for_index(ctx, 0);
+        let (real_ptr, gep_r) =
+            ctx.builder
+                .build_gep(alloca_val, vec![zero_idx], IrType::Ptr, span);
+        emit_inst(ctx, gep_r);
+        let st_real = ctx.builder.build_store(real_val, real_ptr, span);
+        emit_inst(ctx, st_real);
+        // Store zero imaginary part at offset elem_sz.
+        let elem_sz: i64 = match &elem_ir {
+            IrType::F32 => 4,
+            IrType::F64 => 8,
+            IrType::F80 => 16,
+            _ => 8,
+        };
+        let imag_idx = emit_int_const_for_index(ctx, elem_sz);
+        let (imag_ptr, gep_i) =
+            ctx.builder
+                .build_gep(alloca_val, vec![imag_idx], IrType::Ptr, span);
+        emit_inst(ctx, gep_i);
+        let zero_imag = emit_float_const(ctx, 0.0, elem_ir, span);
+        let st_imag = ctx.builder.build_store(zero_imag, imag_ptr, span);
+        emit_inst(ctx, st_imag);
+        // Load the complete complex value.
+        let (v, i) = ctx.builder.build_load(alloca_val, to_ir, span);
+        emit_inst(ctx, i);
+        return v;
+    }
+
+    // Complex → Scalar: extract real part.
+    // C11 §6.3.1.7: "When a value of complex type is converted to a
+    // real type, the imaginary part of the complex value is discarded
+    // and the value of the real part is converted."
+    if let CType::Complex(ref base) = from {
+        let elem_ir = ctype_to_ir(base.as_ref(), ctx.target);
+        // Extract real part (component at offset 0) via alloca+GEP+load.
+        let (alloca_val, alloca_inst) = ctx.builder.build_alloca(from_ir.clone(), span);
+        emit_inst(ctx, alloca_inst);
+        let st = ctx.builder.build_store(value, alloca_val, span);
+        emit_inst(ctx, st);
+        let zero_idx = emit_int_const_for_index(ctx, 0);
+        let (real_ptr, gep_r) =
+            ctx.builder
+                .build_gep(alloca_val, vec![zero_idx], IrType::Ptr, span);
+        emit_inst(ctx, gep_r);
+        let (real_val, ld) = ctx.builder.build_load(real_ptr, elem_ir, span);
+        emit_inst(ctx, ld);
+        // Cast the extracted real value to the target type if needed.
+        return lower_cast(ctx, real_val, base.as_ref(), to_cty, span);
     }
 
     // Fallback: bitcast.

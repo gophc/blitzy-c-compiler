@@ -4637,11 +4637,9 @@ impl<'a> SemanticAnalyzer<'a> {
             FloatSuffix::F => CType::Float,
             FloatSuffix::L => CType::LongDouble,
             // GCC imaginary constant extension: `1.0i` → `_Complex double`
-            // For the imaginary component, we return the base float type.
-            // The complex lowering handles constructing {0.0, imag}.
-            FloatSuffix::I => CType::Double,
-            FloatSuffix::FI => CType::Float,
-            FloatSuffix::LI => CType::LongDouble,
+            FloatSuffix::I => CType::Complex(Box::new(CType::Double)),
+            FloatSuffix::FI => CType::Complex(Box::new(CType::Float)),
+            FloatSuffix::LI => CType::Complex(Box::new(CType::LongDouble)),
         }
     }
 

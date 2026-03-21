@@ -211,9 +211,9 @@ impl<'a> TypeChecker<'a> {
             FloatSuffix::None => CType::Double,
             FloatSuffix::F => CType::Float,
             FloatSuffix::L => CType::LongDouble,
-            FloatSuffix::I => CType::Double,
-            FloatSuffix::FI => CType::Float,
-            FloatSuffix::LI => CType::LongDouble,
+            FloatSuffix::I => CType::Complex(Box::new(CType::Double)),
+            FloatSuffix::FI => CType::Complex(Box::new(CType::Float)),
+            FloatSuffix::LI => CType::Complex(Box::new(CType::LongDouble)),
         }
     }
 

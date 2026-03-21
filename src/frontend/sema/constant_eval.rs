@@ -2102,9 +2102,12 @@ impl<'a> ConstantEvaluator<'a> {
         match expr {
             Expression::IntegerLiteral { suffix, .. } => Ok(self.integer_suffix_to_type(suffix)),
             Expression::FloatLiteral { suffix, .. } => match suffix {
-                FloatSuffix::F | FloatSuffix::FI => Ok(CType::Float),
-                FloatSuffix::L | FloatSuffix::LI => Ok(CType::LongDouble),
-                FloatSuffix::None | FloatSuffix::I => Ok(CType::Double),
+                FloatSuffix::F => Ok(CType::Float),
+                FloatSuffix::L => Ok(CType::LongDouble),
+                FloatSuffix::None => Ok(CType::Double),
+                FloatSuffix::I => Ok(CType::Complex(Box::new(CType::Double))),
+                FloatSuffix::FI => Ok(CType::Complex(Box::new(CType::Float))),
+                FloatSuffix::LI => Ok(CType::Complex(Box::new(CType::LongDouble))),
             },
             Expression::CharLiteral { .. } => Ok(CType::Int),
             Expression::StringLiteral { .. } => {

@@ -1299,6 +1299,24 @@ fn lower_aggregate_local_init(
             }
         }
         CType::Union { ref fields, .. } => {
+            // C11 §6.7.9/10: If the aggregate has union type, the first
+            // named member is initialized (recursively).  All bytes of
+            // the entire union object not explicitly initialized shall
+            // be zero-initialized (C11 §6.7.9/21).  We zero-fill the
+            // full union first, then overlay any explicit initializer.
+            let union_size = ctx.type_builder.sizeof_type(resolved);
+            // Zero-fill every byte of the union via I8 stores.
+            for byte_idx in 0..union_size {
+                let idx_val = make_index_value(ctx, byte_idx as i64);
+                let (ptr, gep_inst) =
+                    ctx.builder
+                        .build_gep(base_alloca, vec![idx_val], IrType::Ptr, span);
+                emit_inst_to_ctx(ctx, gep_inst);
+                let zero_val = expr_lowering::emit_int_const_for_zero(ctx, IrType::I8);
+                let store_inst = ctx.builder.build_store(zero_val, ptr, span);
+                emit_inst_to_ctx(ctx, store_inst);
+            }
+            // Now overlay the explicit initializer if present.
             if let Some(first) = init_list.first() {
                 let field_idx =
                     resolve_field_designator(&first.designators, fields, 0, ctx.name_table);
@@ -1491,7 +1509,18 @@ fn evaluate_constant_expr(
 ) -> Option<Constant> {
     match expr {
         ast::Expression::IntegerLiteral { value, .. } => Some(Constant::Integer(*value as i128)),
-        ast::Expression::FloatLiteral { value, .. } => Some(Constant::Float(*value)),
+        ast::Expression::FloatLiteral { value, suffix, .. } => {
+            // GCC imaginary suffix: `2.0i` → _Complex constant {0.0, 2.0}
+            match suffix {
+                ast::FloatSuffix::I | ast::FloatSuffix::FI | ast::FloatSuffix::LI => {
+                    Some(Constant::Array(vec![
+                        Constant::Float(0.0),
+                        Constant::Float(*value),
+                    ]))
+                }
+                _ => Some(Constant::Float(*value)),
+            }
+        }
         ast::Expression::StringLiteral {
             segments, prefix, ..
         } => {
@@ -2129,6 +2158,15 @@ fn create_anonymous_string_global(bytes: &[u8], target: &Target) -> String {
     anon_name
 }
 
+/// Extract an f64 from a Constant (Integer or Float).
+fn const_as_f64(c: &Constant) -> f64 {
+    match c {
+        Constant::Float(f) => *f,
+        Constant::Integer(i) => *i as f64,
+        _ => 0.0,
+    }
+}
+
 fn evaluate_const_binop(op: &ast::BinaryOp, lhs: &Constant, rhs: &Constant) -> Option<Constant> {
     match (lhs, rhs) {
         (Constant::Integer(a), Constant::Integer(b)) => {
@@ -2259,6 +2297,88 @@ fn evaluate_const_binop(op: &ast::BinaryOp, lhs: &Constant, rhs: &Constant) -> O
                 _ => return Some(Constant::Undefined),
             };
             Some(Constant::Float(result))
+        }
+        // _Complex constant arithmetic: Array([real, imag]) ± Array/Float
+        (Constant::Array(a_parts), Constant::Array(b_parts))
+            if a_parts.len() == 2 && b_parts.len() == 2 =>
+        {
+            let ar = const_as_f64(&a_parts[0]);
+            let ai = const_as_f64(&a_parts[1]);
+            let br = const_as_f64(&b_parts[0]);
+            let bi = const_as_f64(&b_parts[1]);
+            match op {
+                ast::BinaryOp::Add => Some(Constant::Array(vec![
+                    Constant::Float(ar + br),
+                    Constant::Float(ai + bi),
+                ])),
+                ast::BinaryOp::Sub => Some(Constant::Array(vec![
+                    Constant::Float(ar - br),
+                    Constant::Float(ai - bi),
+                ])),
+                ast::BinaryOp::Mul => Some(Constant::Array(vec![
+                    Constant::Float(ar * br - ai * bi),
+                    Constant::Float(ar * bi + ai * br),
+                ])),
+                _ => Some(Constant::Undefined),
+            }
+        }
+        // Float + Complex → promote scalar to Complex{scalar, 0.0}
+        (Constant::Float(a), Constant::Array(b_parts)) if b_parts.len() == 2 => {
+            let br = const_as_f64(&b_parts[0]);
+            let bi = const_as_f64(&b_parts[1]);
+            match op {
+                ast::BinaryOp::Add => Some(Constant::Array(vec![
+                    Constant::Float(a + br),
+                    Constant::Float(bi),
+                ])),
+                ast::BinaryOp::Sub => Some(Constant::Array(vec![
+                    Constant::Float(a - br),
+                    Constant::Float(-bi),
+                ])),
+                ast::BinaryOp::Mul => {
+                    // (a+0i)(br+bi*i) = (a*br) + (a*bi)i
+                    Some(Constant::Array(vec![
+                        Constant::Float(a * br),
+                        Constant::Float(a * bi),
+                    ]))
+                }
+                ast::BinaryOp::Div if br != 0.0 || bi != 0.0 => {
+                    // (a+0i)/(br+bi*i)
+                    let denom = br * br + bi * bi;
+                    Some(Constant::Array(vec![
+                        Constant::Float((a * br) / denom),
+                        Constant::Float((-a * bi) / denom),
+                    ]))
+                }
+                _ => Some(Constant::Undefined),
+            }
+        }
+        // Complex + Float
+        (Constant::Array(a_parts), Constant::Float(b)) if a_parts.len() == 2 => {
+            let ar = const_as_f64(&a_parts[0]);
+            let ai = const_as_f64(&a_parts[1]);
+            match op {
+                ast::BinaryOp::Add => Some(Constant::Array(vec![
+                    Constant::Float(ar + b),
+                    Constant::Float(ai),
+                ])),
+                ast::BinaryOp::Sub => Some(Constant::Array(vec![
+                    Constant::Float(ar - b),
+                    Constant::Float(ai),
+                ])),
+                ast::BinaryOp::Mul => {
+                    // (ar+ai*i)(b+0i) = (ar*b) + (ai*b)i
+                    Some(Constant::Array(vec![
+                        Constant::Float(ar * b),
+                        Constant::Float(ai * b),
+                    ]))
+                }
+                ast::BinaryOp::Div if *b != 0.0 => Some(Constant::Array(vec![
+                    Constant::Float(ar / b),
+                    Constant::Float(ai / b),
+                ])),
+                _ => Some(Constant::Undefined),
+            }
         }
         _ => Some(Constant::Undefined),
     }
@@ -5592,8 +5712,26 @@ fn zero_init_field(
             }
         }
         CType::Union { ref fields, .. } => {
-            // Zero the first (largest) member of the union.
-            if let Some(first) = fields.first() {
+            // Zero ALL bytes of the union (not just the first member)
+            // so that reading through any member after zero-init sees
+            // zeroes.  The first member alone may be smaller than the
+            // entire union, leaving trailing bytes uninitialized.
+            let union_size = crate::common::types::sizeof_ctype(resolved, ctx.target);
+            if union_size > 0 {
+                for byte_idx in 0..union_size {
+                    let off = byte_offset + byte_idx as i64;
+                    let idx_val = make_index_value(ctx, off);
+                    let (ptr, gep_inst) =
+                        ctx.builder
+                            .build_gep(base_alloca, vec![idx_val], IrType::Ptr, span);
+                    emit_inst_to_ctx(ctx, gep_inst);
+                    let zero_val = expr_lowering::emit_int_const_for_zero(ctx, IrType::I8);
+                    let store_inst = ctx.builder.build_store(zero_val, ptr, span);
+                    emit_inst_to_ctx(ctx, store_inst);
+                }
+            } else if let Some(first) = fields.first() {
+                // Fallback: if sizeof fails, at least zero the first
+                // member (matches previous behavior).
                 zero_init_field(base_alloca, byte_offset, &first.ty, ctx, span);
             }
         }
