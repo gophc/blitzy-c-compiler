@@ -1022,6 +1022,7 @@ pub fn lower_translation_unit(
                         target,
                         diagnostics,
                         name_table,
+                        &struct_defs,
                     );
                 } else {
                     decl_lowering::lower_global_variable(

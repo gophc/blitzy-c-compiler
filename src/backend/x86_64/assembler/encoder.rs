@@ -1273,6 +1273,20 @@ impl X86_64Encoder {
                         );
                         EncodedInstruction::with_relocations(bytes, vec![reloc])
                     }
+                    // Immediate address: materialise into scratch, then load.
+                    (
+                        Some(MachineOperand::Register(dst)),
+                        Some(MachineOperand::Immediate(addr)),
+                    ) => {
+                        let scratch: u16 = if *dst == 11 { 10 } else { 11 };
+                        let mut bytes = Vec::new();
+                        let mov_addr = self.encode_mov_imm64(scratch, *addr);
+                        bytes.extend_from_slice(&mov_addr.bytes);
+                        let load =
+                            self.encode_reg_mem_op(&[0x8B], *dst, Some(scratch), None, 1, 0, 4);
+                        bytes.extend_from_slice(&load.bytes);
+                        EncodedInstruction::new(bytes)
+                    }
                     _ => {
                         eprintln!(
                             "[UD2] opcode={} ops={:?} res={:?}",
@@ -1430,6 +1444,42 @@ impl X86_64Encoder {
                         // POP scratch — restore scratch register
                         let restore = self.encode_push_pop(0x58, scratch);
                         bytes.extend_from_slice(&restore.bytes);
+                        EncodedInstruction::new(bytes)
+                    }
+                    // Immediate address (e.g. NULL or unresolved value):
+                    // materialise the address into R11 scratch then store.
+                    (
+                        Some(MachineOperand::Immediate(addr)),
+                        Some(MachineOperand::Register(src)),
+                    ) => {
+                        let scratch: u16 = if *src == 11 { 10 } else { 11 };
+                        let mut bytes = Vec::new();
+                        let mov_addr = self.encode_mov_imm64(scratch, *addr);
+                        bytes.extend_from_slice(&mov_addr.bytes);
+                        let store =
+                            self.encode_mem_reg_op(&[0x89], Some(scratch), None, 1, 0, *src, 4);
+                        bytes.extend_from_slice(&store.bytes);
+                        EncodedInstruction::new(bytes)
+                    }
+                    (
+                        Some(MachineOperand::Immediate(addr)),
+                        Some(MachineOperand::Immediate(val)),
+                    ) => {
+                        let scratch: u16 = 11;
+                        let mut bytes = Vec::new();
+                        let mov_addr = self.encode_mov_imm64(scratch, *addr);
+                        bytes.extend_from_slice(&mov_addr.bytes);
+                        let mem_enc = encode_memory_operand(0, Some(scratch), None, 1, 0);
+                        if let Some(rex) = compute_rex(false, None, None, Some(scratch)) {
+                            bytes.push(rex);
+                        }
+                        bytes.push(0xC7);
+                        bytes.push(mem_enc.modrm);
+                        if let Some(s) = mem_enc.sib {
+                            bytes.push(s);
+                        }
+                        bytes.extend_from_slice(&mem_enc.displacement);
+                        bytes.extend_from_slice(&encode_immediate(*val, 4));
                         EncodedInstruction::new(bytes)
                     }
                     _ => {
@@ -4006,6 +4056,18 @@ impl X86_64Encoder {
     /// Format: `F3 0F 5A /r` — XMM(double) ← convert(XMM(float)).
     fn encode_cvtss2sd(&mut self, inst: &MachineInstruction) -> EncodedInstruction {
         self.encode_sse_op(inst, 0xF3, 0x5A)
+    }
+    /// Encode `MOV r64, imm64` — loads a 64-bit immediate into a register.
+    /// Used to materialise absolute addresses for indirect load/store when
+    /// the pointer operand is an unresolved immediate value.
+    fn encode_mov_imm64(&self, dst: u16, imm: i64) -> EncodedInstruction {
+        let mut bytes = Vec::with_capacity(10);
+        let rex =
+            compute_rex(true, None, None, Some(dst)).unwrap_or(rex_byte(true, false, false, false));
+        bytes.push(rex);
+        bytes.push(0xB8 + (hw_encoding(dst) & 0x7));
+        bytes.extend_from_slice(&imm.to_le_bytes());
+        EncodedInstruction::new(bytes)
     }
 } // end impl X86_64Encoder
 

@@ -809,6 +809,7 @@ pub fn lower_function_declaration(
     target: &Target,
     _diagnostics: &mut DiagnosticEngine,
     name_table: &[String],
+    struct_defs: &FxHashMap<String, CType>,
 ) {
     let specifiers = &decl.specifiers;
 
@@ -825,6 +826,12 @@ pub fn lower_function_declaration(
         if let Some(ref ptr) = declarator.pointer {
             return_c_type = apply_pointer_layers(return_c_type, ptr);
         }
+        // Resolve any forward-referenced struct/union tags in the return
+        // type.  Without this, a declaration like `struct S0 func_4(...)`
+        // processed before the struct definition would leave the return
+        // type as `Struct { fields: [], name: "S0" }` (size 0), causing
+        // the backend to omit the sret buffer for MEMORY-class returns.
+        resolve_struct_forward_ref(&mut return_c_type, struct_defs);
         let return_ir_type = IrType::from_ctype(&return_c_type, target);
 
         // Store the C-level return type for `lower_function_call`.
@@ -838,7 +845,10 @@ pub fn lower_function_declaration(
         let param_types: Vec<IrType> = param_decls
             .iter()
             .map(|pd| {
-                let param_c_type = resolve_param_type(pd, target, name_table);
+                let mut param_c_type = resolve_param_type(pd, target, name_table);
+                // Resolve forward-referenced struct/union tags in parameter
+                // types so ABI classification uses the correct struct size.
+                resolve_struct_forward_ref(&mut param_c_type, struct_defs);
                 c_param_types_decl.push(param_c_type.clone());
                 IrType::from_ctype(&param_c_type, target)
             })
@@ -1375,12 +1385,50 @@ fn lower_aggregate_local_init(
                 let field_idx =
                     resolve_field_designator(&first.designators, fields, 0, ctx.name_table);
                 if field_idx < fields.len() {
-                    lower_single_init_element(
-                        base_alloca,
-                        &first.initializer,
-                        &fields[field_idx].ty,
-                        ctx,
-                    );
+                    // When the selected union member is a bitfield, use
+                    // bitfield store (read-modify-write with masking)
+                    // instead of a plain store.  This ensures only the
+                    // bitfield width bits are written, matching GCC/C11
+                    // semantics — the remaining union bytes stay zero.
+                    if let Some(bw) = fields[field_idx].bit_width {
+                        if bw > 0 {
+                            let tv = expr_lowering::lower_expression_typed(
+                                ctx,
+                                match &first.initializer {
+                                    ast::Initializer::Expression(e) => e,
+                                    _ => {
+                                        // Nested list for bitfield — fall back
+                                        lower_single_init_element(
+                                            base_alloca,
+                                            &first.initializer,
+                                            &fields[field_idx].ty,
+                                            ctx,
+                                        );
+                                        return;
+                                    }
+                                },
+                            );
+                            let val = tv.value;
+                            // Use bitfield store: bit_offset=0 (union members
+                            // always start at offset 0), bit_width=bw.
+                            expr_lowering::lower_bitfield_store(
+                                ctx,
+                                base_alloca,
+                                val,
+                                &fields[field_idx].ty,
+                                0,
+                                bw as usize,
+                                span,
+                            );
+                        }
+                    } else {
+                        lower_single_init_element(
+                            base_alloca,
+                            &first.initializer,
+                            &fields[field_idx].ty,
+                            ctx,
+                        );
+                    }
                 }
             }
         }
@@ -2794,23 +2842,51 @@ fn lower_designated_initializer(
                     // constant_to_bytes_typed can produce the correct
                     // output against the union's Array IR type.
                     if let Some(mc) = member_const {
-                        let needs_serialize =
-                            matches!(mc, Constant::Struct(..) | Constant::Array(..));
-                        if needs_serialize {
-                            let member_size = crate::common::types::sizeof_ctype(member_ty, target);
+                        // When the union member is a bitfield, mask the
+                        // constant value to the bitfield width and produce
+                        // a byte buffer.  Without this, the full integer
+                        // value leaks into the union storage — violating
+                        // C11 §6.7.2.1p10 (bitfield width limits).
+                        let bit_width_opt = fields[field_idx].bit_width;
+                        if let Some(bw) = bit_width_opt {
                             let union_size =
                                 crate::common::types::sizeof_ctype(target_type, target);
-                            let mut bytes = constant_to_le_bytes(
-                                &mc,
-                                member_size,
-                                member_ty,
-                                target,
-                                type_builder,
-                            );
-                            bytes.resize(union_size, 0);
+                            let mut bytes = vec![0u8; union_size];
+                            let val: u128 = match &mc {
+                                Constant::Integer(v) => *v as u128,
+                                Constant::Float(v) => v.to_bits() as u128,
+                                Constant::ZeroInit => 0,
+                                _ => 0,
+                            };
+                            let mask = if bw >= 128 { !0u128 } else { (1u128 << bw) - 1 };
+                            let masked = val & mask;
+                            // Store at bit offset 0 within the first
+                            // storage unit (union always starts at 0).
+                            let unit_bytes = ((bw as usize) + 7) / 8;
+                            let unit_bytes = unit_bytes.max(1).min(union_size);
+                            for b in 0..unit_bytes {
+                                if b < bytes.len() {
+                                    bytes[b] = ((masked >> (b * 8)) & 0xFF) as u8;
+                                }
+                            }
                             return Some(Constant::String(bytes));
                         }
-                        return Some(mc);
+
+                        // Always serialize the member constant to bytes
+                        // for union types.  This ensures that:
+                        //  1. The value is truncated to the member's byte
+                        //     width (e.g. -1L stored into int32_t becomes
+                        //     4 bytes, not 8).
+                        //  2. The remaining union bytes are zero-padded.
+                        // Without this, a Constant::Integer(-1) (8 bytes)
+                        // stored into a union { int32_t; int64_t; } would
+                        // write 8 bytes of 0xFF instead of 4 + 4 zeros.
+                        let member_size = crate::common::types::sizeof_ctype(member_ty, target);
+                        let union_size = crate::common::types::sizeof_ctype(target_type, target);
+                        let mut bytes =
+                            constant_to_le_bytes(&mc, member_size, member_ty, target, type_builder);
+                        bytes.resize(union_size, 0);
+                        return Some(Constant::String(bytes));
                     }
                 }
             }
