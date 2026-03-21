@@ -5367,8 +5367,7 @@ impl X86_64CodeGen {
                         // reset the offsets that previous va_arg calls modified.
 
                         // [+0] gp_offset (32-bit) = named_gpr_count * 8
-                        let gp_offset_init =
-                            (frame.named_gpr_count as i64) * 8;
+                        let gp_offset_init = (frame.named_gpr_count as i64) * 8;
                         {
                             let mut m = Self::mk_inst(
                                 X86Opcode::Mov,
@@ -5388,8 +5387,7 @@ impl X86_64CodeGen {
                         }
 
                         // [+4] fp_offset (32-bit) = 48 + named_fp_count * 16
-                        let fp_offset_init =
-                            48 + (frame.named_fp_count as i64) * 16;
+                        let fp_offset_init = 48 + (frame.named_fp_count as i64) * 16;
                         {
                             let mut m = Self::mk_inst(
                                 X86Opcode::Mov,
@@ -5410,10 +5408,8 @@ impl X86_64CodeGen {
 
                         // [+8] overflow_arg_area (ptr) = RBP + 16 +
                         //       (stack-spilled fixed params) * 8
-                        let gp_stack_fixed =
-                            frame.named_gpr_count.saturating_sub(6);
-                        let fp_stack_fixed =
-                            frame.named_fp_count.saturating_sub(8);
+                        let gp_stack_fixed = frame.named_gpr_count.saturating_sub(6);
+                        let fp_stack_fixed = frame.named_fp_count.saturating_sub(8);
                         let overflow_disp: i64 =
                             16 + ((gp_stack_fixed + fp_stack_fixed) * 8) as i64;
                         let rcx = MachineOperand::Register(RCX);
@@ -5832,9 +5828,7 @@ impl X86_64CodeGen {
                     return None;
                 }
                 // Parse struct byte size from intrinsic name
-                let sz: i64 = s["__builtin_va_arg_mem_".len()..]
-                    .parse()
-                    .unwrap_or(0);
+                let sz: i64 = s["__builtin_va_arg_mem_".len()..].parse().unwrap_or(0);
                 if sz == 0 {
                     return None;
                 }
@@ -6206,7 +6200,10 @@ impl X86_64CodeGen {
                     };
 
                     // Count how many GPR/SSE regs this arg needs
-                    let int_need = eb_classes.iter().filter(|c| **c == AbiClass::Integer).count();
+                    let int_need = eb_classes
+                        .iter()
+                        .filter(|c| **c == AbiClass::Integer)
+                        .count();
                     let sse_need = eb_classes
                         .iter()
                         .filter(|c| **c == AbiClass::Sse || **c == AbiClass::SseUp)
@@ -6250,15 +6247,21 @@ impl X86_64CodeGen {
                         // Lo eightbyte
                         if lo_class == AbiClass::Sse {
                             let reg = SSE_ARG_REGS[sse_idx];
-                            let mut inst_lo =
-                                Self::mk_inst(X86Opcode::Movsd, Some(MachineOperand::Register(reg)), &[mem_base]);
+                            let mut inst_lo = Self::mk_inst(
+                                X86Opcode::Movsd,
+                                Some(MachineOperand::Register(reg)),
+                                &[mem_base],
+                            );
                             inst_lo.is_call_arg_setup = true;
                             reg_arg_setup.push(inst_lo);
                             sse_idx += 1;
                         } else {
                             let reg = INTEGER_ARG_REGS[gpr_idx];
-                            let mut inst_lo =
-                                Self::mk_inst(X86Opcode::Mov, Some(MachineOperand::Register(reg)), &[mem_base]);
+                            let mut inst_lo = Self::mk_inst(
+                                X86Opcode::Mov,
+                                Some(MachineOperand::Register(reg)),
+                                &[mem_base],
+                            );
                             inst_lo.is_call_arg_setup = true;
                             reg_arg_setup.push(inst_lo);
                             gpr_idx += 1;
@@ -6267,15 +6270,21 @@ impl X86_64CodeGen {
                         // Hi eightbyte
                         if hi_class == AbiClass::Sse || hi_class == AbiClass::SseUp {
                             let reg = SSE_ARG_REGS[sse_idx];
-                            let mut inst_hi =
-                                Self::mk_inst(X86Opcode::Movsd, Some(MachineOperand::Register(reg)), &[mem_hi]);
+                            let mut inst_hi = Self::mk_inst(
+                                X86Opcode::Movsd,
+                                Some(MachineOperand::Register(reg)),
+                                &[mem_hi],
+                            );
                             inst_hi.is_call_arg_setup = true;
                             reg_arg_setup.push(inst_hi);
                             sse_idx += 1;
                         } else {
                             let reg = INTEGER_ARG_REGS[gpr_idx];
-                            let mut inst_hi =
-                                Self::mk_inst(X86Opcode::Mov, Some(MachineOperand::Register(reg)), &[mem_hi]);
+                            let mut inst_hi = Self::mk_inst(
+                                X86Opcode::Mov,
+                                Some(MachineOperand::Register(reg)),
+                                &[mem_hi],
+                            );
                             inst_hi.is_call_arg_setup = true;
                             reg_arg_setup.push(inst_hi);
                             gpr_idx += 1;

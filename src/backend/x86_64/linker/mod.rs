@@ -911,10 +911,31 @@ impl X86_64Linker {
                 );
             }
 
-            self.symbol_resolver
-                .relocate_symbol_addresses(&addr_map, &sec_idx_to_name);
-            self.symbol_resolver
-                .relocate_local_symbol_addresses(&addr_map, &sec_idx_to_name);
+            // Build fragment offset map for multi-object linking.
+            let mut frag_off_map: FxHashMap<(u32, u16), u64> = FxHashMap::default();
+            let out_secs2 = self.section_merger.get_ordered_sections();
+            for out_sec in out_secs2 {
+                for frag in &out_sec.fragments {
+                    frag_off_map.insert(
+                        (
+                            frag.input_section_ref.object_id,
+                            frag.input_section_ref.section_index as u16,
+                        ),
+                        frag.offset_in_output,
+                    );
+                }
+            }
+
+            self.symbol_resolver.relocate_symbol_addresses(
+                &addr_map,
+                &sec_idx_to_name,
+                &frag_off_map,
+            );
+            self.symbol_resolver.relocate_local_symbol_addresses(
+                &addr_map,
+                &sec_idx_to_name,
+                &frag_off_map,
+            );
         }
 
         // Build the resolved symbol table and construct a

@@ -850,9 +850,7 @@ impl X86_64Encoder {
             X86Opcode::Cvtsd2ss => self.encode_cvtsd2ss(inst),
             X86Opcode::Cvtss2sd => self.encode_cvtss2sd(inst),
             // REP MOVSQ — repeat move qwords [RSI] → [RDI], RCX times
-            X86Opcode::RepMovsq => {
-                EncodedInstruction::new(vec![0xF3, 0x48, 0xA5])
-            }
+            X86Opcode::RepMovsq => EncodedInstruction::new(vec![0xF3, 0x48, 0xA5]),
             // Fixed-encoding instructions (fallback if not caught above)
             X86Opcode::Ret
             | X86Opcode::Nop

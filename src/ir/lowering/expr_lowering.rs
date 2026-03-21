@@ -7201,12 +7201,11 @@ fn classify_struct_va_arg_eightbytes(cty: &CType, target: &Target) -> Vec<IrType
         let mut offset = base_offset;
         let num_eb = is_sse.len();
         for field in fields {
-            if field.name.is_none() && field.bit_width.is_some() {
-                let bw = field.bit_width.unwrap() as usize;
+            if let (None, Some(bw_val)) = (&field.name, field.bit_width) {
+                let bw = bw_val as usize;
                 if bw == 0 {
                     // Zero-width bitfield: align to next unit boundary
-                    let unit_align =
-                        crate::common::types::alignof_ctype(&field.ty, target);
+                    let unit_align = crate::common::types::alignof_ctype(&field.ty, target);
                     if unit_align > 0 {
                         offset = (offset + unit_align - 1) & !(unit_align - 1);
                     }
@@ -7224,14 +7223,14 @@ fn classify_struct_va_arg_eightbytes(cty: &CType, target: &Target) -> Vec<IrType
             if field_align > 0 && !is_packed {
                 offset = (offset + field_align - 1) & !(field_align - 1);
             }
-            if field.bit_width.is_some() {
+            if let Some(bw_val) = field.bit_width {
                 // Named bitfield → INTEGER class
                 let eb = offset / 8;
                 if eb < num_eb {
                     is_sse[eb] = false;
                     has_field[eb] = true;
                 }
-                let bw = field.bit_width.unwrap() as usize;
+                let bw = bw_val as usize;
                 offset += (bw + 7) / 8;
                 continue;
             }
@@ -7244,8 +7243,12 @@ fn classify_struct_va_arg_eightbytes(cty: &CType, target: &Target) -> Vec<IrType
             // Recurse into nested structs
             match &field.ty {
                 CType::Float | CType::Double => {
-                    for eb in start_eb..=end_eb.min(num_eb - 1) {
-                        has_field[eb] = true;
+                    for item in has_field
+                        .iter_mut()
+                        .take(end_eb.min(num_eb - 1) + 1)
+                        .skip(start_eb)
+                    {
+                        *item = true;
                         // stays SSE
                     }
                 }
@@ -7254,7 +7257,14 @@ fn classify_struct_va_arg_eightbytes(cty: &CType, target: &Target) -> Vec<IrType
                     packed: inner_packed,
                     ..
                 } => {
-                    walk_fields(inner_fields, *inner_packed, offset, target, is_sse, has_field);
+                    walk_fields(
+                        inner_fields,
+                        *inner_packed,
+                        offset,
+                        target,
+                        is_sse,
+                        has_field,
+                    );
                 }
                 _ => {
                     // Integer, pointer, array-of-int, etc. → INTEGER class
@@ -7268,10 +7278,7 @@ fn classify_struct_va_arg_eightbytes(cty: &CType, target: &Target) -> Vec<IrType
         }
     }
 
-    if let CType::Struct {
-        fields, packed, ..
-    } = cty
-    {
+    if let CType::Struct { fields, packed, .. } = cty {
         walk_fields(fields, *packed, 0, target, &mut is_sse, &mut has_field);
     } else {
         // Union or other — all INTEGER
@@ -7284,13 +7291,15 @@ fn classify_struct_va_arg_eightbytes(cty: &CType, target: &Target) -> Vec<IrType
     is_sse
         .iter()
         .zip(has_field.iter())
-        .map(|(&sse, &has)| {
-            if sse && has {
-                IrType::F64
-            } else {
-                IrType::I64
-            }
-        })
+        .map(
+            |(&sse, &has)| {
+                if sse && has {
+                    IrType::F64
+                } else {
+                    IrType::I64
+                }
+            },
+        )
         .collect()
 }
 
@@ -7364,11 +7373,11 @@ fn lower_va_builtin(
                         // from the correct register-save area (GPR or
                         // SSE) for each half.  Assemble the halves
                         // into a temp alloca and return it.
-                        let eb_types =
-                            classify_struct_va_arg_eightbytes(&cty_resolved, ctx.target);
+                        let eb_types = classify_struct_va_arg_eightbytes(&cty_resolved, ctx.target);
                         let struct_ir = ctype_to_ir(&cty_resolved, ctx.target);
                         // Alloca for the temporary struct
-                        let (alloca_val, alloca_i) = ctx.builder.build_alloca(struct_ir.clone(), span);
+                        let (alloca_val, alloca_i) =
+                            ctx.builder.build_alloca(struct_ir.clone(), span);
                         emit_inst(ctx, alloca_i);
 
                         let intrinsic_name_local = "__builtin_va_arg".to_string();
@@ -7399,7 +7408,8 @@ fn lower_va_builtin(
                         // GEP to alloca + 8
                         let off8 = emit_int_const(ctx, 8, IrType::I64, span);
                         let (gep8, gepi) =
-                            ctx.builder.build_gep(alloca_val, vec![off8], IrType::Ptr, span);
+                            ctx.builder
+                                .build_gep(alloca_val, vec![off8], IrType::Ptr, span);
                         emit_inst(ctx, gepi);
                         let st1 = ctx.builder.build_store(val1, gep8, span);
                         emit_inst(ctx, st1);
@@ -7437,8 +7447,7 @@ fn lower_va_builtin(
                         emit_inst(ctx, ci);
 
                         // Load the assembled struct from the alloca
-                        let (loaded, li) =
-                            ctx.builder.build_load(alloca_val, struct_ir, span);
+                        let (loaded, li) = ctx.builder.build_load(alloca_val, struct_ir, span);
                         emit_inst(ctx, li);
 
                         return TypedValue::new(loaded, cty_resolved);

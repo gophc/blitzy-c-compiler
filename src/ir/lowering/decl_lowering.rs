@@ -961,8 +961,7 @@ pub fn lower_local_initializer(
                     // the backend's register-based pipeline correctly.
                     let typed_val = expr_lowering::lower_expression_typed(ctx, expr);
                     let span_dummy = Span::dummy();
-                    let struct_ir_ty =
-                        expr_lowering::ctype_to_ir(&resolved_var_ty, ctx.target);
+                    let struct_ir_ty = expr_lowering::ctype_to_ir(&resolved_var_ty, ctx.target);
                     let (tmp_alloca, tmp_inst) =
                         ctx.builder.build_alloca(struct_ir_ty.clone(), span_dummy);
                     emit_inst_to_ctx(ctx, tmp_inst);
@@ -2587,12 +2586,12 @@ fn lower_designated_initializer(
                         let synthetic_item = ast::DesignatedInitializer {
                             designators: remaining_desig,
                             initializer: first.initializer.clone(),
-                            span: first.span.clone(),
+                            span: first.span,
                         };
                         let synthetic_init = ast::Initializer::List {
                             designators_and_initializers: vec![synthetic_item],
                             trailing_comma: false,
-                            span: first.span.clone(),
+                            span: first.span,
                         };
                         evaluate_initializer_constant(
                             &synthetic_init,
@@ -2621,17 +2620,12 @@ fn lower_designated_initializer(
                     // constant_to_bytes_typed can produce the correct
                     // output against the union's Array IR type.
                     if let Some(mc) = member_const {
-                        let needs_serialize = matches!(
-                            mc,
-                            Constant::Struct(..) | Constant::Array(..)
-                        );
+                        let needs_serialize =
+                            matches!(mc, Constant::Struct(..) | Constant::Array(..));
                         if needs_serialize {
-                            let member_size = crate::common::types::sizeof_ctype(
-                                member_ty, target,
-                            );
-                            let union_size = crate::common::types::sizeof_ctype(
-                                target_type, target,
-                            );
+                            let member_size = crate::common::types::sizeof_ctype(member_ty, target);
+                            let union_size =
+                                crate::common::types::sizeof_ctype(target_type, target);
                             let mut bytes = constant_to_le_bytes(
                                 &mc,
                                 member_size,

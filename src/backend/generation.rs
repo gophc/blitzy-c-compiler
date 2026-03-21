@@ -5277,11 +5277,26 @@ pub fn parse_elf_object_to_linker_input(
 
             let binding = st_info >> 4;
             let sym_type = st_info & 0xf;
-            let name = sym_name_from(st_name);
+            let mut name = sym_name_from(st_name);
 
             // Skip the null symbol entry.
             if j == 0 && name.is_empty() && st_value == 0 && st_shndx == 0 {
                 continue;
+            }
+
+            // Handle ELF section symbols (STT_SECTION = 3).
+            // Section symbols typically have an empty name but reference a
+            // section via st_shndx.  GCC-produced objects use these as
+            // relocation targets (e.g. R_X86_64_PC32 to .rodata for string
+            // literals).  We assign a unique name derived from the section
+            // name and object_id so the linker's symbol resolver can track
+            // per-object section addresses after section merging.
+            if sym_type == 3 && (st_shndx as usize) < shdrs.len() && st_shndx != 0 {
+                let sec_hdr = &shdrs[st_shndx as usize];
+                let sec_nm = section_name(sec_hdr.sh_name);
+                if !sec_nm.is_empty() {
+                    name = format!("__secsym_{}_{}", sec_nm, object_id);
+                }
             }
 
             input.symbols.push(InputSymbol {
@@ -5298,6 +5313,7 @@ pub fn parse_elf_object_to_linker_input(
                     0 => STT_NOTYPE,
                     1 => STT_OBJECT,
                     2 => STT_FUNC,
+                    3 => STT_NOTYPE, // STT_SECTION → treated as NOTYPE
                     _ => STT_NOTYPE,
                 },
                 visibility: st_other & 0x3,
@@ -5325,6 +5341,16 @@ pub fn parse_elf_object_to_linker_input(
             // Relocation sections are processed separately below.
             continue;
         }
+        // Skip sections that are not needed for linking executables:
+        // .eh_frame, .note.*, .comment, .GCC.command.line, etc.
+        if name.starts_with(".eh_frame")
+            || name.starts_with(".note")
+            || name == ".comment"
+            || name.starts_with(".GCC")
+            || name.starts_with(".gnu.hash")
+        {
+            continue;
+        }
 
         let sec_data = if is_nobits {
             Vec::new()
@@ -5345,6 +5371,237 @@ pub fn parse_elf_object_to_linker_input(
             group_signature: None,
             relocations: Vec::new(),
         });
+    }
+
+    // -----------------------------------------------------------------------
+    // Parse .rela.* / .rel.* relocation sections.
+    // -----------------------------------------------------------------------
+    // We build an ELF symbol-index → name mapping from the raw symbol table
+    // so that we can populate the top-level `input.relocations` (which is
+    // what the common linker actually processes).  We also record the
+    // section name that each relocation targets, since the linker needs
+    // `output_section_name` to compute patch addresses within merged output
+    // sections.
+    {
+        // Build ELF symbol-index → name + section-index mapping.
+        // Index 0 in ELF is the null symbol; we preserve that slot so
+        // relocation sym_index values can index directly.
+        let mut elf_sym_names: Vec<String> = Vec::new();
+        let mut elf_sym_sec_idx: Vec<u16> = Vec::new();
+
+        if let Some(si) = symtab_idx {
+            let sym_sh = &shdrs[si];
+            let strtab_sh = if (sym_sh.sh_link as usize) < shdrs.len() {
+                &shdrs[sym_sh.sh_link as usize]
+            } else {
+                &shdrs[0]
+            };
+            let strtab_data_local: &[u8] = {
+                let end = strtab_sh
+                    .sh_offset
+                    .saturating_add(strtab_sh.sh_size)
+                    .min(data.len());
+                &data[strtab_sh.sh_offset..end]
+            };
+            let sym_name_local = |st_name: u32| -> String {
+                let off = st_name as usize;
+                if off >= strtab_data_local.len() {
+                    return String::new();
+                }
+                let end = strtab_data_local[off..]
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(strtab_data_local.len() - off);
+                String::from_utf8_lossy(&strtab_data_local[off..off + end]).into_owned()
+            };
+
+            let sym_entry_size = if sym_sh.sh_entsize > 0 {
+                sym_sh.sh_entsize as usize
+            } else if is_64bit {
+                24
+            } else {
+                16
+            };
+            let num_syms_local = if sym_entry_size > 0 {
+                sym_sh.sh_size / sym_entry_size
+            } else {
+                0
+            };
+            for j in 0..num_syms_local {
+                let sym_off = sym_sh.sh_offset + j * sym_entry_size;
+                if sym_off + sym_entry_size > data.len() {
+                    elf_sym_names.push(String::new());
+                    elf_sym_sec_idx.push(0);
+                    continue;
+                }
+                let (st_name_val, st_shndx_val) = if is_64bit {
+                    (read_u32(sym_off), read_u16(sym_off + 6))
+                } else {
+                    (read_u32(sym_off), read_u16(sym_off + 14))
+                };
+                elf_sym_names.push(sym_name_local(st_name_val));
+                elf_sym_sec_idx.push(st_shndx_val);
+            }
+        }
+
+        // Build a map from section original_index to position in
+        // input.sections so we can look up the section name.
+        let mut sec_idx_map: std::collections::HashMap<u32, usize> =
+            std::collections::HashMap::new();
+        for (pos, sec) in input.sections.iter().enumerate() {
+            sec_idx_map.insert(sec.original_index, pos);
+        }
+
+        // Map from section original_index to section name (covers all
+        // loaded sections including .text, .data, .rodata, .bss).
+        let sec_name_map: std::collections::HashMap<u32, String> = input
+            .sections
+            .iter()
+            .map(|s| (s.original_index, s.name.clone()))
+            .collect();
+
+        for sh in shdrs.iter() {
+            // SHT_RELA = 4, SHT_REL = 9
+            if sh.sh_type != 4 && sh.sh_type != 9 {
+                continue;
+            }
+            // sh_info points to the section these relocations apply to.
+            let target_sec_idx = sh.sh_info;
+            // Skip relocations targeting sections we didn't load
+            // (e.g. .eh_frame, .note.*, .comment).
+            if !sec_idx_map.contains_key(&target_sec_idx) {
+                continue;
+            }
+            let target_sec_name = sec_name_map
+                .get(&target_sec_idx)
+                .cloned()
+                .unwrap_or_default();
+            // Determine the input.sections position (for section_index).
+            let sec_input_pos = sec_idx_map.get(&target_sec_idx).copied();
+
+            let is_rela = sh.sh_type == 4;
+            let entry_size = if sh.sh_entsize > 0 {
+                sh.sh_entsize as usize
+            } else if is_64bit {
+                if is_rela {
+                    24
+                } else {
+                    16
+                }
+            } else if is_rela {
+                12
+            } else {
+                8
+            };
+
+            if entry_size == 0 {
+                continue;
+            }
+            let num_entries = sh.sh_size / entry_size;
+
+            for j in 0..num_entries {
+                let rel_off = sh.sh_offset + j * entry_size;
+                if rel_off + entry_size > data.len() {
+                    break;
+                }
+
+                let (r_offset, r_info, r_addend) = if is_64bit {
+                    let offset = read_u64(rel_off);
+                    let info = read_u64(rel_off + 8);
+                    let addend = if is_rela {
+                        i64::from_le_bytes([
+                            data[rel_off + 16],
+                            data[rel_off + 17],
+                            data[rel_off + 18],
+                            data[rel_off + 19],
+                            data[rel_off + 20],
+                            data[rel_off + 21],
+                            data[rel_off + 22],
+                            data[rel_off + 23],
+                        ])
+                    } else {
+                        0i64
+                    };
+                    (offset, info, addend)
+                } else {
+                    let offset = read_u32(rel_off) as u64;
+                    let info = read_u32(rel_off + 4) as u64;
+                    let addend = if is_rela {
+                        i32::from_le_bytes([
+                            data[rel_off + 8],
+                            data[rel_off + 9],
+                            data[rel_off + 10],
+                            data[rel_off + 11],
+                        ]) as i64
+                    } else {
+                        0i64
+                    };
+                    (offset, info, addend)
+                };
+
+                // Extract sym_index and rel_type from r_info.
+                let (sym_index, rel_type) = if is_64bit {
+                    ((r_info >> 32) as u32, (r_info & 0xffffffff) as u32)
+                } else {
+                    ((r_info >> 8) as u32, (r_info & 0xff) as u32)
+                };
+
+                // Resolve symbol name from the ELF symbol table mapping.
+                let symbol_name = if (sym_index as usize) < elf_sym_names.len() {
+                    elf_sym_names[sym_index as usize].clone()
+                } else {
+                    String::new()
+                };
+
+                // For relocations referencing section symbols (name is
+                // empty, STT_SECTION type), use the per-object unique
+                // section symbol name so the linker can resolve them to the
+                // correct fragment address within merged output sections.
+                let symbol_name = if symbol_name.is_empty() {
+                    if (sym_index as usize) < elf_sym_sec_idx.len() {
+                        let sym_sec = elf_sym_sec_idx[sym_index as usize];
+                        match sec_name_map.get(&(sym_sec as u32)) {
+                            Some(sec_nm) => {
+                                format!("__secsym_{}_{}", sec_nm, object_id)
+                            }
+                            None => String::new(),
+                        }
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    symbol_name
+                };
+
+                // Use the original section index in the ELF file as
+                // section_index. The linker uses output_section_name to
+                // find the right output section.
+                let section_index = if let Some(pos) = sec_input_pos {
+                    (pos + 1) as u32 // 1-based (section 0 = null)
+                } else {
+                    target_sec_idx
+                };
+
+                // Push into the top-level relocations that the common
+                // linker's Phase 5 collects.
+                input
+                    .relocations
+                    .push(crate::backend::linker_common::relocation::Relocation {
+                        offset: r_offset,
+                        symbol_name,
+                        sym_index,
+                        rel_type,
+                        addend: r_addend,
+                        object_id,
+                        section_index,
+                        output_section_name: if target_sec_name.is_empty() {
+                            None
+                        } else {
+                            Some(target_sec_name.clone())
+                        },
+                    });
+            }
+        }
     }
 
     // If no sections were extracted, provide the raw bytes as a .text

@@ -754,10 +754,16 @@ impl SymbolResolver {
     /// For each resolved symbol, looks up its input section via
     /// `(object_file_id, section_index)` → section_name, then adds the
     /// section's virtual address to the symbol's `final_address`.
+    ///
+    /// When multiple object files contribute sections with the same name
+    /// (e.g. `.text`), the `fragment_offset_map` provides the byte offset
+    /// of each input section fragment within the merged output section.
+    /// The final address is: `section_va + fragment_offset + symbol_value`.
     pub fn relocate_symbol_addresses(
         &mut self,
         address_map: &crate::backend::linker_common::section_merger::AddressMap,
         section_index_to_name: &FxHashMap<(u32, u16), String>,
+        fragment_offset_map: &FxHashMap<(u32, u16), u64>,
     ) {
         for resolved in self.resolved.values_mut() {
             if !resolved.is_defined {
@@ -770,7 +776,11 @@ impl SymbolResolver {
                     let lookup_key = (resolved.from_object, idx);
                     if let Some(section_name) = section_index_to_name.get(&lookup_key) {
                         if let Some(addr_info) = address_map.section_addresses.get(section_name) {
-                            resolved.final_address += addr_info.virtual_address;
+                            // Add output section VA + fragment offset within
+                            // the merged output section.
+                            let frag_off =
+                                fragment_offset_map.get(&lookup_key).copied().unwrap_or(0);
+                            resolved.final_address += addr_info.virtual_address + frag_off;
                             // Update section_name to the real name.
                             resolved.section_name = section_name.clone();
                         }
@@ -782,16 +792,22 @@ impl SymbolResolver {
 
     /// Relocate local symbol values from section-relative offsets to
     /// absolute virtual addresses after section merging.
+    ///
+    /// Like [`relocate_symbol_addresses`], this accounts for fragment
+    /// offsets within merged output sections when multiple objects
+    /// contribute the same section.
     pub fn relocate_local_symbol_addresses(
         &mut self,
         address_map: &crate::backend::linker_common::section_merger::AddressMap,
         section_index_to_name: &FxHashMap<(u32, u16), String>,
+        fragment_offset_map: &FxHashMap<(u32, u16), u64>,
     ) {
         for sym in &mut self.local_symbols {
             let lookup_key = (sym.object_file_id, sym.section_index);
             if let Some(section_name) = section_index_to_name.get(&lookup_key) {
                 if let Some(addr_info) = address_map.section_addresses.get(section_name) {
-                    sym.value += addr_info.virtual_address;
+                    let frag_off = fragment_offset_map.get(&lookup_key).copied().unwrap_or(0);
+                    sym.value += addr_info.virtual_address + frag_off;
                 }
             }
         }

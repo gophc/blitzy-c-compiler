@@ -824,10 +824,15 @@ pub fn annotate_relocations(
 ) {
     for rel in relocations.iter_mut() {
         if rel.output_section_name.is_none() {
-            if let Some((sec_name, _frag_offset)) =
+            if let Some((sec_name, frag_offset)) =
                 input_to_output.get(&(rel.object_id, rel.section_index))
             {
                 rel.output_section_name = Some(sec_name.clone());
+                // Adjust the relocation offset to be relative to the
+                // merged output section by adding the fragment's offset.
+                // This ensures resolve_relocations computes the correct
+                // patch_address = section_vaddr + adjusted_offset.
+                rel.offset += frag_offset;
             }
         }
     }

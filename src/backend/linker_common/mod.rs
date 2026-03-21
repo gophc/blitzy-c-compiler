@@ -536,11 +536,32 @@ pub fn link(
         }
     }
 
-    // For each resolved symbol, compute: final_address = section_va + symbol_offset.
-    resolver.relocate_symbol_addresses(&address_map, &section_index_to_name);
+    // Build a fragment-offset map so that symbols from multi-object
+    // linking get correct addresses within merged output sections.
+    // (object_id, section_original_index) → offset_in_merged_output_section
+    let mut fragment_offset_map: FxHashMap<(u32, u16), u64> = FxHashMap::default();
+    for out_sec in merger.get_ordered_sections() {
+        for frag in &out_sec.fragments {
+            fragment_offset_map.insert(
+                (
+                    frag.input_section_ref.object_id,
+                    frag.input_section_ref.section_index as u16,
+                ),
+                frag.offset_in_output,
+            );
+        }
+    }
+
+    // For each resolved symbol, compute:
+    //   final_address = section_va + fragment_offset + symbol_offset.
+    resolver.relocate_symbol_addresses(&address_map, &section_index_to_name, &fragment_offset_map);
 
     // Also relocate local symbols.
-    resolver.relocate_local_symbol_addresses(&address_map, &section_index_to_name);
+    resolver.relocate_local_symbol_addresses(
+        &address_map,
+        &section_index_to_name,
+        &fragment_offset_map,
+    );
 
     // -----------------------------------------------------------------------
     // Phase 3: Linker-Defined Symbols
@@ -553,7 +574,7 @@ pub fn link(
     resolver.define_linker_symbols(&section_addr_map);
 
     // Build the final resolved symbol table.
-    let sym_table = resolver.build_symbol_table();
+    let mut sym_table = resolver.build_symbol_table();
 
     // -----------------------------------------------------------------------
     // Phase 4: Build Symbol Address Map for Relocations
@@ -586,6 +607,21 @@ pub fn link(
         all_relocations.extend(input.relocations.iter().cloned());
     }
 
+    // For multi-object linking, adjust relocation offsets by the fragment
+    // offset within merged output sections.  Build a
+    // (object_id, section_index) → (output_section_name, fragment_offset)
+    // mapping and annotate each relocation.
+    {
+        let ordered_secs = merger.get_ordered_sections();
+        let input_to_output = relocation::build_input_to_output_map(
+            &ordered_secs
+                .iter()
+                .map(|s| (*s).clone())
+                .collect::<Vec<_>>(),
+        );
+        relocation::annotate_relocations(&mut all_relocations, &input_to_output);
+    }
+
     let mut section_data_map: FxHashMap<String, Vec<u8>> = FxHashMap::default();
     let ordered_sections = merger.get_ordered_sections();
     for output_section in &ordered_sections {
@@ -607,6 +643,48 @@ pub fn link(
     // processing match the final ELF output.
     let mut dyn_section_addresses: FxHashMap<String, (u64, u64)> = FxHashMap::default();
 
+    // When producing a dynamically-linked executable and `_start` is missing
+    // but `main` is defined, we will synthesise a `_start` stub in Phase 7.
+    // That stub calls `exit()` to flush stdio buffers after `main` returns.
+    // Ensure `exit` is registered as an undefined import symbol so it gets a
+    // `.dynsym` entry and PLT stub.
+    let need_synthetic_start = config.is_executable()
+        && !config.needed_libs.is_empty()
+        && !sym_table
+            .symbols
+            .iter()
+            .any(|s| s.name == "_start" || s.name == "__start")
+        && sym_table.symbols.iter().any(|s| s.name == "main");
+
+    if need_synthetic_start && !symbol_address_map.contains_key("exit") {
+        // Inject `exit` as an undefined import symbol.
+        let exit_sym = symbol_resolver::OutputSymbol {
+            name: "exit".to_string(),
+            value: 0,
+            size: 0,
+            binding: 1,  // STB_GLOBAL
+            sym_type: 2, // STT_FUNC
+            visibility: 0,
+            section_index: symbol_resolver::SHN_UNDEF,
+        };
+        sym_table.symbols.push(exit_sym);
+        symbol_address_map.insert(
+            "exit".to_string(),
+            symbol_resolver::ResolvedSymbol {
+                name: "exit".to_string(),
+                final_address: 0,
+                size: 0,
+                binding: 1,
+                sym_type: 2,
+                visibility: 0,
+                section_name: String::new(),
+                is_defined: false,
+                from_object: 0,
+                export_dynamic: false,
+            },
+        );
+    }
+
     if config.is_shared() || !config.needed_libs.is_empty() {
         // Collect referenced symbols from relocations for .dynsym filtering.
         let mut referenced_symbols: FxHashSet<String> = FxHashSet::default();
@@ -618,6 +696,40 @@ pub fn link(
             }
         }
 
+        // When producing an executable and _start is missing but main is
+        // defined, we will inject a synthetic _start stub in Phase 7.
+        // That stub needs to call exit() via PLT to flush stdio buffers,
+        // so we must ensure `exit` appears in the dynamic symbol table
+        // (and therefore gets a PLT entry) before generating sections.
+        if config.is_executable() {
+            let has_start = sym_table
+                .symbols
+                .iter()
+                .any(|s| s.name == "_start" || s.name == "__start");
+            let has_main = sym_table.symbols.iter().any(|s| s.name == "main");
+            if !has_start && has_main {
+                referenced_symbols.insert("exit".to_string());
+            }
+        }
+
+        // Build a set of symbols that have PLT-type relocations. This is
+        // needed because GCC .o files mark external functions as STT_NOTYPE
+        // (not STT_FUNC), so sym_type alone is insufficient to determine
+        // whether a symbol needs a PLT stub. Using relocation types
+        // (R_X86_64_PLT32, etc.) is the authoritative signal.
+        let mut plt_needed_symbols: FxHashSet<String> = FxHashSet::default();
+        for input in &inputs {
+            for reloc in &input.relocations {
+                if !reloc.symbol_name.is_empty() && handler.needs_plt(reloc.rel_type) {
+                    plt_needed_symbols.insert(reloc.symbol_name.clone());
+                }
+            }
+        }
+        // The synthetic _start stub calls exit via PLT.
+        if need_synthetic_start {
+            plt_needed_symbols.insert("exit".to_string());
+        }
+
         // Generate all dynamic linking sections (PLT, GOT, .dynamic, etc.).
         generate_dynamic_sections(
             config,
@@ -625,6 +737,7 @@ pub fn link(
             &mut section_data_map,
             &address_map,
             &referenced_symbols,
+            &plt_needed_symbols,
             diagnostics,
         );
 
@@ -708,6 +821,27 @@ pub fn link(
                 }
             }
 
+            // When generating a synthetic _start, ensure `exit` gets a PLT
+            // entry even though no relocation explicitly references it.
+            // This lets the _start stub call exit() to flush stdio buffers.
+            if config.is_executable() {
+                let has_start_sym = sym_table
+                    .symbols
+                    .iter()
+                    .any(|s| s.name == "_start" || s.name == "__start");
+                let has_main_sym = sym_table.symbols.iter().any(|s| s.name == "main");
+                if !has_start_sym && has_main_sym && !seen.contains("exit") {
+                    if let Some(sym) = symbol_address_map.get("exit") {
+                        if !sym.is_defined {
+                            seen.insert("exit".to_string());
+                            let entry_addr = plt_vaddr + plt0_size + plt_index * pltn_size;
+                            plt_sym_addrs.push(("exit".to_string(), entry_addr));
+                            let _ = plt_index; // used for address computation above
+                        }
+                    }
+                }
+            }
+
             // Update the symbol address map so resolve_relocations sees
             // these PLT-bound symbols as "defined" with PLT stub addresses.
             for (name, addr) in &plt_sym_addrs {
@@ -774,6 +908,34 @@ pub fn link(
                                 ordered_plt_syms.push((reloc.symbol_name.clone(), gp_off));
                                 stub_idx += 1;
                             }
+                        }
+                    }
+                }
+            }
+
+            // Add PLT stubs for synthetic imports (e.g. `exit` injected for
+            // the synthetic _start stub) that were assigned PLT addresses in
+            // the first PLT assignment pass but were NOT covered by the
+            // relocation-based loop above.
+            if need_synthetic_start {
+                let name = "exit".to_string();
+                if !seen_stubs.contains(&name) {
+                    if let Some(sym) = symbol_address_map.get(&name) {
+                        let expected_addr = plt_va + plt0_sz + stub_idx as u64 * pltn_sz;
+                        if sym.final_address == expected_addr {
+                            seen_stubs.insert(name.clone());
+                            let gp_off = (reserved + stub_idx as u64) * pw;
+                            let stub = dynamic::PltStub {
+                                symbol_name: name.clone(),
+                                got_plt_offset: gp_off,
+                                index: stub_idx,
+                            };
+                            let off = plt0_sz + stub_idx as u64 * pltn_sz;
+                            plt_buf.extend_from_slice(
+                                &plt_table.generate_plt_entry(&stub, got_plt_va, plt_va, off),
+                            );
+                            ordered_plt_syms.push((name, gp_off));
+                            stub_idx += 1;
                         }
                     }
                 }
@@ -1043,20 +1205,96 @@ pub fn link(
     }
 
     // -----------------------------------------------------------------------
-    // Phase 7: Entry Point Resolution
+    // Phase 7: Entry Point Resolution (with synthetic _start fallback)
     // -----------------------------------------------------------------------
     let entry_point = if config.is_executable() {
         // Build a simple symbol name → address map for the entry point lookup.
+        // Includes both defined symbols and PLT-resolved external symbols.
         let mut sym_addr_flat: FxHashMap<String, u64> = FxHashMap::default();
         for sym in &sym_table.symbols {
             sym_addr_flat.insert(sym.name.clone(), sym.value);
         }
+        // Overlay PLT addresses from symbol_address_map so synthetic _start
+        // can resolve `exit` (and other PLT-bound imports).
+        for (name, resolved) in &symbol_address_map {
+            if resolved.is_defined && resolved.final_address != 0 {
+                sym_addr_flat.insert(name.clone(), resolved.final_address);
+            }
+        }
 
         match resolve_entry_point(&config.entry_point, &sym_addr_flat) {
             Ok(addr) => addr,
-            Err(err_msg) => {
-                diagnostics.emit_error(Span::dummy(), err_msg.clone());
-                return Err(err_msg);
+            Err(_no_start) => {
+                // `_start` is not defined among the input objects.  If `main`
+                // IS defined, synthesise a minimal C-runtime stub that:
+                //   1. Extracts argc/argv from the Linux kernel ABI stack
+                //   2. Calls `main(argc, argv)`
+                //   3. Passes main's return value to exit_group(2)
+                //
+                // This lets `bcc foo.o bar.o -o prog` "just work" the same
+                // way that `gcc foo.o bar.o -o prog` does.
+                if let Some(&main_addr) = sym_addr_flat.get("main") {
+                    // Append the synthetic stub to the .text section data.
+                    // The stub's virtual address = .text vaddr + current .text size.
+                    let text_vaddr = address_map
+                        .section_addresses
+                        .get(".text")
+                        .map(|a| a.virtual_address)
+                        .unwrap_or(0x401000);
+                    let text_size = section_data_map
+                        .get(".text")
+                        .map(|d| d.len() as u64)
+                        .unwrap_or(0);
+
+                    // Align stub to 16 bytes within .text.
+                    let padding = ((16 - (text_size % 16)) % 16) as usize;
+                    let stub_offset = text_size + padding as u64;
+                    let stub_vaddr = text_vaddr + stub_offset;
+
+                    // If `exit` is available (via PLT from libc), use it
+                    // instead of raw syscall so stdio buffers get flushed.
+                    let exit_addr = sym_addr_flat.get("exit").copied();
+
+                    let stub_code =
+                        generate_synthetic_start(config.target, main_addr, stub_vaddr, exit_addr);
+                    let stub_len = stub_code.len() as u64;
+
+                    // Extend .text section data with alignment padding and stub.
+                    if let Some(text_data) = section_data_map.get_mut(".text") {
+                        text_data.extend(std::iter::repeat(0xCC).take(padding)); // INT3 fill
+                        text_data.extend_from_slice(&stub_code);
+                    } else {
+                        // No .text section yet — create one with just the stub.
+                        let mut data = vec![0xCC; padding];
+                        data.extend_from_slice(&stub_code);
+                        section_data_map.insert(".text".to_string(), data);
+                    }
+
+                    // Update .text section size in address map.
+                    if let Some(text_addr) = address_map.section_addresses.get_mut(".text") {
+                        text_addr.size = stub_offset + stub_len;
+                        text_addr.mem_size = stub_offset + stub_len;
+                    }
+
+                    // Register `_start` in the symbol table.
+                    sym_table.symbols.push(symbol_resolver::OutputSymbol {
+                        name: "_start".to_string(),
+                        value: stub_vaddr,
+                        size: stub_len,
+                        binding: 1,       // STB_GLOBAL
+                        sym_type: 2,      // STT_FUNC
+                        visibility: 0,    // STV_DEFAULT
+                        section_index: 0, // absolute
+                    });
+
+                    stub_vaddr
+                } else {
+                    // Neither _start nor main — fatal error.
+                    let err_msg =
+                        "linker error: neither '_start' nor 'main' symbol is defined".to_string();
+                    diagnostics.emit_error(Span::dummy(), err_msg.clone());
+                    return Err(err_msg);
+                }
             }
         }
     } else {
@@ -1202,6 +1440,218 @@ fn resolve_entry_point(entry_name: &str, symbols: &FxHashMap<String, u64>) -> Re
     }
 }
 
+/// Generate architecture-specific machine code for a minimal synthetic
+/// `_start` entry point that calls `main(argc, argv)` and then terminates
+/// the process via the `exit_group` syscall.
+///
+/// Linux kernel ABI guarantees the following stack layout at process entry:
+///
+/// ```text
+///   (%rsp)       → argc          (x86-64 / i686: top of stack)
+///   8(%rsp)      → argv[0]       (subsequent entries follow)
+/// ```
+///
+/// The generated stub is a self-contained blob of machine code with all
+/// addresses resolved — no relocations are emitted.
+fn generate_synthetic_start(
+    target: Target,
+    main_addr: u64,
+    _stub_vaddr: u64,
+    exit_addr: Option<u64>,
+) -> Vec<u8> {
+    match target {
+        Target::X86_64 => {
+            // xor  %ebp, %ebp        ; ABI: zero the frame pointer
+            // pop  %rdi               ; argc  (first arg for main)
+            // mov  %rsp, %rsi         ; argv  (second arg for main)
+            // and  $-16, %rsp         ; align stack to 16 bytes
+            // movabs $main, %rax      ; load main address
+            // call *%rax              ; main(argc, argv)
+            // mov  %eax, %edi         ; exit code = main return value
+            //
+            // If `exit` symbol is available (via PLT/libc), call it so that
+            // stdio buffers (stdout, stderr) are flushed before process
+            // termination.  Otherwise fall back to the raw exit_group
+            // syscall which is safe but skips libc atexit handlers.
+            let mut code = Vec::with_capacity(48);
+            code.extend_from_slice(&[0x31, 0xed]); // xor %ebp, %ebp
+            code.push(0x5f); // pop %rdi
+            code.extend_from_slice(&[0x48, 0x89, 0xe6]); // mov %rsp, %rsi
+            code.extend_from_slice(&[0x48, 0x83, 0xe4, 0xf0]); // and $-16, %rsp
+            code.extend_from_slice(&[0x48, 0xb8]); // movabs $imm64, %rax
+            code.extend_from_slice(&main_addr.to_le_bytes()); // imm64 = main
+            code.extend_from_slice(&[0xff, 0xd0]); // call *%rax
+            code.extend_from_slice(&[0x89, 0xc7]); // mov %eax, %edi
+            if let Some(eaddr) = exit_addr {
+                // movabs $exit_addr, %rax
+                code.extend_from_slice(&[0x48, 0xb8]);
+                code.extend_from_slice(&eaddr.to_le_bytes());
+                // call *%rax  (calls exit() which flushes stdio)
+                code.extend_from_slice(&[0xff, 0xd0]);
+            }
+            // Always emit the raw syscall as a fallback — if exit()
+            // returns (it shouldn't) we still terminate the process.
+            code.extend_from_slice(&[0xb8, 0xe7, 0x00, 0x00, 0x00]); // mov $231, %eax
+            code.extend_from_slice(&[0x0f, 0x05]); // syscall
+            code
+        }
+        Target::I686 => {
+            // xor  %ebp, %ebp        ; ABI: zero the frame pointer
+            // pop  %esi               ; argc (save for later)
+            // mov  %esp, %ecx         ; argv
+            // and  $-16, %esp         ; align stack to 16 bytes
+            // push %ecx               ; argv  (arg 2)
+            // push %esi               ; argc  (arg 1)
+            // mov  $MAIN, %eax        ; load main address
+            // call *%eax              ; main(argc, argv)
+            //
+            // After main returns, call exit() if available (flushes stdio),
+            // otherwise fall back to raw exit_group syscall.
+            let mut code = Vec::with_capacity(40);
+            code.extend_from_slice(&[0x31, 0xed]); // xor %ebp, %ebp
+            code.push(0x5e); // pop %esi
+            code.extend_from_slice(&[0x89, 0xe1]); // mov %esp, %ecx
+            code.extend_from_slice(&[0x83, 0xe4, 0xf0]); // and $-16, %esp
+            code.push(0x51); // push %ecx  (argv)
+            code.push(0x56); // push %esi  (argc)
+            code.extend_from_slice(&[0xb8]); // mov $imm32, %eax
+            code.extend_from_slice(&(main_addr as u32).to_le_bytes()); // imm32 = main
+            code.extend_from_slice(&[0xff, 0xd0]); // call *%eax
+            if let Some(eaddr) = exit_addr {
+                // push %eax           ; exit code as arg on stack
+                code.push(0x50);
+                // mov $exit_addr, %eax
+                code.extend_from_slice(&[0xb8]);
+                code.extend_from_slice(&(eaddr as u32).to_le_bytes());
+                // call *%eax          ; exit(main_return_value)
+                code.extend_from_slice(&[0xff, 0xd0]);
+            }
+            // Fallback raw syscall
+            code.extend_from_slice(&[0x89, 0xc3]); // mov %eax, %ebx
+            code.extend_from_slice(&[0xb8, 0xfc, 0x00, 0x00, 0x00]); // mov $252, %eax
+            code.extend_from_slice(&[0xcd, 0x80]); // int $0x80
+            code
+        }
+        Target::AArch64 => {
+            // AArch64 Linux kernel entry: x0 = 0, sp points to argc.
+            // ldr  x0, [sp]           ; argc
+            // add  x1, sp, #8         ; argv
+            // and  sp, sp, #-16       ; align stack
+            // ldr  x16, =main         ; load main address (literal pool)
+            // blr  x16                ; call main(argc, argv)
+            //
+            // If exit_addr available: call exit(retval), else raw syscall.
+            let mut code = Vec::with_capacity(64);
+            // ldr x0, [sp]  → 0xF94003E0
+            code.extend_from_slice(&0xF94003E0u32.to_le_bytes());
+            // add x1, sp, #8 → 0x910023E1
+            code.extend_from_slice(&0x910023E1u32.to_le_bytes());
+            // and sp, sp, #-16 → 0x927CEBFF
+            code.extend_from_slice(&0x927CEBFFu32.to_le_bytes());
+
+            if let Some(eaddr) = exit_addr {
+                // --- With exit() via PLT ---
+                // ldr x16, .+28 → literal pool at offset 28 from this instruction
+                // (7 more instructions * 4 = 28 bytes to main_addr pool entry)
+                let ldr_main: u32 = 0x58000000 | (16) | ((7 & 0x7FFFF) << 5);
+                code.extend_from_slice(&ldr_main.to_le_bytes());
+                // blr x16  → 0xD63F0200
+                code.extend_from_slice(&0xD63F0200u32.to_le_bytes());
+                // mov x0, x0 — exit code is already in x0 from main return
+                // ldr x16, .+16 → literal pool for exit_addr (4 more insns * 4 = 16)
+                let ldr_exit: u32 = 0x58000000 | (16) | ((4 & 0x7FFFF) << 5);
+                code.extend_from_slice(&ldr_exit.to_le_bytes());
+                // blr x16  → call exit()
+                code.extend_from_slice(&0xD63F0200u32.to_le_bytes());
+                // Fallback syscall in case exit() somehow returns
+                // mov x8, #94 → movz x8, #94 → 0xD2800BC8
+                code.extend_from_slice(&0xD2800BC8u32.to_le_bytes());
+                // svc #0 → 0xD4000001
+                code.extend_from_slice(&0xD4000001u32.to_le_bytes());
+                // Literal pool (8 bytes each, aligned)
+                code.extend_from_slice(&main_addr.to_le_bytes());
+                code.extend_from_slice(&eaddr.to_le_bytes());
+            } else {
+                // --- Raw syscall fallback (no exit() available) ---
+                // ldr x16, .+20 (skip 5 instructions to literal pool)
+                code.extend_from_slice(&0x580000B0u32.to_le_bytes());
+                // blr x16 → 0xD63F0200
+                code.extend_from_slice(&0xD63F0200u32.to_le_bytes());
+                // mov x8, #94 → movz x8, #94 → 0xD2800BC8
+                code.extend_from_slice(&0xD2800BC8u32.to_le_bytes());
+                // svc #0 → 0xD4000001
+                code.extend_from_slice(&0xD4000001u32.to_le_bytes());
+                // nop for alignment → 0xD503201F
+                code.extend_from_slice(&0xD503201Fu32.to_le_bytes());
+                // Literal pool: 8-byte address of main
+                code.extend_from_slice(&main_addr.to_le_bytes());
+            }
+            code
+        }
+        Target::RiscV64 => {
+            // RISC-V Linux entry: sp points to argc.
+            // ld   a0, 0(sp)          ; argc
+            // addi a1, sp, 8          ; argv
+            // andi sp, sp, -16        ; align stack
+            // Load main from literal pool via auipc+ld, call main.
+            // Then call exit() via PLT if available, else raw ecall.
+            let mut code = Vec::with_capacity(64);
+            // ld a0, 0(sp)
+            code.extend_from_slice(&0x00013503u32.to_le_bytes());
+            // addi a1, sp, 8
+            code.extend_from_slice(&0x00810593u32.to_le_bytes());
+            // andi sp, sp, -16
+            code.extend_from_slice(&0xFF017113u32.to_le_bytes());
+
+            if let Some(eaddr) = exit_addr {
+                // With exit() available:
+                // auipc t0, 0   → get PC
+                code.extend_from_slice(&0x00000297u32.to_le_bytes());
+                // ld t0, 28(t0) → load main_addr from literal pool
+                // offset 28 = 7 more instructions * 4 bytes
+                let ld_main: u32 = (28 << 20) | (5 << 15) | (3 << 12) | (5 << 7) | 0x03;
+                code.extend_from_slice(&ld_main.to_le_bytes());
+                // jalr ra, t0, 0  → call main
+                code.extend_from_slice(&0x000280E7u32.to_le_bytes());
+                // a0 already has return value from main
+                // auipc t0, 0   → get PC for exit literal pool load
+                code.extend_from_slice(&0x00000297u32.to_le_bytes());
+                // ld t0, 20(t0) → load exit_addr (5 more insns * 4 = 20)
+                let ld_exit: u32 = (20 << 20) | (5 << 15) | (3 << 12) | (5 << 7) | 0x03;
+                code.extend_from_slice(&ld_exit.to_le_bytes());
+                // jalr ra, t0, 0 → call exit()
+                code.extend_from_slice(&0x000280E7u32.to_le_bytes());
+                // Fallback raw syscall
+                // addi a7, x0, 94 — RISC-V I-type: imm[11:0]|rs1|funct3|rd|opcode
+                let li_a7: u32 = (94 << 20) | (17 << 7) | 0x13; // rs1=x0, funct3=0
+                code.extend_from_slice(&li_a7.to_le_bytes());
+                // ecall
+                code.extend_from_slice(&0x00000073u32.to_le_bytes());
+                // Literal pool (8 bytes each)
+                code.extend_from_slice(&main_addr.to_le_bytes());
+                code.extend_from_slice(&eaddr.to_le_bytes());
+            } else {
+                // No exit() — use raw syscall only
+                // auipc t0, 0
+                code.extend_from_slice(&0x00000297u32.to_le_bytes());
+                // ld t0, 16(t0) → offset to literal pool
+                let ld_inst: u32 = (16 << 20) | (5 << 15) | (3 << 12) | (5 << 7) | 0x03;
+                code.extend_from_slice(&ld_inst.to_le_bytes());
+                // jalr ra, t0, 0
+                code.extend_from_slice(&0x000280E7u32.to_le_bytes());
+                // addi a7, x0, 94 — RISC-V I-type: imm[11:0]|rs1|funct3|rd|opcode
+                let li_a7: u32 = (94 << 20) | (17 << 7) | 0x13; // rs1=x0, funct3=0
+                code.extend_from_slice(&li_a7.to_le_bytes());
+                // ecall
+                code.extend_from_slice(&0x00000073u32.to_le_bytes());
+                // Literal pool: main address
+                code.extend_from_slice(&main_addr.to_le_bytes());
+            }
+            code
+        }
+    }
+}
+
 /// Generate dynamic linking sections for shared library output.
 ///
 /// Populates section data buffers with `.dynamic`, `.dynsym`, `.dynstr`,
@@ -1213,6 +1663,7 @@ fn generate_dynamic_sections(
     section_data_map: &mut FxHashMap<String, Vec<u8>>,
     _address_map: &section_merger::AddressMap,
     referenced_symbols: &FxHashSet<String>,
+    plt_needed_symbols: &FxHashSet<String>,
     _diagnostics: &mut DiagnosticEngine,
 ) {
     // Build lists of exported and imported symbols for the dynamic linker.
@@ -1255,7 +1706,8 @@ fn generate_dynamic_sections(
                 name: sym.name.clone(),
                 binding: sym.binding,
                 sym_type: sym.sym_type,
-                needs_plt: sym.sym_type == symbol_resolver::STT_FUNC,
+                needs_plt: sym.sym_type == symbol_resolver::STT_FUNC
+                    || plt_needed_symbols.contains(&sym.name),
             });
         }
     }

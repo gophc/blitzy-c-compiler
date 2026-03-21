@@ -1303,13 +1303,23 @@ pub fn build_dynamic_sections(
 
     // Add all imported (undefined) symbols — give them GOT/PLT entries as needed
     for sym in imported_symbols {
-        let needs_plt = sym.needs_plt && sym.sym_type == STT_FUNC;
+        // Trust the needs_plt flag computed from relocation types — do NOT
+        // re-filter on sym_type because GCC .o files mark external
+        // functions as STT_NOTYPE rather than STT_FUNC.
+        let needs_plt = sym.needs_plt;
+        // If the symbol needs PLT, it is a function — upgrade its type
+        // for the .dynsym entry so the dynamic linker knows.
+        let effective_sym_type = if needs_plt && sym.sym_type == STT_NOTYPE {
+            STT_FUNC
+        } else {
+            sym.sym_type
+        };
         let mut ds = DynamicSymbol {
             name: sym.name.clone(),
             value: 0,
             size: 0,
             binding: sym.binding,
-            sym_type: sym.sym_type,
+            sym_type: effective_sym_type,
             visibility: STV_DEFAULT,
             section_index: 0, // SHN_UNDEF
             is_defined: false,
