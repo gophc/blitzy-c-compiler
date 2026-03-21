@@ -712,16 +712,46 @@ pub fn link(
             }
         }
 
-        // Build a set of symbols that have PLT-type relocations. This is
-        // needed because GCC .o files mark external functions as STT_NOTYPE
-        // (not STT_FUNC), so sym_type alone is insufficient to determine
-        // whether a symbol needs a PLT stub. Using relocation types
-        // (R_X86_64_PLT32, etc.) is the authoritative signal.
+        // Build a set of symbols that need PLT stubs for dynamic resolution.
+        //
+        // Strategy: any undefined symbol referenced by ANY relocation needs
+        // dynamic resolution. For symbols referenced by PLT-specific reloc
+        // types (R_X86_64_PLT32, etc.) this is obvious. But BCC-generated
+        // .o files also reference external functions via R_X86_64_64 and
+        // R_X86_64_PC32, and libc data symbols (stdout, stderr, stdin) use
+        // R_X86_64_PC32. All of these need PLT/GOT entries to be resolvable
+        // at runtime by the dynamic linker.
         let mut plt_needed_symbols: FxHashSet<String> = FxHashSet::default();
+
+        // First pass: collect symbols from PLT-type relocations.
         for input in &inputs {
             for reloc in &input.relocations {
                 if !reloc.symbol_name.is_empty() && handler.needs_plt(reloc.rel_type) {
                     plt_needed_symbols.insert(reloc.symbol_name.clone());
+                }
+            }
+        }
+
+        // Second pass: for any undefined symbol referenced by non-PLT
+        // relocations, also add it to the PLT set so it gets a dynamic
+        // resolution stub. This covers cases like:
+        //  - close/read/write referenced via R_X86_64_64
+        //  - stdout/stderr/stdin referenced via R_X86_64_PC32
+        {
+            let defined_names: FxHashSet<String> = sym_table
+                .symbols
+                .iter()
+                .filter(|s| s.section_index != symbol_resolver::SHN_UNDEF)
+                .map(|s| s.name.clone())
+                .collect();
+            for input in &inputs {
+                for reloc in &input.relocations {
+                    if !reloc.symbol_name.is_empty()
+                        && !defined_names.contains(&reloc.symbol_name)
+                        && !plt_needed_symbols.contains(&reloc.symbol_name)
+                    {
+                        plt_needed_symbols.insert(reloc.symbol_name.clone());
+                    }
                 }
             }
         }
@@ -804,14 +834,39 @@ pub fn link(
                 Target::I686 => (16, 16),
             };
 
-            // Scan relocations for PLT-needed undefined function symbols.
+            // Assign PLT addresses to ALL symbols in plt_needed_symbols
+            // (which includes both PLT-reloc and non-PLT-reloc undefined
+            // symbols). Order: first by relocation encounter order for
+            // PLT-type relocs, then alphabetically for the rest. This
+            // must match the order used by generate_dynamic_sections.
             let mut plt_index: u64 = 0;
             let mut plt_sym_addrs: Vec<(String, u64)> = Vec::new();
             let mut seen: FxHashSet<String> = FxHashSet::default();
+
+            // First pass: PLT-type relocations (maintains original order).
             for reloc in all_relocations.iter() {
                 if handler.needs_plt(reloc.rel_type) && !reloc.symbol_name.is_empty() {
                     if let Some(sym) = symbol_address_map.get(&reloc.symbol_name) {
                         if !sym.is_defined && !seen.contains(&reloc.symbol_name) {
+                            seen.insert(reloc.symbol_name.clone());
+                            let entry_addr = plt_vaddr + plt0_size + plt_index * pltn_size;
+                            plt_sym_addrs.push((reloc.symbol_name.clone(), entry_addr));
+                            plt_index += 1;
+                        }
+                    }
+                }
+            }
+
+            // Second pass: non-PLT-reloc undefined symbols that still need
+            // PLT stubs (e.g. close, read, stdout referenced via R_X86_64_64
+            // or R_X86_64_PC32). Order by relocation encounter order.
+            for reloc in all_relocations.iter() {
+                if !reloc.symbol_name.is_empty()
+                    && !seen.contains(&reloc.symbol_name)
+                    && plt_needed_symbols.contains(&reloc.symbol_name)
+                {
+                    if let Some(sym) = symbol_address_map.get(&reloc.symbol_name) {
+                        if !sym.is_defined {
                             seen.insert(reloc.symbol_name.clone());
                             let entry_addr = plt_vaddr + plt0_size + plt_index * pltn_size;
                             plt_sym_addrs.push((reloc.symbol_name.clone(), entry_addr));
@@ -908,6 +963,34 @@ pub fn link(
                                 ordered_plt_syms.push((reloc.symbol_name.clone(), gp_off));
                                 stub_idx += 1;
                             }
+                        }
+                    }
+                }
+            }
+
+            // Second pass: add PLT stubs for non-PLT-reloc undefined symbols
+            // (e.g. close, read, stdout referenced via R_X86_64_64 / PC32).
+            for reloc in all_relocations.iter() {
+                if !reloc.symbol_name.is_empty()
+                    && !seen_stubs.contains(&reloc.symbol_name)
+                    && plt_needed_symbols.contains(&reloc.symbol_name)
+                {
+                    if let Some(sym) = symbol_address_map.get(&reloc.symbol_name) {
+                        let expected_addr = plt_va + plt0_sz + stub_idx as u64 * pltn_sz;
+                        if sym.final_address == expected_addr {
+                            seen_stubs.insert(reloc.symbol_name.clone());
+                            let gp_off = (reserved + stub_idx as u64) * pw;
+                            let stub = dynamic::PltStub {
+                                symbol_name: reloc.symbol_name.clone(),
+                                got_plt_offset: gp_off,
+                                index: stub_idx,
+                            };
+                            let off = plt0_sz + stub_idx as u64 * pltn_sz;
+                            plt_buf.extend_from_slice(
+                                &plt_table.generate_plt_entry(&stub, got_plt_va, plt_va, off),
+                            );
+                            ordered_plt_syms.push((reloc.symbol_name.clone(), gp_off));
+                            stub_idx += 1;
                         }
                     }
                 }
@@ -1201,6 +1284,10 @@ pub fn link(
     }
 
     if diagnostics.has_errors() && !config.allow_undefined {
+        // Print all diagnostic messages so the user can see which relocations failed.
+        for diag in diagnostics.diagnostics() {
+            eprintln!("  linker diagnostic: {}", diag.message);
+        }
         return Err("linking aborted due to relocation errors".to_string());
     }
 

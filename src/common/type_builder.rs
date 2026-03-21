@@ -775,7 +775,10 @@ pub fn usual_arithmetic_conversion(lhs: &CType, rhs: &CType) -> CType {
 /// Types with rank below `int` are promoted to `int`. All other types
 /// are returned unchanged.
 pub fn integer_promote(ty: &CType) -> CType {
-    match ty {
+    // Resolve through typedefs, qualifiers, and _Atomic before matching,
+    // so that e.g. `typedef unsigned char u8` is correctly promoted to int.
+    let resolved = resolve_and_strip(ty);
+    match resolved {
         CType::Bool | CType::Char | CType::SChar | CType::Short => CType::Int,
         CType::UChar | CType::UShort => {
             // unsigned char and unsigned short fit in int on all targets
@@ -799,8 +802,9 @@ fn types_equal_for_conversion(a: &CType, b: &CType) -> bool {
 
 /// Returns `true` if `ty` is an unsigned integer type.
 fn is_unsigned_type(ty: &CType) -> bool {
+    let resolved = resolve_and_strip(ty);
     matches!(
-        ty,
+        resolved,
         CType::Bool | CType::UChar | CType::UShort | CType::UInt | CType::ULong | CType::ULongLong
     )
 }
