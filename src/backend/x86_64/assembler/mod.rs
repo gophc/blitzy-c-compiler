@@ -46,7 +46,8 @@ use crate::backend::elf_writer_common::{
     SHT_NOTE, SHT_PROGBITS, SHT_RELA, STB_GLOBAL, STB_LOCAL, STB_WEAK, STT_FUNC, STT_NOTYPE,
     STT_SECTION, STV_DEFAULT, STV_HIDDEN,
 };
-use crate::backend::traits::MachineFunction;
+use crate::backend::traits::{MachineFunction, MachineOperand};
+use crate::backend::x86_64::codegen::X86Opcode;
 use crate::backend::x86_64::registers::{
     hw_encoding, reg_name_64, R10, R11, R12, R13, R14, R15, R8, R9, RAX, RBP, RBX, RCX, RDI, RDX,
     RSI, RSP,
@@ -567,6 +568,15 @@ pub fn assemble(
                 );
                 ctx.emit_bytes(&asm_bytes);
                 enc.current_offset = ctx.current_offset;
+                continue;
+            }
+
+            // Handle InternalLabelDef pseudo-instruction: define a local
+            // label at the current text offset.  Emits zero bytes.
+            if inst.opcode == X86Opcode::InternalLabelDef.as_u32() {
+                if let Some(MachineOperand::GlobalSymbol(ref name)) = inst.operands.first() {
+                    ctx.define_label(name);
+                }
                 continue;
             }
 

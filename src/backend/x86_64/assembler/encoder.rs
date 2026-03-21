@@ -786,7 +786,9 @@ impl X86_64Encoder {
             | X86Opcode::Ja
             | X86Opcode::Jae
             | X86Opcode::Jp
-            | X86Opcode::Jnp => {
+            | X86Opcode::Jnp
+            | X86Opcode::Js
+            | X86Opcode::Jns => {
                 let cc = condition_code(&opcode);
                 self.encode_jcc(inst, cc)
             }

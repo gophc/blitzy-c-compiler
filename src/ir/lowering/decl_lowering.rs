@@ -497,6 +497,19 @@ pub fn lower_function_definition(
     ir_function.section = extract_section_attribute(&all_attributes, name_table);
     ir_function.alignment = extract_alignment_attribute(&all_attributes, name_table);
 
+    // Merge alignment from prior declarations.
+    // Example: `void f(void) __attribute__((aligned(256)));` (declaration)
+    //          `void f(void) { ... }` (definition, no attribute)
+    // The definition should inherit alignment 256 from the declaration.
+    if let Some(&decl_align) = module.func_alignments.get(&func_name) {
+        ir_function.alignment = Some(ir_function.alignment.unwrap_or(0).max(decl_align));
+    }
+    // Store the final alignment in the module map so `__alignof__` can find it.
+    if let Some(align) = ir_function.alignment {
+        let entry = module.func_alignments.entry(func_name.clone()).or_insert(0);
+        *entry = (*entry).max(align);
+    }
+
     // --- Alloca-first: parameter allocation in entry block ---
     // Consume BlockId(0) from the builder so that subsequent create_block()
     // calls return BlockId(1), BlockId(2), etc.  The entry block already
@@ -698,6 +711,29 @@ pub fn lower_function_definition(
         module.add_declaration(fwd_decl);
     }
 
+    // --- Evaluate VLA parameter dimension side-effects (C11 §6.7.6.2p5) ---
+    // When a function parameter is declared as a VLA (e.g. `int arr[n++]`),
+    // the dimension expression must be evaluated at function entry for its
+    // side effects. The parameter itself decays to a pointer, but `n++` must
+    // still execute. We evaluate these expressions here, before the body.
+    evaluate_vla_param_side_effects(
+        &param_declarations,
+        &mut builder,
+        &mut ir_function,
+        module,
+        target,
+        type_builder,
+        diagnostics,
+        &local_vars,
+        &param_values,
+        name_table,
+        &local_types,
+        enum_constants,
+        &mut static_locals,
+        struct_defs,
+        &func_name,
+    );
+
     // --- Lower the function body statements ---
     {
         let body_stmt = ast::Statement::Compound(func_def.body.clone());
@@ -815,9 +851,27 @@ pub fn lower_function_declaration(
             .entry(func_name.clone())
             .or_insert(c_param_types_decl);
 
-        let attributes = &specifiers.attributes;
-        let linkage = determine_linkage(specifiers.storage_class, attributes, name_table);
-        let visibility = determine_visibility(attributes, name_table);
+        // Collect ALL attributes from specifiers + declarator + init_decl.
+        let all_attrs_decl = {
+            let mut a = Vec::new();
+            a.extend_from_slice(&specifiers.attributes);
+            a.extend_from_slice(&declarator.attributes);
+            a.extend_from_slice(&init_decl.declarator.attributes);
+            a
+        };
+        let linkage = determine_linkage(specifiers.storage_class, &all_attrs_decl, name_table);
+        let visibility = determine_visibility(&all_attrs_decl, name_table);
+
+        // Store function-level alignment override if present.
+        // This is needed so that later `__alignof__(func_name)` can return
+        // the correct value even when the function definition does not
+        // repeat the `aligned` attribute (attribute inheritance from prior
+        // declarations — standard C behaviour).
+        if let Some(align_val) = extract_alignment_attribute(&all_attrs_decl, name_table) {
+            // Store the maximum alignment seen across all declarations.
+            let entry = module.func_alignments.entry(func_name.clone()).or_insert(0);
+            *entry = (*entry).max(align_val);
+        }
 
         let mut func_decl = FunctionDeclaration::new(func_name, return_ir_type, param_types);
         func_decl.is_variadic = is_variadic;
@@ -2785,6 +2839,74 @@ fn lower_designated_initializer(
 // ===========================================================================
 
 /// Create allocas for all function parameters in the entry block.
+/// Evaluate VLA parameter dimension expressions for their side effects.
+///
+/// C11 §6.7.6.2p5: If a function parameter is declared as a VLA
+/// (e.g., `int arr[n++]`), the dimension expression is evaluated at
+/// function entry even though the parameter type decays to a pointer.
+/// The result of the evaluation is discarded — only the side effects
+/// (like `n++`) matter.
+#[allow(clippy::too_many_arguments)]
+fn evaluate_vla_param_side_effects(
+    params: &[ast::ParameterDeclaration],
+    builder: &mut IrBuilder,
+    function: &mut IrFunction,
+    module: &mut IrModule,
+    target: &Target,
+    type_builder: &TypeBuilder,
+    diagnostics: &mut DiagnosticEngine,
+    local_vars: &FxHashMap<String, Value>,
+    param_values: &FxHashMap<String, Value>,
+    name_table: &[String],
+    local_types: &FxHashMap<String, CType>,
+    enum_constants: &FxHashMap<String, i128>,
+    static_locals: &mut FxHashMap<String, String>,
+    struct_defs: &FxHashMap<String, CType>,
+    func_name: &str,
+) {
+    for param_decl in params {
+        // Extract VLA size expressions from the parameter's declarator.
+        // For `int arr[i++]`, this returns the expression `i++`.
+        let vla_expr = param_decl
+            .declarator
+            .as_ref()
+            .and_then(extract_vla_size_expr);
+        if let Some(vla_expr) = vla_expr {
+            // Evaluate the expression (for side effects only).
+            let empty_labels = FxHashMap::default();
+            let empty_vla = FxHashMap::default();
+            let empty_scope_overrides = FxHashMap::default();
+            let mut layout_cache = FxHashMap::default();
+            let mut expr_ctx = expr_lowering::ExprLoweringContext {
+                builder,
+                function,
+                module,
+                target,
+                type_builder,
+                diagnostics,
+                local_vars,
+                param_values,
+                name_table,
+                local_types,
+                enum_constants,
+                static_locals,
+                struct_defs,
+                label_blocks: &empty_labels,
+                current_function_name: Some(func_name),
+                enclosing_loop_stack: Vec::new(),
+                scope_type_overrides: &empty_scope_overrides,
+                last_bitfield_info: None,
+                layout_cache: &mut layout_cache,
+                vla_sizes: &empty_vla,
+            };
+            // Lower the expression — the result value is discarded,
+            // but any side effects (increment, decrement, function
+            // calls in the dimension expression) will be emitted.
+            let _ = expr_lowering::lower_expression(&mut expr_ctx, &vla_expr);
+        }
+    }
+}
+
 fn allocate_parameters(
     builder: &mut IrBuilder,
     function: &mut IrFunction,
@@ -4273,10 +4395,48 @@ fn resolve_multi_word_type_fast(specs: &[ast::TypeSpecifier], name_table: &[Stri
     if has_complex {
         let base = if has_float {
             CType::Float
-        } else if long_count > 0 {
+        } else if has_double && long_count > 0 {
             CType::LongDouble
-        } else {
+        } else if has_double {
             CType::Double
+        } else if has_char {
+            if has_unsigned {
+                CType::UChar
+            } else if has_signed {
+                CType::SChar
+            } else {
+                CType::Char
+            }
+        } else if has_short {
+            if has_unsigned {
+                CType::UShort
+            } else {
+                CType::Short
+            }
+        } else if long_count >= 2 {
+            if has_unsigned {
+                CType::ULongLong
+            } else {
+                CType::LongLong
+            }
+        } else if long_count == 1 {
+            if has_unsigned {
+                CType::ULong
+            } else {
+                CType::Long
+            }
+        } else if has_unsigned {
+            CType::UInt
+        } else {
+            // Default: _Complex with `int`, `signed`, or bare _Complex → double
+            // For `_Complex int` or `_Complex signed int`: use Int
+            // For bare `_Complex`: use Double (C11 default)
+            // We check has_signed because `_Complex signed` → _Complex int
+            if has_signed || specs.iter().any(|s| matches!(s, ast::TypeSpecifier::Int)) {
+                CType::Int
+            } else {
+                CType::Double
+            }
         };
         return CType::Complex(Box::new(base));
     }
@@ -4559,6 +4719,14 @@ fn evaluate_const_int_expr(expr: &ast::Expression) -> Option<usize> {
             operand,
             ..
         } => evaluate_const_int_expr(operand),
+        ast::Expression::UnaryOp {
+            op: ast::UnaryOp::LogicalNot,
+            operand,
+            ..
+        } => {
+            let inner = evaluate_const_int_expr(operand)?;
+            Some(if inner == 0 { 1 } else { 0 })
+        }
         ast::Expression::Binary {
             op, left, right, ..
         } => {
@@ -4581,6 +4749,8 @@ fn evaluate_const_int_expr(expr: &ast::Expression) -> Option<usize> {
                 ast::BinaryOp::Greater => Some(if (l as i64) > (r as i64) { 1 } else { 0 }),
                 ast::BinaryOp::LessEqual => Some(if (l as i64) <= (r as i64) { 1 } else { 0 }),
                 ast::BinaryOp::GreaterEqual => Some(if (l as i64) >= (r as i64) { 1 } else { 0 }),
+                ast::BinaryOp::LogicalAnd => Some(if l != 0 && r != 0 { 1 } else { 0 }),
+                ast::BinaryOp::LogicalOr => Some(if l != 0 || r != 0 { 1 } else { 0 }),
                 _ => None,
             }
         }

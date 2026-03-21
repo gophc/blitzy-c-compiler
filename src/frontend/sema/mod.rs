@@ -2747,7 +2747,7 @@ impl<'a> SemanticAnalyzer<'a> {
         let mut has_void = false;
         let mut has_char = false;
         let mut has_short = false;
-        let mut _has_int = false;
+        let mut has_int = false;
         let mut long_count = 0u32;
         let mut has_float = false;
         let mut has_double = false;
@@ -2765,7 +2765,7 @@ impl<'a> SemanticAnalyzer<'a> {
                 TypeSpecifier::Void => has_void = true,
                 TypeSpecifier::Char => has_char = true,
                 TypeSpecifier::Short => has_short = true,
-                TypeSpecifier::Int => _has_int = true,
+                TypeSpecifier::Int => has_int = true,
                 TypeSpecifier::Long => long_count += 1,
                 TypeSpecifier::Float => has_float = true,
                 TypeSpecifier::Double => has_double = true,
@@ -2851,24 +2851,39 @@ impl<'a> SemanticAnalyzer<'a> {
         } else if has_bool {
             CType::Bool
         } else if has_char {
-            if has_unsigned {
+            let base = if has_unsigned {
                 CType::UChar
             } else if has_signed {
                 CType::SChar
             } else {
                 CType::Char
+            };
+            if has_complex {
+                CType::Complex(Box::new(base))
+            } else {
+                base
             }
         } else if has_int128 {
-            if has_unsigned {
+            let base = if has_unsigned {
                 CType::UInt128
             } else {
                 CType::Int128
+            };
+            if has_complex {
+                CType::Complex(Box::new(base))
+            } else {
+                base
             }
         } else if has_short {
-            if has_unsigned {
+            let base = if has_unsigned {
                 CType::UShort
             } else {
                 CType::Short
+            };
+            if has_complex {
+                CType::Complex(Box::new(base))
+            } else {
+                base
             }
         } else if has_float {
             if has_complex {
@@ -2889,19 +2904,41 @@ impl<'a> SemanticAnalyzer<'a> {
                 CType::Double
             }
         } else if long_count >= 2 {
-            if has_unsigned {
+            let base = if has_unsigned {
                 CType::ULongLong
             } else {
                 CType::LongLong
+            };
+            if has_complex {
+                CType::Complex(Box::new(base))
+            } else {
+                base
             }
         } else if long_count == 1 {
-            if has_unsigned {
+            let base = if has_unsigned {
                 CType::ULong
             } else {
                 CType::Long
+            };
+            if has_complex {
+                CType::Complex(Box::new(base))
+            } else {
+                base
             }
         } else if has_unsigned {
-            CType::UInt
+            if has_complex {
+                CType::Complex(Box::new(CType::UInt))
+            } else {
+                CType::UInt
+            }
+        } else if has_complex {
+            // `_Complex` with `int`/`signed`/`signed int` → _Complex int.
+            // Bare `_Complex` alone defaults to `_Complex double` per C11 §6.7.2p2.
+            if has_int || has_signed {
+                CType::Complex(Box::new(CType::Int))
+            } else {
+                CType::Complex(Box::new(CType::Double))
+            }
         } else {
             // Default: signed int (covers `int`, `signed`, `signed int`, or bare specifiers).
             CType::Int

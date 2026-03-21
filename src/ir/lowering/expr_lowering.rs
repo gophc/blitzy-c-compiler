@@ -147,12 +147,33 @@ pub struct TypedValue {
     pub value: Value,
     /// The C-level type of this value.
     pub ty: CType,
+    /// Bitfield precision — when set, arithmetic on this value should
+    /// truncate results to the given number of bits.  This implements
+    /// C11 §6.7.2.1p10: "A bit-field is interpreted as having a signed
+    /// or unsigned integer type consisting of the specified number of
+    /// bits."  For bitfields wider than `int` (> 32 bits), the promoted
+    /// type is the declared type but arithmetic wraps at the bitfield
+    /// width (matching GCC behavior).
+    pub bitfield_width: Option<u32>,
 }
 
 impl TypedValue {
     #[inline]
     fn new(value: Value, ty: CType) -> Self {
-        Self { value, ty }
+        Self {
+            value,
+            ty,
+            bitfield_width: None,
+        }
+    }
+
+    #[inline]
+    fn with_bitfield_width(value: Value, ty: CType, width: u32) -> Self {
+        Self {
+            value,
+            ty,
+            bitfield_width: Some(width),
+        }
     }
 
     #[inline]
@@ -160,6 +181,7 @@ impl TypedValue {
         Self {
             value: Value::UNDEF,
             ty: CType::Void,
+            bitfield_width: None,
         }
     }
 }
@@ -272,6 +294,61 @@ fn is_compile_time_constant(expr: &ast::Expression) -> bool {
         // Everything else (variables, function calls, etc.) is NOT constant.
         _ => false,
     }
+}
+
+/// Apply bitfield-width truncation to a `TypedValue` when either operand
+/// of a binary expression originated from a bitfield read wider than 32
+/// bits.  C11 §6.7.2.1p10 says a bitfield is interpreted as having a
+/// type "consisting of the specified number of bits," so arithmetic wraps
+/// at the bitfield precision — not at the full declared type width.
+///
+/// `lhs_bfw` / `rhs_bfw` are the `bitfield_width` from the two operands.
+/// The narrower width wins (matching GCC); unsigned fields are truncated
+/// with AND, signed fields with sign-extension (SHL + ASHR).
+fn maybe_truncate_bitfield(
+    ctx: &mut ExprLoweringContext<'_>,
+    mut tv: TypedValue,
+    lhs_bfw: Option<u32>,
+    rhs_bfw: Option<u32>,
+    span: Span,
+) -> TypedValue {
+    let bfw = match (lhs_bfw, rhs_bfw) {
+        (Some(a), Some(b)) => std::cmp::max(a, b),
+        (Some(a), None) | (None, Some(a)) => a,
+        (None, None) => return tv,
+    };
+    let ir = ctype_to_ir(&tv.ty, ctx.target);
+    let ir_bits = match &ir {
+        IrType::I8 => 8u32,
+        IrType::I16 => 16,
+        IrType::I32 => 32,
+        IrType::I64 => 64,
+        _ => return tv,
+    };
+    if bfw >= ir_bits {
+        return tv;
+    }
+    // For unsigned types: AND with (2^bfw - 1)
+    if is_unsigned(&tv.ty) {
+        let mask = (1u64 << bfw).wrapping_sub(1);
+        let mask_val = emit_int_const(ctx, mask as i128, ir.clone(), span);
+        let (v, inst) = ctx.builder.build_and(tv.value, mask_val, ir, span);
+        emit_inst(ctx, inst);
+        tv.value = v;
+    } else {
+        // For signed types: sign-extend from bit_width
+        let shift = ir_bits - bfw;
+        let shift_val = emit_int_const(ctx, shift as i128, ir.clone(), span);
+        let (shl, si) = ctx.builder.build_shl(tv.value, shift_val, ir.clone(), span);
+        emit_inst(ctx, si);
+        let shift_val2 = emit_int_const(ctx, shift as i128, ir.clone(), span);
+        let (sar, ai) = ctx.builder.build_shr(shl, shift_val2, ir, true, span);
+        emit_inst(ctx, ai);
+        tv.value = sar;
+    }
+    // Propagate bitfield width to result
+    tv.bitfield_width = Some(bfw);
+    tv
 }
 
 fn emit_int_const(
@@ -457,6 +534,10 @@ fn emit_float_const(
     let const_id = ctx.module.globals().len();
     let gname = format!(".Lconst.f.{}", const_id);
     let gname_clone = gname.clone();
+    // Note: F80 (long double) currently treated as F64 in the backend
+    // (SSE-only codegen without x87 support), so we always store as
+    // Constant::Float(f64) for consistency between .rodata layout and
+    // the Movsd load instruction used by the backend.
     let mut gv = GlobalVariable::new(gname, ir_ty.clone(), Some(Constant::Float(value)));
     gv.linkage = ir_module::Linkage::Internal;
     gv.is_constant = true;
@@ -501,13 +582,17 @@ fn emit_zero(ctx: &mut ExprLoweringContext<'_>, ir_ty: IrType, span: Span) -> Va
             ctx.module.add_global(gv);
             emit_int_const(ctx, 0, IrType::I32, span)
         }
+        IrType::F32 | IrType::F64 | IrType::F80 => emit_float_const(ctx, 0.0, ir_ty, span),
         _ => emit_int_const(ctx, 0, ir_ty, span),
     }
 }
 
 /// Emit integer constant `1` of the given IR type.
 fn emit_one(ctx: &mut ExprLoweringContext<'_>, ir_ty: IrType, span: Span) -> Value {
-    emit_int_const(ctx, 1, ir_ty, span)
+    match &ir_ty {
+        IrType::F32 | IrType::F64 | IrType::F80 => emit_float_const(ctx, 1.0, ir_ty, span),
+        _ => emit_int_const(ctx, 1, ir_ty, span),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1030,16 +1115,7 @@ fn lower_expr_inner(ctx: &mut ExprLoweringContext<'_>, expr: &ast::Expression) -
         ast::Expression::AlignofType { type_name, span } => {
             lower_alignof_type(ctx, type_name, *span)
         }
-        ast::Expression::AlignofExpr { expr: inner, span } => {
-            // GCC __alignof__(expr) — evaluate to the alignment of the
-            // expression's type.  The expression itself is not evaluated.
-            // Treat as alignment 1 (conservative) if the type cannot be
-            // determined; the sema already validated the expression.
-            let size_ty = size_ir_type(ctx.target);
-            let val = emit_int_const(ctx, 1, size_ty, *span);
-            let _ = inner; // expression intentionally unevaluated
-            TypedValue::new(val, CType::ULong)
-        }
+        ast::Expression::AlignofExpr { expr: inner, span } => lower_alignof_expr(ctx, inner, *span),
 
         // ---- Member access ----
         ast::Expression::MemberAccess {
@@ -1200,12 +1276,7 @@ fn lower_lvalue_inner(ctx: &mut ExprLoweringContext<'_>, expr: &ast::Expression)
             if let CType::Complex(base) = resolved {
                 let elem_ctype = base.as_ref().clone();
                 let elem_ir = ctype_to_ir(&elem_ctype, ctx.target);
-                let elem_size: i64 = match &elem_ir {
-                    IrType::F32 => 4,
-                    IrType::F64 => 8,
-                    IrType::F80 => 16,
-                    _ => 8,
-                };
+                let elem_size: i64 = complex_elem_size(&elem_ir);
                 // Imaginary part at offset elem_size from the complex alloca.
                 let off_idx = emit_int_const_for_index(ctx, elem_size);
                 let (imag_ptr, gep) =
@@ -1316,12 +1387,7 @@ fn lower_float_literal(
 
         // Imaginary part (offset elem_size) = value
         let imag_val = emit_float_const(ctx, value, elem_ir.clone(), span);
-        let elem_size: i64 = match &elem_ir {
-            IrType::F32 => 4,
-            IrType::F64 => 8,
-            IrType::F80 => 16,
-            _ => 8,
-        };
+        let elem_size: i64 = complex_elem_size(&elem_ir);
         let off_idx = emit_int_const_for_index(ctx, elem_size);
         let (imag_ptr, gep_i) = ctx
             .builder
@@ -2323,18 +2389,23 @@ fn lower_binary(
             rv
         };
         let lhs_unsigned = is_unsigned(&lhs_promoted);
+        // C11 §6.5.7: result type is the promoted LEFT operand type.
+        // If the left operand is a bitfield, truncate the shift result.
+        let lhs_bfw = lhs.bitfield_width;
         return match op {
             ast::BinaryOp::ShiftLeft => {
                 let (v, i) = ctx.builder.build_shl(lv, rv_conv, lhs_ir, span);
                 emit_inst(ctx, i);
-                TypedValue::new(v, lhs_promoted)
+                let tv = TypedValue::new(v, lhs_promoted);
+                maybe_truncate_bitfield(ctx, tv, lhs_bfw, None, span)
             }
             ast::BinaryOp::ShiftRight => {
                 let (v, i) = ctx
                     .builder
                     .build_shr(lv, rv_conv, lhs_ir, !lhs_unsigned, span);
                 emit_inst(ctx, i);
-                TypedValue::new(v, lhs_promoted)
+                let tv = TypedValue::new(v, lhs_promoted);
+                maybe_truncate_bitfield(ctx, tv, lhs_bfw, None, span)
             }
             _ => unreachable!(),
         };
@@ -2345,6 +2416,9 @@ fn lower_binary(
     let _lhs_rank = type_builder::integer_rank(&lhs.ty);
     let _rhs_rank = type_builder::integer_rank(&rhs.ty);
     let _lhs_is_int = type_builder::is_integer_type(&lhs.ty);
+    // Capture bitfield widths before consuming operands.
+    let lhs_bfw = lhs.bitfield_width;
+    let rhs_bfw = rhs.bitfield_width;
     let common = type_builder::usual_arithmetic_conversion(&lhs.ty, &rhs.ty);
     let ci = ctype_to_ir(&common, ctx.target);
     let lv = insert_implicit_conversion(ctx, lhs.value, &lhs.ty, &common, span);
@@ -2355,27 +2429,32 @@ fn lower_binary(
         ast::BinaryOp::Add => {
             let (v, i) = ctx.builder.build_add(lv, rv, ci, span);
             emit_inst(ctx, i);
-            TypedValue::new(v, common)
+            let tv = TypedValue::new(v, common);
+            maybe_truncate_bitfield(ctx, tv, lhs_bfw, rhs_bfw, span)
         }
         ast::BinaryOp::Sub => {
             let (v, i) = ctx.builder.build_sub(lv, rv, ci, span);
             emit_inst(ctx, i);
-            TypedValue::new(v, common)
+            let tv = TypedValue::new(v, common);
+            maybe_truncate_bitfield(ctx, tv, lhs_bfw, rhs_bfw, span)
         }
         ast::BinaryOp::Mul => {
             let (v, i) = ctx.builder.build_mul(lv, rv, ci, span);
             emit_inst(ctx, i);
-            TypedValue::new(v, common)
+            let tv = TypedValue::new(v, common);
+            maybe_truncate_bitfield(ctx, tv, lhs_bfw, rhs_bfw, span)
         }
         ast::BinaryOp::Div => {
             let (v, i) = ctx.builder.build_div(lv, rv, ci, !uns, span);
             emit_inst(ctx, i);
-            TypedValue::new(v, common)
+            let tv = TypedValue::new(v, common);
+            maybe_truncate_bitfield(ctx, tv, lhs_bfw, rhs_bfw, span)
         }
         ast::BinaryOp::Mod => {
             let (v, i) = ctx.builder.build_rem(lv, rv, ci, !uns, span);
             emit_inst(ctx, i);
-            TypedValue::new(v, common)
+            let tv = TypedValue::new(v, common);
+            maybe_truncate_bitfield(ctx, tv, lhs_bfw, rhs_bfw, span)
         }
         ast::BinaryOp::BitwiseAnd => {
             let (v, i) = ctx.builder.build_and(lv, rv, ci, span);
@@ -2457,6 +2536,27 @@ fn emit_cmp(
 // =========================================================================
 // _COMPLEX ARITHMETIC  (component-wise FP decomposition)
 // =========================================================================
+
+/// Compute the byte-size of a single element of a `_Complex` type.
+/// Handles both floating-point and integer element types correctly.
+fn complex_elem_size(elem_ir: &IrType) -> i64 {
+    match elem_ir {
+        IrType::F32 => 4,
+        IrType::F64 => 8,
+        IrType::F80 => 16, // 80-bit extended padded to 16 bytes
+        IrType::I8 => 1,
+        IrType::I16 => 2,
+        IrType::I32 => 4,
+        IrType::I64 => 8,
+        IrType::I128 => 16,
+        _ => 8,
+    }
+}
+
+/// Returns `true` if the given `IrType` is a floating-point type.
+fn is_fp_ir_type(ir_ty: &IrType) -> bool {
+    matches!(ir_ty, IrType::F32 | IrType::F64 | IrType::F80)
+}
 
 /// Determine the scalar element type for a `_Complex` C type.
 /// Returns `None` if `ty` is not `_Complex`.
@@ -2598,24 +2698,36 @@ fn lower_complex_binary(
 
     let complex_ctype: CType;
     let elem_ctype: CType;
-    if let Some(elem) = complex_element_ctype(lhs_resolved) {
-        elem_ctype = elem.clone();
-        complex_ctype = lhs_resolved.clone();
-    } else if let Some(elem) = complex_element_ctype(rhs_resolved) {
-        elem_ctype = elem.clone();
-        complex_ctype = rhs_resolved.clone();
-    } else {
-        unreachable!("lower_complex_binary called without _Complex type");
+    let lhs_elem = complex_element_ctype(lhs_resolved);
+    let rhs_elem = complex_element_ctype(rhs_resolved);
+    match (lhs_elem, rhs_elem) {
+        (Some(le), Some(re)) => {
+            // Both complex: promote to the common element type using
+            // usual arithmetic conversions.
+            let common_elem = type_builder::usual_arithmetic_conversion(le, re);
+            elem_ctype = common_elem.clone();
+            complex_ctype = CType::Complex(Box::new(common_elem));
+        }
+        (Some(le), None) => {
+            // LHS is complex, RHS is scalar: promote scalar side.
+            // If the scalar is floating and wider, use float type.
+            let rhs_promoted = type_builder::usual_arithmetic_conversion(le, rhs_resolved);
+            elem_ctype = rhs_promoted.clone();
+            complex_ctype = CType::Complex(Box::new(rhs_promoted));
+        }
+        (None, Some(re)) => {
+            let lhs_promoted = type_builder::usual_arithmetic_conversion(lhs_resolved, re);
+            elem_ctype = lhs_promoted.clone();
+            complex_ctype = CType::Complex(Box::new(lhs_promoted));
+        }
+        (None, None) => {
+            unreachable!("lower_complex_binary called without _Complex type");
+        }
     }
 
     let elem_ir = ctype_to_ir(&elem_ctype, ctx.target);
     let complex_ir = ctype_to_ir(&complex_ctype, ctx.target);
-    let elem_size = match &elem_ir {
-        IrType::F32 => 4i64,
-        IrType::F64 => 8i64,
-        IrType::F80 => 16i64, // 80-bit extended padded to 16 bytes
-        _ => 8i64,
-    };
+    let elem_size = complex_elem_size(&elem_ir);
 
     // Load real/imaginary parts from both operands.  If one operand is a
     // plain real scalar (not _Complex), promote it to complex by treating
@@ -2623,21 +2735,67 @@ fn lower_complex_binary(
     let lhs_is_complex = matches!(types::resolve_typedef(&_lhs_tv.ty), CType::Complex(..));
     let rhs_is_complex = matches!(types::resolve_typedef(&_rhs_tv.ty), CType::Complex(..));
 
+    let elem_is_fp = is_fp_ir_type(&elem_ir);
+
+    // Helper: extract complex parts from an operand, converting to the
+    // common element type if the operand's element type differs.
+    let extract_complex_parts = |ctx: &mut ExprLoweringContext<'_>,
+                                 expr: &ast::Expression,
+                                 operand_ty: &CType|
+     -> (Value, Value) {
+        let operand_resolved = types::resolve_typedef(operand_ty);
+        if let Some(op_elem) = complex_element_ctype(operand_resolved) {
+            let op_elem_ir = ctype_to_ir(op_elem, ctx.target);
+            let op_complex_ir = ctype_to_ir(operand_resolved, ctx.target);
+            let op_esz = complex_elem_size(&op_elem_ir);
+            // Load parts using the operand's native element type
+            let (raw_r, raw_i) =
+                lower_complex_operand_parts(ctx, expr, &op_complex_ir, &op_elem_ir, op_esz, span);
+            // Convert to the common element type if needed
+            if op_elem_ir == elem_ir {
+                (raw_r, raw_i)
+            } else {
+                let cvt_r = lower_cast(ctx, raw_r, op_elem, &elem_ctype, span);
+                let cvt_i = lower_cast(ctx, raw_i, op_elem, &elem_ctype, span);
+                (cvt_r, cvt_i)
+            }
+        } else {
+            // Should not happen (caller verified lhs_is_complex)
+            lower_complex_operand_parts(ctx, expr, &complex_ir, &elem_ir, elem_size, span)
+        }
+    };
+
     let (lr, li) = if lhs_is_complex {
-        lower_complex_operand_parts(ctx, lhs_expr, &complex_ir, &elem_ir, elem_size, span)
+        extract_complex_parts(ctx, lhs_expr, &_lhs_tv.ty)
     } else {
-        // Scalar: real = scalar value, imag = 0.0
+        // Scalar: real = scalar value, imag = 0
         let scalar = lower_expr_inner(ctx, lhs_expr);
-        let real_val = ensure_fp_type(ctx, scalar.value, &scalar.ty, &elem_ir, span);
-        let zero = emit_float_const(ctx, 0.0, elem_ir.clone(), span);
+        let real_val = if elem_is_fp {
+            ensure_fp_type(ctx, scalar.value, &scalar.ty, &elem_ir, span)
+        } else {
+            lower_cast(ctx, scalar.value, &scalar.ty, &elem_ctype, span)
+        };
+        let zero = if elem_is_fp {
+            emit_float_const(ctx, 0.0, elem_ir.clone(), span)
+        } else {
+            emit_int_const(ctx, 0, elem_ir.clone(), span)
+        };
         (real_val, zero)
     };
     let (rr, ri) = if rhs_is_complex {
-        lower_complex_operand_parts(ctx, rhs_expr, &complex_ir, &elem_ir, elem_size, span)
+        extract_complex_parts(ctx, rhs_expr, &_rhs_tv.ty)
     } else {
         let scalar = lower_expr_inner(ctx, rhs_expr);
-        let real_val = ensure_fp_type(ctx, scalar.value, &scalar.ty, &elem_ir, span);
-        let zero = emit_float_const(ctx, 0.0, elem_ir.clone(), span);
+        let real_val = if elem_is_fp {
+            ensure_fp_type(ctx, scalar.value, &scalar.ty, &elem_ir, span)
+        } else {
+            lower_cast(ctx, scalar.value, &scalar.ty, &elem_ctype, span)
+        };
+        let zero = if elem_is_fp {
+            emit_float_const(ctx, 0.0, elem_ir.clone(), span)
+        } else {
+            emit_int_const(ctx, 0, elem_ir.clone(), span)
+        };
         (real_val, zero)
     };
 
@@ -2780,6 +2938,47 @@ fn lower_complex_binary(
     }
 }
 
+/// Helper: get a pointer to a complex aggregate for an expression.
+/// For simple lvalues (identifiers, member access), re-lowers as lvalue.
+/// For non-lvalue expressions (assignments, function calls), stores the
+/// evaluated aggregate value to a temporary alloca.
+fn complex_expr_to_ptr(
+    ctx: &mut ExprLoweringContext<'_>,
+    expr: &ast::Expression,
+    value: Value,
+    ctype: &CType,
+    span: Span,
+) -> Value {
+    match expr {
+        ast::Expression::Identifier { .. }
+        | ast::Expression::MemberAccess { .. }
+        | ast::Expression::PointerMemberAccess { .. }
+        | ast::Expression::ArraySubscript { .. }
+        | ast::Expression::UnaryOp { .. } => lower_lvalue(ctx, expr),
+        _ => {
+            // Store aggregate value to a temp alloca for decomposition.
+            let complex_ir = ctype_to_ir(ctype, ctx.target);
+            let (alloca_val, alloca_inst) = ctx.builder.build_alloca(complex_ir, span);
+            emit_inst(ctx, alloca_inst);
+            let store_inst = ctx.builder.build_store(value, alloca_val, span);
+            emit_inst(ctx, store_inst);
+            alloca_val
+        }
+    }
+}
+
+/// Helper: convert expression to boolean, handling Complex types via lvalue pointer.
+fn expr_to_bool(ctx: &mut ExprLoweringContext<'_>, expr: &ast::Expression, span: Span) -> Value {
+    let inner = lower_expr_inner(ctx, expr);
+    let resolved = types::resolve_typedef(&inner.ty);
+    if let CType::Complex(ref base) = resolved {
+        let ptr = complex_expr_to_ptr(ctx, expr, inner.value, resolved, span);
+        complex_ptr_to_bool(ctx, ptr, base, span)
+    } else {
+        lower_to_bool(ctx, inner.value, &inner.ty, span)
+    }
+}
+
 fn lower_logical_and(
     ctx: &mut ExprLoweringContext<'_>,
     le: &ast::Expression,
@@ -2788,8 +2987,7 @@ fn lower_logical_and(
 ) -> TypedValue {
     let rb = new_block(ctx);
     let mb = new_block(ctx);
-    let lhs = lower_expr_inner(ctx, le);
-    let lb = lower_to_bool(ctx, lhs.value, &lhs.ty, span);
+    let lb = expr_to_bool(ctx, le, span);
     // Emit the short-circuit false constant (0) in the current block BEFORE
     // the conditional branch.  This ensures the phi in the merge block is the
     // very first instruction, maintaining the SSA invariant that phi nodes
@@ -2803,8 +3001,7 @@ fn lower_logical_and(
     add_cfg_edge(ctx, cond_blk.index(), mb.index());
     let le_blk = cond_blk;
     ctx.builder.set_insert_point(rb);
-    let rhs = lower_expr_inner(ctx, re);
-    let rbv = lower_to_bool(ctx, rhs.value, &rhs.ty, span);
+    let rbv = expr_to_bool(ctx, re, span);
     let bi = ctx.builder.build_branch(mb, span);
     emit_inst(ctx, bi);
     let re_blk = ctx.builder.get_insert_block().unwrap();
@@ -2826,8 +3023,7 @@ fn lower_logical_or(
 ) -> TypedValue {
     let rb = new_block(ctx);
     let mb = new_block(ctx);
-    let lhs = lower_expr_inner(ctx, le);
-    let lb = lower_to_bool(ctx, lhs.value, &lhs.ty, span);
+    let lb = expr_to_bool(ctx, le, span);
     // Emit the short-circuit true constant (1) in the current block BEFORE
     // the conditional branch, so the phi in the merge block is the very
     // first instruction, preserving the phi-prefix invariant.
@@ -2840,8 +3036,7 @@ fn lower_logical_or(
     add_cfg_edge(ctx, cond_blk.index(), rb.index());
     let le_blk = cond_blk;
     ctx.builder.set_insert_point(rb);
-    let rhs = lower_expr_inner(ctx, re);
-    let rbv = lower_to_bool(ctx, rhs.value, &rhs.ty, span);
+    let rbv = expr_to_bool(ctx, re, span);
     let bi = ctx.builder.build_branch(mb, span);
     emit_inst(ctx, bi);
     let re_blk = ctx.builder.get_insert_block().unwrap();
@@ -3004,12 +3199,7 @@ fn lower_unary(
             if let CType::Complex(ref base) = resolved_ty {
                 let elem_ir = ctype_to_ir(base.as_ref(), ctx.target);
                 let complex_ir = ctype_to_ir(resolved_ty, ctx.target);
-                let elem_sz: i64 = match &elem_ir {
-                    IrType::F32 => 4,
-                    IrType::F64 => 8,
-                    IrType::F80 => 16,
-                    _ => 8,
-                };
+                let elem_sz: i64 = complex_elem_size(&elem_ir);
 
                 // Store complex value to alloca.
                 let (alloca_val, alloca_inst) = ctx.builder.build_alloca(complex_ir.clone(), span);
@@ -3075,7 +3265,14 @@ fn lower_unary(
         }
         ast::UnaryOp::LogicalNot => {
             let inner = lower_expr_inner(ctx, operand);
-            let bv = lower_to_bool(ctx, inner.value, &inner.ty, span);
+            let resolved = types::resolve_typedef(&inner.ty);
+            let bv = if let CType::Complex(ref base) = resolved {
+                // Complex types need lvalue pointer for decomposition.
+                let ptr = complex_expr_to_ptr(ctx, operand, inner.value, resolved, span);
+                complex_ptr_to_bool(ctx, ptr, base, span)
+            } else {
+                lower_to_bool(ctx, inner.value, &inner.ty, span)
+            };
             let one = emit_int_const(ctx, 1, IrType::I1, span);
             let (r, i) = ctx.builder.build_xor(bv, one, IrType::I1, span);
             emit_inst(ctx, i);
@@ -3112,12 +3309,7 @@ fn lower_unary(
             if let CType::Complex(base) = resolved {
                 let elem_ctype = base.as_ref().clone();
                 let elem_ir = ctype_to_ir(&elem_ctype, ctx.target);
-                let elem_size: i64 = match &elem_ir {
-                    IrType::F32 => 4,
-                    IrType::F64 => 8,
-                    IrType::F80 => 16,
-                    _ => 8,
-                };
+                let elem_size: i64 = complex_elem_size(&elem_ir);
                 // Get pointer to the complex value's storage.
                 let ptr = lower_lvalue(ctx, operand);
                 // Imaginary part is at offset elem_size.
@@ -3179,6 +3371,99 @@ fn lower_assignment(
                 let _ = lower_expr_inner(ctx, value);
                 return TypedValue::new(lhs.value, lhs.ty);
             }
+
+            // Special case: LHS is _Complex but RHS is a non-complex scalar.
+            // Convert the scalar to complex first, then store.
+            // Complex→Complex assignment falls through to the normal
+            // scalar Store path — the codegen handles aggregate copies
+            // via struct_load_source for function-call returns and
+            // struct_pair_hi for parameter-received pairs.
+            if let CType::Complex(ref base_ty) = resolved_lhs_ty {
+                let rhs_tv = lower_expr_inner(ctx, value);
+                let rhs_resolved = types::resolve_typedef(&rhs_tv.ty);
+                let rhs_is_complex = matches!(rhs_resolved, CType::Complex(_));
+                if !rhs_is_complex {
+                    // Scalar → Complex: store real=scalar, imag=0 directly
+                    // into the LHS alloca, component by component.
+                    let elem_ir = crate::ir::types::IrType::from_ctype(base_ty, ctx.target);
+                    let scalar_as_elem = lower_cast(ctx, rhs_tv.value, &rhs_tv.ty, base_ty, span);
+                    // Store real part at [lhs+0]
+                    let si_real = ctx.builder.build_store(scalar_as_elem, lhs.value, span);
+                    emit_inst(ctx, si_real);
+                    // Store zero imag part at [lhs+elem_size]
+                    let elem_size = elem_ir.size_bytes(ctx.target);
+                    let off_val = emit_int_const(ctx, elem_size as i128, IrType::I64, span);
+                    let (imag_ptr, gep_inst) =
+                        ctx.builder
+                            .build_gep(lhs.value, vec![off_val], elem_ir.clone(), span);
+                    emit_inst(ctx, gep_inst);
+                    let zero_imag = if is_fp_ir_type(&elem_ir) {
+                        emit_float_const(ctx, 0.0, elem_ir.clone(), span)
+                    } else {
+                        emit_int_const(ctx, 0, elem_ir.clone(), span)
+                    };
+                    let si_imag = ctx.builder.build_store(zero_imag, imag_ptr, span);
+                    emit_inst(ctx, si_imag);
+                    return TypedValue::new(lhs.value, lhs.ty);
+                }
+                // For Complex→Complex with different element types,
+                // we must convert component-by-component. For same types,
+                // fall through to the normal Store path which handles
+                // aggregate copies via struct_load_source/struct_pair_hi.
+                if let CType::Complex(ref rhs_base) = *rhs_resolved {
+                    if **rhs_base != **base_ty {
+                        // Different element types (e.g. _Complex float → _Complex double).
+                        // Get a pointer to the RHS complex value.
+                        let rhs_ptr = if expr_is_natural_lvalue(value) {
+                            lower_lvalue_inner(ctx, value).value
+                        } else {
+                            // Spill the rvalue to a temp alloca.
+                            let rhs_ir = IrType::from_ctype(&rhs_tv.ty, ctx.target);
+                            let (tmp, tmp_inst) = ctx.builder.build_alloca(rhs_ir, span);
+                            emit_inst(ctx, tmp_inst);
+                            let si = ctx.builder.build_store(rhs_tv.value, tmp, span);
+                            emit_inst(ctx, si);
+                            tmp
+                        };
+                        let src_elem_ir = IrType::from_ctype(rhs_base, ctx.target);
+                        let dst_elem_ir = IrType::from_ctype(base_ty, ctx.target);
+                        let src_elem_sz = src_elem_ir.size_bytes(ctx.target);
+                        let dst_elem_sz = dst_elem_ir.size_bytes(ctx.target);
+                        // Convert real part
+                        let (src_real, src_real_li) =
+                            ctx.builder.build_load(rhs_ptr, src_elem_ir.clone(), span);
+                        emit_inst(ctx, src_real_li);
+                        let dst_real = lower_cast(ctx, src_real, rhs_base, base_ty, span);
+                        let si_real = ctx.builder.build_store(dst_real, lhs.value, span);
+                        emit_inst(ctx, si_real);
+                        // Convert imag part
+                        let src_imag_off =
+                            emit_int_const(ctx, src_elem_sz as i128, IrType::I64, span);
+                        let (src_imag_ptr, src_gep) = ctx.builder.build_gep(
+                            rhs_ptr,
+                            vec![src_imag_off],
+                            src_elem_ir.clone(),
+                            span,
+                        );
+                        emit_inst(ctx, src_gep);
+                        let (src_imag, src_imag_li) =
+                            ctx.builder.build_load(src_imag_ptr, src_elem_ir, span);
+                        emit_inst(ctx, src_imag_li);
+                        let dst_imag = lower_cast(ctx, src_imag, rhs_base, base_ty, span);
+                        let dst_imag_off =
+                            emit_int_const(ctx, dst_elem_sz as i128, IrType::I64, span);
+                        let (dst_imag_ptr, dst_gep) =
+                            ctx.builder
+                                .build_gep(lhs.value, vec![dst_imag_off], dst_elem_ir, span);
+                        emit_inst(ctx, dst_gep);
+                        let si_imag = ctx.builder.build_store(dst_imag, dst_imag_ptr, span);
+                        emit_inst(ctx, si_imag);
+                        return TypedValue::new(lhs.value, lhs.ty);
+                    }
+                }
+                // Same-type Complex: fall through to normal Store path.
+            }
+
             if is_agg && struct_size > 8 {
                 // Get source pointer for the struct copy.
                 // If the RHS is a natural lvalue (variable, array element,
@@ -3399,12 +3684,7 @@ fn lower_assignment(
                     CType::Double
                 };
                 let elem_ir = ctype_to_ir(&elem_ctype, ctx.target);
-                let elem_size: i64 = match &elem_ir {
-                    IrType::F32 => 4,
-                    IrType::F64 => 8,
-                    IrType::F80 => 16,
-                    _ => 8,
-                };
+                let elem_size: i64 = complex_elem_size(&elem_ir);
 
                 // Load LHS real/imag from the lvalue pointer
                 let zero_idx = emit_int_const_for_index(ctx, 0);
@@ -3777,8 +4057,17 @@ fn lower_conditional(
     let else_blk = new_block(ctx);
     let merge_blk = new_block(ctx);
 
+    // Evaluate condition — we need both the boolean result and the full
+    // typed value (for the GNU extension `x ?: y` where the condition IS
+    // the then-value).
     let cond_tv = lower_expr_inner(ctx, cond);
-    let cond_bool = lower_to_bool(ctx, cond_tv.value, &cond_tv.ty, span);
+    let resolved_cond = types::resolve_typedef(&cond_tv.ty);
+    let cond_bool = if let CType::Complex(ref base) = resolved_cond {
+        let ptr = complex_expr_to_ptr(ctx, cond, cond_tv.value, resolved_cond, span);
+        complex_ptr_to_bool(ctx, ptr, base, span)
+    } else {
+        lower_to_bool(ctx, cond_tv.value, &cond_tv.ty, span)
+    };
 
     // Record the block that emits the conditional branch (current block).
     let cond_blk = ctx.builder.get_insert_block().unwrap();
@@ -5316,18 +5605,18 @@ fn lower_cast(
         let st_real = ctx.builder.build_store(real_val, real_ptr, span);
         emit_inst(ctx, st_real);
         // Store zero imaginary part at offset elem_sz.
-        let elem_sz: i64 = match &elem_ir {
-            IrType::F32 => 4,
-            IrType::F64 => 8,
-            IrType::F80 => 16,
-            _ => 8,
-        };
+        let elem_sz: i64 = complex_elem_size(&elem_ir);
         let imag_idx = emit_int_const_for_index(ctx, elem_sz);
         let (imag_ptr, gep_i) =
             ctx.builder
                 .build_gep(alloca_val, vec![imag_idx], IrType::Ptr, span);
         emit_inst(ctx, gep_i);
-        let zero_imag = emit_float_const(ctx, 0.0, elem_ir, span);
+        // Use integer zero for integer-based complex, float zero for FP complex.
+        let zero_imag = if is_fp_ir_type(&elem_ir) {
+            emit_float_const(ctx, 0.0, elem_ir, span)
+        } else {
+            emit_int_const(ctx, 0, elem_ir, span)
+        };
         let st_imag = ctx.builder.build_store(zero_imag, imag_ptr, span);
         emit_inst(ctx, st_imag);
         // Load the complete complex value.
@@ -5803,6 +6092,69 @@ fn lower_alignof_type(
     TypedValue::new(val, size_ctype(ctx.target))
 }
 
+/// GCC `__alignof__(expr)` — evaluate to the alignment of the expression's
+/// type.  The expression itself is not evaluated.
+///
+/// When the operand is an identifier that refers to a function or global
+/// variable with an explicit `__attribute__((aligned(N)))`, the alignment
+/// returned is the maximum of the type's natural alignment and the explicit
+/// override — matching GCC's semantics.
+fn lower_alignof_expr(
+    ctx: &mut ExprLoweringContext<'_>,
+    operand: &ast::Expression,
+    span: Span,
+) -> TypedValue {
+    // Determine the expression's C type (without array-to-pointer decay,
+    // without evaluating the expression) — same approach as sizeof(expr).
+    let expr_ty = sizeof_infer_type(ctx, operand);
+    let mut align = ctx.type_builder.alignof_type(&expr_ty);
+
+    // For identifiers, check if the declaration has an explicit alignment
+    // override (from `__attribute__((aligned(N)))`) stored on the IR
+    // function or global variable.  This is the key difference between
+    // `__alignof__(expr)` and `_Alignof(type)`: the former considers
+    // declaration-level attributes, the latter does not.
+    if let Some(name) = alignof_extract_ident_name(ctx, operand) {
+        // Check the module-level function alignment map.  This covers
+        // alignment from both prior declarations and definitions, merged
+        // across multiple declarations.
+        if let Some(&func_align) = ctx.module.func_alignments.get(name.as_str()) {
+            align = align.max(func_align);
+        }
+        // Check functions (IrFunction.alignment from definition).
+        if let Some(func) = ctx.module.get_function(&name) {
+            if let Some(func_align) = func.alignment {
+                align = align.max(func_align);
+            }
+        }
+        // Check global variables
+        if let Some(global) = ctx.module.get_global(&name) {
+            if let Some(global_align) = global.alignment {
+                align = align.max(global_align);
+            }
+        }
+    }
+
+    let ir_ty = size_ir_type(ctx.target);
+    let val = emit_int_const(ctx, align as i128, ir_ty, span);
+    TypedValue::new(val, size_ctype(ctx.target))
+}
+
+/// Extract the identifier name from an expression for `__alignof__` purposes.
+/// Strips parentheses to handle `__alignof__((var))`.
+fn alignof_extract_ident_name(
+    ctx: &ExprLoweringContext<'_>,
+    expr: &ast::Expression,
+) -> Option<String> {
+    match expr {
+        ast::Expression::Identifier { name, .. } => {
+            Some(resolve_sym(ctx, name.as_u32()).to_string())
+        }
+        ast::Expression::Parenthesized { inner, .. } => alignof_extract_ident_name(ctx, inner),
+        _ => None,
+    }
+}
+
 // =========================================================================
 // MEMBER ACCESS  (. and ->)
 // =========================================================================
@@ -5986,7 +6338,16 @@ fn lower_bitfield_read(
         result
     };
 
-    TypedValue::new(final_val, promoted_ty)
+    // C11 §6.7.2.1p10: bitfields wider than `int` (> 32 bits) retain
+    // their precision — arithmetic on them wraps at the bitfield width,
+    // not the declared type width.  Track this so that `lower_binary`
+    // and shift operations can insert the appropriate truncation.
+    let storage_bits = storage_size * 8;
+    if bit_width > 32 && bit_width < storage_bits {
+        TypedValue::with_bitfield_width(final_val, promoted_ty, bit_width as u32)
+    } else {
+        TypedValue::new(final_val, promoted_ty)
+    }
 }
 
 /// Emit IR for writing a bitfield: load the storage unit, clear the
@@ -6184,7 +6545,9 @@ fn find_struct_member(
     struct_defs: &FxHashMap<String, CType>,
     layout_cache: &mut FxHashMap<String, crate::common::type_builder::StructLayout>,
 ) -> (usize, CType, Option<(usize, usize)>) {
-    let resolved = types::resolve_typedef(ctype);
+    // Strip both qualifiers (const, volatile, restrict) AND typedefs so that
+    // `const struct F`, `volatile union U`, etc. match the Struct/Union arms.
+    let resolved = types::resolve_and_strip(ctype);
     // Resolve lightweight tag references (empty fields with a tag name)
     // by looking up the full definition from the struct_defs registry.
     let resolved = match resolved {
@@ -6531,7 +6894,31 @@ fn lower_pre_inc_dec(
     if let Some((bo, bw)) = bf_info {
         if bw > 0 {
             lower_bitfield_store(ctx, lv.value, new_val, &lv.ty, bo, bw, span);
-            return TypedValue::new(new_val, lv.ty);
+            // The value actually stored is truncated to `bw` bits.
+            // Return the truncated value, not the raw arithmetic result.
+            let storage_bits = crate::common::types::sizeof_ctype(&lv.ty, ctx.target) * 8;
+            let truncated = if bw < storage_bits {
+                let ir = ctype_to_ir(&lv.ty, ctx.target);
+                if is_unsigned(&lv.ty) {
+                    let mask = (1u64 << bw).wrapping_sub(1);
+                    let mask_val = emit_int_const(ctx, mask as i128, ir.clone(), span);
+                    let (v, inst) = ctx.builder.build_and(new_val, mask_val, ir, span);
+                    emit_inst(ctx, inst);
+                    v
+                } else {
+                    let shift = (storage_bits - bw) as i128;
+                    let shift_val = emit_int_const(ctx, shift, ir.clone(), span);
+                    let (shl, si2) = ctx.builder.build_shl(new_val, shift_val, ir.clone(), span);
+                    emit_inst(ctx, si2);
+                    let sv2 = emit_int_const(ctx, shift, ir.clone(), span);
+                    let (sar, ai) = ctx.builder.build_shr(shl, sv2, ir, true, span);
+                    emit_inst(ctx, ai);
+                    sar
+                }
+            } else {
+                new_val
+            };
+            return TypedValue::new(truncated, lv.ty);
         }
     }
     let si = ctx.builder.build_store(new_val, lv.value, span);
@@ -8874,124 +9261,150 @@ fn lower_overflow_arith(
                 }
             } else {
                 // Unsigned result type.
-                match op {
-                    IrBinOp::Add => {
-                        // Unsigned add overflow: result < a (or result < b).
-                        let ov = ctx.builder.fresh_value();
-                        emit_inst(
-                            ctx,
-                            Instruction::ICmp {
-                                result: ov,
-                                op: ICmpOp::Ult,
-                                lhs: result64,
-                                rhs: a64,
-                                span,
-                            },
-                        );
-                        ov
+                // When operands are signed and fit in < 64 bits, the
+                // mathematical result of add/sub/mul fits exactly in i64
+                // (magnitude bounded by ~2^62 for mul, ~2^33 for add/sub).
+                // Overflow for an unsigned destination simply means
+                // the mathematical result is negative.
+                let any_operand_signed = a_signed || b_signed;
+                if any_operand_signed && max_operand_bits < 64 {
+                    // The i64 result is the exact mathematical result.
+                    // Overflow iff result < 0 (signed comparison).
+                    let zero = emit_int_const(ctx, 0, IrType::I64, span);
+                    let ov = ctx.builder.fresh_value();
+                    emit_inst(
+                        ctx,
+                        Instruction::ICmp {
+                            result: ov,
+                            op: ICmpOp::Slt,
+                            lhs: result64,
+                            rhs: zero,
+                            span,
+                        },
+                    );
+                    ov
+                } else {
+                    // Both operands unsigned (or 64-bit signed→unsigned
+                    // where standard unsigned checks apply).
+                    match op {
+                        IrBinOp::Add => {
+                            // Unsigned add overflow: result < a.
+                            let ov = ctx.builder.fresh_value();
+                            emit_inst(
+                                ctx,
+                                Instruction::ICmp {
+                                    result: ov,
+                                    op: ICmpOp::Ult,
+                                    lhs: result64,
+                                    rhs: a64,
+                                    span,
+                                },
+                            );
+                            ov
+                        }
+                        IrBinOp::Sub => {
+                            // Unsigned sub overflow: a < b.
+                            let ov = ctx.builder.fresh_value();
+                            emit_inst(
+                                ctx,
+                                Instruction::ICmp {
+                                    result: ov,
+                                    op: ICmpOp::Ult,
+                                    lhs: a64,
+                                    rhs: b64,
+                                    span,
+                                },
+                            );
+                            ov
+                        }
+                        IrBinOp::Mul => {
+                            // Unsigned mul: result / b != a (when b != 0).
+                            // Guard division: safe_b = b | (b==0).
+                            let zero = emit_int_const(ctx, 0, IrType::I64, span);
+                            let b_eq_zero_i1 = ctx.builder.fresh_value();
+                            emit_inst(
+                                ctx,
+                                Instruction::ICmp {
+                                    result: b_eq_zero_i1,
+                                    op: ICmpOp::Eq,
+                                    lhs: b64,
+                                    rhs: zero,
+                                    span,
+                                },
+                            );
+                            let b_nz = ctx.builder.fresh_value();
+                            emit_inst(
+                                ctx,
+                                Instruction::ICmp {
+                                    result: b_nz,
+                                    op: ICmpOp::Ne,
+                                    lhs: b64,
+                                    rhs: zero,
+                                    span,
+                                },
+                            );
+                            let b_eq_zero_i64 = ctx.builder.fresh_value();
+                            emit_inst(
+                                ctx,
+                                Instruction::ZExt {
+                                    result: b_eq_zero_i64,
+                                    value: b_eq_zero_i1,
+                                    to_type: IrType::I64,
+                                    from_type: IrType::I1,
+                                    span,
+                                },
+                            );
+                            let safe_b = ctx.builder.fresh_value();
+                            emit_inst(
+                                ctx,
+                                Instruction::BinOp {
+                                    result: safe_b,
+                                    op: IrBinOp::Or,
+                                    lhs: b64,
+                                    rhs: b_eq_zero_i64,
+                                    ty: IrType::I64,
+                                    span,
+                                },
+                            );
+                            let div_back = ctx.builder.fresh_value();
+                            emit_inst(
+                                ctx,
+                                Instruction::BinOp {
+                                    result: div_back,
+                                    op: IrBinOp::UDiv,
+                                    lhs: result64,
+                                    rhs: safe_b,
+                                    ty: IrType::I64,
+                                    span,
+                                },
+                            );
+                            let ne_a = ctx.builder.fresh_value();
+                            emit_inst(
+                                ctx,
+                                Instruction::ICmp {
+                                    result: ne_a,
+                                    op: ICmpOp::Ne,
+                                    lhs: div_back,
+                                    rhs: a64,
+                                    span,
+                                },
+                            );
+                            let ov = ctx.builder.fresh_value();
+                            emit_inst(
+                                ctx,
+                                Instruction::BinOp {
+                                    result: ov,
+                                    op: IrBinOp::And,
+                                    lhs: b_nz,
+                                    rhs: ne_a,
+                                    ty: IrType::I1,
+                                    span,
+                                },
+                            );
+                            ov
+                        }
+                        _ => emit_int_const(ctx, 0, IrType::I1, span),
                     }
-                    IrBinOp::Sub => {
-                        // Unsigned sub overflow: a < b.
-                        let ov = ctx.builder.fresh_value();
-                        emit_inst(
-                            ctx,
-                            Instruction::ICmp {
-                                result: ov,
-                                op: ICmpOp::Ult,
-                                lhs: a64,
-                                rhs: b64,
-                                span,
-                            },
-                        );
-                        ov
-                    }
-                    IrBinOp::Mul => {
-                        // Unsigned mul: result / b != a (when b != 0).
-                        // Guard division with safe_b = b | (b==0) to avoid SIGFPE.
-                        let zero = emit_int_const(ctx, 0, IrType::I64, span);
-                        let b_eq_zero_i1 = ctx.builder.fresh_value();
-                        emit_inst(
-                            ctx,
-                            Instruction::ICmp {
-                                result: b_eq_zero_i1,
-                                op: ICmpOp::Eq,
-                                lhs: b64,
-                                rhs: zero,
-                                span,
-                            },
-                        );
-                        let b_nz = ctx.builder.fresh_value();
-                        emit_inst(
-                            ctx,
-                            Instruction::ICmp {
-                                result: b_nz,
-                                op: ICmpOp::Ne,
-                                lhs: b64,
-                                rhs: zero,
-                                span,
-                            },
-                        );
-                        let b_eq_zero_i64 = ctx.builder.fresh_value();
-                        emit_inst(
-                            ctx,
-                            Instruction::ZExt {
-                                result: b_eq_zero_i64,
-                                value: b_eq_zero_i1,
-                                to_type: IrType::I64,
-                                from_type: IrType::I1,
-                                span,
-                            },
-                        );
-                        let safe_b = ctx.builder.fresh_value();
-                        emit_inst(
-                            ctx,
-                            Instruction::BinOp {
-                                result: safe_b,
-                                op: IrBinOp::Or,
-                                lhs: b64,
-                                rhs: b_eq_zero_i64,
-                                ty: IrType::I64,
-                                span,
-                            },
-                        );
-                        let div_back = ctx.builder.fresh_value();
-                        emit_inst(
-                            ctx,
-                            Instruction::BinOp {
-                                result: div_back,
-                                op: IrBinOp::UDiv,
-                                lhs: result64,
-                                rhs: safe_b,
-                                ty: IrType::I64,
-                                span,
-                            },
-                        );
-                        let ne_a = ctx.builder.fresh_value();
-                        emit_inst(
-                            ctx,
-                            Instruction::ICmp {
-                                result: ne_a,
-                                op: ICmpOp::Ne,
-                                lhs: div_back,
-                                rhs: a64,
-                                span,
-                            },
-                        );
-                        let ov = ctx.builder.fresh_value();
-                        emit_inst(
-                            ctx,
-                            Instruction::BinOp {
-                                result: ov,
-                                op: IrBinOp::And,
-                                lhs: b_nz,
-                                rhs: ne_a,
-                                ty: IrType::I1,
-                                span,
-                            },
-                        );
-                        ov
-                    }
-                    _ => emit_int_const(ctx, 0, IrType::I1, span),
                 }
             };
 
@@ -9348,6 +9761,102 @@ pub fn insert_implicit_conversion(
         return value;
     }
 
+    // Complex → Complex (different element types, e.g. _Complex double → _Complex int).
+    if let (CType::Complex(from_elem), CType::Complex(to_elem)) = (from, to) {
+        let from_elem_ir = ctype_to_ir(from_elem, ctx.target);
+        let to_elem_ir = ctype_to_ir(to_elem, ctx.target);
+        if from_elem_ir != to_elem_ir {
+            // Spill the source complex to memory so we can decompose it.
+            let from_array_ir = IrType::Array(Box::new(from_elem_ir.clone()), 2);
+            let (src_alloca, alloca_i) = ctx.builder.build_alloca(from_array_ir.clone(), span);
+            emit_inst(ctx, alloca_i);
+            let st = ctx.builder.build_store(value, src_alloca, span);
+            emit_inst(ctx, st);
+
+            let from_esz = complex_elem_size(&from_elem_ir);
+
+            // Load real part from source
+            let (src_real, lr) = ctx
+                .builder
+                .build_load(src_alloca, from_elem_ir.clone(), span);
+            emit_inst(ctx, lr);
+            // Load imag part from source
+            let off = emit_int_const_for_index(ctx, from_esz);
+            let (src_imag_ptr, gep_si) =
+                ctx.builder
+                    .build_gep(src_alloca, vec![off], IrType::Ptr, span);
+            emit_inst(ctx, gep_si);
+            let (src_imag, li) = ctx
+                .builder
+                .build_load(src_imag_ptr, from_elem_ir.clone(), span);
+            emit_inst(ctx, li);
+
+            // Convert each component
+            let cvt_real = insert_implicit_conversion(ctx, src_real, from_elem, to_elem, span);
+            let cvt_imag = insert_implicit_conversion(ctx, src_imag, from_elem, to_elem, span);
+
+            // Build destination complex
+            let to_array_ir = IrType::Array(Box::new(to_elem_ir.clone()), 2);
+            let (dst_alloca, da) = ctx.builder.build_alloca(to_array_ir.clone(), span);
+            emit_inst(ctx, da);
+            let st_r = ctx.builder.build_store(cvt_real, dst_alloca, span);
+            emit_inst(ctx, st_r);
+            let to_esz = complex_elem_size(&to_elem_ir);
+            let off2 = emit_int_const_for_index(ctx, to_esz);
+            let (dst_imag_ptr, gep_di) =
+                ctx.builder
+                    .build_gep(dst_alloca, vec![off2], IrType::Ptr, span);
+            emit_inst(ctx, gep_di);
+            let st_i = ctx.builder.build_store(cvt_imag, dst_imag_ptr, span);
+            emit_inst(ctx, st_i);
+            let (loaded, ld) = ctx.builder.build_load(dst_alloca, to_array_ir, span);
+            emit_inst(ctx, ld);
+            return loaded;
+        }
+    }
+
+    // Scalar → Complex: promote scalar to the complex's element type.
+    if let CType::Complex(to_elem) = to {
+        let to_elem_ir = ctype_to_ir(to_elem, ctx.target);
+        let to_array_ir = IrType::Array(Box::new(to_elem_ir.clone()), 2);
+        let (alloca_val, alloca_i) = ctx.builder.build_alloca(to_array_ir.clone(), span);
+        emit_inst(ctx, alloca_i);
+        // Convert the scalar to the element type
+        let cvt_real = insert_implicit_conversion(ctx, value, from, to_elem, span);
+        let st_r = ctx.builder.build_store(cvt_real, alloca_val, span);
+        emit_inst(ctx, st_r);
+        // Zero imaginary part
+        let to_esz = complex_elem_size(&to_elem_ir);
+        let off = emit_int_const_for_index(ctx, to_esz);
+        let (imag_ptr, gep_i) = ctx
+            .builder
+            .build_gep(alloca_val, vec![off], IrType::Ptr, span);
+        emit_inst(ctx, gep_i);
+        let zero_imag = if is_fp_ir_type(&to_elem_ir) {
+            emit_float_const(ctx, 0.0, to_elem_ir.clone(), span)
+        } else {
+            emit_int_const(ctx, 0, to_elem_ir.clone(), span)
+        };
+        let st_i = ctx.builder.build_store(zero_imag, imag_ptr, span);
+        emit_inst(ctx, st_i);
+        let (loaded, ld) = ctx.builder.build_load(alloca_val, to_array_ir, span);
+        emit_inst(ctx, ld);
+        return loaded;
+    }
+
+    // Complex → Scalar: extract real part and convert to target type.
+    if let CType::Complex(from_elem) = from {
+        let from_elem_ir = ctype_to_ir(from_elem, ctx.target);
+        let from_array_ir = IrType::Array(Box::new(from_elem_ir.clone()), 2);
+        let (src_alloca, alloca_i) = ctx.builder.build_alloca(from_array_ir, span);
+        emit_inst(ctx, alloca_i);
+        let st = ctx.builder.build_store(value, src_alloca, span);
+        emit_inst(ctx, st);
+        let (real_val, lr) = ctx.builder.build_load(src_alloca, from_elem_ir, span);
+        emit_inst(ctx, lr);
+        return insert_implicit_conversion(ctx, real_val, from_elem, to, span);
+    }
+
     // Default: no conversion (return as-is).
     value
 }
@@ -9361,6 +9870,59 @@ pub fn insert_implicit_conversion(
 /// - Integer: `value != 0`
 /// - Float: `value != 0.0`
 /// - Pointer: `value != null`
+///
+/// Convert a _Complex value (given its alloca pointer) to a boolean (I1).
+///
+/// Per C11, a complex value is truthy if EITHER its real or imaginary part
+/// is non-zero.  This function takes a POINTER to the complex aggregate
+/// (not the loaded value, which is meaningless for >8-byte aggregates).
+pub fn complex_ptr_to_bool(
+    ctx: &mut ExprLoweringContext<'_>,
+    ptr: Value,
+    base_ctype: &CType,
+    span: Span,
+) -> Value {
+    let elem_ir = ctype_to_ir(base_ctype, ctx.target);
+    let elem_sz: i64 = complex_elem_size(&elem_ir);
+
+    // Load real part at offset 0 (direct load from alloca pointer).
+    let (real_val, load_r) = ctx.builder.build_load(ptr, elem_ir.clone(), span);
+    emit_inst(ctx, load_r);
+
+    // GEP + load imaginary part at offset elem_sz.
+    let imag_idx = emit_int_const_for_index(ctx, elem_sz);
+    let (imag_ptr, gep_i) = ctx
+        .builder
+        .build_gep(ptr, vec![imag_idx], IrType::Ptr, span);
+    emit_inst(ctx, gep_i);
+    let (imag_val, load_i) = ctx.builder.build_load(imag_ptr, elem_ir.clone(), span);
+    emit_inst(ctx, load_i);
+
+    // Compare each part to zero.
+    let (real_nz, imag_nz) = if elem_ir.is_float() {
+        let fzero_r = emit_float_const(ctx, 0.0, elem_ir.clone(), span);
+        let (rnz, ri) = ctx.builder.build_fcmp(FCmpOp::One, real_val, fzero_r, span);
+        emit_inst(ctx, ri);
+        let fzero_i = emit_float_const(ctx, 0.0, elem_ir, span);
+        let (inz, ii) = ctx.builder.build_fcmp(FCmpOp::One, imag_val, fzero_i, span);
+        emit_inst(ctx, ii);
+        (rnz, inz)
+    } else {
+        let izero_r = emit_zero(ctx, elem_ir.clone(), span);
+        let (rnz, ri) = ctx.builder.build_icmp(ICmpOp::Ne, real_val, izero_r, span);
+        emit_inst(ctx, ri);
+        let izero_i = emit_zero(ctx, elem_ir, span);
+        let (inz, ii) = ctx.builder.build_icmp(ICmpOp::Ne, imag_val, izero_i, span);
+        emit_inst(ctx, ii);
+        (rnz, inz)
+    };
+
+    // OR: truthy if either part is non-zero.
+    let (result, or_inst) = ctx.builder.build_or(real_nz, imag_nz, IrType::I1, span);
+    emit_inst(ctx, or_inst);
+    result
+}
+
 fn lower_to_bool(
     ctx: &mut ExprLoweringContext<'_>,
     value: Value,
@@ -9401,6 +9963,53 @@ fn lower_to_bool(
         emit_inst(ctx, pti);
         let zero = emit_zero(ctx, ptr_int_ty, span);
         let (v, i) = ctx.builder.build_icmp(ICmpOp::Ne, int_val, zero, span);
+        emit_inst(ctx, i);
+        return v;
+    }
+
+    // Complex types: truthy if real != 0 OR imag != 0.
+    // NOTE: For complex types, `value` is a pointer to the complex aggregate.
+    if let CType::Complex(ref base) = stripped {
+        let elem_ir = ctype_to_ir(base.as_ref(), ctx.target);
+        let elem_sz: i64 = complex_elem_size(&elem_ir);
+
+        // Load real part (offset 0) — value is already a pointer to the aggregate.
+        let zero_idx = emit_int_const_for_index(ctx, 0);
+        let (real_ptr, gep_r) = ctx
+            .builder
+            .build_gep(value, vec![zero_idx], IrType::Ptr, span);
+        emit_inst(ctx, gep_r);
+        let (real_val, ld_r) = ctx.builder.build_load(real_ptr, elem_ir.clone(), span);
+        emit_inst(ctx, ld_r);
+
+        // Load imaginary part (offset elem_sz).
+        let imag_idx = emit_int_const_for_index(ctx, elem_sz);
+        let (imag_ptr, gep_i) = ctx
+            .builder
+            .build_gep(value, vec![imag_idx], IrType::Ptr, span);
+        emit_inst(ctx, gep_i);
+        let (imag_val, ld_i) = ctx.builder.build_load(imag_ptr, elem_ir.clone(), span);
+        emit_inst(ctx, ld_i);
+
+        // Compare each part to zero.
+        let (real_nz, imag_nz) = if elem_ir.is_float() {
+            let fzero = emit_float_const(ctx, 0.0, elem_ir.clone(), span);
+            let (rnz, ri) = ctx.builder.build_fcmp(FCmpOp::One, real_val, fzero, span);
+            emit_inst(ctx, ri);
+            let (inz, ii) = ctx.builder.build_fcmp(FCmpOp::One, imag_val, fzero, span);
+            emit_inst(ctx, ii);
+            (rnz, inz)
+        } else {
+            let izero = emit_zero(ctx, elem_ir.clone(), span);
+            let (rnz, ri) = ctx.builder.build_icmp(ICmpOp::Ne, real_val, izero, span);
+            emit_inst(ctx, ri);
+            let (inz, ii) = ctx.builder.build_icmp(ICmpOp::Ne, imag_val, izero, span);
+            emit_inst(ctx, ii);
+            (rnz, inz)
+        };
+
+        // Result = real_nz OR imag_nz
+        let (v, i) = ctx.builder.build_or(real_nz, imag_nz, IrType::I1, span);
         emit_inst(ctx, i);
         return v;
     }

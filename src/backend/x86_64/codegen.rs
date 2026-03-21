@@ -248,6 +248,14 @@ pub enum X86Opcode {
 
     /// Inline assembly marker — template is carried in the operands.
     InlineAsm,
+
+    /// Internal label definition pseudo-instruction.
+    ///
+    /// Carries a `GlobalSymbol(name)` operand.  Emits zero bytes — the
+    /// assembler loop calls `ctx.define_label(name)` at the current offset.
+    /// Used for intra-block branching sequences (e.g. unsigned u64→f64
+    /// conversion) that need forward-reference labels resolved locally.
+    InternalLabelDef,
 }
 
 impl X86Opcode {
@@ -379,6 +387,7 @@ impl X86Opcode {
             X86Opcode::Ud2,
             X86Opcode::RepMovsq,
             X86Opcode::InlineAsm,
+            X86Opcode::InternalLabelDef,
         ];
         TABLE.get(val as usize).copied()
     }
@@ -1675,20 +1684,26 @@ impl X86_64CodeGen {
 
             // Classify aggregate eightbytes to determine SSE vs INTEGER register
             // usage.  Structs with double fields should use XMM registers.
-            let is_sse_pair = if is_aggregate_pair {
-                let classes = crate::backend::x86_64::abi::classify_ir_type_eightbytes(
-                    &param.ty,
-                    &self.target,
-                );
-                classes.len() == 2
-                    && classes[0] == crate::backend::x86_64::abi::AbiClass::Sse
-                    && classes[1] == crate::backend::x86_64::abi::AbiClass::Sse
+            // Also detect mixed INTEGER+SSE pairs (e.g. struct { int *p; float b; }).
+            let agg_classes = if is_aggregate_pair {
+                crate::backend::x86_64::abi::classify_ir_type_eightbytes(&param.ty, &self.target)
             } else {
-                false
+                vec![]
             };
+            let is_sse_pair = agg_classes.len() == 2
+                && agg_classes[0] == crate::backend::x86_64::abi::AbiClass::Sse
+                && agg_classes[1] == crate::backend::x86_64::abi::AbiClass::Sse;
+            // Mixed INTEGER+SSE pair (e.g. struct { int *p; float b; } or
+            // struct { float a; int *p; }).  One eightbyte uses a GPR, the
+            // other uses an XMM register.
+            let is_mixed_pair = is_aggregate_pair
+                && agg_classes.len() == 2
+                && !is_sse_pair
+                && agg_classes.contains(&crate::backend::x86_64::abi::AbiClass::Sse)
+                && agg_classes.contains(&crate::backend::x86_64::abi::AbiClass::Integer);
 
             // INTEGER-pair structs: both eightbytes classified as INTEGER
-            let is_struct_pair = is_aggregate_pair && !is_sse_pair;
+            let is_struct_pair = is_aggregate_pair && !is_sse_pair && !is_mixed_pair;
             // --- Preemptive struct-pair ABI register save ---
             // The register allocator treats parameter MOVs (ABI physical
             // register → vreg) sequentially, but they logically form a
@@ -1802,6 +1817,129 @@ impl X86_64CodeGen {
                     self.struct_pair_hi.insert(param.value, vreg_hi);
                 }
                 gpr_idx += 2;
+            } else if is_mixed_pair
+                && gpr_idx < INTEGER_ARG_REGS.len()
+                && sse_idx < SSE_ARG_REGS.len()
+            {
+                // Mixed INTEGER+SSE pair parameter (e.g. struct { int *p; float b; }).
+                // One eightbyte is passed in a GPR, the other in an XMM register.
+                // We store both halves directly to the alloca frame slot
+                // (using physical registers → memory stores that run before
+                // any vreg instructions).
+                let lo_class = agg_classes[0];
+                let (lo_reg, lo_opcode) = if lo_class == crate::backend::x86_64::abi::AbiClass::Sse
+                {
+                    let r = SSE_ARG_REGS[sse_idx];
+                    (r, X86Opcode::Movsd)
+                } else {
+                    let r = INTEGER_ARG_REGS[gpr_idx];
+                    (r, X86Opcode::Mov)
+                };
+                let hi_class = agg_classes[1];
+                let (hi_reg, hi_opcode) = if hi_class == crate::backend::x86_64::abi::AbiClass::Sse
+                    || hi_class == crate::backend::x86_64::abi::AbiClass::SseUp
+                {
+                    let r = SSE_ARG_REGS[sse_idx
+                        + if lo_class == crate::backend::x86_64::abi::AbiClass::Sse {
+                            1
+                        } else {
+                            0
+                        }];
+                    (r, X86Opcode::Movsd)
+                } else {
+                    let r = INTEGER_ARG_REGS[gpr_idx
+                        + if lo_class == crate::backend::x86_64::abi::AbiClass::Integer {
+                            1
+                        } else {
+                            0
+                        }];
+                    (r, X86Opcode::Mov)
+                };
+
+                let mut saved_to_alloca = false;
+                if let Some(ref frame) = self.frame {
+                    let entry_block = &func.blocks()[0];
+                    for ir_inst in entry_block.instructions() {
+                        if let crate::ir::instructions::Instruction::Store {
+                            value: sv,
+                            ptr: sp,
+                            ..
+                        } = ir_inst
+                        {
+                            if *sv == param.value {
+                                if let Some(&offset) = frame.alloca_offsets.get(sp) {
+                                    // Store lo-half
+                                    param_hi_stores.push(Self::mk_inst(
+                                        lo_opcode,
+                                        None,
+                                        &[
+                                            MachineOperand::Memory {
+                                                base: Some(RBP),
+                                                index: None,
+                                                scale: 1,
+                                                displacement: offset as i64,
+                                            },
+                                            MachineOperand::Register(lo_reg),
+                                        ],
+                                    ));
+                                    // Store hi-half (may need smaller store
+                                    // if struct is 9-12 bytes)
+                                    let hi_remaining = param_size.saturating_sub(8);
+                                    let mut hi_store = Self::mk_inst(
+                                        hi_opcode,
+                                        None,
+                                        &[
+                                            MachineOperand::Memory {
+                                                base: Some(RBP),
+                                                index: None,
+                                                scale: 1,
+                                                displacement: (offset as i64) + 8,
+                                            },
+                                            MachineOperand::Register(hi_reg),
+                                        ],
+                                    );
+                                    if hi_remaining <= 4 && hi_opcode == X86Opcode::Mov {
+                                        hi_store.operand_size = 4;
+                                    }
+                                    param_hi_stores.push(hi_store);
+
+                                    // Record alloca so Load/Store handlers
+                                    // can access the struct from its frame slot.
+                                    self.struct_load_source.insert(
+                                        param.value,
+                                        MachineOperand::Memory {
+                                            base: Some(RBP),
+                                            index: None,
+                                            scale: 1,
+                                            displacement: offset as i64,
+                                        },
+                                    );
+                                    self.memory_class_params.insert(param.value);
+                                    saved_to_alloca = true;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+                if !saved_to_alloca {
+                    // Alloca not found — fall back to vreg-based capture
+                    param_insts.push(Self::mk_inst(
+                        X86Opcode::Mov,
+                        Some(vreg),
+                        &[MachineOperand::Register(lo_reg)],
+                    ));
+                    let vreg_hi = self.new_vreg();
+                    param_insts.push(Self::mk_inst(
+                        X86Opcode::Mov,
+                        Some(vreg_hi.clone()),
+                        &[MachineOperand::Register(hi_reg)],
+                    ));
+                    self.struct_pair_hi.insert(param.value, vreg_hi);
+                }
+                // Advance both GPR and SSE indices by 1 each
+                gpr_idx += 1;
+                sse_idx += 1;
             } else if is_sse_pair && sse_idx + 1 < SSE_ARG_REGS.len() {
                 // SSE-pair parameter (e.g., _Complex double = Array(F64, 2)):
                 // Two consecutive XMM registers carry the real and imaginary
@@ -2823,7 +2961,19 @@ impl X86_64CodeGen {
                 let mut load_result = match &src {
                     MachineOperand::Memory { .. } | MachineOperand::FrameSlot(_) => {
                         let opcode = Self::mov_opcode(&load_ty);
-                        vec![Self::mk_inst(opcode, Some(dst), &[src])]
+                        let mut inst = Self::mk_inst(opcode, Some(dst), &[src]);
+                        // For small struct/array loads, set operand_size to
+                        // prevent reading past the allocation (e.g. a 4-byte
+                        // struct must NOT be loaded with a 64-bit MOV that
+                        // reads 8 bytes, potentially into adjacent stack data
+                        // that gets stored back and clobbers globals).
+                        if let IrType::Struct(_) | IrType::Array(_, _) = &load_ty {
+                            let sz = load_ty.size_bytes(&self.target);
+                            if sz > 0 && sz <= 4 {
+                                inst.operand_size = sz as u8;
+                            }
+                        }
+                        vec![inst]
                     }
                     MachineOperand::GlobalSymbol(name) => {
                         if self.pic {
@@ -2890,17 +3040,27 @@ impl X86_64CodeGen {
                         // Pointer is in a register (virtual or physical).
                         // Use size-specific LoadInd to ensure correct memory
                         // access width: I8 → byte load, I16 → word, I32 → dword,
-                        // I64/Ptr → qword.
+                        // I64/Ptr → qword.  Small struct/array types use
+                        // sized loads to avoid reading adjacent memory.
                         let opcode = if load_ty.is_float() {
                             match load_ty {
                                 IrType::F32 => X86Opcode::Movss,
                                 _ => X86Opcode::Movsd,
                             }
                         } else {
-                            match load_ty {
+                            match &load_ty {
                                 IrType::I1 | IrType::I8 => X86Opcode::LoadInd8,
                                 IrType::I16 => X86Opcode::LoadInd16,
                                 IrType::I32 => X86Opcode::LoadInd32,
+                                IrType::Struct(_) | IrType::Array(_, _) => {
+                                    let sz = load_ty.size_bytes(&self.target);
+                                    match sz {
+                                        0 | 1 => X86Opcode::LoadInd8,
+                                        2 => X86Opcode::LoadInd16,
+                                        3..=4 => X86Opcode::LoadInd32,
+                                        _ => X86Opcode::LoadInd,
+                                    }
+                                }
                                 _ => X86Opcode::LoadInd,
                             }
                         };
@@ -4072,9 +4232,21 @@ impl X86_64CodeGen {
                         };
                         let mut inst = Self::mk_inst(opcode, Some(dst), &[src]);
                         // Set operand_size to target width for REX.W control:
-                        // 8 = 64-bit dest (REX.W), 4 = 32-bit dest (no REX.W)
+                        // 8 = 64-bit dest (REX.W), 4 = 32-bit dest (no REX.W).
+                        //
+                        // CRITICAL: For unsigned 32-bit (or smaller) targets,
+                        // we MUST use 64-bit conversion (REX.W).  The 32-bit
+                        // `cvttsd2si` treats the destination as *signed* i32,
+                        // so values in [2^31, 2^32-1] produce the x86
+                        // "integer indefinite" value 0x80000000 instead of
+                        // the correct unsigned result.  By converting to
+                        // signed i64 first, values up to 2^32-1 fit in the
+                        // positive range of i64, and the lower 32 bits of
+                        // the result register naturally give the correct
+                        // unsigned 32-bit value.
                         inst.operand_size = match to_type {
                             IrType::I64 | IrType::I128 => 8,
+                            _ if is_unsigned => 8,
                             _ => 4,
                         };
                         vec![inst]
@@ -4086,136 +4258,91 @@ impl X86_64CodeGen {
                         matches!(from_type.as_ref(), Some(IrType::I64) | Some(IrType::I128));
 
                     if is_unsigned && from_is_i64 {
-                        // Unsigned 64-bit → Float.  cvtsi2sd treats reg
-                        // as signed; for values with bit 63 set we need:
-                        //   test  rN, rN
-                        //   js    .Lneg
-                        //   cvtsi2sd rN, xmmD       ; positive path
-                        //   jmp   .Ldone
-                        // .Lneg:
-                        //   mov   tmp, rN
-                        //   and   tmp, 1            ; save LSB
-                        //   shr   rN, 1             ; halve
-                        //   or    tmp, rN           ; restore LSB
-                        //   cvtsi2sd tmp, xmmD
-                        //   addsd xmmD, xmmD        ; double
-                        // .Ldone:
-                        // We emit this as a linear sequence using
-                        // branchless encoding to avoid label management:
-                        //   mov  r11, src           ; copy
-                        //   shr  r11, 1             ; r11 = src >> 1
-                        //   and  r10d, srcd, 1      ; r10 = src & 1
-                        //   or   r11, r10           ; r11 = (src>>1) | (src&1)
-                        //   cvtsi2sd r11, xmm_tmp   ; convert halved val
-                        //   addsd xmm_tmp, xmm_tmp  ; double it
-                        //   -- separately --
-                        //   cvtsi2sd src, xmm_dst    ; signed path
-                        //   test src, src
-                        //   cmov: pick xmm based on SF
+                        // Unsigned 64-bit → Float conversion.
                         //
-                        // Actually the cleanest x86-64 approach:
+                        // `cvtsi2sd` treats its GPR source as *signed* i64.
+                        // For values 0..2^63-1 the signed interpretation
+                        // is correct and gives a more precise result than
+                        // the halving trick.  For values with bit 63 set
+                        // (≥ 2^63), cvtsi2sd would produce a negative
+                        // double, so we must halve, convert, then double.
+                        //
+                        // Generated pattern (matches GCC):
+                        //   push  r10
+                        //   push  r11
                         //   test  src, src
-                        //   js    .unsigned_path
-                        //   cvtsi2sd src -> dst
-                        //   jmp .done
-                        // .unsigned_path:
-                        //   mov  r11, src
-                        //   shr  r11, 1
-                        //   mov  r10, src
-                        //   and  r10, 1
-                        //   or   r11, r10
-                        //   cvtsi2sd r11 -> dst
-                        //   addsd dst, dst
-                        // .done:
+                        //   js    .Lu64halve_N       ; bit 63 set → halve
+                        //   cvtsi2sd src, dst        ; positive path
+                        //   jmp   .Lu64done_N
+                        // .Lu64halve_N:
+                        //   mov   r10, src
+                        //   and   r10, 1             ; save LSB
+                        //   mov   r11, src
+                        //   shr   r11, 1             ; halve
+                        //   or    r11, r10           ; (src>>1) | (src&1)
+                        //   cvtsi2sd r11, dst
+                        //   addsd dst, dst           ; double
+                        // .Lu64done_N:
+                        //   pop   r11
+                        //   pop   r10
                         //
-                        // We'll generate this using internal labels.
-                        // Simpler: use the branchless approach with
-                        // two conversions and a conditional select.
-                        //
-                        // Actually, simplest correct approach that avoids
-                        // labels: always do the unsigned path.
-                        // (src >> 1) | (src & 1) then cvtsi2sd then addsd.
-                        // This loses the LSB for odd values >2^53, but
-                        // that matches GCC/Clang behavior (double only has
-                        // 53-bit mantissa).
-                        //
-                        // But for values < 2^63 the signed path is more
-                        // precise. Let's use the two-path approach.
-                        //
-                        // For simplicity and correctness, we use the
-                        // standard GCC pattern with branching:
+                        // We use R10/R11 (caller-saved) as scratch, with
+                        // push/pop to preserve live values placed there
+                        // by the register allocator.
+                        let uid = self.next_vreg;
+                        self.next_vreg += 1;
+                        let halve_label = format!(".Lu64halve_{}", uid);
+                        let done_label = format!(".Lu64done_{}", uid);
+
                         let r11 = MachineOperand::Register(R11);
                         let r10 = MachineOperand::Register(R10);
                         let mut insts = Vec::new();
 
-                        // Move src to r11 (may already be in a vreg)
-                        let mut mov_to_r11 =
-                            Self::mk_inst(X86Opcode::Mov, Some(r11.clone()), &[src.clone()]);
-                        mov_to_r11.operand_size = 8;
-                        insts.push(mov_to_r11);
+                        // Save R10 and R11.
+                        insts.push(Self::mk_inst(X86Opcode::Push, None, &[r10.clone()]));
+                        insts.push(Self::mk_inst(X86Opcode::Push, None, &[r11.clone()]));
 
-                        // test r11, r11 (set SF if bit 63 is set)
+                        // test src, src — sets SF if bit 63 is set.
                         let mut test_inst =
-                            Self::mk_inst(X86Opcode::Test, None, &[r11.clone(), r11.clone()]);
+                            Self::mk_inst(X86Opcode::Test, None, &[src.clone(), src.clone()]);
                         test_inst.operand_size = 8;
                         insts.push(test_inst);
 
-                        // js .Lunsigned (jump if SF=1, i.e. bit 63 set)
-                        // For this, we emit: Js forward by N bytes.
-                        // But we can't easily do labels in our MachineInst.
-                        // Instead, use the branchless two-path approach:
-                        //
-                        // r10 = r11 & 1
-                        // r11 >>= 1
-                        // r10 |= r11         ; (src>>1)|(src&1)
-                        // cvtsi2sd r10 → xmm_tmp (some vreg)
-                        // addsd xmm_tmp, xmm_tmp → xmm_unsigned
-                        // cvtsi2sd src → xmm_signed
-                        // test src, src
-                        // cmov: if SF, use unsigned result; else signed
-                        //
-                        // But we don't have SSE cmov. We need a different
-                        // approach. Use integer test + branch-free blend:
-                        //
-                        // The GCC approach for x86-64 uitofp u64→f64:
-                        //   test rdi, rdi
-                        //   js .L2
-                        //   pxor xmm0, xmm0
-                        //   cvtsi2sd rdi, xmm0
-                        //   ret
-                        // .L2:
-                        //   mov rax, rdi
-                        //   shr rax
-                        //   and edi, 1
-                        //   or rax, rdi
-                        //   pxor xmm0, xmm0
-                        //   cvtsi2sd rax, xmm0
-                        //   addsd xmm0, xmm0
-                        //   ret
-                        //
-                        // We can't easily do labels in MachineInst, so use
-                        // the always-do-unsigned approach which is simpler
-                        // and works for all values:
-                        //   mov  r10, src
-                        //   and  r10, 1       ; LSB
-                        //   mov  r11, src
-                        //   shr  r11, 1       ; src >> 1
-                        //   or   r11, r10     ; (src>>1) | LSB
-                        //   cvtsi2sd r11 → dst
-                        //   addsd dst, dst    ; ×2
-                        //   -- now check if src was < 2^63 for better precision
-                        //   test src, src
-                        //   ... nah, too complex without branches.
-                        //
-                        // Let's just always use the halving approach.
-                        // For values < 2^63, this loses 1 bit of precision
-                        // (LSB of odd values), but double only has 53 bits
-                        // of mantissa, so any u64 > 2^53 already loses
-                        // precision. This matches what compilers do in
-                        // practice for -O0 without branches.
-                        insts.clear();
+                        // js .Lu64halve_N — jump to halving path if
+                        // bit 63 set (SF=1).
+                        insts.push(Self::mk_inst(
+                            X86Opcode::Js,
+                            None,
+                            &[MachineOperand::GlobalSymbol(halve_label.clone())],
+                        ));
 
-                        // r10 = src & 1
+                        // ---- Positive path: direct signed conversion ----
+                        let conv_opcode = if is_f32 {
+                            X86Opcode::Cvtsi2ss
+                        } else {
+                            X86Opcode::Cvtsi2sd
+                        };
+                        let mut pos_conv =
+                            Self::mk_inst(conv_opcode, Some(dst.clone()), &[src.clone()]);
+                        pos_conv.operand_size = 8;
+                        insts.push(pos_conv);
+
+                        // jmp .Lu64done_N — skip halving path.
+                        insts.push(Self::mk_inst(
+                            X86Opcode::Jmp,
+                            None,
+                            &[MachineOperand::GlobalSymbol(done_label.clone())],
+                        ));
+
+                        // ---- Halving path (bit 63 set) ----
+                        // .Lu64halve_N:
+                        insts.push(Self::mk_inst(
+                            X86Opcode::InternalLabelDef,
+                            None,
+                            &[MachineOperand::GlobalSymbol(halve_label)],
+                        ));
+
+                        // r10 = src & 1  (save LSB before shifting)
                         let mut mov_r10 =
                             Self::mk_inst(X86Opcode::Mov, Some(r10.clone()), &[src.clone()]);
                         mov_r10.operand_size = 8;
@@ -4241,7 +4368,7 @@ impl X86_64CodeGen {
                         shr_r11.operand_size = 8;
                         insts.push(shr_r11);
 
-                        // r11 |= r10
+                        // r11 |= r10  →  (src>>1) | (src&1)
                         let mut or_r11 = Self::mk_inst(
                             X86Opcode::Or,
                             Some(r11.clone()),
@@ -4250,18 +4377,13 @@ impl X86_64CodeGen {
                         or_r11.operand_size = 8;
                         insts.push(or_r11);
 
-                        // cvtsi2sd r11, dst  (signed conv of halved value, always < 2^63)
-                        let conv_opcode = if is_f32 {
-                            X86Opcode::Cvtsi2ss
-                        } else {
-                            X86Opcode::Cvtsi2sd
-                        };
-                        let mut conv =
+                        // cvtsi2sd r11, dst  (halved value, always < 2^63)
+                        let mut halve_conv =
                             Self::mk_inst(conv_opcode, Some(dst.clone()), &[r11.clone()]);
-                        conv.operand_size = 8; // REX.W for 64-bit source
-                        insts.push(conv);
+                        halve_conv.operand_size = 8;
+                        insts.push(halve_conv);
 
-                        // addsd dst, dst  (double the result)
+                        // addsd dst, dst  (double to recover original scale)
                         let add_opcode = if is_f32 {
                             X86Opcode::Addss
                         } else {
@@ -4273,18 +4395,17 @@ impl X86_64CodeGen {
                             &[dst.clone(), dst.clone()],
                         ));
 
-                        // Now handle the case where src < 2^63 (signed
-                        // conversion is more precise). We use test+cmov:
-                        // test src, src → SF set if negative
-                        // If not negative, the signed cvtsi2sd result is
-                        // better. We compute both and pick.
-                        //
-                        // Actually, for the halving approach, the result is
-                        // correct for ALL values (both positive and negative
-                        // as unsigned). The only precision loss is 1 ULP for
-                        // odd values, which is unavoidable for u64→f64 since
-                        // f64 only has 53 mantissa bits. GCC -O0 uses the
-                        // same halving approach. So we're done.
+                        // .Lu64done_N:
+                        insts.push(Self::mk_inst(
+                            X86Opcode::InternalLabelDef,
+                            None,
+                            &[MachineOperand::GlobalSymbol(done_label)],
+                        ));
+
+                        // Restore R11 and R10 (reverse order).
+                        insts.push(Self::mk_inst(X86Opcode::Pop, Some(r11.clone()), &[]));
+                        insts.push(Self::mk_inst(X86Opcode::Pop, Some(r10.clone()), &[]));
+
                         insts
                     } else {
                         // Signed conversion, or unsigned but ≤32-bit
@@ -7647,6 +7768,7 @@ impl std::fmt::Display for X86Opcode {
             X86Opcode::Ud2 => "ud2",
             X86Opcode::RepMovsq => "rep_movsq",
             X86Opcode::InlineAsm => "<inline-asm>",
+            X86Opcode::InternalLabelDef => "<label-def>",
             X86Opcode::LoadInd => "movq_ind_load",
             X86Opcode::LoadInd32 => "movl_ind_load",
             X86Opcode::LoadInd16 => "movw_ind_load",

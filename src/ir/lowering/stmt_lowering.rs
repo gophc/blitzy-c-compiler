@@ -545,6 +545,19 @@ fn ctypes_compatible_for_scope_shadowing(a: &CType, b: &CType, target: &Target) 
         (CType::Pointer(pa, _), CType::Pointer(pb, _)) => {
             ctypes_compatible_for_scope_shadowing(pa, pb, target)
         }
+        // For scalar integer types that map to the same IR width (e.g.
+        // `unsigned char` vs `signed char` → both I8, `unsigned int` vs
+        // `signed int` → both I32), signedness MUST be distinguished.
+        // The code generator uses different widening operations (ZExt vs
+        // SExt) depending on the C-level signedness, so reusing the same
+        // alloca for variables of different signedness produces incorrect
+        // results (e.g. `unsigned char 0xFF` → 255 vs `signed char 0xFF` → -1).
+        _ if crate::common::types::is_integer(a)
+            && crate::common::types::is_integer(b)
+            && crate::common::types::is_unsigned(a) != crate::common::types::is_unsigned(b) =>
+        {
+            false
+        }
         // For all other types, compare via IR types which normalises
         // typedefs and minor representation differences.
         _ => IrType::from_ctype(a, target) == IrType::from_ctype(b, target),
@@ -2623,6 +2636,204 @@ fn lower_expr_to_i1(
         };
         emit_instruction_to_current_block(ctx, cmp_inst);
         return cmp_result;
+    }
+
+    // Complex types: truthy if real != 0 OR imag != 0.
+    // We need a pointer to the aggregate to extract real/imag via GEP.
+    // Try getting the lvalue first (works for identifiers); if the expression
+    // is not a simple lvalue (e.g. assignment `c = z`, function call result),
+    // store the aggregate value to a temporary alloca and use that instead.
+    if let CType::Complex(ref base) = tv.ty {
+        let elem_ir = crate::ir::lowering::expr_lowering::ctype_to_ir(base.as_ref(), ctx.target);
+        let elem_sz: i64 = match &elem_ir {
+            IrType::F32 => 4,
+            IrType::F64 => 8,
+            IrType::F80 => 16,
+            _ => 8,
+        };
+
+        // Determine complex aggregate IR type and get a pointer to it.
+        let complex_ir = crate::ir::lowering::expr_lowering::ctype_to_ir(&tv.ty, ctx.target);
+        // Use the already-lowered value (`tv.value`): for complex types the
+        // lowering result is the alloca pointer produced by lower_expr_inner.
+        // However for some expression forms (function calls, assignment
+        // expressions) the "value" is actually the loaded first-word of the
+        // aggregate — we need an alloca pointer.  Check the value's type:
+        // if we can determine the expression is a simple identifier we re-
+        // lower as lvalue; otherwise we store the aggregate to a temporary.
+        let complex_ptr = match expr {
+            ast::Expression::Identifier { .. }
+            | ast::Expression::MemberAccess { .. }
+            | ast::Expression::PointerMemberAccess { .. }
+            | ast::Expression::ArraySubscript { .. }
+            | ast::Expression::UnaryOp { .. } => {
+                // These are guaranteed lvalues.
+                lower_lvalue_via_context(ctx, expr)
+            }
+            _ => {
+                // For non-lvalue expressions (assignments, function calls,
+                // casts, etc.), create a temp alloca and store the aggregate.
+                let (alloca_val, alloca_inst) = ctx.builder.build_alloca(complex_ir.clone(), span);
+                emit_instruction_to_current_block(ctx, alloca_inst);
+                let store_inst = ctx.builder.build_store(tv.value, alloca_val, span);
+                emit_instruction_to_current_block(ctx, store_inst);
+                alloca_val
+            }
+        };
+
+        // Load real part (offset 0) directly from alloca pointer.
+        let (real_val, load_r) = ctx.builder.build_load(complex_ptr, elem_ir.clone(), span);
+        emit_instruction_to_current_block(ctx, load_r);
+
+        // GEP to get pointer to imaginary part (offset elem_sz), then load.
+        let imag_idx = ctx.builder.fresh_value();
+        let imag_idx_inst = Instruction::BinOp {
+            result: imag_idx,
+            op: crate::ir::instructions::BinOp::Add,
+            lhs: imag_idx,
+            rhs: Value::UNDEF,
+            ty: IrType::I64,
+            span,
+        };
+        emit_instruction_to_current_block(ctx, imag_idx_inst);
+        ctx.function.constant_values.insert(imag_idx, elem_sz);
+
+        let imag_ptr = ctx.builder.fresh_value();
+        let gep_i = Instruction::GetElementPtr {
+            result: imag_ptr,
+            base: complex_ptr,
+            indices: vec![imag_idx],
+            result_type: IrType::Ptr,
+            in_bounds: true,
+            span,
+        };
+        emit_instruction_to_current_block(ctx, gep_i);
+
+        let (imag_val, load_i) = ctx.builder.build_load(imag_ptr, elem_ir.clone(), span);
+        emit_instruction_to_current_block(ctx, load_i);
+
+        // Compare each part to zero.
+        let (real_nz, imag_nz) = if elem_ir.is_float() {
+            // Create float zero constants for real and imaginary comparisons.
+            let fzero_gid = ctx.module.globals().len();
+            let fzero_name = format!(".Lconst.f.{}", fzero_gid);
+            let fzero_name_c = fzero_name.clone();
+            let mut gv = crate::ir::module::GlobalVariable::new(
+                fzero_name,
+                elem_ir.clone(),
+                Some(crate::ir::module::Constant::Float(0.0)),
+            );
+            gv.linkage = crate::ir::module::Linkage::Internal;
+            gv.is_constant = true;
+            ctx.module.add_global(gv);
+
+            let fzero_r = ctx.builder.fresh_value();
+            let fzero_r_inst = Instruction::BinOp {
+                result: fzero_r,
+                op: crate::ir::instructions::BinOp::FAdd,
+                lhs: fzero_r,
+                rhs: Value::UNDEF,
+                ty: elem_ir.clone(),
+                span,
+            };
+            emit_instruction_to_current_block(ctx, fzero_r_inst);
+            ctx.function
+                .float_constant_values
+                .insert(fzero_r, (fzero_name_c.clone(), 0.0));
+
+            let fzero_i = ctx.builder.fresh_value();
+            let fzero_i_inst = Instruction::BinOp {
+                result: fzero_i,
+                op: crate::ir::instructions::BinOp::FAdd,
+                lhs: fzero_i,
+                rhs: Value::UNDEF,
+                ty: elem_ir.clone(),
+                span,
+            };
+            emit_instruction_to_current_block(ctx, fzero_i_inst);
+            ctx.function
+                .float_constant_values
+                .insert(fzero_i, (fzero_name_c, 0.0));
+
+            let rnz = ctx.builder.fresh_value();
+            let cmp_r = Instruction::FCmp {
+                result: rnz,
+                op: crate::ir::instructions::FCmpOp::One,
+                lhs: real_val,
+                rhs: fzero_r,
+                span,
+            };
+            emit_instruction_to_current_block(ctx, cmp_r);
+
+            let inz = ctx.builder.fresh_value();
+            let cmp_i = Instruction::FCmp {
+                result: inz,
+                op: crate::ir::instructions::FCmpOp::One,
+                lhs: imag_val,
+                rhs: fzero_i,
+                span,
+            };
+            emit_instruction_to_current_block(ctx, cmp_i);
+            (rnz, inz)
+        } else {
+            let izero_r = ctx.builder.fresh_value();
+            let izero_r_inst = Instruction::BinOp {
+                result: izero_r,
+                op: crate::ir::instructions::BinOp::Add,
+                lhs: izero_r,
+                rhs: Value::UNDEF,
+                ty: elem_ir.clone(),
+                span,
+            };
+            emit_instruction_to_current_block(ctx, izero_r_inst);
+            ctx.function.constant_values.insert(izero_r, 0);
+
+            let izero_i = ctx.builder.fresh_value();
+            let izero_i_inst = Instruction::BinOp {
+                result: izero_i,
+                op: crate::ir::instructions::BinOp::Add,
+                lhs: izero_i,
+                rhs: Value::UNDEF,
+                ty: elem_ir.clone(),
+                span,
+            };
+            emit_instruction_to_current_block(ctx, izero_i_inst);
+            ctx.function.constant_values.insert(izero_i, 0);
+
+            let rnz = ctx.builder.fresh_value();
+            let cmp_r = Instruction::ICmp {
+                result: rnz,
+                op: crate::ir::instructions::ICmpOp::Ne,
+                lhs: real_val,
+                rhs: izero_r,
+                span,
+            };
+            emit_instruction_to_current_block(ctx, cmp_r);
+
+            let inz = ctx.builder.fresh_value();
+            let cmp_i = Instruction::ICmp {
+                result: inz,
+                op: crate::ir::instructions::ICmpOp::Ne,
+                lhs: imag_val,
+                rhs: izero_i,
+                span,
+            };
+            emit_instruction_to_current_block(ctx, cmp_i);
+            (rnz, inz)
+        };
+
+        // OR the two boolean results: truthy if either part is non-zero.
+        let result = ctx.builder.fresh_value();
+        let or_inst = Instruction::BinOp {
+            result,
+            op: crate::ir::instructions::BinOp::Or,
+            lhs: real_nz,
+            rhs: imag_nz,
+            ty: IrType::I1,
+            span,
+        };
+        emit_instruction_to_current_block(ctx, or_inst);
+        return result;
     }
 
     // Non-comparison, non-float expression: emit `val != 0` to convert to boolean.

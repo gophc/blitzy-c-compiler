@@ -1397,7 +1397,6 @@ fn check_add_char(flags: &SpecifierFlags) -> Result<(), &'static str> {
         || flags.has_float
         || flags.has_double
         || flags.has_bool
-        || flags.has_complex
         || flags.has_struct_union_enum
         || flags.has_typedef_name
         || flags.has_atomic
@@ -1405,7 +1404,7 @@ fn check_add_char(flags: &SpecifierFlags) -> Result<(), &'static str> {
     {
         return Err("invalid type specifier combination with 'char'");
     }
-    // char can combine with signed/unsigned only
+    // char can combine with signed/unsigned, and _Complex (GCC extension)
     Ok(())
 }
 
@@ -1420,7 +1419,6 @@ fn check_add_short(flags: &SpecifierFlags) -> Result<(), &'static str> {
         || flags.has_float
         || flags.has_double
         || flags.has_bool
-        || flags.has_complex
         || flags.has_struct_union_enum
         || flags.has_typedef_name
         || flags.has_atomic
@@ -1428,7 +1426,7 @@ fn check_add_short(flags: &SpecifierFlags) -> Result<(), &'static str> {
     {
         return Err("cannot combine 'short' with 'long' or other incompatible specifiers");
     }
-    // short can combine with: int, signed, unsigned
+    // short can combine with: int, signed, unsigned, _Complex (GCC extension)
     Ok(())
 }
 
@@ -1442,7 +1440,6 @@ fn check_add_int(flags: &SpecifierFlags) -> Result<(), &'static str> {
         || flags.has_float
         || flags.has_double
         || flags.has_bool
-        || flags.has_complex
         || flags.has_struct_union_enum
         || flags.has_typedef_name
         || flags.has_atomic
@@ -1450,7 +1447,7 @@ fn check_add_int(flags: &SpecifierFlags) -> Result<(), &'static str> {
     {
         return Err("invalid type specifier combination with 'int'");
     }
-    // int can combine with: short, long, long long, signed, unsigned
+    // int can combine with: short, long, long long, signed, unsigned, _Complex
     Ok(())
 }
 
@@ -1543,7 +1540,6 @@ fn check_add_signed(flags: &SpecifierFlags) -> Result<(), &'static str> {
         || flags.has_float
         || flags.has_double
         || flags.has_bool
-        || flags.has_complex
         || flags.has_struct_union_enum
         || flags.has_typedef_name
         || flags.has_atomic
@@ -1551,7 +1547,7 @@ fn check_add_signed(flags: &SpecifierFlags) -> Result<(), &'static str> {
     {
         return Err("invalid type specifier combination with 'signed'");
     }
-    // signed can combine with: char, short, int, long, long long
+    // signed can combine with: char, short, int, long, long long, _Complex (GCC ext)
     Ok(())
 }
 
@@ -1567,7 +1563,6 @@ fn check_add_unsigned(flags: &SpecifierFlags) -> Result<(), &'static str> {
         || flags.has_float
         || flags.has_double
         || flags.has_bool
-        || flags.has_complex
         || flags.has_struct_union_enum
         || flags.has_typedef_name
         || flags.has_atomic
@@ -1575,7 +1570,7 @@ fn check_add_unsigned(flags: &SpecifierFlags) -> Result<(), &'static str> {
     {
         return Err("invalid type specifier combination with 'unsigned'");
     }
-    // unsigned can combine with: char, short, int, long, long long
+    // unsigned can combine with: char, short, int, long, long long, _Complex (GCC ext)
     Ok(())
 }
 
@@ -1591,16 +1586,13 @@ fn check_add_bool(flags: &SpecifierFlags) -> Result<(), &'static str> {
 }
 
 /// Check whether adding `_Complex` is valid.
+/// GCC extension: `_Complex` can combine with integer types too
+/// (`__complex__ int`, `__complex__ char`, etc.).
 fn check_add_complex(flags: &SpecifierFlags) -> Result<(), &'static str> {
     if flags.has_complex {
         return Err("duplicate '_Complex' specifier");
     }
     if flags.has_void
-        || flags.has_char
-        || flags.has_short
-        || flags.has_int
-        || flags.has_signed
-        || flags.has_unsigned
         || flags.has_bool
         || flags.has_struct_union_enum
         || flags.has_typedef_name
@@ -1609,6 +1601,8 @@ fn check_add_complex(flags: &SpecifierFlags) -> Result<(), &'static str> {
     {
         return Err("invalid type specifier combination with '_Complex'");
     }
-    // _Complex can combine with: float, double, long double
+    // _Complex can combine with: float, double, long double, and
+    // integer types (int, char, short, long, signed, unsigned) as a
+    // GCC extension.
     Ok(())
 }

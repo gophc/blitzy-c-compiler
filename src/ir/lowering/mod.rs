@@ -869,6 +869,14 @@ pub fn lower_translation_unit(
                 }
                 _ => {}
             }
+            // Incrementally update SIZEOF_STRUCT_DEFS so that subsequent
+            // struct definitions whose field array sizes depend on
+            // sizeof/offsetof of previously collected structs can resolve
+            // correctly during pass-0 collection.
+            // (Example: `struct B { char a[sizeof(struct A) - offsetof(struct A, x)]; };`)
+            SIZEOF_STRUCT_DEFS.with(|defs| {
+                *defs.borrow_mut() = Some(map.clone());
+            });
         }
         map
     };

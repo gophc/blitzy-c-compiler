@@ -753,6 +753,16 @@ pub struct IrModule {
     /// emit an inline-asm register read; writes emit a register store.
     pub register_globals: FxHashMap<String, (String, crate::common::types::CType)>,
 
+    /// Function-level alignment overrides from `__attribute__((aligned(N)))`.
+    ///
+    /// Populated during both function declaration and definition lowering.
+    /// A declaration `void f(void) __attribute__((aligned(256)));` followed
+    /// by a definition `void f(void) {}` stores `("f", 256)`.  This allows
+    /// `__alignof__(f)` to return the correct value even when the definition
+    /// itself does not repeat the attribute (attribute inheritance from
+    /// prior declarations — standard C behaviour).
+    pub func_alignments: FxHashMap<String, usize>,
+
     /// Symbol aliases: `__attribute__((alias("target")))`.
     ///
     /// Maps the alias symbol name to the target symbol name. Both functions
@@ -802,6 +812,7 @@ impl IrModule {
             func_c_param_types: FxHashMap::default(),
             global_c_types: FxHashMap::default(),
             register_globals: FxHashMap::default(),
+            func_alignments: FxHashMap::default(),
             symbol_aliases: Vec::new(),
         }
     }
