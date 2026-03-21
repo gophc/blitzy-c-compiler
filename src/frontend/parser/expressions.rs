@@ -676,6 +676,20 @@ fn parse_sizeof_expression(parser: &mut Parser<'_>) -> Result<Expression, ()> {
             parser.advance(); // consume `(`
             let type_name = parse_type_name(parser)?;
             parser.expect(TokenKind::RightParen)?;
+
+            // Check for compound literal: sizeof(type-name){init-list}
+            // If `{` follows, this is sizeof on a compound literal, not
+            // sizeof(type-name). Re-interpret as sizeof on a compound
+            // literal expression.
+            if parser.check(&TokenKind::LeftBrace) {
+                let compound_lit = parse_compound_literal_body(parser, type_name, start)?;
+                let span = parser.make_span(start);
+                return Ok(Expression::SizeofExpr {
+                    operand: Box::new(compound_lit),
+                    span,
+                });
+            }
+
             let span = parser.make_span(start);
             return Ok(Expression::SizeofType {
                 type_name: Box::new(type_name),
@@ -691,6 +705,25 @@ fn parse_sizeof_expression(parser: &mut Parser<'_>) -> Result<Expression, ()> {
     let span = start.merge(operand.span());
     Ok(Expression::SizeofExpr {
         operand: Box::new(operand),
+        span,
+    })
+}
+
+/// Helper to parse the body of a compound literal starting at `{`.
+///
+/// This is used when `sizeof(type-name)` is followed by `{`, indicating
+/// that the construct is `sizeof` on a compound literal, not `sizeof` on
+/// a type followed by a braced statement.
+fn parse_compound_literal_body(
+    parser: &mut Parser<'_>,
+    type_name: crate::frontend::parser::ast::TypeName,
+    start: Span,
+) -> Result<Expression, ()> {
+    let initializer = parser.parse_initializer()?;
+    let span = parser.make_span(start);
+    Ok(Expression::CompoundLiteral {
+        type_name: Box::new(type_name),
+        initializer,
         span,
     })
 }
@@ -1217,6 +1250,40 @@ fn parse_generic_selection(parser: &mut Parser<'_>) -> Result<Expression, ()> {
     }
 
     parser.expect(TokenKind::RightParen)?;
+
+    // Check for duplicate type associations (C11 6.5.1.1p2: "No two
+    // generic associations in the same _Generic selection shall
+    // specify compatible types.").
+    {
+        let mut default_count = 0u32;
+        for assoc in &associations {
+            if assoc.type_name.is_none() {
+                default_count += 1;
+                if default_count > 1 {
+                    parser.error(assoc.span, "duplicate 'default' association in _Generic");
+                }
+            }
+        }
+        // Simple duplicate check by comparing type source text via Debug
+        // representation. A more precise check would compare canonical
+        // types, but this catches the most common case.
+        let typed_assocs: Vec<_> = associations
+            .iter()
+            .filter_map(|a| a.type_name.as_ref().map(|t| (t, a.span)))
+            .collect();
+        for i in 0..typed_assocs.len() {
+            for j in (i + 1)..typed_assocs.len() {
+                let ti_dbg = format!("{:?}", typed_assocs[i].0);
+                let tj_dbg = format!("{:?}", typed_assocs[j].0);
+                if ti_dbg == tj_dbg {
+                    parser.error(
+                        typed_assocs[j].1,
+                        "duplicate type in _Generic association list",
+                    );
+                }
+            }
+        }
+    }
 
     let span = parser.make_span(start);
     Ok(Expression::Generic {

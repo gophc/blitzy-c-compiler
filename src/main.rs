@@ -1144,6 +1144,10 @@ fn run_preprocess_only(
         let mut pp =
             Preprocessor::new(&mut source_map, &mut diagnostics, ctx.target, &mut interner);
 
+        // In `-E` mode, preserve `#pragma` directives in the output stream
+        // so they appear in the preprocessed output, matching GCC behaviour.
+        pp.preserve_pragmas = true;
+
         // Add include paths from CLI
         for path in &ctx.include_paths {
             pp.add_include_path(path);

@@ -868,6 +868,10 @@ pub struct Preprocessor<'a> {
     /// Stack for `#pragma push_macro("name")` / `#pragma pop_macro("name")`.
     /// Maps macro name → stack of saved definitions (None = was undefined).
     pub macro_push_stack: FxHashMap<String, Vec<Option<MacroDef>>>,
+    /// When `true`, `#pragma` directives are preserved as output tokens
+    /// (for `-E` preprocess-only mode).  When `false` (default), pragmas
+    /// are consumed silently and not emitted into the token stream.
+    pub preserve_pragmas: bool,
 }
 
 impl<'a> Preprocessor<'a> {
@@ -904,6 +908,7 @@ impl<'a> Preprocessor<'a> {
             conditional_stack: Vec::new(),
             counter_value: 0,
             macro_push_stack: FxHashMap::default(),
+            preserve_pragmas: false,
         }
     }
 
@@ -1545,7 +1550,39 @@ impl<'a> Preprocessor<'a> {
             }
             "pragma" => {
                 self.process_pragma(&rest);
-                None
+                // When in `-E` (preprocess-only) mode, preserve `#pragma`
+                // directives in the output token stream, matching GCC
+                // behaviour (C11 §6.10.6).
+                if self.preserve_pragmas {
+                    let mut pragma_tokens = Vec::new();
+                    pragma_tokens.push(PPToken {
+                        kind: PPTokenKind::Punctuator,
+                        text: "#pragma".to_string(),
+                        span: directive.span,
+                        from_macro: false,
+                        painted: false,
+                    });
+                    for t in &rest {
+                        pragma_tokens.push(PPToken {
+                            kind: PPTokenKind::Whitespace,
+                            text: " ".to_string(),
+                            span: t.span,
+                            from_macro: false,
+                            painted: false,
+                        });
+                        pragma_tokens.push(t.clone());
+                    }
+                    pragma_tokens.push(PPToken {
+                        kind: PPTokenKind::Newline,
+                        text: "\n".to_string(),
+                        span: directive.span,
+                        from_macro: false,
+                        painted: false,
+                    });
+                    Some(pragma_tokens)
+                } else {
+                    None
+                }
             }
             _ => {
                 // Unknown directive — emit diagnostic.

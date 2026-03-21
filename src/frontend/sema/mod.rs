@@ -975,6 +975,14 @@ impl<'a> SemanticAnalyzer<'a> {
 
     /// Analyze an expression, returning its resolved C type.
     ///
+    /// Check whether a C type has the `const` qualifier at the top level.
+    fn is_const_qualified(&self, ty: &CType) -> bool {
+        match ty {
+            CType::Qualified(_, quals) => quals.is_const,
+            _ => false,
+        }
+    }
+
     /// Increments the recursion depth guard (max 512 per AAP §0.7.3) before
     /// dispatching to variant-specific handlers. Decrements on return.
     ///
@@ -1183,8 +1191,15 @@ impl<'a> SemanticAnalyzer<'a> {
             } => {
                 let target_ty = self.analyze_expression(target)?;
                 let _value_ty = self.analyze_expression(value)?;
+
+                // Check for const-qualified target — assignment to const is
+                // an error per C11 §6.5.16p2.
+                if self.is_const_qualified(&target_ty) {
+                    self.diagnostics
+                        .emit_error(*span, "assignment of read-only variable (const-qualified)");
+                }
+
                 // Assignment yields the type of the left operand.
-                let _ = span; // Used for diagnostics in full impl.
                 Ok(target_ty)
             }
 

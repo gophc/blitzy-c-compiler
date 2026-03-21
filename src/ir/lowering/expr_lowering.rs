@@ -4553,6 +4553,30 @@ fn lower_cast(
         return v;
     }
 
+    // Pointer → Bool: convert to integer-sized value, then compare != 0.
+    // C11 §6.3.1.2: any scalar (including pointers) converted to _Bool gives
+    // 0 if equal to 0, otherwise 1.  A plain PtrToInt to I1 would just grab
+    // the low bit of the address, which is wrong.
+    if from_ir.is_pointer() && matches!(to, CType::Bool) {
+        let ptr_int_ty = size_ir_type(ctx.target);
+        let (int_val, pti) = ctx
+            .builder
+            .build_ptr_to_int(value, ptr_int_ty.clone(), span);
+        emit_inst(ctx, pti);
+        let zero = emit_zero(ctx, ptr_int_ty, span);
+        let (v, i) = ctx.builder.build_icmp(ICmpOp::Ne, int_val, zero, span);
+        emit_inst(ctx, i);
+        return v;
+    }
+
+    // Float → Bool: compare != 0.0.
+    if from_ir.is_float() && matches!(to, CType::Bool) {
+        let zero = emit_float_const(ctx, 0.0, from_ir, span);
+        let (v, i) = ctx.builder.build_fcmp(FCmpOp::One, value, zero, span);
+        emit_inst(ctx, i);
+        return v;
+    }
+
     // Integer → Pointer.
     if from_ir.is_integer() && to_ir.is_pointer() {
         let (v, i) = ctx.builder.build_int_to_ptr(value, span);

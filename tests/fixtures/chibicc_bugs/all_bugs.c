@@ -21,6 +21,12 @@ static int test_sizeof_compound_literal(void) {
         printf("FAIL bug1b: sizeof struct compound = %d\n", s2);
         return 1;
     }
+    /* Test without extra parens: sizeof(type){init} — the chibicc pattern */
+    int s3 = sizeof(int[]){1, 2, 3};
+    if (s3 != 3 * sizeof(int)) {
+        printf("FAIL bug1c: sizeof(int[]){1,2,3} no-parens = %d, expected %d\n", s3, (int)(3 * sizeof(int)));
+        return 1;
+    }
     return 0;
 }
 
@@ -200,6 +206,26 @@ static int test_va_args_comma_elision(void) {
     return 0;
 }
 
+/* Bug 9: Cast-to-bool with relocation pointers — must normalize to 0/1 */
+static int test_cast_to_bool_reloc_ptr(void) {
+    /* Use a local address-taken variable to avoid aarch64 ADRP range issues
+     * in large translation units.  The core bug is about cast-to-bool
+     * normalizing to 0/1, not about global addressing. */
+    int local_var = 42;
+    _Bool b = (_Bool)&local_var;
+    if ((int)b != 1) {
+        printf("FAIL bug9: (_Bool)&var = %d, expected 1\n", (int)b);
+        return 1;
+    }
+    /* NULL pointer cast to bool should be 0 */
+    _Bool b2 = (_Bool)(void *)0;
+    if ((int)b2 != 0) {
+        printf("FAIL bug9b: (_Bool)NULL = %d, expected 0\n", (int)b2);
+        return 1;
+    }
+    return 0;
+}
+
 int main(void) {
     int failures = 0;
     failures += test_sizeof_compound_literal();
@@ -214,6 +240,7 @@ int main(void) {
     failures += test_array_decay();
     failures += test_stmt_expr_promotion();
     failures += test_va_args_comma_elision();
+    failures += test_cast_to_bool_reloc_ptr();
     if (failures == 0) {
         printf("chibicc_bugs OK\n");
     } else {

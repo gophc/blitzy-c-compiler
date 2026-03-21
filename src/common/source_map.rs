@@ -277,6 +277,24 @@ impl SourceMap {
             .map(|f| f.filename.as_str())
     }
 
+    /// Return all `#line` directive filenames for a given file.
+    ///
+    /// This is used by the DWARF debug information generator to include
+    /// `#line`-specified filenames in the `.debug_line` file table.
+    pub fn get_line_directive_filenames(&self, file_id: u32) -> Vec<String> {
+        let mut names = Vec::new();
+        if let Some(directives) = self.line_directives.get(file_id as usize) {
+            for d in directives {
+                if let Some(ref name) = d.new_filename {
+                    if !names.contains(name) {
+                        names.push(name.clone());
+                    }
+                }
+            }
+        }
+        names
+    }
+
     /// Register a `#line` directive for future
     /// [`resolve_location`](SourceMap::resolve_location) lookups.
     ///

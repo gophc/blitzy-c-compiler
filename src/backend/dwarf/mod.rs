@@ -717,6 +717,18 @@ fn generate_debug_line_section(
     encode_uleb128(0, &mut buffer); // last modified (0 = unknown)
     encode_uleb128(0, &mut buffer); // file length (0 = unknown)
 
+    // Emit additional files referenced by `#line` directives.
+    // Each unique `#line "filename"` gets its own entry in the file table
+    // so that DWARF consumers can resolve source locations correctly.
+    let line_dir_filenames = source_map.get_line_directive_filenames(0);
+    for fname in &line_dir_filenames {
+        buffer.extend_from_slice(fname.as_bytes());
+        buffer.push(0); // null terminator
+        encode_uleb128(1, &mut buffer); // directory index
+        encode_uleb128(0, &mut buffer); // last modified
+        encode_uleb128(0, &mut buffer); // file length
+    }
+
     // Empty entry terminates the file name table
     buffer.push(0);
 
