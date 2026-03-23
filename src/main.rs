@@ -1409,17 +1409,13 @@ fn parse_ar_archive(data: &[u8], archive_name: &str) -> Vec<(String, Vec<u8>)> {
         // Parse name field (16 bytes)
         let name_raw = &header[0..16];
         // Parse size field (10 bytes, ASCII decimal)
-        let size_str = std::str::from_utf8(&header[48..58])
-            .unwrap_or("0")
-            .trim();
+        let size_str = std::str::from_utf8(&header[48..58]).unwrap_or("0").trim();
         let member_size: usize = size_str.parse().unwrap_or(0);
         let member_start = offset + 60;
         let member_end = (member_start + member_size).min(data.len());
 
         // Determine the member name.
-        let name_trimmed = std::str::from_utf8(name_raw)
-            .unwrap_or("")
-            .trim_end();
+        let name_trimmed = std::str::from_utf8(name_raw).unwrap_or("").trim_end();
 
         if name_trimmed == "/" || name_trimmed == "/SYM64/" {
             // Symbol table — skip.
@@ -1428,9 +1424,9 @@ fn parse_ar_archive(data: &[u8], archive_name: &str) -> Vec<(String, Vec<u8>)> {
             extended_names = &data[member_start..member_end];
         } else {
             // Regular member or extended-name reference.
-            let member_name = if name_trimmed.starts_with('/') {
+            let member_name = if let Some(stripped) = name_trimmed.strip_prefix('/') {
                 // Extended name: "/NN" where NN is offset into extended names table.
-                let ext_offset: usize = name_trimmed[1..].trim().parse().unwrap_or(0);
+                let ext_offset: usize = stripped.trim().parse().unwrap_or(0);
                 if ext_offset < extended_names.len() {
                     // Name ends at '/' or '\n' within the extended names table.
                     let end = extended_names[ext_offset..]
@@ -2402,8 +2398,11 @@ fn link_object_files(
             // separate LinkerInput.
             let members = parse_ar_archive(&data, filename);
             for (member_name, member_data) in &members {
-                let li =
-                    parse_elf_object_to_linker_input_uniquified(input_idx, member_name, member_data);
+                let li = parse_elf_object_to_linker_input_uniquified(
+                    input_idx,
+                    member_name,
+                    member_data,
+                );
                 inputs.push(li);
                 input_idx += 1;
             }

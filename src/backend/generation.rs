@@ -5492,7 +5492,11 @@ fn parse_elf_object_to_linker_input_impl(
                 let (st_name_val, st_shndx_val, st_info_val) = if is_64bit {
                     (read_u32(sym_off), read_u16(sym_off + 6), data[sym_off + 4])
                 } else {
-                    (read_u32(sym_off), read_u16(sym_off + 14), data[sym_off + 12])
+                    (
+                        read_u32(sym_off),
+                        read_u16(sym_off + 14),
+                        data[sym_off + 12],
+                    )
                 };
                 elf_sym_names.push(sym_name_local(st_name_val));
                 elf_sym_sec_idx.push(st_shndx_val);
@@ -5640,10 +5644,7 @@ fn parse_elf_object_to_linker_input_impl(
                         .get(sym_index as usize)
                         .copied()
                         .unwrap_or(1);
-                    let sym_type_val = elf_sym_types
-                        .get(sym_index as usize)
-                        .copied()
-                        .unwrap_or(0);
+                    let sym_type_val = elf_sym_types.get(sym_index as usize).copied().unwrap_or(0);
                     if sym_binding_val == 0
                         && !symbol_name.is_empty()
                         && sym_type_val != 3

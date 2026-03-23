@@ -965,29 +965,23 @@ pub fn link(
                                 rela_data[base + 8..base + 16].try_into().unwrap(),
                             );
                             let rtype = (r_info & 0xFFFF_FFFF) as u32;
-                            if rtype == copy_reloc_type {
-                                if copy_idx < copy_symbols.len() {
-                                    let addr = bss_copy_va + copy_offset;
-                                    // Patch r_offset
-                                    rela_data[base..base + 8]
-                                        .copy_from_slice(&addr.to_le_bytes());
-                                    copy_offset += copy_symbols[copy_idx].1 as u64;
-                                    copy_idx += 1;
-                                }
+                            if rtype == copy_reloc_type && copy_idx < copy_symbols.len() {
+                                let addr = bss_copy_va + copy_offset;
+                                // Patch r_offset
+                                rela_data[base..base + 8].copy_from_slice(&addr.to_le_bytes());
+                                copy_offset += copy_symbols[copy_idx].1 as u64;
+                                copy_idx += 1;
                             }
                         } else {
                             let r_info = u32::from_le_bytes(
                                 rela_data[base + 4..base + 8].try_into().unwrap(),
                             );
                             let rtype = r_info & 0xFF;
-                            if rtype == copy_reloc_type {
-                                if copy_idx < copy_symbols.len() {
-                                    let addr = (bss_copy_va + copy_offset) as u32;
-                                    rela_data[base..base + 4]
-                                        .copy_from_slice(&addr.to_le_bytes());
-                                    copy_offset += copy_symbols[copy_idx].1 as u64;
-                                    copy_idx += 1;
-                                }
+                            if rtype == copy_reloc_type && copy_idx < copy_symbols.len() {
+                                let addr = (bss_copy_va + copy_offset) as u32;
+                                rela_data[base..base + 4].copy_from_slice(&addr.to_le_bytes());
+                                copy_offset += copy_symbols[copy_idx].1 as u64;
+                                copy_idx += 1;
                             }
                         }
                     }

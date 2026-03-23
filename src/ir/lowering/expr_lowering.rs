@@ -2636,6 +2636,10 @@ fn store_complex_result(
 /// If the expression is an lvalue (variable/array element), we use the
 /// existing pointer.  Otherwise (e.g. imaginary literal, function call
 /// result), we materialise a temporary alloca and load parts from that.
+/// Lower a `_Complex` expression from its AST node and extract its real/imaginary parts.
+/// Prefer `extract_complex_parts_from_value` when you already have a lowered Value to avoid
+/// duplicate IR node creation.
+#[allow(dead_code)]
 fn lower_complex_operand_parts(
     ctx: &mut ExprLoweringContext<'_>,
     expr: &ast::Expression,
@@ -2644,13 +2648,24 @@ fn lower_complex_operand_parts(
     elem_size: i64,
     span: Span,
 ) -> (Value, Value) {
-    // Try lowering as lvalue first (zero-cost for variables).
-    // If that yields a non-pointer / causes issues, fall back to rvalue path.
     let tv = lower_expr_inner(ctx, expr);
-    // Materialise into a temp alloca so we can GEP into it.
+    extract_complex_parts_from_value(ctx, tv.value, complex_ir, elem_ir, elem_size, span)
+}
+
+/// Extract real and imaginary parts from an already-lowered `_Complex` value.
+/// Materialises into a temp alloca so we can GEP into it, then loads both parts.
+/// This avoids re-lowering expressions and prevents duplicate IR node creation.
+fn extract_complex_parts_from_value(
+    ctx: &mut ExprLoweringContext<'_>,
+    value: Value,
+    complex_ir: &IrType,
+    elem_ir: &IrType,
+    elem_size: i64,
+    span: Span,
+) -> (Value, Value) {
     let (alloca, ai) = ctx.builder.build_alloca(complex_ir.clone(), span);
     emit_inst(ctx, ai);
-    let st = ctx.builder.build_store(tv.value, alloca, span);
+    let st = ctx.builder.build_store(value, alloca, span);
     emit_inst(ctx, st);
     load_complex_parts(ctx, alloca, elem_ir, elem_size, span)
 }
@@ -2686,8 +2701,8 @@ fn ensure_fp_type(
 fn lower_complex_binary(
     ctx: &mut ExprLoweringContext<'_>,
     op: &ast::BinaryOp,
-    lhs_expr: &ast::Expression,
-    rhs_expr: &ast::Expression,
+    _lhs_expr: &ast::Expression,
+    _rhs_expr: &ast::Expression,
     _lhs_tv: &TypedValue,
     _rhs_tv: &TypedValue,
     span: Span,
@@ -2732,25 +2747,35 @@ fn lower_complex_binary(
     // Load real/imaginary parts from both operands.  If one operand is a
     // plain real scalar (not _Complex), promote it to complex by treating
     // its value as the real component with imaginary = 0.0.
+    //
+    // IMPORTANT: We use the already-lowered values (_lhs_tv, _rhs_tv) directly
+    // rather than re-lowering from the AST expressions. Re-lowering would create
+    // duplicate IR nodes for every complex binary operation, causing unbounded
+    // IR growth (memory leak) in programs with many _Complex operations.
     let lhs_is_complex = matches!(types::resolve_typedef(&_lhs_tv.ty), CType::Complex(..));
     let rhs_is_complex = matches!(types::resolve_typedef(&_rhs_tv.ty), CType::Complex(..));
 
     let elem_is_fp = is_fp_ir_type(&elem_ir);
 
-    // Helper: extract complex parts from an operand, converting to the
-    // common element type if the operand's element type differs.
-    let extract_complex_parts = |ctx: &mut ExprLoweringContext<'_>,
-                                 expr: &ast::Expression,
-                                 operand_ty: &CType|
+    // Helper: extract complex parts from an already-lowered operand value,
+    // converting to the common element type if the operand's element type differs.
+    let extract_complex_parts_typed = |ctx: &mut ExprLoweringContext<'_>,
+                                       tv: &TypedValue|
      -> (Value, Value) {
-        let operand_resolved = types::resolve_typedef(operand_ty);
+        let operand_resolved = types::resolve_typedef(&tv.ty);
         if let Some(op_elem) = complex_element_ctype(operand_resolved) {
             let op_elem_ir = ctype_to_ir(op_elem, ctx.target);
             let op_complex_ir = ctype_to_ir(operand_resolved, ctx.target);
             let op_esz = complex_elem_size(&op_elem_ir);
-            // Load parts using the operand's native element type
-            let (raw_r, raw_i) =
-                lower_complex_operand_parts(ctx, expr, &op_complex_ir, &op_elem_ir, op_esz, span);
+            // Extract parts from the already-lowered value (no re-lowering)
+            let (raw_r, raw_i) = extract_complex_parts_from_value(
+                ctx,
+                tv.value,
+                &op_complex_ir,
+                &op_elem_ir,
+                op_esz,
+                span,
+            );
             // Convert to the common element type if needed
             if op_elem_ir == elem_ir {
                 (raw_r, raw_i)
@@ -2761,19 +2786,18 @@ fn lower_complex_binary(
             }
         } else {
             // Should not happen (caller verified lhs_is_complex)
-            lower_complex_operand_parts(ctx, expr, &complex_ir, &elem_ir, elem_size, span)
+            extract_complex_parts_from_value(ctx, tv.value, &complex_ir, &elem_ir, elem_size, span)
         }
     };
 
     let (lr, li) = if lhs_is_complex {
-        extract_complex_parts(ctx, lhs_expr, &_lhs_tv.ty)
+        extract_complex_parts_typed(ctx, _lhs_tv)
     } else {
-        // Scalar: real = scalar value, imag = 0
-        let scalar = lower_expr_inner(ctx, lhs_expr);
+        // Scalar: use the already-lowered value, don't re-lower
         let real_val = if elem_is_fp {
-            ensure_fp_type(ctx, scalar.value, &scalar.ty, &elem_ir, span)
+            ensure_fp_type(ctx, _lhs_tv.value, &_lhs_tv.ty, &elem_ir, span)
         } else {
-            lower_cast(ctx, scalar.value, &scalar.ty, &elem_ctype, span)
+            lower_cast(ctx, _lhs_tv.value, &_lhs_tv.ty, &elem_ctype, span)
         };
         let zero = if elem_is_fp {
             emit_float_const(ctx, 0.0, elem_ir.clone(), span)
@@ -2783,13 +2807,13 @@ fn lower_complex_binary(
         (real_val, zero)
     };
     let (rr, ri) = if rhs_is_complex {
-        extract_complex_parts(ctx, rhs_expr, &_rhs_tv.ty)
+        extract_complex_parts_typed(ctx, _rhs_tv)
     } else {
-        let scalar = lower_expr_inner(ctx, rhs_expr);
+        // Scalar: use the already-lowered value, don't re-lower
         let real_val = if elem_is_fp {
-            ensure_fp_type(ctx, scalar.value, &scalar.ty, &elem_ir, span)
+            ensure_fp_type(ctx, _rhs_tv.value, &_rhs_tv.ty, &elem_ir, span)
         } else {
-            lower_cast(ctx, scalar.value, &scalar.ty, &elem_ctype, span)
+            lower_cast(ctx, _rhs_tv.value, &_rhs_tv.ty, &elem_ctype, span)
         };
         let zero = if elem_is_fp {
             emit_float_const(ctx, 0.0, elem_ir.clone(), span)

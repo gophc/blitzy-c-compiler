@@ -1398,12 +1398,12 @@ pub fn build_dynamic_sections(
         // patch the value to the .bss.copy VA after layout.
         let ds = DynamicSymbol {
             name: sym.name.clone(),
-            value: 0,              // patched to .bss.copy VA later
+            value: 0, // patched to .bss.copy VA later
             size: sym.copy_size,
             binding: sym.binding,
             sym_type: STT_OBJECT,
             visibility: STV_DEFAULT,
-            section_index: 0, // will be patched to .bss.copy shndx later
+            section_index: 0,  // will be patched to .bss.copy shndx later
             is_defined: false, // UND — ld.so resolves from shared lib
             is_plt_entry: false,
             got_offset: None,
