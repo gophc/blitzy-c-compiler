@@ -3089,6 +3089,28 @@ fn constant_to_bytes_typed(
 
     match constant {
         Constant::Integer(v) => {
+            // When the target IR type is a float/double but the constant
+            // was evaluated as an integer (e.g. `double C = 2;`), convert
+            // the integer value to the appropriate IEEE 754 representation.
+            match ir_ty {
+                Some(IrType::F32) => {
+                    let fv = *v as f32;
+                    return fv.to_le_bytes().to_vec();
+                }
+                Some(IrType::F64) => {
+                    let fv = *v as f64;
+                    return fv.to_le_bytes().to_vec();
+                }
+                Some(IrType::F80) => {
+                    let fv = *v as f64;
+                    let ld = crate::common::long_double::LongDouble::from_f64(fv);
+                    let raw = ld.to_bytes();
+                    let mut result = raw.to_vec();
+                    result.resize(16, 0);
+                    return result;
+                }
+                _ => {}
+            }
             // Determine byte width from the IR type when available.
             let width = match ir_ty {
                 Some(IrType::I1) | Some(IrType::I8) => 1,

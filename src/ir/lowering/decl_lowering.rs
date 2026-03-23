@@ -2159,9 +2159,50 @@ fn constant_to_le_bytes(
     target: &Target,
     type_builder: &TypeBuilder,
 ) -> Vec<u8> {
+    // Resolve the ctype through typedefs to check the underlying kind.
+    let resolved = crate::common::types::resolve_typedef(ctype);
     match c {
         Constant::ZeroInit => vec![0u8; expected_size],
         Constant::Integer(v) => {
+            // When the target type is a floating-point type but the constant
+            // was evaluated as an integer (e.g. `double C = 2;`), convert
+            // the integer value to the appropriate float representation so
+            // the correct IEEE 754 bytes are emitted.
+            match resolved {
+                CType::Float => {
+                    let fv = *v as f32;
+                    let bits = fv.to_bits();
+                    let mut buf = vec![0u8; expected_size];
+                    for b in 0..expected_size.min(4) {
+                        buf[b] = ((bits >> (b * 8)) & 0xFF) as u8;
+                    }
+                    return buf;
+                }
+                CType::Double => {
+                    let fv = *v as f64;
+                    let bits = fv.to_bits();
+                    let mut buf = vec![0u8; expected_size];
+                    for b in 0..expected_size.min(8) {
+                        buf[b] = ((bits >> (b * 8)) & 0xFF) as u8;
+                    }
+                    return buf;
+                }
+                CType::LongDouble => {
+                    // Use the software long-double conversion for 80-bit
+                    // extended precision (10 or 12 or 16 byte representation).
+                    let fv = *v as f64;
+                    let ld = crate::common::long_double::LongDouble::from_f64(fv);
+                    let raw = ld.to_bytes();
+                    let mut buf = vec![0u8; expected_size];
+                    for (i, &byte) in raw.iter().enumerate() {
+                        if i < buf.len() {
+                            buf[i] = byte;
+                        }
+                    }
+                    return buf;
+                }
+                _ => {}
+            }
             let vu = *v as u128;
             let mut buf = vec![0u8; expected_size];
             for b in 0..expected_size.min(16) {

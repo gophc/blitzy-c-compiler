@@ -1922,8 +1922,16 @@ impl X86_64CodeGen {
                                             MachineOperand::Register(hi_reg),
                                         ],
                                     );
-                                    if hi_remaining <= 4 && hi_opcode == X86Opcode::Mov {
-                                        hi_store.operand_size = 4;
+                                    if hi_remaining <= 4 {
+                                        if hi_opcode == X86Opcode::Mov {
+                                            hi_store.operand_size = 4;
+                                        } else if hi_opcode == X86Opcode::Movsd {
+                                            // Use movss (4-byte SSE store) instead of movsd
+                                            // (8-byte) when only 4 bytes of struct remain in
+                                            // the second eightbyte.  An 8-byte movsd would
+                                            // overflow the alloca and corrupt the saved RBP.
+                                            hi_store.opcode = X86Opcode::Movss.as_u32();
+                                        }
                                     }
                                     param_hi_stores.push(hi_store);
 
@@ -6747,8 +6755,20 @@ impl X86_64CodeGen {
                         // Hi eightbyte
                         if hi_class == AbiClass::Sse || hi_class == AbiClass::SseUp {
                             let reg = SSE_ARG_REGS[sse_idx];
+                            // Use movss (4-byte) instead of movsd (8-byte) when
+                            // the hi eightbyte only contains 4 bytes (e.g. a
+                            // 12-byte struct whose second eightbyte is a single
+                            // float).  An 8-byte movsd would read past the
+                            // struct's alloca, which is harmless for loads but
+                            // keeping it precise avoids UB.
+                            let hi_remaining = struct_load_size.saturating_sub(8);
+                            let hi_sse_opcode = if hi_remaining <= 4 {
+                                X86Opcode::Movss
+                            } else {
+                                X86Opcode::Movsd
+                            };
                             let mut inst_hi = Self::mk_inst(
-                                X86Opcode::Movsd,
+                                hi_sse_opcode,
                                 Some(MachineOperand::Register(reg)),
                                 &[mem_hi],
                             );
