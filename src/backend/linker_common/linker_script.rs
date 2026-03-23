@@ -464,6 +464,63 @@ impl DefaultLinkerScript {
             }
         }
 
+        // --- Ensure all allocatable sections are covered by a segment ---
+        // Unknown sections (e.g. `.data.rel.ro`, `.data.rel.ro.local`,
+        // `.text.startup`) are assigned addresses above but may not appear
+        // in any `SegmentDef.sections` list.  Walk every active section
+        // and inject it into the matching PT_LOAD segment so that the
+        // segment layout builder correctly extends the segment to cover
+        // all content.
+        {
+            // Collect the names already present in each PT_LOAD segment.
+            let mut covered: FxHashSet<String> = FxHashSet::default();
+            for seg in &self.segments {
+                for name in &seg.sections {
+                    covered.insert(name.clone());
+                }
+            }
+
+            for sec in &active_sections {
+                let f = sec.flags as u64;
+                // Only allocatable sections need a LOAD segment.
+                if f & SHF_ALLOC == 0 {
+                    continue;
+                }
+                if covered.contains(&sec.name) {
+                    continue;
+                }
+
+                // Determine which PT_LOAD segment this section belongs to.
+                let target_flags: u32 = if f & SHF_EXECINSTR != 0 {
+                    PF_R | PF_X
+                } else if f & SHF_WRITE != 0 {
+                    PF_R | PF_W
+                } else {
+                    PF_R
+                };
+
+                // Find the matching PT_LOAD segment and append.
+                let mut found = false;
+                for seg in &mut self.segments {
+                    if seg.seg_type == PT_LOAD && seg.flags == target_flags {
+                        seg.sections.push(sec.name.clone());
+                        found = true;
+                        break;
+                    }
+                }
+
+                // If no matching segment exists, create one.
+                if !found {
+                    self.segments.push(SegmentDef {
+                        seg_type: PT_LOAD,
+                        flags: target_flags,
+                        alignment: PAGE_ALIGNMENT,
+                        sections: vec![sec.name.clone()],
+                    });
+                }
+            }
+        }
+
         // --- Build Segment Layouts ---
         let segment_layouts = self.build_segment_layouts(&section_layouts, page_size);
 

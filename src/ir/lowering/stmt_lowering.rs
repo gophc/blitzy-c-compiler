@@ -1085,10 +1085,18 @@ pub fn lower_declaration_initializers(ctx: &mut StmtLoweringContext<'_>, decl: &
         };
 
         // Determine the C type for this variable (needed for aggregate initializers).
+        // Check scope_type_overrides FIRST — when a variable is shadowed in a
+        // nested scope with a different type (e.g. `long long x` in the if-branch
+        // and `double x` in the else-branch), ensure_allocas_for_declaration
+        // updates scope_type_overrides with the correct type for the current
+        // scope.  The immutable local_types map may have the WRONG type because
+        // the pre-scan's HashMap overwrites earlier entries with later ones when
+        // the same variable name appears in different branches.
         let var_type = ctx
-            .local_types
+            .scope_type_overrides
             .get(&var_name)
             .cloned()
+            .or_else(|| ctx.local_types.get(&var_name).cloned())
             .unwrap_or(CType::Int);
 
         // Build an ExprLoweringContext and call decl_lowering::lower_local_initializer

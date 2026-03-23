@@ -431,6 +431,15 @@ fn parse_cast_expression(parser: &mut Parser<'_>) -> Result<Expression, ()> {
         return parse_unary_expression(parser);
     }
 
+    // Case 1b: `(__extension__ ...)` — `__extension__` is a unary prefix
+    // that applies to expressions, not to type names.  Patterns like
+    // `(__extension__ (int)(x))` are parenthesized expressions containing
+    // `__extension__` applied to the cast `(int)(x)`.  They must NOT be
+    // mis-parsed as casts of the form `(__extension__-type) expr`.
+    if next.is(&TokenKind::Extension) {
+        return parse_unary_expression(parser);
+    }
+
     // Case 2 & 3: Check if the token after `(` could start a type name.
     if types::is_type_specifier_start(&next.kind, parser) {
         let start_span = parser.current_span();
@@ -610,9 +619,11 @@ fn parse_unary_expression(parser: &mut Parser<'_>) -> Result<Expression, ()> {
         TokenKind::Alignof => parse_alignof_expression(parser),
 
         // __extension__ — suppress pedantic warnings, parse following expr.
+        // Must use parse_cast_expression (not parse_unary_expression) so that
+        // patterns like `__extension__ (Type)(value)` are parsed correctly.
         TokenKind::Extension => {
             parser.advance();
-            parse_unary_expression(parser)
+            parse_cast_expression(parser)
         }
 
         // GCC __real__ / __imag__ — extract real/imaginary part of _Complex.
@@ -1154,9 +1165,11 @@ fn parse_primary_expression(parser: &mut Parser<'_>) -> Result<Expression, ()> {
         TokenKind::BuiltinPrefetch => parse_builtin_simple(parser, BuiltinKind::PrefetchData),
 
         // __extension__ — suppress pedantic warnings for the next expr.
+        // Must use parse_cast_expression (not parse_unary_expression) so that
+        // patterns like `__extension__ (Type)(value)` are parsed correctly.
         TokenKind::Extension => {
             parser.advance();
-            parse_unary_expression(parser)
+            parse_cast_expression(parser)
         }
 
         // Semicolon or EOF — the expression is missing.

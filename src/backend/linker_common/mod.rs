@@ -951,37 +951,87 @@ pub fn link(
 
                 // Patch R_*_COPY entries in .rela.dyn — their r_offset was 0
                 // when generated and must now point to .bss.copy VA + offset.
+                //
+                // IMPORTANT: We must match each COPY relocation to its
+                // symbol by looking up the r_info sym_index in .dynsym/
+                // .dynstr, NOT by sequential index.  The copy_symbols
+                // list is ordered by first encounter in input relocations
+                // while the COPY relocs in .rela.dyn follow the
+                // imported_symbols / sym_table iteration order — these
+                // two orders can diverge for multi-file links with
+                // several copy-relocated data symbols (e.g. stderr,
+                // stdin, stdout).  Sequential matching causes
+                // relocation-address / symbol-address mismatches that
+                // make the dynamic linker copy the wrong data, silently
+                // swapping stdin and stdout.
                 let copy_reloc_type = dynamic::default_copy_reloc(config.target);
+
+                // Build a name→.bss.copy VA map for the copy symbols.
+                let mut copy_addr_by_name: FxHashMap<String, u64> = FxHashMap::default();
+                {
+                    let mut coff: u64 = 0;
+                    for (cname, csize) in &copy_symbols {
+                        copy_addr_by_name.insert(cname.clone(), bss_copy_va + coff);
+                        coff += *csize as u64;
+                    }
+                }
+
+                // Pre-read .dynsym and .dynstr so we can resolve the
+                // sym_index inside each COPY relocation to a symbol name.
+                let dynsym_snap = section_data_map.get(".dynsym").cloned();
+                let dynstr_snap = section_data_map.get(".dynstr").cloned();
+
                 if let Some(rela_data) = section_data_map.get_mut(".rela.dyn") {
                     let entry_size = if is64 { 24usize } else { 12usize };
+                    let sym_entry_size = if is64 { 24usize } else { 16usize };
                     let num_entries = rela_data.len() / entry_size;
-                    let mut copy_idx: usize = 0;
-                    let mut copy_offset: u64 = 0;
                     for i in 0..num_entries {
                         let base = i * entry_size;
                         if is64 {
-                            // Read r_info to check relocation type
                             let r_info = u64::from_le_bytes(
                                 rela_data[base + 8..base + 16].try_into().unwrap(),
                             );
                             let rtype = (r_info & 0xFFFF_FFFF) as u32;
-                            if rtype == copy_reloc_type && copy_idx < copy_symbols.len() {
-                                let addr = bss_copy_va + copy_offset;
-                                // Patch r_offset
+                            if rtype != copy_reloc_type {
+                                continue;
+                            }
+                            let sym_idx = (r_info >> 32) as usize;
+                            // Resolve sym_idx → name via .dynsym/.dynstr
+                            let name = resolve_dynsym_name(
+                                sym_idx,
+                                sym_entry_size,
+                                dynsym_snap.as_deref(),
+                                dynstr_snap.as_deref(),
+                                is64,
+                            );
+                            if let Some(addr) = name
+                                .as_ref()
+                                .and_then(|n| copy_addr_by_name.get(n.as_str()))
+                            {
                                 rela_data[base..base + 8].copy_from_slice(&addr.to_le_bytes());
-                                copy_offset += copy_symbols[copy_idx].1 as u64;
-                                copy_idx += 1;
                             }
                         } else {
                             let r_info = u32::from_le_bytes(
                                 rela_data[base + 4..base + 8].try_into().unwrap(),
                             );
                             let rtype = r_info & 0xFF;
-                            if rtype == copy_reloc_type && copy_idx < copy_symbols.len() {
-                                let addr = (bss_copy_va + copy_offset) as u32;
-                                rela_data[base..base + 4].copy_from_slice(&addr.to_le_bytes());
-                                copy_offset += copy_symbols[copy_idx].1 as u64;
-                                copy_idx += 1;
+                            if rtype != copy_reloc_type {
+                                continue;
+                            }
+                            let sym_idx = (r_info >> 8) as usize;
+                            let name = resolve_dynsym_name(
+                                sym_idx,
+                                sym_entry_size,
+                                dynsym_snap.as_deref(),
+                                dynstr_snap.as_deref(),
+                                is64,
+                            );
+                            if let Some(addr) = name
+                                .as_ref()
+                                .and_then(|n| copy_addr_by_name.get(n.as_str()))
+                            {
+                                let addr32 = *addr as u32;
+                                rela_data[base..base + 4].copy_from_slice(&addr32.to_le_bytes());
                             }
                         }
                     }
@@ -2400,7 +2450,7 @@ fn write_elf_output(
 fn build_program_headers(
     config: &LinkerConfig,
     ordered_sections: &[&section_merger::OutputSection],
-    _address_map: &section_merger::AddressMap,
+    address_map: &section_merger::AddressMap,
     writer: &mut ElfWriter,
 ) {
     // Use the linker script to compute the segment layout from section info.
@@ -2408,13 +2458,23 @@ fn build_program_headers(
     let mut script = linker_script::DefaultLinkerScript::new(config.target, is_shared);
 
     // Build InputSectionInfo for each output section.
+    // Use updated sizes from address_map when available — the address map
+    // is patched after late additions (e.g. synthetic _start stub appended
+    // to .text), whereas ordered_sections retains original pre-stub sizes.
     let section_infos: Vec<linker_script::InputSectionInfo> = ordered_sections
         .iter()
-        .map(|sec| linker_script::InputSectionInfo {
-            name: sec.name.clone(),
-            size: sec.total_size,
-            alignment: sec.alignment,
-            flags: sec.flags as u32,
+        .map(|sec| {
+            let size = address_map
+                .section_addresses
+                .get(&sec.name)
+                .map(|a| a.size)
+                .unwrap_or(sec.total_size);
+            linker_script::InputSectionInfo {
+                name: sec.name.clone(),
+                size,
+                alignment: sec.alignment,
+                flags: sec.flags as u32,
+            }
         })
         .collect();
 
@@ -2486,6 +2546,41 @@ fn dynamic_section_attributes(name: &str, config: &LinkerConfig) -> (u32, u64, u
 // ============================================================================
 // Copy Relocation Helpers
 // ============================================================================
+
+/// Resolve a `.dynsym` index to its symbol name string via `.dynstr`.
+///
+/// This is used when patching `R_*_COPY` relocations so that we match each
+/// relocation to the correct copy symbol **by name** rather than by
+/// sequential position (which can diverge between the `copy_symbols` list
+/// and the `.rela.dyn` emission order).
+fn resolve_dynsym_name(
+    sym_idx: usize,
+    sym_entry_size: usize,
+    dynsym: Option<&[u8]>,
+    dynstr: Option<&[u8]>,
+    is64: bool,
+) -> Option<String> {
+    let dynsym = dynsym?;
+    let dynstr = dynstr?;
+    let base = sym_idx * sym_entry_size;
+    if base + sym_entry_size > dynsym.len() {
+        return None;
+    }
+    // st_name is always the first 4 bytes of Elf32_Sym / Elf64_Sym.
+    let st_name = u32::from_le_bytes(dynsym[base..base + 4].try_into().ok()?) as usize;
+    let _ = is64; // st_name offset is identical for both Elf32 and Elf64
+    if st_name >= dynstr.len() {
+        return None;
+    }
+    let end = dynstr[st_name..]
+        .iter()
+        .position(|&b| b == 0)
+        .map(|p| st_name + p)
+        .unwrap_or(dynstr.len());
+    std::str::from_utf8(&dynstr[st_name..end])
+        .ok()
+        .map(|s| s.to_string())
+}
 
 /// Returns `true` if `name` is a known libc **data** symbol that requires a
 /// copy relocation (`R_*_COPY`) rather than a PLT entry. Data symbols need

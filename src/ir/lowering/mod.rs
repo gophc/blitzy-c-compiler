@@ -129,6 +129,12 @@ thread_local! {
 
     // Counter for generating unique anonymous compound literal global names.
     pub(super) static COMPOUND_LITERAL_COUNTER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+
+    // Enum constants map — maps enum constant names to their integer values.
+    // Populated BEFORE struct collection (Pass 0) so that array dimensions
+    // using enum constants (e.g., `TString *tmname[TM_N]`) can be resolved
+    // during struct field extraction.
+    pub(super) static ENUM_CONSTANTS_TL: RefCell<Option<FxHashMap<String, i128>>> = const { RefCell::new(None) };
 }
 
 // ============================================================================
@@ -778,6 +784,50 @@ pub fn lower_translation_unit(
     NAME_TABLE.with(|nt| {
         *nt.borrow_mut() = Some(name_table.to_vec());
     });
+
+    // ====================================================================
+    // Pass 0-pre — Early enum constant collection for struct array sizes
+    // ====================================================================
+    // Enum constants must be available BEFORE both typedef collection
+    // (Pass 0.5) and struct collection (Pass 0) because struct field
+    // array dimensions may reference enum constants (e.g.,
+    // `TString *tmname[TM_N]` in Lua's global_State).  When a typedef
+    // wraps such a struct (e.g., `typedef struct global_State { ... }
+    // global_State;`), the typedef pass calls extract_struct_union_fields
+    // → evaluate_const_int_expr which must be able to resolve enum
+    // constant identifiers to their integer values.
+    //
+    // This pass MUST run BEFORE Pass 0.5 (typedef collection).
+    {
+        let mut early_enum_map = FxHashMap::default();
+        for ext_decl in &translation_unit.declarations {
+            match ext_decl {
+                ast::ExternalDeclaration::Declaration(decl) => {
+                    collect_enum_constants_from_specifiers(
+                        &decl.specifiers.type_specifiers,
+                        name_table,
+                        &mut early_enum_map,
+                    );
+                }
+                ast::ExternalDeclaration::FunctionDefinition(func_def) => {
+                    collect_enum_constants_from_specifiers(
+                        &func_def.specifiers.type_specifiers,
+                        name_table,
+                        &mut early_enum_map,
+                    );
+                    collect_enum_constants_from_compound(
+                        &func_def.body,
+                        name_table,
+                        &mut early_enum_map,
+                    );
+                }
+                _ => {}
+            }
+        }
+        ENUM_CONSTANTS_TL.with(|ec| {
+            *ec.borrow_mut() = Some(early_enum_map);
+        });
+    }
 
     // Initialize the typedef map with builtin typedefs BEFORE scanning
     // user code, so that typedef chains (e.g., typedef __builtin_va_list
@@ -1890,6 +1940,43 @@ fn try_eval_const_int_expr_ctx(
         // Parenthesized expression — just unwrap.
         ast::Expression::Parenthesized { inner, .. } => {
             try_eval_const_int_expr_ctx(inner, name_table, enum_map)
+        }
+        // Ternary / conditional expression: `cond ? then : else`
+        // Required for glibc's ctype.h which uses _ISbit() macro
+        // that expands to a ternary in enum initializers.
+        ast::Expression::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+            ..
+        } => {
+            let cond = try_eval_const_int_expr_ctx(condition, name_table, enum_map)?;
+            if cond != 0 {
+                // If then_expr is None, this is the GCC `x ?: y` extension —
+                // the result is the condition value itself.
+                if let Some(ref then_e) = then_expr {
+                    try_eval_const_int_expr_ctx(then_e, name_table, enum_map)
+                } else {
+                    Some(cond)
+                }
+            } else {
+                try_eval_const_int_expr_ctx(else_expr, name_table, enum_map)
+            }
+        }
+        // Comma expression — evaluate all sub-expressions, return the last value.
+        ast::Expression::Comma { exprs, .. } => {
+            let mut last = None;
+            for e in exprs {
+                last = try_eval_const_int_expr_ctx(e, name_table, enum_map);
+            }
+            last
+        }
+        // Sizeof(type) — needed for enum initializers that reference sizeof.
+        ast::Expression::SizeofType { type_name, .. } => {
+            let target = crate::common::target::Target::X86_64;
+            let tb = crate::common::type_builder::TypeBuilder::new(target);
+            let ct = resolve_type_name_for_const(type_name, &target, &tb);
+            Some(crate::common::types::sizeof_ctype(&ct, &target) as i128)
         }
         _ => None,
     }

@@ -5386,6 +5386,38 @@ fn evaluate_const_int_expr(expr: &ast::Expression) -> Option<usize> {
                 compute_struct_field_offset(&resolved, &chain, target)
             })
         }
+        // Handle identifiers — enum constants used as array sizes or in
+        // constant expressions (e.g., `int arr[NUM_ITEMS]` where NUM_ITEMS
+        // is an enum constant).  Look up the identifier in the
+        // ENUM_CONSTANTS_TL thread-local populated during early enum
+        // collection (before struct definition collection).
+        ast::Expression::Identifier { name, .. } => {
+            super::ENUM_CONSTANTS_TL.with(|ec| {
+                let ec_borrow = ec.borrow();
+                if let Some(ref map) = *ec_borrow {
+                    // Resolve the symbol to a string
+                    let name_str = super::NAME_TABLE.with(|nt| {
+                        let nt_borrow = nt.borrow();
+                        if let Some(ref table) = *nt_borrow {
+                            let idx = name.as_u32() as usize;
+                            if idx < table.len() {
+                                Some(table[idx].clone())
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(ref name_s) = name_str {
+                        if let Some(&val) = map.get(name_s) {
+                            return Some(val as usize);
+                        }
+                    }
+                }
+                None
+            })
+        }
         _ => None,
     }
 }
