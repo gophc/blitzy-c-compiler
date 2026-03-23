@@ -256,6 +256,20 @@ pub enum X86Opcode {
     /// Used for intra-block branching sequences (e.g. unsigned u64→f64
     /// conversion) that need forward-reference labels resolved locally.
     InternalLabelDef,
+
+    // -- x87 FPU instructions (for long double ABI compliance) --
+    /// `FLD QWORD [mem]` — load 64-bit double from memory into x87 ST(0),
+    /// automatically converting to 80-bit extended precision internally.
+    /// Opcode: 0xDD /0 (ModRM.reg = 0).
+    FldMem64,
+    /// `FSTP TWORD [mem]` — store 80-bit extended precision from x87 ST(0)
+    /// to 10-byte memory location, then pop the FPU stack.
+    /// Opcode: 0xDB /7 (ModRM.reg = 7).
+    FstpMem80,
+    /// `FSTP QWORD [mem]` — store 64-bit double from x87 ST(0)
+    /// to 8-byte memory location, then pop the FPU stack.
+    /// Opcode: 0xDD /3 (ModRM.reg = 3).
+    FstpMem64,
 }
 
 impl X86Opcode {
@@ -388,6 +402,9 @@ impl X86Opcode {
             X86Opcode::RepMovsq,
             X86Opcode::InlineAsm,
             X86Opcode::InternalLabelDef,
+            X86Opcode::FldMem64,
+            X86Opcode::FstpMem80,
+            X86Opcode::FstpMem64,
         ];
         TABLE.get(val as usize).copied()
     }
@@ -1080,8 +1097,13 @@ impl X86_64CodeGen {
                     // consume a register.
                     continue;
                 }
+                // F80 (long double) is MEMORY-class per AMD64 ABI — does not
+                // consume a register slot. It is passed on the stack.
+                if matches!(p.ty, IrType::F80) {
+                    continue;
+                }
                 // Detect SSE-class scalars and small SSE arrays (e.g. _Complex float).
-                let is_fp = matches!(p.ty, IrType::F32 | IrType::F64 | IrType::F80)
+                let is_fp = matches!(p.ty, IrType::F32 | IrType::F64)
                     || matches!(&p.ty, IrType::Array(ref elem, count)
                         if *count <= 2
                             && param_size <= 8
@@ -1658,11 +1680,13 @@ impl X86_64CodeGen {
             // Check bare scalar floats AND SSE-class structs (e.g.
             // `struct { double d; }` which is ABI-classified as SSE
             // and must be passed in an XMM register, not a GPR).
-            let is_fp = matches!(param.ty, IrType::F32 | IrType::F64 | IrType::F80) || {
+            // F80 (long double) is MEMORY-class → passed on the stack,
+            // not in SSE registers. Exclude from SSE routing.
+            let is_fp = matches!(param.ty, IrType::F32 | IrType::F64) || {
                 if let IrType::Struct(ref st) = param.ty {
                     let sz = param.ty.size_bytes(&self.target);
                     if sz <= 8 && st.fields.len() == 1 {
-                        matches!(st.fields[0], IrType::F32 | IrType::F64 | IrType::F80)
+                        matches!(st.fields[0], IrType::F32 | IrType::F64)
                     } else {
                         false
                     }
@@ -5905,7 +5929,9 @@ impl X86_64CodeGen {
                     return None;
                 }
                 let ap_slot = self.get_value(args[0]);
-                let is_float_arg = matches!(ret_type, IrType::F32 | IrType::F64 | IrType::F80);
+                // F80 (long double) is MEMORY-class — it uses the
+                // overflow_arg_area (stack path), not fp_offset.
+                let is_float_arg = matches!(ret_type, IrType::F32 | IrType::F64);
                 let mut out = Vec::new();
 
                 let rcx = MachineOperand::Register(RCX);
@@ -6543,7 +6569,14 @@ impl X86_64CodeGen {
         //    (pre-clobber) register values.  The parallel-move resolver
         //    (`resolve_call_arg_conflicts`) then handles any remaining
         //    reg-to-reg conflicts among the register arguments.
-        let mut stack_args: Vec<(MachineOperand, bool)> = Vec::new(); // (operand, is_fp)
+        // Stack argument kind: Int = integer/pointer, Fp = F32/F64, F80 = long double
+        #[derive(Clone, Copy, PartialEq)]
+        enum StackArgKind {
+            Int,
+            Fp,
+            F80,
+        }
+        let mut stack_args: Vec<(MachineOperand, StackArgKind)> = Vec::new();
         let mut reg_arg_setup: Vec<MachineInstruction> = Vec::new();
         // For MEMORY-class (>16 byte) struct arguments: each inner Vec is
         // one argument's push operands. Outer Vec is in argument order;
@@ -6646,7 +6679,14 @@ impl X86_64CodeGen {
                             reg_arg_setup.push(inst);
                             gpr_idx += 1;
                         } else {
-                            stack_args.push((mem_base, cls == AbiClass::Sse));
+                            stack_args.push((
+                                mem_base,
+                                if cls == AbiClass::Sse {
+                                    StackArgKind::Fp
+                                } else {
+                                    StackArgKind::Int
+                                },
+                            ));
                             stack_offset += 8;
                         }
                     } else if int_avail && sse_avail && eb_classes.len() >= 2 {
@@ -6742,8 +6782,8 @@ impl X86_64CodeGen {
                             },
                             _ => arg_op.clone(),
                         };
-                        stack_args.push((mem_base, false));
-                        stack_args.push((mem_hi, false));
+                        stack_args.push((mem_base, StackArgKind::Int));
+                        stack_args.push((mem_hi, StackArgKind::Int));
                         stack_offset += 16;
                     }
                     continue;
@@ -6802,8 +6842,22 @@ impl X86_64CodeGen {
                 } else {
                     // Same lo-before-hi ordering as struct_load_source path:
                     // lo at higher index → pushed first in reverse → lowest addr.
-                    stack_args.push((arg_op, pair_is_sse));
-                    stack_args.push((hi_op, pair_is_sse));
+                    stack_args.push((
+                        arg_op,
+                        if pair_is_sse {
+                            StackArgKind::Fp
+                        } else {
+                            StackArgKind::Int
+                        },
+                    ));
+                    stack_args.push((
+                        hi_op,
+                        if pair_is_sse {
+                            StackArgKind::Fp
+                        } else {
+                            StackArgKind::Int
+                        },
+                    ));
                     stack_offset += 16;
                 }
                 continue;
@@ -6954,17 +7008,40 @@ impl X86_64CodeGen {
                 }
             }
 
+            // ---- F80 (long double) special handling ----
+            // Per the AMD64 ABI, long double is classified as X87/X87UP
+            // and always passed in memory (on the stack) as 80-bit
+            // extended precision (10 bytes in a 16-byte aligned slot).
+            // BCC internally stores long double as a 64-bit double.
+            // We use x87 FLD QWORD / FSTP TBYTE to convert the internal
+            // double representation to 80-bit extended format on the stack.
+            let is_f80 = self
+                .value_types
+                .get(arg_val)
+                .map(|ty| matches!(ty, IrType::F80))
+                .unwrap_or(false);
+            if is_f80 {
+                // F80 arguments are collected for stack pushing later.
+                // The arg_op holds the XMM register or memory operand
+                // containing the double value.
+                stack_args.push((arg_op, StackArgKind::F80));
+                stack_offset += 16; // 16 bytes for long double on stack
+                continue;
+            }
+
             // Classify the argument as FP or integer by consulting the
             // value_types map (populated from IR instruction result types).
-            // F32, F64, and F80 arguments are routed to XMM0–XMM7 per the
+            // F32 and F64 arguments are routed to XMM0–XMM7 per the
             // System V AMD64 ABI; all other types use integer GPRs.
             // Also includes _Complex float (Array(F32, 2), 8 bytes) which
             // fits in a single XMM register.
+            // NOTE: F80 (long double) is handled above — it is passed
+            // on the stack via x87 FLD/FSTP conversion, not through XMM.
             let is_fp = self
                 .value_types
                 .get(arg_val)
                 .map(|ty| {
-                    matches!(ty, IrType::F32 | IrType::F64 | IrType::F80)
+                    matches!(ty, IrType::F32 | IrType::F64)
                         || matches!(ty, IrType::Array(ref elem, count)
                             if *count <= 2
                                 && ty.size_bytes(&self.target) <= 8
@@ -7009,7 +7086,14 @@ impl X86_64CodeGen {
                 gpr_idx += 1;
             } else {
                 // Collect stack arguments for reverse-order pushing.
-                stack_args.push((arg_op, is_fp));
+                stack_args.push((
+                    arg_op,
+                    if is_fp {
+                        StackArgKind::Fp
+                    } else {
+                        StackArgKind::Int
+                    },
+                ));
                 stack_offset += 8;
             }
         }
@@ -7085,64 +7169,100 @@ impl X86_64CodeGen {
         // Push stack arguments in reverse order (right-to-left) so the
         // first stack argument (leftmost in the source) ends up at the
         // lowest stack address as the ABI requires.
-        for (arg_op, arg_is_fp) in stack_args.into_iter().rev() {
-            if arg_is_fp {
-                // Floating-point values live in XMM registers and CANNOT
-                // be pushed with the PUSH instruction.  Store to scratch
-                // memory (via the existing frame), reload as integer, and
-                // push.  We use a dedicated 8-byte spill slot at [RBP-8]
-                // reserved by frame layout (the first 8 bytes below RBP
-                // after push rbp are always callee-saved or padding).
-                //
-                // Strategy: MOVSD [RBP - frame_size - 8], xmmN  → store
-                //           MOV R11, [RBP - frame_size - 8]      → reload as int
-                //           PUSH R11
-                //
-                // Simpler and more reliable approach: SUB RSP, 8 (emitted
-                // OUTSIDE arg-setup window), then MOVSD [RSP], xmmN, then
-                // the cleanup add at the end covers it.
-                //
-                // Actually simplest: keep fp stack args as Memory operands.
-                // Before the arg-setup window, emit the MOVSD store, then
-                // load the integer and push it.
-                let sub_inst = Self::mk_inst(
-                    X86Opcode::Sub,
-                    Some(MachineOperand::Register(RSP)),
-                    &[MachineOperand::Register(RSP), MachineOperand::Immediate(8)],
-                );
-                out.push(sub_inst);
-                // MOVSD [RSP], xmm (store float to newly allocated stack slot)
-                let mut store_inst = MachineInstruction::new(X86Opcode::Movsd.as_u32());
-                store_inst.operands.push(MachineOperand::Memory {
-                    base: Some(RSP),
-                    index: None,
-                    scale: 1,
-                    displacement: 0,
-                });
-                store_inst.operands.push(arg_op);
-                store_inst.is_call_arg_setup = true;
-                out.push(store_inst);
-            } else {
-                match &arg_op {
-                    MachineOperand::GlobalSymbol(_) => {
-                        // The x86-64 PUSH instruction cannot encode a 64-bit
-                        // address operand directly.  For function references
-                        // and global variable addresses (represented as
-                        // GlobalSymbol operands), materialize the address into
-                        // the scratch register R11 via LEA, then push R11.
-                        let r11 = MachineOperand::Register(R11);
-                        let mut lea_inst =
-                            Self::mk_inst(X86Opcode::Lea, Some(r11.clone()), &[arg_op]);
-                        lea_inst.is_call_arg_setup = true;
-                        out.push(lea_inst);
-                        let mut push_inst = Self::mk_inst(X86Opcode::Push, None, &[r11]);
-                        push_inst.is_call_arg_setup = true;
-                        out.push(push_inst);
-                    }
-                    _ => {
-                        let mut push_inst = Self::mk_inst(X86Opcode::Push, None, &[arg_op]);
-                        push_inst.is_call_arg_setup = true;
-                        out.push(push_inst);
+        for (arg_op, arg_kind) in stack_args.into_iter().rev() {
+            match arg_kind {
+                StackArgKind::F80 => {
+                    // ---- Long double (F80) stack argument ----
+                    // Per AMD64 ABI, long double occupies 16 bytes on the
+                    // stack in 80-bit x87 extended precision format.
+                    // BCC internally stores long double as a 64-bit double.
+                    // Conversion sequence:
+                    //   1. SUB RSP, 16          — allocate 16-byte stack slot
+                    //   2. MOVSD [RSP], xmmN    — store double to [RSP]
+                    //   3. FLD QWORD [RSP]      — load double into x87 ST(0)
+                    //      (auto-converts to 80-bit extended internally)
+                    //   4. FSTP TWORD [RSP]     — store 80-bit extended to [RSP]
+                    //      (10 bytes of data + 6 bytes padding = 16 bytes)
+                    let sub_inst = Self::mk_inst(
+                        X86Opcode::Sub,
+                        Some(MachineOperand::Register(RSP)),
+                        &[MachineOperand::Register(RSP), MachineOperand::Immediate(16)],
+                    );
+                    out.push(sub_inst);
+                    // Store the double value from XMM register to [RSP]
+                    let mut store_inst = MachineInstruction::new(X86Opcode::Movsd.as_u32());
+                    store_inst.operands.push(MachineOperand::Memory {
+                        base: Some(RSP),
+                        index: None,
+                        scale: 1,
+                        displacement: 0,
+                    });
+                    store_inst.operands.push(arg_op);
+                    store_inst.is_call_arg_setup = true;
+                    out.push(store_inst);
+                    // FLD QWORD [RSP] — load double into x87, converts to 80-bit
+                    let mut fld_inst = MachineInstruction::new(X86Opcode::FldMem64.as_u32());
+                    fld_inst.operands.push(MachineOperand::Memory {
+                        base: Some(RSP),
+                        index: None,
+                        scale: 1,
+                        displacement: 0,
+                    });
+                    fld_inst.is_call_arg_setup = true;
+                    out.push(fld_inst);
+                    // FSTP TWORD [RSP] — store 80-bit extended to stack slot
+                    let mut fstp_inst = MachineInstruction::new(X86Opcode::FstpMem80.as_u32());
+                    fstp_inst.operands.push(MachineOperand::Memory {
+                        base: Some(RSP),
+                        index: None,
+                        scale: 1,
+                        displacement: 0,
+                    });
+                    fstp_inst.is_call_arg_setup = true;
+                    out.push(fstp_inst);
+                }
+                StackArgKind::Fp => {
+                    // Floating-point (F32/F64) values live in XMM registers
+                    // and CANNOT be pushed with the PUSH instruction.
+                    // Strategy: SUB RSP, 8 then MOVSD [RSP], xmmN.
+                    let sub_inst = Self::mk_inst(
+                        X86Opcode::Sub,
+                        Some(MachineOperand::Register(RSP)),
+                        &[MachineOperand::Register(RSP), MachineOperand::Immediate(8)],
+                    );
+                    out.push(sub_inst);
+                    // MOVSD [RSP], xmm (store float to newly allocated stack slot)
+                    let mut store_inst = MachineInstruction::new(X86Opcode::Movsd.as_u32());
+                    store_inst.operands.push(MachineOperand::Memory {
+                        base: Some(RSP),
+                        index: None,
+                        scale: 1,
+                        displacement: 0,
+                    });
+                    store_inst.operands.push(arg_op);
+                    store_inst.is_call_arg_setup = true;
+                    out.push(store_inst);
+                }
+                StackArgKind::Int => {
+                    match &arg_op {
+                        MachineOperand::GlobalSymbol(_) => {
+                            // The x86-64 PUSH instruction cannot encode a 64-bit
+                            // address operand directly. Materialize the address
+                            // into R11 via LEA, then push R11.
+                            let r11 = MachineOperand::Register(R11);
+                            let mut lea_inst =
+                                Self::mk_inst(X86Opcode::Lea, Some(r11.clone()), &[arg_op]);
+                            lea_inst.is_call_arg_setup = true;
+                            out.push(lea_inst);
+                            let mut push_inst = Self::mk_inst(X86Opcode::Push, None, &[r11]);
+                            push_inst.is_call_arg_setup = true;
+                            out.push(push_inst);
+                        }
+                        _ => {
+                            let mut push_inst = Self::mk_inst(X86Opcode::Push, None, &[arg_op]);
+                            push_inst.is_call_arg_setup = true;
+                            out.push(push_inst);
+                        }
                     }
                 }
             }
@@ -7777,6 +7897,9 @@ impl std::fmt::Display for X86Opcode {
             X86Opcode::StoreInd32 => "movl_ind_store",
             X86Opcode::StoreInd16 => "movw_ind_store",
             X86Opcode::StoreInd8 => "movb_ind_store",
+            X86Opcode::FldMem64 => "fld_qword",
+            X86Opcode::FstpMem80 => "fstp_tword",
+            X86Opcode::FstpMem64 => "fstp_qword",
         };
         f.write_str(name)
     }

@@ -2333,6 +2333,35 @@ impl<'a> SemanticAnalyzer<'a> {
         let ctrl_stripped = self.strip_qualifiers(&decayed).clone();
         let mut default_expr_type: Option<CType> = None;
 
+        // C11 §6.5.1.1p3: No two generic associations in the same
+        // _Generic selection shall specify compatible types.
+        // Also, at most one `default` association is allowed.
+        {
+            let mut seen_types: Vec<CType> = Vec::new();
+            let mut seen_default = false;
+            for assoc in associations {
+                if let Some(ref tn) = assoc.type_name {
+                    let assoc_type = self.resolve_type_name(tn);
+                    let assoc_stripped = self.strip_qualifiers(&assoc_type).clone();
+                    for prev in &seen_types {
+                        if self.types_match_generic(&assoc_stripped, prev) {
+                            self.diagnostics
+                                .emit_error(span, "duplicate type name in _Generic association");
+                            return Err(());
+                        }
+                    }
+                    seen_types.push(assoc_stripped);
+                } else {
+                    if seen_default {
+                        self.diagnostics
+                            .emit_error(span, "duplicate default case in _Generic association");
+                        return Err(());
+                    }
+                    seen_default = true;
+                }
+            }
+        }
+
         // First pass: try to match the controlling type against each
         // association's type name.
         for assoc in associations {

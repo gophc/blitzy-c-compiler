@@ -3201,7 +3201,7 @@ fn lower_unary(
                 };
                 let (ir_ty, c_ty) = match suffix {
                     ast::FloatSuffix::F | ast::FloatSuffix::FI => (IrType::F32, CType::Float),
-                    ast::FloatSuffix::L | ast::FloatSuffix::LI => (IrType::F64, CType::LongDouble),
+                    ast::FloatSuffix::L | ast::FloatSuffix::LI => (IrType::F80, CType::LongDouble),
                     ast::FloatSuffix::None | ast::FloatSuffix::I => (IrType::F64, CType::Double),
                 };
                 let val = emit_float_const(ctx, negated, ir_ty, span);
@@ -9523,6 +9523,33 @@ fn lower_generic(
     // This means: array → pointer decay, function → pointer decay,
     // and strip all qualifiers (including on pointee for _Generic).
     let ctrl_ty = generic_lvalue_convert(&ctrl_tv.ty);
+
+    // C11 §6.5.1.1p3: No two generic associations in the same _Generic
+    // selection shall specify compatible types.  Check this before matching.
+    {
+        let mut seen: Vec<CType> = Vec::new();
+        let mut seen_default = false;
+        for assoc in associations {
+            if let Some(ref tn) = assoc.type_name {
+                let aty = resolve_type_name(ctx, tn);
+                let ac = generic_lvalue_convert(&aty);
+                for prev in &seen {
+                    if types::is_compatible(&ac, prev) {
+                        ctx.diagnostics
+                            .emit_error(span, "duplicate type name in _Generic association");
+                        break;
+                    }
+                }
+                seen.push(ac);
+            } else {
+                if seen_default {
+                    ctx.diagnostics
+                        .emit_error(span, "duplicate default case in _Generic association");
+                }
+                seen_default = true;
+            }
+        }
+    }
 
     // Find the matching association.
     // GenericAssociation is a struct with type_name: Option<TypeName> and expression: Box<Expression>.

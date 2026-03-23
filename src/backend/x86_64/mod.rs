@@ -867,6 +867,9 @@ fn x86_opcode_mnemonic(opcode: u32) -> &'static str {
         Some(X86Opcode::RepMovsq) => "rep movsq",
         Some(X86Opcode::InlineAsm) => "# inline asm",
         Some(X86Opcode::InternalLabelDef) => "# label",
+        Some(X86Opcode::FldMem64) => "fldl",
+        Some(X86Opcode::FstpMem80) => "fstpt",
+        Some(X86Opcode::FstpMem64) => "fstpl",
         None => "ud2",
     }
 }

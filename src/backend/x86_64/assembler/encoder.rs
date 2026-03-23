@@ -1604,6 +1604,78 @@ impl X86_64Encoder {
                 }
             }
 
+            // ---- x87 FPU instructions for long double ABI ----
+
+            // FLD QWORD [mem] — load 64-bit double from memory into ST(0)
+            // Opcode: 0xDD /0  (ModRM reg field = 0)
+            X86Opcode::FldMem64 => {
+                match inst.operands.first() {
+                    Some(MachineOperand::Memory {
+                        base,
+                        index,
+                        scale,
+                        displacement,
+                    }) => {
+                        self.encode_reg_mem_op(
+                            &[0xDD],
+                            0, // /0 = FLD
+                            *base,
+                            *index,
+                            *scale,
+                            *displacement,
+                            0, // no REX.W needed for x87
+                        )
+                    }
+                    _ => EncodedInstruction::new(vec![0x0F, 0x0B]), // UD2 fallback
+                }
+            }
+            // FSTP TWORD [mem] — store 80-bit extended from ST(0), pop stack
+            // Opcode: 0xDB /7  (ModRM reg field = 7)
+            X86Opcode::FstpMem80 => {
+                match inst.operands.first() {
+                    Some(MachineOperand::Memory {
+                        base,
+                        index,
+                        scale,
+                        displacement,
+                    }) => {
+                        self.encode_reg_mem_op(
+                            &[0xDB],
+                            7, // /7 = FSTP m80
+                            *base,
+                            *index,
+                            *scale,
+                            *displacement,
+                            0, // no REX.W needed for x87
+                        )
+                    }
+                    _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
+                }
+            }
+            // FSTP QWORD [mem] — store 64-bit double from ST(0), pop stack
+            // Opcode: 0xDD /3  (ModRM reg field = 3)
+            X86Opcode::FstpMem64 => {
+                match inst.operands.first() {
+                    Some(MachineOperand::Memory {
+                        base,
+                        index,
+                        scale,
+                        displacement,
+                    }) => {
+                        self.encode_reg_mem_op(
+                            &[0xDD],
+                            3, // /3 = FSTP m64
+                            *base,
+                            *index,
+                            *scale,
+                            *displacement,
+                            0,
+                        )
+                    }
+                    _ => EncodedInstruction::new(vec![0x0F, 0x0B]),
+                }
+            }
+
             // Catch-all
             _ => {
                 eprintln!(

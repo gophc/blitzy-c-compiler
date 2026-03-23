@@ -381,8 +381,12 @@ pub fn classify_type(ty: &CType, target: &Target) -> AbiClass {
         // float, double → SSE class
         CType::Float | CType::Double => AbiClass::Sse,
 
-        // BCC treats long double as double internally → SSE class
-        CType::LongDouble => AbiClass::Sse,
+        // long double (80-bit extended precision) → MEMORY class
+        // Per the AMD64 ABI, long double is classified as X87/X87UP
+        // which is always passed in memory (on the stack) for both
+        // variadic and non-variadic calls.  Classifying as MEMORY
+        // ensures correct ABI behavior with glibc printf("%Lf", ...).
+        CType::LongDouble => AbiClass::Memory,
 
         // Complex types
         CType::Complex(base) => match base.as_ref() {
@@ -757,11 +761,13 @@ pub fn classify_ir_type_eightbytes(ty: &IrType, target: &Target) -> Vec<AbiClass
         }
         IrType::I128 => vec![AbiClass::Integer, AbiClass::Integer],
         IrType::F32 | IrType::F64 => vec![AbiClass::Sse],
-        // BCC treats long double as double internally (no x87 FPU support).
-        // Classify F80 as SSE so it passes/returns in XMM registers,
-        // matching BCC's internal handling. True x87 precision is not
-        // supported, but the calling convention must be self-consistent.
-        IrType::F80 => vec![AbiClass::Sse],
+        // long double (F80) → MEMORY class
+        // Per the AMD64 ABI, long double is classified as X87/X87UP,
+        // always passed in memory.  We classify as MEMORY so the
+        // calling convention correctly passes F80 values on the stack
+        // using x87 FLD/FSTP conversion from the internal double
+        // representation to 80-bit extended format.
+        IrType::F80 => vec![AbiClass::Memory],
         IrType::Ptr => vec![AbiClass::Integer],
         IrType::Struct(st) => classify_ir_struct_eightbytes(st, target),
         IrType::Array(elem, count) => {
@@ -788,8 +794,8 @@ fn classify_ir_type_scalar(ty: &IrType, target: &Target) -> AbiClass {
             AbiClass::Integer
         }
         IrType::F32 | IrType::F64 => AbiClass::Sse,
-        // BCC treats long double as double → SSE class
-        IrType::F80 => AbiClass::Sse,
+        // long double → MEMORY class (X87/X87UP per AMD64 ABI)
+        IrType::F80 => AbiClass::Memory,
         IrType::Ptr => AbiClass::Integer,
         IrType::Struct(st) => {
             let classes = classify_ir_struct_eightbytes(st, target);
@@ -840,11 +846,11 @@ fn classify_ir_struct_eightbytes(st: &StructType, target: &Target) -> Vec<AbiCla
         // Handle special multi-eightbyte scalar types.
         match field {
             IrType::F80 if start_eb < num_eb => {
-                // BCC treats F80 (long double) as SSE (double) internally
-                classes[start_eb] = merge_abi_class(classes[start_eb], AbiClass::Sse);
+                // long double → MEMORY class per AMD64 ABI (X87/X87UP)
+                classes[start_eb] = merge_abi_class(classes[start_eb], AbiClass::Memory);
                 if start_eb + 1 < num_eb {
                     classes[start_eb + 1] =
-                        merge_abi_class(classes[start_eb + 1], AbiClass::NoClass);
+                        merge_abi_class(classes[start_eb + 1], AbiClass::Memory);
                 }
             }
             IrType::I128 if start_eb < num_eb => {
@@ -938,14 +944,16 @@ fn classify_field_into_eightbytes(
         start_eb
     };
 
-    // BCC treats long double as double internally → SSE class.
+    // long double (80-bit extended) → MEMORY class.
+    // Per AMD64 ABI, a struct containing a long double field is always
+    // passed in memory because X87/X87UP eightbytes force the whole
+    // struct to MEMORY class during post-merge cleanup.
     if matches!(field_ty, CType::LongDouble) && target.long_double_size() == 16 {
         if start_eb < num_eightbytes {
-            classes[start_eb] = merge_abi_class(classes[start_eb], AbiClass::Sse);
+            classes[start_eb] = merge_abi_class(classes[start_eb], AbiClass::Memory);
         }
-        // Second eightbyte is padding (NoClass), not X87Up
         if start_eb + 1 < num_eightbytes {
-            classes[start_eb + 1] = merge_abi_class(classes[start_eb + 1], AbiClass::NoClass);
+            classes[start_eb + 1] = merge_abi_class(classes[start_eb + 1], AbiClass::Memory);
         }
         return;
     }
@@ -1100,8 +1108,8 @@ mod tests {
         assert_eq!(classify_type(&CType::Long, &t), AbiClass::Integer);
         assert_eq!(classify_type(&CType::Float, &t), AbiClass::Sse);
         assert_eq!(classify_type(&CType::Double, &t), AbiClass::Sse);
-        // BCC treats long double as double internally → SSE
-        assert_eq!(classify_type(&CType::LongDouble, &t), AbiClass::Sse);
+        // long double → MEMORY class (X87/X87UP per AMD64 ABI)
+        assert_eq!(classify_type(&CType::LongDouble, &t), AbiClass::Memory);
         assert_eq!(classify_type(&CType::Bool, &t), AbiClass::Integer);
         assert_eq!(classify_type(&CType::Char, &t), AbiClass::Integer);
     }
@@ -1201,12 +1209,12 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_return_f80_sse() {
+    fn test_classify_return_f80_indirect() {
         let t = Target::X86_64;
-        // BCC treats long double (F80) as double → SSE return in XMM0
+        // long double (F80) → MEMORY class → returned via hidden pointer (Indirect)
         assert!(matches!(
             classify_return(&IrType::F80, &t),
-            RetLocation::Register(r) if r == registers::XMM0
+            RetLocation::Indirect
         ));
     }
 
@@ -1405,14 +1413,14 @@ mod tests {
     }
 
     #[test]
-    fn test_long_double_sse() {
+    fn test_long_double_memory() {
         let t = Target::X86_64;
-        // BCC treats long double as double → SSE class
-        assert_eq!(classify_type(&CType::LongDouble, &t), AbiClass::Sse);
+        // long double → MEMORY class per AMD64 ABI
+        assert_eq!(classify_type(&CType::LongDouble, &t), AbiClass::Memory);
         let locs = classify_arguments(&[IrType::F80], &t);
         assert_eq!(locs.len(), 1);
-        // Now passes in XMM register (SSE) instead of stack
-        assert!(matches!(locs[0], ArgLocation::Register(_)));
+        // F80 (long double) is passed on the stack (Memory class)
+        assert!(matches!(locs[0], ArgLocation::Stack(_)));
     }
 
     #[test]
