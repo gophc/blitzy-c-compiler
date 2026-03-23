@@ -461,6 +461,26 @@ fn generate_for_arch<A: ArchCodegen>(
         // Update MachineFunction with allocation results.
         apply_allocation_result(&mut mf, &alloc_result, &ctx.target);
 
+        // ── Stack alignment fixup ────────────────────────────────────
+        // System V AMD64 / i386 ABIs require RSP ≡ 0 (mod 16) before
+        // any CALL instruction.  After the prologue:
+        //
+        //   push rbp             ; RSP goes from 8 mod 16 → 0 mod 16
+        //   sub rsp, frame_size  ; RSP stays 0 mod 16 (frame_size is 16-aligned)
+        //   push <callee-saved>×N ; each push subtracts 8 bytes
+        //
+        // For RSP to remain 0 mod 16: (frame_size + 8·N) must be 0 mod 16.
+        // If frame_size is 0 mod 16 and N is odd, the pushes leave RSP at
+        // 8 mod 16 — violating the ABI.  We pad frame_size by 8 bytes
+        // when (frame_size + 8·N) is not a multiple of 16.
+        if matches!(ctx.target, Target::X86_64 | Target::I686) {
+            let callee_push_bytes = mf.callee_saved_regs.len() * 8;
+            let total = mf.frame_size + callee_push_bytes;
+            if total % 16 != 0 {
+                mf.frame_size += 8;
+            }
+        }
+
         // Resolve integer-division register conflicts.
         // After register allocation, the divisor may be assigned to RAX or
         // RDX — which get clobbered by the dividend setup sequence (MOV RAX
@@ -5797,6 +5817,15 @@ fn emit_assembly_text<A: ArchCodegen>(
             let alloc_result = allocate_registers(&mut intervals, &alloc_reg_info, &ctx.target);
             insert_spill_code_from_result(&mut mf, &alloc_result);
             apply_allocation_result(&mut mf, &alloc_result, &ctx.target);
+
+            // Stack alignment fixup (same as the object-code path).
+            if matches!(ctx.target, Target::X86_64 | Target::I686) {
+                let callee_push_bytes = mf.callee_saved_regs.len() * 8;
+                let total = mf.frame_size + callee_push_bytes;
+                if total % 16 != 0 {
+                    mf.frame_size += 8;
+                }
+            }
 
             // Insert prologue/epilogue.
             let prologue = arch.emit_prologue(&mf);

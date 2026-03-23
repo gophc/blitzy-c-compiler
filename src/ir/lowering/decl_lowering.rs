@@ -2023,8 +2023,20 @@ fn evaluate_constant_expr(
         // FunctionCall — not a compile-time constant, but don't error
         // (some kernel macros produce these in initializer context).
         ast::Expression::FunctionCall { .. } => Some(Constant::Undefined),
-        // MemberAccess and PointerMemberAccess — not compile-time.
+        // MemberAccess and PointerMemberAccess — might be a compile-time
+        // address constant if the expression is an array-to-pointer decay
+        // on a global struct member (e.g. `g.arr` where arr is an array
+        // field inside global struct g).  Use evaluate_address_of_member_chain
+        // to resolve the base symbol + byte offset.
         ast::Expression::MemberAccess { .. } | ast::Expression::PointerMemberAccess { .. } => {
+            if let Some((sym, byte_off)) =
+                evaluate_address_of_member_chain(expr, target, name_table)
+            {
+                if byte_off == 0 {
+                    return Some(Constant::GlobalRef(sym));
+                }
+                return Some(Constant::GlobalRefOffset(sym, byte_off));
+            }
             Some(Constant::Undefined)
         }
         // AddressOfLabel (GCC &&label) — NOT a link-time constant.
@@ -5310,6 +5322,21 @@ fn evaluate_address_of_subscript(
             // &(("X")[0]) — unwrap parentheses and recurse.
             evaluate_address_of_subscript(inner, index, target, name_table)
         }
+        ast::Expression::MemberAccess { .. } | ast::Expression::PointerMemberAccess { .. } => {
+            // &struct_var.array_member[idx] — evaluate the member access
+            // chain to get the base symbol + offset, then add the array
+            // element offset.
+            let (sym, base_off) = evaluate_address_of_member_chain(base, target, name_table)?;
+            // Determine element size from the member expression's type.
+            // The member is expected to be an array type — its element
+            // size is needed to compute the byte offset for `[idx]`.
+            let elem_sz = infer_member_array_element_size(base, target, name_table);
+            Some((sym, base_off + idx_val * elem_sz))
+        }
+        ast::Expression::Cast { operand, .. } => {
+            // &((type)expr)[idx] — unwrap cast and recurse.
+            evaluate_address_of_subscript(operand, index, target, name_table)
+        }
         _ => None,
     }
 }
@@ -5393,6 +5420,88 @@ fn evaluate_address_of_member_chain(
         }
     }
     None
+}
+
+/// Infer the element size when a member-access expression is used as an
+/// array base in a static initializer — e.g., for `g.arr[1]` where `g` is
+/// `struct Outer { struct Inner arr[3]; }`, this returns `sizeof(struct Inner)`.
+///
+/// Walks the member chain to find the struct field type, which should be an
+/// array, and returns the element size of that array.
+/// Infer the array element size when a member-access expression is used
+/// as an array base in a static initializer — e.g., for `g.arr[1]` where
+/// `g` is `struct Outer { struct Inner arr[3]; }`, returns `sizeof(struct Inner)`.
+fn infer_member_array_element_size(
+    member_expr: &ast::Expression,
+    target: &Target,
+    name_table: &[String],
+) -> i64 {
+    // For MemberAccess { object, member }, look up the struct layout from
+    // TYPEOF_CONTEXT, find the member field, and if it is an array,
+    // return the size of one element.
+    if let ast::Expression::MemberAccess { object, member, .. }
+    | ast::Expression::PointerMemberAccess { object, member, .. } = member_expr
+    {
+        let member_name = resolve_sym(name_table, member).to_string();
+        // Get the struct type of the object (e.g. `g` → struct Outer).
+        if let Some(struct_ty) = infer_struct_type_from_expr(object, name_table) {
+            let resolved = resolve_sizeof_struct_ref(struct_ty, target);
+            if let CType::Struct { ref fields, .. } = resolved {
+                for f in fields {
+                    if f.name.as_deref() == Some(&member_name) {
+                        // The field type is the full type of the member.
+                        // If it is an array, we want the element size.
+                        match &f.ty {
+                            CType::Array(elem, _) => {
+                                let elem_resolved =
+                                    resolve_sizeof_struct_ref(elem.as_ref().clone(), target);
+                                let esz = crate::common::types::sizeof_ctype(&elem_resolved, target)
+                                    as i64;
+                                if esz > 0 {
+                                    return esz;
+                                }
+                            }
+                            CType::Pointer(pointee, _) => {
+                                let p_resolved =
+                                    resolve_sizeof_struct_ref(pointee.as_ref().clone(), target);
+                                return crate::common::types::sizeof_ctype(&p_resolved, target)
+                                    as i64;
+                            }
+                            _ => {
+                                return crate::common::types::sizeof_ctype(&f.ty, target) as i64;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: use infer_struct_type_from_expr on the full expression.
+    // This returns the *result type* after the member access, which may
+    // be an array type or an element type depending on how MemberAccess
+    // is modeled.  If it is an array, unwrap it.
+    if let Some(member_ty) = infer_struct_type_from_expr(member_expr, name_table) {
+        let resolved = resolve_sizeof_struct_ref(member_ty, target);
+        match &resolved {
+            CType::Array(elem, _) => {
+                let elem_resolved = resolve_sizeof_struct_ref(elem.as_ref().clone(), target);
+                let esz = crate::common::types::sizeof_ctype(&elem_resolved, target) as i64;
+                if esz > 0 {
+                    return esz;
+                }
+            }
+            _ => {
+                let sz = crate::common::types::sizeof_ctype(&resolved, target) as i64;
+                if sz > 0 {
+                    return sz;
+                }
+            }
+        }
+    }
+
+    // Ultimate fallback — pointer size.
+    target.pointer_width() as i64
 }
 
 /// Infer the element size for pointer arithmetic on a global variable.
