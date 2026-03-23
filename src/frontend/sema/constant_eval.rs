@@ -2288,11 +2288,208 @@ impl<'a> ConstantEvaluator<'a> {
                     _ => Ok(CType::Int),
                 }
             }
+            // Statement expression: `({ T _a = v; _a; })` — the type is the
+            // type of the last expression statement.  We must resolve identifiers
+            // declared inside the compound block from their local declarations
+            // rather than from the outer scope, which doesn't see them.
+            Expression::StatementExpression { compound, .. } => {
+                if let Some(BlockItem::Statement(Statement::Expression(Some(ref inner_expr)))) =
+                    compound.items.last()
+                {
+                    // Build a local type map from compound declarations.
+                    let mut local_types: FxHashMap<Symbol, CType> = FxHashMap::default();
+                    for item in &compound.items {
+                        if let BlockItem::Declaration(decl) = item {
+                            if let Ok(base) =
+                                self.resolve_type_specifiers(&decl.specifiers.type_specifiers, span)
+                            {
+                                for id in &decl.declarators {
+                                    if let Some(sym) = Self::extract_decl_name(&id.declarator) {
+                                        let full_ty = self
+                                            .apply_declarator_type(base.clone(), &id.declarator);
+                                        local_types.insert(sym, full_ty);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return self.infer_expr_type_with_locals(inner_expr, span, &local_types);
+                }
+                Ok(CType::Int)
+            }
             _ => {
                 // Default: assume int for expressions we can't easily type
                 // The full sema will provide accurate types
                 Ok(CType::Int)
             }
+        }
+    }
+
+    /// Extract the declared name (as a Symbol) from a declarator.
+    /// Used by statement-expression typeof inference to build local type maps.
+    fn extract_decl_name(declarator: &Declarator) -> Option<Symbol> {
+        Self::extract_dd_name(&declarator.direct)
+    }
+
+    /// Extract the identifier from a direct declarator.
+    fn extract_dd_name(dd: &DirectDeclarator) -> Option<Symbol> {
+        match dd {
+            DirectDeclarator::Identifier(sym, _) => Some(*sym),
+            DirectDeclarator::Parenthesized(inner) => Self::extract_decl_name(inner),
+            DirectDeclarator::Array { base, .. } => Self::extract_dd_name(base),
+            DirectDeclarator::Function { base, .. } => Self::extract_dd_name(base),
+        }
+    }
+
+    /// Apply pointer/array/function derivations from a declarator to a base type.
+    /// Simplified version for statement-expression typeof inference — handles
+    /// the common cases (plain identifiers, pointer declarators).
+    fn apply_declarator_type(&self, base: CType, declarator: &Declarator) -> CType {
+        let mut ty = base;
+        // Apply pointer chain from the declarator
+        if let Some(ref ptr) = declarator.pointer {
+            ty = self.apply_pointer_chain(ty, ptr);
+        }
+        ty
+    }
+
+    /// Infer expression type with a set of locally-declared variable types,
+    /// used when resolving `typeof` on statement expressions where the inner
+    /// identifiers are declared inside the compound block.
+    fn infer_expr_type_with_locals(
+        &mut self,
+        expr: &Expression,
+        span: Span,
+        locals: &FxHashMap<Symbol, CType>,
+    ) -> Result<CType, ()> {
+        match expr {
+            Expression::Identifier { name, .. } => {
+                // Check locals first, then fall back to variable_types
+                if let Some(ty) = locals.get(name) {
+                    return Ok(ty.clone());
+                }
+                if let Some(ty) = self.variable_types.get(name) {
+                    return Ok(ty.clone());
+                }
+                Ok(CType::Int)
+            }
+            Expression::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+                ..
+            } => {
+                let then_actual = then_expr.as_deref().unwrap_or(condition.as_ref());
+                let then_ty = self.infer_expr_type_with_locals(then_actual, span, locals)?;
+                let else_ty = self.infer_expr_type_with_locals(else_expr, span, locals)?;
+
+                // Apply the same void* null-pointer-constant logic as infer_expr_type.
+                let then_is_void_ptr = matches!(
+                    &then_ty,
+                    CType::Pointer(inner, _) if matches!(inner.as_ref(), CType::Void)
+                );
+                let else_is_void_ptr = matches!(
+                    &else_ty,
+                    CType::Pointer(inner, _) if matches!(inner.as_ref(), CType::Void)
+                );
+
+                if then_is_void_ptr && !else_is_void_ptr {
+                    if self.is_null_pointer_constant(then_actual) {
+                        Ok(else_ty)
+                    } else {
+                        Ok(then_ty)
+                    }
+                } else if else_is_void_ptr && !then_is_void_ptr {
+                    if self.is_null_pointer_constant(else_expr) {
+                        Ok(then_ty)
+                    } else {
+                        Ok(else_ty)
+                    }
+                } else {
+                    Ok(then_ty)
+                }
+            }
+            Expression::Parenthesized { inner, .. } => {
+                self.infer_expr_type_with_locals(inner, span, locals)
+            }
+            Expression::Comma { exprs, .. } => {
+                if let Some(last) = exprs.last() {
+                    self.infer_expr_type_with_locals(last, span, locals)
+                } else {
+                    Ok(CType::Void)
+                }
+            }
+            Expression::Binary {
+                op, left, right, ..
+            } => {
+                use crate::frontend::parser::ast::BinaryOp;
+                match op {
+                    BinaryOp::Equal
+                    | BinaryOp::NotEqual
+                    | BinaryOp::Less
+                    | BinaryOp::LessEqual
+                    | BinaryOp::Greater
+                    | BinaryOp::GreaterEqual
+                    | BinaryOp::LogicalAnd
+                    | BinaryOp::LogicalOr => Ok(CType::Int),
+                    _ => {
+                        let lt = self.infer_expr_type_with_locals(left, span, locals)?;
+                        let _rt = self.infer_expr_type_with_locals(right, span, locals)?;
+                        Ok(lt)
+                    }
+                }
+            }
+            Expression::UnaryOp { op, operand, .. } => match op {
+                UnaryOp::AddressOf => {
+                    let inner = self.infer_expr_type_with_locals(operand, span, locals)?;
+                    Ok(CType::Pointer(
+                        Box::new(inner),
+                        crate::common::types::TypeQualifiers::default(),
+                    ))
+                }
+                UnaryOp::Deref => {
+                    let inner = self.infer_expr_type_with_locals(operand, span, locals)?;
+                    match inner {
+                        CType::Pointer(pointee, _) => Ok(*pointee),
+                        _ => Ok(CType::Int),
+                    }
+                }
+                _ => self.infer_expr_type_with_locals(operand, span, locals),
+            },
+            Expression::Cast { type_name, .. } => self.resolve_type_name(type_name, span),
+            Expression::PostIncrement { operand, .. }
+            | Expression::PostDecrement { operand, .. }
+            | Expression::PreIncrement { operand, .. }
+            | Expression::PreDecrement { operand, .. } => {
+                self.infer_expr_type_with_locals(operand, span, locals)
+            }
+            // Nested statement expression — recurse with merged locals.
+            Expression::StatementExpression { compound, .. } => {
+                if let Some(BlockItem::Statement(Statement::Expression(Some(ref inner_expr)))) =
+                    compound.items.last()
+                {
+                    let mut inner_locals = locals.clone();
+                    for item in &compound.items {
+                        if let BlockItem::Declaration(decl) = item {
+                            if let Ok(base) =
+                                self.resolve_type_specifiers(&decl.specifiers.type_specifiers, span)
+                            {
+                                for id in &decl.declarators {
+                                    if let Some(sym) = Self::extract_decl_name(&id.declarator) {
+                                        let full_ty = self
+                                            .apply_declarator_type(base.clone(), &id.declarator);
+                                        inner_locals.insert(sym, full_ty);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return self.infer_expr_type_with_locals(inner_expr, span, &inner_locals);
+                }
+                Ok(CType::Int)
+            }
+            // For anything else, delegate to the standard infer_expr_type.
+            _ => self.infer_expr_type(expr, span),
         }
     }
 

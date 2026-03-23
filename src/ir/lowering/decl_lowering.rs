@@ -4219,6 +4219,38 @@ fn resolve_typeof_arg(arg: &ast::TypeofArg, name_table: &[String]) -> CType {
 /// This mirrors `SemanticAnalyzer::infer_typeof_expr_type` but operates in
 /// the IR lowering context where the only type information available is the
 /// thread-local `TYPEOF_CONTEXT` (variable name → CType map).
+/// Resolve a struct/union member type for typeof inference.
+/// Given a struct/union type and a member symbol, look through the member
+/// definitions to find the matching member's type.
+fn infer_typeof_resolve_member(
+    struct_ty: &CType,
+    member: crate::common::string_interner::Symbol,
+    name_table: &[String],
+) -> CType {
+    let member_name = resolve_sym(name_table, &member);
+    let resolved = crate::common::types::resolve_typedef(struct_ty);
+    match resolved {
+        CType::Struct { ref fields, .. } | CType::Union { ref fields, .. } => {
+            for f in fields {
+                if let Some(ref fname) = f.name {
+                    if fname.as_str() == member_name {
+                        return f.ty.clone();
+                    }
+                }
+                // Check anonymous struct/union members recursively.
+                if f.name.is_none() {
+                    let inner = infer_typeof_resolve_member(&f.ty, member, name_table);
+                    if !matches!(inner, CType::Int) {
+                        return inner;
+                    }
+                }
+            }
+            CType::Int
+        }
+        _ => CType::Int,
+    }
+}
+
 fn infer_typeof_expr_ctype(expr: &ast::Expression, name_table: &[String]) -> CType {
     match expr {
         // Identifier — look up in the typeof resolution context.
@@ -4334,6 +4366,52 @@ fn infer_typeof_expr_ctype(expr: &ast::Expression, name_table: &[String]) -> CTy
             }
         }
 
+        // Array subscript (a[i]): get element type from base.
+        ast::Expression::ArraySubscript { base, .. } => {
+            let arr_ty = infer_typeof_expr_ctype(base, name_table);
+            match &arr_ty {
+                CType::Array(elem, _) => (**elem).clone(),
+                CType::Pointer(pointee, _) => (**pointee).clone(),
+                _ => arr_ty,
+            }
+        }
+
+        // Member access (s.member): resolve struct type and find member.
+        ast::Expression::MemberAccess { object, member, .. } => {
+            let obj_ty = infer_typeof_expr_ctype(object, name_table);
+            infer_typeof_resolve_member(&obj_ty, *member, name_table)
+        }
+
+        // Pointer member access (p->member): dereference then find member.
+        ast::Expression::PointerMemberAccess { object, member, .. } => {
+            let ptr_ty = infer_typeof_expr_ctype(object, name_table);
+            let obj_ty = match &ptr_ty {
+                CType::Pointer(inner, _) => (**inner).clone(),
+                CType::Array(inner, _) => (**inner).clone(),
+                other => other.clone(),
+            };
+            infer_typeof_resolve_member(&obj_ty, *member, name_table)
+        }
+
+        // Post/pre increment/decrement: type of the operand.
+        ast::Expression::PostIncrement { operand, .. }
+        | ast::Expression::PostDecrement { operand, .. }
+        | ast::Expression::PreIncrement { operand, .. }
+        | ast::Expression::PreDecrement { operand, .. } => {
+            infer_typeof_expr_ctype(operand, name_table)
+        }
+
+        // Compound literal: resolve the type name.
+        ast::Expression::CompoundLiteral { type_name, .. } => {
+            let base =
+                resolve_base_type_from_sqlist_fast(&type_name.specifier_qualifiers, name_table);
+            if let Some(ref abs) = type_name.abstract_declarator {
+                apply_abstract_declarator_to_type(base, abs)
+            } else {
+                base
+            }
+        }
+
         // Function call: for now return Int (full resolution would require
         // looking up the function return type).
         ast::Expression::FunctionCall { .. } => CType::Int,
@@ -4350,8 +4428,231 @@ fn infer_typeof_expr_ctype(expr: &ast::Expression, name_table: &[String]) -> CTy
         // Parenthesized: transparent.
         ast::Expression::Parenthesized { inner, .. } => infer_typeof_expr_ctype(inner, name_table),
 
+        // Statement expression — the type is determined by the last expression
+        // in the compound block.  We must resolve identifiers declared inside
+        // the statement expression from the compound's local declarations.
+        ast::Expression::StatementExpression { compound, .. } => {
+            if let Some(ast::BlockItem::Statement(ast::Statement::Expression(Some(
+                ref inner_expr,
+            )))) = compound.items.last()
+            {
+                // Build a local type map from compound declarations.
+                let mut local_types = crate::common::fx_hash::FxHashMap::default();
+                for item in &compound.items {
+                    if let ast::BlockItem::Declaration(decl) = item {
+                        let base = resolve_base_type_fast(&decl.specifiers, name_table);
+                        for id in &decl.declarators {
+                            if let Some(sym_name) =
+                                extract_declarator_sym_name(&id.declarator, name_table)
+                            {
+                                let full_ty =
+                                    apply_declarator_type(base.clone(), &id.declarator, name_table);
+                                local_types.insert(sym_name, full_ty);
+                            }
+                        }
+                    }
+                }
+                infer_typeof_with_stmt_locals(inner_expr, name_table, &local_types)
+            } else {
+                CType::Int
+            }
+        }
+
         // Default fallback.
         _ => CType::Int,
+    }
+}
+
+/// Extract the declared name as a String from a declarator.
+fn extract_declarator_sym_name(
+    declarator: &ast::Declarator,
+    name_table: &[String],
+) -> Option<String> {
+    extract_dd_sym_name(&declarator.direct, name_table)
+}
+
+fn extract_dd_sym_name(dd: &ast::DirectDeclarator, name_table: &[String]) -> Option<String> {
+    match dd {
+        ast::DirectDeclarator::Identifier(sym, _) => Some(resolve_sym(name_table, sym).to_string()),
+        ast::DirectDeclarator::Parenthesized(inner) => {
+            extract_declarator_sym_name(inner, name_table)
+        }
+        ast::DirectDeclarator::Array { base, .. } => extract_dd_sym_name(base, name_table),
+        ast::DirectDeclarator::Function { base, .. } => extract_dd_sym_name(base, name_table),
+    }
+}
+
+/// Infer typeof expression type with additional local declarations from a
+/// statement expression compound block.  Identifiers are resolved first
+/// from `locals`, then from TYPEOF_CONTEXT, matching the scoping semantics
+/// of GCC's statement expressions used in min/max macros.
+fn infer_typeof_with_stmt_locals(
+    expr: &ast::Expression,
+    name_table: &[String],
+    locals: &crate::common::fx_hash::FxHashMap<String, CType>,
+) -> CType {
+    match expr {
+        ast::Expression::Identifier { name, .. } => {
+            let var_name = resolve_sym(name_table, name).to_string();
+            // Check locals first
+            if let Some(ty) = locals.get(&var_name) {
+                return ty.clone();
+            }
+            // Fall back to TYPEOF_CONTEXT
+            super::TYPEOF_CONTEXT.with(|ctx| {
+                let borrow = ctx.borrow();
+                borrow
+                    .as_ref()
+                    .and_then(|map| map.get(&var_name).cloned())
+                    .unwrap_or(CType::Int)
+            })
+        }
+        ast::Expression::Conditional {
+            then_expr,
+            else_expr,
+            ..
+        } => {
+            if let Some(then_e) = then_expr {
+                infer_typeof_with_stmt_locals(then_e, name_table, locals)
+            } else {
+                infer_typeof_with_stmt_locals(else_expr, name_table, locals)
+            }
+        }
+        ast::Expression::Parenthesized { inner, .. } => {
+            infer_typeof_with_stmt_locals(inner, name_table, locals)
+        }
+        ast::Expression::Comma { exprs, .. } => {
+            if let Some(last) = exprs.last() {
+                infer_typeof_with_stmt_locals(last, name_table, locals)
+            } else {
+                CType::Int
+            }
+        }
+        ast::Expression::Binary { left, op, .. } => {
+            if matches!(
+                op,
+                ast::BinaryOp::Equal
+                    | ast::BinaryOp::NotEqual
+                    | ast::BinaryOp::Less
+                    | ast::BinaryOp::LessEqual
+                    | ast::BinaryOp::Greater
+                    | ast::BinaryOp::GreaterEqual
+                    | ast::BinaryOp::LogicalAnd
+                    | ast::BinaryOp::LogicalOr
+            ) {
+                CType::Int
+            } else {
+                infer_typeof_with_stmt_locals(left, name_table, locals)
+            }
+        }
+        ast::Expression::UnaryOp {
+            op: ast::UnaryOp::Deref,
+            operand,
+            ..
+        } => {
+            let inner = infer_typeof_with_stmt_locals(operand, name_table, locals);
+            match inner {
+                CType::Pointer(pointee, _) | CType::Array(pointee, _) => *pointee,
+                _ => CType::Int,
+            }
+        }
+        ast::Expression::UnaryOp {
+            op: ast::UnaryOp::AddressOf,
+            operand,
+            ..
+        } => {
+            let inner = infer_typeof_with_stmt_locals(operand, name_table, locals);
+            CType::Pointer(
+                Box::new(inner),
+                crate::common::types::TypeQualifiers::default(),
+            )
+        }
+        ast::Expression::UnaryOp {
+            op: ast::UnaryOp::LogicalNot,
+            ..
+        } => CType::Int,
+        ast::Expression::UnaryOp { operand, .. } => {
+            infer_typeof_with_stmt_locals(operand, name_table, locals)
+        }
+        ast::Expression::Cast { type_name, .. } => {
+            let base =
+                resolve_base_type_from_sqlist_fast(&type_name.specifier_qualifiers, name_table);
+            if let Some(ref abs) = type_name.abstract_declarator {
+                apply_abstract_declarator_to_type(base, abs)
+            } else {
+                base
+            }
+        }
+        ast::Expression::PostIncrement { operand, .. }
+        | ast::Expression::PostDecrement { operand, .. }
+        | ast::Expression::PreIncrement { operand, .. }
+        | ast::Expression::PreDecrement { operand, .. } => {
+            infer_typeof_with_stmt_locals(operand, name_table, locals)
+        }
+        // Array subscript (a[i]): get element type from base.
+        ast::Expression::ArraySubscript { base, .. } => {
+            let arr_ty = infer_typeof_with_stmt_locals(base, name_table, locals);
+            match &arr_ty {
+                CType::Array(elem, _) => (**elem).clone(),
+                CType::Pointer(pointee, _) => (**pointee).clone(),
+                _ => arr_ty,
+            }
+        }
+        // Member access (s.member): resolve struct type and find member.
+        ast::Expression::MemberAccess { object, member, .. } => {
+            let obj_ty = infer_typeof_with_stmt_locals(object, name_table, locals);
+            infer_typeof_resolve_member(&obj_ty, *member, name_table)
+        }
+        // Pointer member access (p->member): dereference then find member.
+        ast::Expression::PointerMemberAccess { object, member, .. } => {
+            let ptr_ty = infer_typeof_with_stmt_locals(object, name_table, locals);
+            let obj_ty = match &ptr_ty {
+                CType::Pointer(inner, _) => (**inner).clone(),
+                CType::Array(inner, _) => (**inner).clone(),
+                other => other.clone(),
+            };
+            infer_typeof_resolve_member(&obj_ty, *member, name_table)
+        }
+        // Compound literal: resolve the type name.
+        ast::Expression::CompoundLiteral { type_name, .. } => {
+            let base =
+                resolve_base_type_from_sqlist_fast(&type_name.specifier_qualifiers, name_table);
+            if let Some(ref abs) = type_name.abstract_declarator {
+                apply_abstract_declarator_to_type(base, abs)
+            } else {
+                base
+            }
+        }
+        // sizeof always yields size_t (unsigned long on 64-bit).
+        ast::Expression::SizeofExpr { .. } | ast::Expression::SizeofType { .. } => CType::ULong,
+        // Nested statement expression — collect inner locals and recurse.
+        ast::Expression::StatementExpression { compound, .. } => {
+            if let Some(ast::BlockItem::Statement(ast::Statement::Expression(Some(
+                ref inner_expr,
+            )))) = compound.items.last()
+            {
+                let mut inner_locals = locals.clone();
+                for item in &compound.items {
+                    if let ast::BlockItem::Declaration(decl) = item {
+                        let base = resolve_base_type_fast(&decl.specifiers, name_table);
+                        for id in &decl.declarators {
+                            if let Some(sym_name) =
+                                extract_declarator_sym_name(&id.declarator, name_table)
+                            {
+                                let full_ty =
+                                    apply_declarator_type(base.clone(), &id.declarator, name_table);
+                                inner_locals.insert(sym_name, full_ty);
+                            }
+                        }
+                    }
+                }
+                infer_typeof_with_stmt_locals(inner_expr, name_table, &inner_locals)
+            } else {
+                CType::Int
+            }
+        }
+        // For anything else, delegate to the standard typeof inference.
+        _ => infer_typeof_expr_ctype(expr, name_table),
     }
 }
 

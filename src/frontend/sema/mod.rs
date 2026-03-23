@@ -2708,16 +2708,147 @@ impl<'a> SemanticAnalyzer<'a> {
             // Statement expression — infer from last expression in compound.
             Expression::StatementExpression { compound, .. } => {
                 // The type is the type of the last expression statement.
+                // We must collect local declarations from the compound so that
+                // identifiers declared inside (e.g. `_a` in `({T _a = v; _a;})`)
+                // are resolved to their declared type rather than falling back
+                // to CType::Int.  This is critical for nested statement-expression
+                // macros like min/max where the last expression is a ternary
+                // whose branches reference locally-declared variables.
                 if let Some(crate::frontend::parser::ast::BlockItem::Statement(
                     Statement::Expression(Some(ref expr)),
                 )) = compound.items.last()
                 {
-                    return self.infer_typeof_expr_type(expr);
+                    // Build a map of locally-declared variable names → types.
+                    let mut local_types = FxHashMap::default();
+                    for item in &compound.items {
+                        if let crate::frontend::parser::ast::BlockItem::Declaration(decl) = item {
+                            let base = self.resolve_type_from_specifiers(&decl.specifiers);
+                            for id in &decl.declarators {
+                                if let Some(sym) = self.extract_declarator_name(&id.declarator) {
+                                    let full_ty =
+                                        self.apply_declarator_to_type(base.clone(), &id.declarator);
+                                    local_types.insert(sym, full_ty);
+                                }
+                            }
+                        }
+                    }
+                    return self.infer_typeof_with_locals(expr, &local_types);
                 }
                 CType::Int
             }
             // Default fallback.
             _ => CType::Int,
+        }
+    }
+
+    /// Infer the type of an expression within a statement-expression context,
+    /// where `locals` maps identifiers declared inside the compound block to
+    /// their types.  This is needed because `infer_typeof_expr_type` normally
+    /// resolves identifiers via scope lookup, which does not see variables
+    /// local to the statement expression (the inner scope isn't active during
+    /// typeof evaluation).
+    ///
+    /// Handles recursive descent through Conditional (ternary), Binary,
+    /// UnaryOp, Parenthesized, Comma, Cast, and nested StatementExpression
+    /// nodes so that expressions like `_a < _b ? _a : _b` correctly resolve
+    /// `_a`/`_b` from the local declarations map.
+    fn infer_typeof_with_locals(
+        &self,
+        expr: &Expression,
+        locals: &FxHashMap<crate::common::string_interner::Symbol, CType>,
+    ) -> CType {
+        match expr {
+            Expression::Identifier { name, .. } => {
+                // Check statement-expression locals first, then outer scope.
+                if let Some(ty) = locals.get(name) {
+                    return ty.clone();
+                }
+                if let Some(id) = self.scopes.lookup_ordinary(*name) {
+                    return self.symbols.get(id).ty.clone();
+                }
+                CType::Int
+            }
+            Expression::Conditional {
+                then_expr,
+                else_expr,
+                ..
+            } => {
+                if let Some(then_e) = then_expr {
+                    self.infer_typeof_with_locals(then_e, locals)
+                } else {
+                    self.infer_typeof_with_locals(else_expr, locals)
+                }
+            }
+            Expression::Parenthesized { inner, .. } => self.infer_typeof_with_locals(inner, locals),
+            Expression::Comma { exprs, .. } => {
+                if let Some(last) = exprs.last() {
+                    self.infer_typeof_with_locals(last, locals)
+                } else {
+                    CType::Void
+                }
+            }
+            Expression::Binary { left, .. } => self.infer_typeof_with_locals(left, locals),
+            Expression::UnaryOp {
+                op: ast::UnaryOp::Deref,
+                operand,
+                ..
+            } => {
+                let inner = self.infer_typeof_with_locals(operand, locals);
+                match inner {
+                    CType::Pointer(pointee, _) | CType::Array(pointee, _) => *pointee,
+                    _ => CType::Int,
+                }
+            }
+            Expression::UnaryOp {
+                op: ast::UnaryOp::AddressOf,
+                operand,
+                ..
+            } => {
+                let inner = self.infer_typeof_with_locals(operand, locals);
+                CType::Pointer(Box::new(inner), TypeQualifiers::default())
+            }
+            Expression::UnaryOp { operand, op, .. } => {
+                if matches!(op, ast::UnaryOp::LogicalNot) {
+                    CType::Int
+                } else {
+                    self.infer_typeof_with_locals(operand, locals)
+                }
+            }
+            Expression::Cast { type_name, .. } => self.resolve_type_name(type_name),
+            Expression::PostIncrement { operand, .. }
+            | Expression::PostDecrement { operand, .. }
+            | Expression::PreIncrement { operand, .. }
+            | Expression::PreDecrement { operand, .. } => {
+                self.infer_typeof_with_locals(operand, locals)
+            }
+            // Nested statement expression: recurse with a fresh local map
+            // built from the inner compound's declarations.
+            Expression::StatementExpression { compound, .. } => {
+                if let Some(crate::frontend::parser::ast::BlockItem::Statement(
+                    Statement::Expression(Some(ref inner_expr)),
+                )) = compound.items.last()
+                {
+                    let mut inner_locals = locals.clone();
+                    for item in &compound.items {
+                        if let crate::frontend::parser::ast::BlockItem::Declaration(decl) = item {
+                            let base = self.resolve_type_from_specifiers(&decl.specifiers);
+                            for id in &decl.declarators {
+                                if let Some(sym) = self.extract_declarator_name(&id.declarator) {
+                                    let full_ty =
+                                        self.apply_declarator_to_type(base.clone(), &id.declarator);
+                                    inner_locals.insert(sym, full_ty);
+                                }
+                            }
+                        }
+                    }
+                    return self.infer_typeof_with_locals(inner_expr, &inner_locals);
+                }
+                CType::Int
+            }
+            // For anything not specifically handled, delegate to the standard
+            // typeof inference (which handles FunctionCall, SizeofExpr,
+            // CompoundLiteral, Generic, MemberAccess, etc.).
+            _ => self.infer_typeof_expr_type(expr),
         }
     }
 

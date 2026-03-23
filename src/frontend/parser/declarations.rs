@@ -1204,6 +1204,13 @@ fn parse_struct_or_union_specifier(parser: &mut Parser<'_>) -> Result<TypeSpecif
         parser.enter_recursion()?;
         let mut member_list = Vec::new();
         while !parser.check(&TokenKind::RightBrace) && !parser.current.is_eof() {
+            // Skip empty declarations (bare semicolons) inside struct/union bodies.
+            // These are null statements that contribute no members and must not
+            // affect struct layout.  Example: `struct S { ; int x; };`
+            if parser.check(&TokenKind::Semicolon) {
+                parser.advance();
+                continue;
+            }
             match parse_struct_member(parser) {
                 Ok(m) => member_list.push(m),
                 Err(()) => {
