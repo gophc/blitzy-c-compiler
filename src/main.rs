@@ -2363,6 +2363,48 @@ fn link_object_files(
             }
         }
 
+        // If no plain lib<name>.so was found, try versioned variants
+        // (lib<name>.so.6, .so.2, .so.1, .so.0) in all search dirs.
+        // This handles libraries like libatomic that only ship a
+        // versioned .so.1 symlink without a plain .so in the runtime
+        // library directories.
+        if resolved_soname.is_none() {
+            'versioned_search: for dir in &search_dirs {
+                for ver in &["6", "2", "1", "0"] {
+                    let versioned = format!("lib{}.so.{}", lib_name, ver);
+                    let vpath = std::path::Path::new(dir).join(&versioned);
+                    if vpath.exists() {
+                        resolved_soname = Some(versioned);
+                        break 'versioned_search;
+                    }
+                }
+            }
+        }
+
+        // Also try GCC's cross-compiler library directories if nothing
+        // was found in the standard paths. Libraries like libatomic
+        // have their development symlinks under the GCC tree.
+        if resolved_soname.is_none() {
+            let gcc_lib_dirs: &[&str] = &[
+                "/usr/lib/gcc/x86_64-linux-gnu/13",
+                "/usr/lib/gcc/x86_64-linux-gnu/14",
+                "/usr/lib/gcc/x86_64-linux-gnu/12",
+            ];
+            for dir in gcc_lib_dirs {
+                let candidate = std::path::Path::new(dir).join(&base_so);
+                if candidate.exists() {
+                    if let Ok(header) = std::fs::read(&candidate) {
+                        if header.len() >= 4 && &header[..4] == b"\x7fELF" {
+                            if let Some(soname) = extract_elf_soname(&header) {
+                                resolved_soname = Some(soname);
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
         // If no resolution found, fall back to lib<name>.so.
         let final_soname = resolved_soname.unwrap_or(base_so);
 

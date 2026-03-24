@@ -929,9 +929,19 @@ mod tests {
 
     #[test]
     fn test_read_source_file_with_tempfile() {
-        // Create a temp file with mixed content
+        // Create a temp file with mixed content.
+        // Use a unique file name incorporating thread ID + timestamp
+        // to avoid race conditions when tests run in parallel.
         let temp_dir = std::env::temp_dir();
-        let temp_path = temp_dir.join("bcc_encoding_test.c");
+        let unique_name = format!(
+            "bcc_encoding_test_{:?}_{}.c",
+            std::thread::current().id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let temp_path = temp_dir.join(unique_name);
         let content: Vec<u8> = vec![
             0x69, 0x6E, 0x74, 0x20, // "int "
             0x78, 0x20, 0x3D, 0x20, // "x = "

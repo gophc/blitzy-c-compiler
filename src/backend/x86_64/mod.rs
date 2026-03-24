@@ -595,6 +595,38 @@ impl ArchCodegen for X86_64Backend {
     fn emit_epilogue(&self, mf: &MachineFunction) -> Vec<MachineInstruction> {
         let mut epilogue = Vec::new();
 
+        // Before restoring callee-saved registers, reset RSP to the position
+        // where those registers were pushed during the prologue.
+        //
+        // The prologue layout is:
+        //   push rbp           → RBP = RSP after this + mov rbp,rsp
+        //   sub rsp, aligned_size
+        //   push <callee-saved regs>
+        //
+        // So callee-saved regs sit at [RBP - aligned_size - 8], [RBP - aligned_size - 16], etc.
+        // RSP after all callee-saved pushes = RBP - aligned_total, where:
+        //   aligned_total = (frame_size + callee_push_bytes + 15) & !15
+        //
+        // During the function body, RSP may drift from this position due to
+        // PUSH instructions for call arguments.  The epilogue POP instructions
+        // read from the current RSP, so if RSP drifted, they restore wrong values.
+        // We must reset RSP before the pops.
+        if !mf.callee_saved_regs.is_empty() {
+            let callee_push_bytes = mf.callee_saved_regs.len() * 8;
+            let total = mf.frame_size + callee_push_bytes;
+            let aligned_total = (total + 15) & !15;
+            // LEA RSP, [RBP - aligned_total]
+            let mut lea_rsp = MachineInstruction::new(X86Opcode::Lea.as_u32());
+            lea_rsp.operands.push(MachineOperand::Memory {
+                base: Some(RBP),
+                index: None,
+                scale: 1,
+                displacement: -(aligned_total as i64),
+            });
+            lea_rsp.result = Some(MachineOperand::Register(RSP));
+            epilogue.push(lea_rsp);
+        }
+
         // Restore callee-saved registers in reverse order
         for &reg in mf.callee_saved_regs.iter().rev() {
             let mut pop_inst = MachineInstruction::new(X86Opcode::Pop.as_u32());
@@ -1254,19 +1286,21 @@ mod tests {
         mf.callee_saved_regs = vec![registers::RBX, registers::R12, registers::R13];
 
         let epilogue = backend.emit_epilogue(&mf);
-        // Expect: pop r13, pop r12, pop rbx, mov rsp rbp, pop rbp, ret
-        assert_eq!(epilogue.len(), 6);
+        // Expect: lea rsp [rbp-N], pop r13, pop r12, pop rbx, mov rsp rbp, pop rbp, ret
+        assert_eq!(epilogue.len(), 7);
+        // First instruction is LEA to reset RSP before pops
+        assert_eq!(epilogue[0].opcode, X86Opcode::Lea.as_u32());
         // Callee-saved restores in reverse order: R13, R12, RBX
         assert_eq!(
-            epilogue[0].operands[0],
+            epilogue[1].operands[0],
             MachineOperand::Register(registers::R13)
         );
         assert_eq!(
-            epilogue[1].operands[0],
+            epilogue[2].operands[0],
             MachineOperand::Register(registers::R12)
         );
         assert_eq!(
-            epilogue[2].operands[0],
+            epilogue[3].operands[0],
             MachineOperand::Register(registers::RBX)
         );
     }

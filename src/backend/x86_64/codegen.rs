@@ -1546,6 +1546,28 @@ impl X86_64CodeGen {
     pub fn emit_epilogue(&self, mf: &MachineFunction) -> Vec<MachineInstruction> {
         let mut epilogue = Vec::new();
 
+        // Reset RSP to the callee-save area using RBP-relative LEA.
+        // During the function body, call argument pushes and other RSP
+        // adjustments may cause RSP to drift from the position established
+        // after the prologue.  The pop instructions below rely on RSP
+        // pointing to the bottom of the callee-save area, so we
+        // explicitly restore it here.
+        if !mf.callee_saved_regs.is_empty() {
+            let callee_push_bytes = mf.callee_saved_regs.len() * 8;
+            let total = mf.frame_size + callee_push_bytes;
+            let aligned_total = (total + 15) & !15;
+            epilogue.push(Self::mk_inst(
+                X86Opcode::Lea,
+                Some(MachineOperand::Register(RSP)),
+                &[MachineOperand::Memory {
+                    base: Some(RBP),
+                    index: None,
+                    scale: 1,
+                    displacement: -(aligned_total as i64),
+                }],
+            ));
+        }
+
         // Restore callee-saved registers in reverse order.
         for &reg in mf.callee_saved_regs.iter().rev() {
             epilogue.push(Self::mk_inst(
@@ -2237,7 +2259,18 @@ impl X86_64CodeGen {
                 // Store handler can skip writing it.
                 self.memory_class_params.insert(param.value);
                 stack_param_idx += eightbytes;
-            } else if !is_fp && gpr_idx < INTEGER_ARG_REGS.len() {
+            } else if !is_fp && !is_aggregate_pair && gpr_idx < INTEGER_ARG_REGS.len() {
+                // Scalar integer parameter — single GPR.
+                // IMPORTANT: The `!is_aggregate_pair` guard prevents 16-byte
+                // struct pairs (9–16 bytes, classified as INTEGER/INTEGER)
+                // from being incorrectly assigned to a single register when
+                // only 1 GPR remains.  Without this guard, the callee would
+                // read a struct pair's first eightbyte from a GPR that the
+                // caller actually used for a later scalar parameter (e.g.,
+                // flags), causing an ABI mismatch.  Struct pairs that can't
+                // get 2 consecutive GPRs must fall through to the stack
+                // branch below, matching the caller-side classify_arguments
+                // behavior which also routes them to the stack.
                 let abi_reg = INTEGER_ARG_REGS[gpr_idx];
                 param_insts.push(Self::mk_inst(
                     X86Opcode::Mov,
@@ -7772,6 +7805,28 @@ impl X86_64CodeGen {
     /// Static epilogue emitter.
     fn emit_epilogue_static(mf: &MachineFunction) -> Vec<MachineInstruction> {
         let mut epilogue = Vec::new();
+
+        // Reset RSP to the callee-save area using RBP-relative LEA.
+        // During the function body, call argument pushes and other RSP
+        // adjustments may cause RSP to drift from the position established
+        // after the prologue.  The pop instructions below rely on RSP
+        // pointing to the bottom of the callee-save area, so we
+        // explicitly restore it here.
+        if !mf.callee_saved_regs.is_empty() {
+            let callee_push_bytes = mf.callee_saved_regs.len() * 8;
+            let total = mf.frame_size + callee_push_bytes;
+            let aligned_total = (total + 15) & !15;
+            epilogue.push(Self::mk_inst(
+                X86Opcode::Lea,
+                Some(MachineOperand::Register(RSP)),
+                &[MachineOperand::Memory {
+                    base: Some(RBP),
+                    index: None,
+                    scale: 1,
+                    displacement: -(aligned_total as i64),
+                }],
+            ));
+        }
 
         for &reg in mf.callee_saved_regs.iter().rev() {
             epilogue.push(Self::mk_inst(

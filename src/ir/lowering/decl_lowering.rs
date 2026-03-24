@@ -33,7 +33,7 @@
 //! - `crate::common::*` — Types, diagnostics, target
 
 use crate::common::diagnostics::{DiagnosticEngine, Span};
-use crate::common::fx_hash::FxHashMap;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::target::Target;
 use crate::common::type_builder::TypeBuilder;
 use crate::common::types::{CType, StructField};
@@ -295,6 +295,165 @@ pub fn lower_global_variable(
 // String-in-pointer fixup for static initializers
 // ===========================================================================
 
+/// Recursively checks whether a `Constant` initializer, when paired with
+/// its C-level type, contains data that would require linker relocation:
+/// symbol addresses (`GlobalRef`/`GlobalRefOffset`) or string literals at
+/// pointer-typed positions.  The check walks into struct fields and array
+/// elements to detect nested pointers (e.g. `struct { const char *val; }`
+/// inside a union member).
+///
+/// Used by the union initializer handler to decide whether the member
+/// constant must be preserved in structured form (so that relocations
+/// survive) rather than being serialized to flat bytes.
+fn constant_contains_relocatable(c: &Constant, cty: &CType) -> bool {
+    let resolved = crate::common::types::resolve_typedef(cty);
+    match (c, resolved) {
+        // GlobalRef / GlobalRefOffset always carry relocations.
+        (Constant::GlobalRef(_) | Constant::GlobalRefOffset(_, _), _) => true,
+        // String at a pointer-typed position = string literal as pointer.
+        (Constant::String(_), CType::Pointer(..)) => true,
+        // Recurse into struct fields, matching constant fields to C fields.
+        (Constant::Struct(fields), CType::Struct { fields: defs, .. }) => fields
+            .iter()
+            .zip(defs.iter())
+            .any(|(f, d)| constant_contains_relocatable(f, &d.ty)),
+        // Recurse into array elements.
+        (Constant::Array(elems), CType::Array(elem_ty, _)) => elems
+            .iter()
+            .any(|e| constant_contains_relocatable(e, elem_ty)),
+        // For non-matching type combinations (e.g., Array constant at
+        // Union type position, or Struct constant at a non-Struct type),
+        // fall back to a type-independent deep scan for GlobalRef /
+        // GlobalRefOffset entries.  This catches nested unions within
+        // structs where the inner union handler already serialized the
+        // member to Array form (e.g., JSCFunctionType inside a struct
+        // within QuickJS's JSCFunctionListEntry union).
+        _ => constant_tree_has_global_ref(c),
+    }
+}
+
+/// Type-independent recursive check for `GlobalRef` / `GlobalRefOffset`
+/// anywhere in a `Constant` tree.  This catches relocatable data that
+/// appears in nested structures where the C type and Constant variant
+/// don't align (e.g., a union's inner handler already serialized a
+/// function pointer member to `Array([GlobalRef])` form).
+fn constant_tree_has_global_ref(c: &Constant) -> bool {
+    match c {
+        Constant::GlobalRef(_) | Constant::GlobalRefOffset(_, _) => true,
+        Constant::Struct(fields) => fields.iter().any(constant_tree_has_global_ref),
+        Constant::Array(elems) => elems.iter().any(constant_tree_has_global_ref),
+        _ => false,
+    }
+}
+
+/// Walks a `Constant` initializer alongside its C-level type and collects
+/// the byte offsets of all relocatable entries (GlobalRef, GlobalRefOffset,
+/// String-at-Pointer).
+///
+/// This is used by the union initializer handler to properly distribute a
+/// multi-field struct member across the union's `Array(I64, N)` IR
+/// representation, placing relocatable entries at the correct element
+/// indices while serializing non-relocatable data to byte-packed integers.
+///
+/// For example, `struct { uint8_t a; uint8_t b; func_ptr_union cfunc; }`
+/// produces relocs = `[(8, GlobalRef("fn"))]` because the function pointer
+/// lives at byte offset 8 within the struct (after 2 bytes + 6 padding).
+fn collect_reloc_positions_in_constant(
+    c: &Constant,
+    cty: &CType,
+    base_offset: usize,
+    type_builder: &TypeBuilder,
+    target: &Target,
+    relocs: &mut Vec<(usize, Constant)>,
+) {
+    let resolved = crate::common::types::resolve_typedef(cty);
+    match (c, resolved) {
+        // Direct relocatable entries.
+        (Constant::GlobalRef(_) | Constant::GlobalRefOffset(_, _), _) => {
+            relocs.push((base_offset, c.clone()));
+        }
+        // String literal at a pointer-typed position.
+        (Constant::String(_), CType::Pointer(..)) => {
+            relocs.push((base_offset, c.clone()));
+        }
+        // Recurse into struct fields using the computed layout for correct
+        // byte offsets (respecting alignment and padding).
+        (
+            Constant::Struct(fields),
+            CType::Struct {
+                fields: defs,
+                packed,
+                aligned,
+                ..
+            },
+        ) => {
+            let layout = type_builder.compute_struct_layout_with_fields(defs, *packed, *aligned);
+            for (i, fc) in fields.iter().enumerate() {
+                if let Some(fl) = layout.fields.get(i) {
+                    let ft = if i < defs.len() {
+                        &defs[i].ty
+                    } else {
+                        &CType::Int
+                    };
+                    collect_reloc_positions_in_constant(
+                        fc,
+                        ft,
+                        base_offset + fl.offset,
+                        type_builder,
+                        target,
+                        relocs,
+                    );
+                }
+            }
+        }
+        // Recurse into C array elements.
+        (Constant::Array(elems), CType::Array(elem_ty, _)) => {
+            let elem_size = type_builder.sizeof_type(elem_ty);
+            for (i, e) in elems.iter().enumerate() {
+                collect_reloc_positions_in_constant(
+                    e,
+                    elem_ty,
+                    base_offset + i * elem_size,
+                    type_builder,
+                    target,
+                    relocs,
+                );
+            }
+        }
+        // Inner union already serialized to Array form by the recursive
+        // union handler.  Each element is pointer-width.  Check elements
+        // for relocatable entries.
+        (Constant::Array(elems), CType::Union { .. }) => {
+            let ptr_size: usize = if target.is_64bit() { 8 } else { 4 };
+            for (i, e) in elems.iter().enumerate() {
+                let elem_off = base_offset + i * ptr_size;
+                match e {
+                    Constant::GlobalRef(_)
+                    | Constant::GlobalRefOffset(_, _)
+                    | Constant::String(_) => {
+                        relocs.push((elem_off, e.clone()));
+                    }
+                    // A Struct nested inside an already-serialized union
+                    // element — recursively scan its fields.
+                    Constant::Struct(inner_fields) => {
+                        for f in inner_fields {
+                            if matches!(f, Constant::GlobalRef(_) | Constant::GlobalRefOffset(_, _))
+                            {
+                                // This inner struct's relocatable field
+                                // occupies the same element slot.
+                                relocs.push((elem_off, f.clone()));
+                                break;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Recursively walks a `Constant` initializer alongside its IR type tree
 /// and replaces `Constant::String` values that appear at `IrType::Ptr`
 /// positions with `Constant::GlobalRef` entries.  The raw string bytes
@@ -317,6 +476,37 @@ fn fixup_string_ptrs_in_constant(
             let id = module.intern_string(bytes.clone());
             let label = format!(".L.str.{}", id);
             Constant::GlobalRef(label)
+        }
+        // Union pointer member case: a String constant at an I64 or I32
+        // position within a union-typed Array.  Union IR types are
+        // `Array(I64, N)` (or I32 on 32-bit targets).  When a union
+        // member is a pointer type initialized with a string literal,
+        // the union handler preserves the String constant (instead of
+        // serializing to bytes) so that we can intern it here and
+        // produce a GlobalRef for the linker to relocate.
+        (Constant::String(bytes), IrType::I64 | IrType::I32) => {
+            let id = module.intern_string(bytes.clone());
+            let label = format!(".L.str.{}", id);
+            Constant::GlobalRef(label)
+        }
+        // Struct-within-union case: a Struct constant at an I64 or I32
+        // position.  This occurs when a union member is a struct type
+        // containing pointer fields (e.g., `struct { const char *val; }`).
+        // The union handler preserved the Struct constant (instead of
+        // serializing to bytes) when it detected nested relocatable data.
+        // Recurse into the struct fields, treating each String field as
+        // a pointer to be interned as a GlobalRef.
+        (Constant::Struct(fields), IrType::I64 | IrType::I32) => {
+            let new_fields: Vec<Constant> = fields
+                .iter()
+                .map(|f| {
+                    // Assume every String inside a struct-within-union
+                    // is a pointer.  Non-String constants pass through
+                    // unchanged because they don't match any fixup case.
+                    fixup_string_ptrs_in_constant(f.clone(), &IrType::Ptr, module)
+                })
+                .collect();
+            Constant::Struct(new_fields)
         }
         // Recurse into struct fields.
         (Constant::Struct(fields), IrType::Struct(st)) => {
@@ -586,6 +776,18 @@ pub fn lower_function_definition(
         }
     }
 
+    // --- Save parameter allocas before local variable allocation ---
+    // C11 §6.2.1: Parameter names live in the outermost block scope of
+    // the function body.  Inner-scope local variables with the same name
+    // shadow them only within that inner scope.  The pre-scan
+    // `allocate_local_variables` creates allocas for ALL locals (including
+    // those in nested scopes) and inserts them into `local_vars`, which
+    // would permanently overwrite parameter allocas for same-name locals.
+    // We save the parameter mapping here and restore it after the pre-scan
+    // so that the function body's top-level scope starts with parameter
+    // names correctly mapped to parameter allocas.
+    let param_alloca_map: FxHashMap<String, Value> = local_vars.clone();
+
     // Allocate stack-local variables in entry block.
     let stack_locals: Vec<&LocalVarInfo> = locals.iter().filter(|l| !l.is_static).collect();
     allocate_local_variables(
@@ -595,6 +797,17 @@ pub fn lower_function_definition(
         target,
         &mut local_vars,
     );
+
+    // --- Restore parameter allocas that were overwritten by locals ---
+    // After allocate_local_variables, some parameter names may have been
+    // overwritten by same-name local variables from nested scopes.
+    // Restore the parameter allocas so the function body's top-level scope
+    // sees parameters, not inner-scope locals.  The scope save/restore in
+    // lower_compound_statement will handle re-mapping to local allocas
+    // when we enter the inner scope where the shadowing declaration lives.
+    for (pname, palloca) in &param_alloca_map {
+        local_vars.insert(pname.clone(), *palloca);
+    }
 
     ir_function.local_count = local_vars.len() as u32;
 
@@ -761,6 +974,7 @@ pub fn lower_function_definition(
             layout_cache: FxHashMap::default(),
             vla_sizes: FxHashMap::default(),
             vla_stack_save: None,
+            claimed_vars: FxHashSet::default(),
         };
         stmt_lowering::lower_statement(&mut stmt_ctx, &body_stmt);
     }
@@ -2925,8 +3139,108 @@ fn lower_designated_initializer(
                             return Some(Constant::String(bytes));
                         }
 
-                        // Always serialize the member constant to bytes
-                        // for union types.  This ensures that:
+                        // Check if the member constant carries relocation
+                        // information (address of a global, string literal
+                        // used as a pointer, etc.).  Serializing such
+                        // constants to raw bytes with `constant_to_le_bytes`
+                        // loses the relocation, causing the linker to emit
+                        // zero bytes instead of patching the address.
+                        //
+                        // The check is recursive: it detects not only bare
+                        // pointers (`const char *`) but also struct members
+                        // containing pointers (e.g., `struct { uint8_t a;
+                        // uint8_t b; func_ptr_union cfunc; }`) and nested
+                        // unions (e.g., QuickJS `JSCFunctionType`).
+                        //
+                        // For relocation-bearing constants, we produce an
+                        // `Array(I64, N)` constant that distributes the
+                        // member data across elements based on byte offset:
+                        //  - Relocatable entries (GlobalRef, String-at-ptr)
+                        //    are placed at the element index corresponding
+                        //    to their byte offset / element_size.
+                        //  - Non-relocatable data is serialized to bytes
+                        //    and packed into Integer constants.
+                        //
+                        // This correctly handles multi-field struct members
+                        // where the pointer is NOT at byte offset 0 (e.g.,
+                        // `struct { uint8_t, uint8_t, func_ptr }` has the
+                        // pointer at offset 8, landing in element 1).
+                        let needs_reloc = constant_contains_relocatable(&mc, member_ty);
+                        if needs_reloc {
+                            let union_ir_ty = IrType::from_ctype(target_type, target);
+                            if let IrType::Array(ref elem_ir_ty, count) = union_ir_ty {
+                                let count = count.max(1);
+                                let elem_size = match elem_ir_ty.as_ref() {
+                                    IrType::I64 => 8usize,
+                                    IrType::I32 => 4usize,
+                                    IrType::I16 => 2usize,
+                                    _ => 1usize,
+                                };
+                                let union_size = count * elem_size;
+
+                                // 1) Serialize the member to a byte
+                                //    buffer.  Relocatable entries produce
+                                //    zeros in the buffer (placeholder).
+                                let member_size =
+                                    crate::common::types::sizeof_ctype(member_ty, target);
+                                let mut bytes = constant_to_le_bytes(
+                                    &mc,
+                                    member_size,
+                                    member_ty,
+                                    target,
+                                    type_builder,
+                                );
+                                bytes.resize(union_size, 0);
+
+                                // 2) Collect byte offsets of all
+                                //    relocatable entries.
+                                let mut relocs = Vec::new();
+                                collect_reloc_positions_in_constant(
+                                    &mc,
+                                    member_ty,
+                                    0,
+                                    type_builder,
+                                    target,
+                                    &mut relocs,
+                                );
+
+                                // 3) Build Array elements: relocatable
+                                //    entries at their correct positions,
+                                //    byte-packed Integers elsewhere.
+                                let mut elems = Vec::with_capacity(count);
+                                for i in 0..count {
+                                    let offset = i * elem_size;
+                                    if let Some((_, ref rc)) =
+                                        relocs.iter().find(|(o, _)| *o == offset)
+                                    {
+                                        elems.push(rc.clone());
+                                    } else {
+                                        // Pack serialized bytes into an
+                                        // Integer constant.
+                                        let end = (offset + elem_size).min(bytes.len());
+                                        let start = offset.min(bytes.len());
+                                        let avail = end - start;
+                                        if elem_size <= 4 {
+                                            let mut buf = [0u8; 4];
+                                            buf[..avail].copy_from_slice(&bytes[start..end]);
+                                            elems.push(Constant::Integer(i128::from(
+                                                u32::from_le_bytes(buf),
+                                            )));
+                                        } else {
+                                            let mut buf = [0u8; 8];
+                                            buf[..avail].copy_from_slice(&bytes[start..end]);
+                                            elems.push(Constant::Integer(i128::from(
+                                                u64::from_le_bytes(buf),
+                                            )));
+                                        }
+                                    }
+                                }
+                                return Some(Constant::Array(elems));
+                            }
+                        }
+
+                        // For non-relocation constants, serialize the member
+                        // value to bytes.  This ensures that:
                         //  1. The value is truncated to the member's byte
                         //     width (e.g. -1L stored into int32_t becomes
                         //     4 bytes, not 8).
@@ -6043,21 +6357,217 @@ fn evaluate_sizeof_expr(
             type_builder.sizeof_type(&resolved) as u64
         }
         ast::Expression::SizeofExpr { operand, .. } => {
-            // For sizeof(expr), try to infer the expression type.
-            // Common cases: sizeof(variable), sizeof(*ptr), sizeof(literal).
-            match operand.as_ref() {
-                ast::Expression::IntegerLiteral { .. } => {
-                    // sizeof(integer_literal) — type is int
-                    type_builder.sizeof_type(&CType::Int) as u64
-                }
-                _ => {
-                    // Default to pointer width for unknown expression types.
-                    target.pointer_width() as u64
-                }
-            }
+            // For sizeof(expr), infer the expression type from context.
+            // Uses TYPEOF_CONTEXT thread-local to resolve variable types
+            // so that sizeof(array_variable) returns the full array size
+            // rather than decaying to pointer width.
+            evaluate_sizeof_operand(operand, target, type_builder)
         }
         _ => target.pointer_width() as u64,
     }
+}
+
+/// Resolve the size of a sizeof(expr) operand in a global initializer context.
+/// Uses TYPEOF_CONTEXT to look up variable types so that sizeof(array_var)
+/// returns the full array byte-count instead of decaying to pointer width.
+fn evaluate_sizeof_operand(
+    operand: &ast::Expression,
+    target: &Target,
+    type_builder: &TypeBuilder,
+) -> u64 {
+    match operand {
+        ast::Expression::IntegerLiteral { .. } => type_builder.sizeof_type(&CType::Int) as u64,
+        ast::Expression::StringLiteral { segments, .. } => {
+            let total: usize = segments.iter().map(|s| s.value.len()).sum();
+            (total + 1) as u64
+        }
+        ast::Expression::Identifier { name, .. } => {
+            // Look up the identifier in TYPEOF_CONTEXT — this preserves
+            // array types (C11 §6.3.2.1p3: sizeof suppresses decay).
+            let result = super::TYPEOF_CONTEXT.with(|ctx| {
+                let ctx_borrow = ctx.borrow();
+                if let Some(ref map) = *ctx_borrow {
+                    let name_str = super::NAME_TABLE.with(|nt| {
+                        let nt_borrow = nt.borrow();
+                        if let Some(ref table) = *nt_borrow {
+                            let idx = name.as_u32() as usize;
+                            if idx < table.len() {
+                                Some(table[idx].clone())
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(ns) = name_str {
+                        if let Some(cty) = map.get(&ns) {
+                            let resolved = resolve_sizeof_struct_ref(cty.clone(), target);
+                            return Some(
+                                crate::common::types::sizeof_ctype(&resolved, target) as u64
+                            );
+                        }
+                    }
+                }
+                None
+            });
+            result.unwrap_or(target.pointer_width() as u64)
+        }
+        ast::Expression::ArraySubscript { base, index: _, .. } => {
+            // sizeof(arr[i]) — resolve arr's element type.
+            // The index value is irrelevant for sizeof; we need the
+            // element type of the base expression.
+            let base_type = resolve_expr_type_from_context(base, target);
+            if let Some(cty) = base_type {
+                let elem_ty = match cty {
+                    CType::Array(elem, _) => *elem,
+                    CType::Pointer(pointee, _) => *pointee,
+                    _ => cty,
+                };
+                let resolved = resolve_sizeof_struct_ref(elem_ty, target);
+                crate::common::types::sizeof_ctype(&resolved, target) as u64
+            } else {
+                // Try recursive: if index is integer literal and base is
+                // a known array, get element size
+                target.pointer_width() as u64
+            }
+        }
+        ast::Expression::UnaryOp {
+            op: ast::UnaryOp::Deref,
+            operand: inner,
+            ..
+        } => {
+            // sizeof(*ptr) — resolve pointee type
+            let base_type = resolve_expr_type_from_context(inner, target);
+            if let Some(cty) = base_type {
+                let pointee = match cty {
+                    CType::Pointer(p, _) => *p,
+                    CType::Array(elem, _) => *elem,
+                    _ => cty,
+                };
+                let resolved = resolve_sizeof_struct_ref(pointee, target);
+                crate::common::types::sizeof_ctype(&resolved, target) as u64
+            } else {
+                target.pointer_width() as u64
+            }
+        }
+        ast::Expression::MemberAccess { object, member, .. } => {
+            // sizeof(expr.field) — resolve field type
+            let base_type = resolve_expr_type_from_context(object, target);
+            if let Some(cty) = base_type {
+                let resolved = resolve_sizeof_struct_ref(cty, target);
+                if let Some(field_ty) = find_struct_field_type(&resolved, member) {
+                    let resolved_field = resolve_sizeof_struct_ref(field_ty, target);
+                    crate::common::types::sizeof_ctype(&resolved_field, target) as u64
+                } else {
+                    target.pointer_width() as u64
+                }
+            } else {
+                target.pointer_width() as u64
+            }
+        }
+        ast::Expression::PointerMemberAccess {
+            object: pointer,
+            member,
+            ..
+        } => {
+            // sizeof(ptr->field) — resolve pointer→struct→field type
+            let base_type = resolve_expr_type_from_context(pointer, target);
+            if let Some(cty) = base_type {
+                let pointee = match cty {
+                    CType::Pointer(p, _) => *p,
+                    _ => cty,
+                };
+                let resolved = resolve_sizeof_struct_ref(pointee, target);
+                if let Some(field_ty) = find_struct_field_type(&resolved, member) {
+                    let resolved_field = resolve_sizeof_struct_ref(field_ty, target);
+                    crate::common::types::sizeof_ctype(&resolved_field, target) as u64
+                } else {
+                    target.pointer_width() as u64
+                }
+            } else {
+                target.pointer_width() as u64
+            }
+        }
+        ast::Expression::Parenthesized { inner, .. } => {
+            evaluate_sizeof_operand(inner, target, type_builder)
+        }
+        ast::Expression::Cast { type_name, .. } => {
+            // sizeof((type)expr) — the sizeof of the cast target type
+            let cty = resolve_base_type_from_sqlist(&type_name.specifier_qualifiers);
+            let cty = if let Some(ref abs) = type_name.abstract_declarator {
+                apply_abstract_declarator_to_type(cty, abs)
+            } else {
+                cty
+            };
+            let resolved = resolve_sizeof_struct_ref(cty, target);
+            crate::common::types::sizeof_ctype(&resolved, target) as u64
+        }
+        _ => target.pointer_width() as u64,
+    }
+}
+
+/// Resolve the C type of an expression by looking up identifiers in
+/// TYPEOF_CONTEXT. Returns None if the type cannot be determined.
+fn resolve_expr_type_from_context(expr: &ast::Expression, target: &Target) -> Option<CType> {
+    match expr {
+        ast::Expression::Identifier { name, .. } => super::TYPEOF_CONTEXT.with(|ctx| {
+            let ctx_borrow = ctx.borrow();
+            if let Some(ref map) = *ctx_borrow {
+                let name_str = super::NAME_TABLE.with(|nt| {
+                    let nt_borrow = nt.borrow();
+                    if let Some(ref table) = *nt_borrow {
+                        let idx = name.as_u32() as usize;
+                        if idx < table.len() {
+                            Some(table[idx].clone())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                });
+                if let Some(ns) = name_str {
+                    return map.get(&ns).cloned();
+                }
+            }
+            None
+        }),
+        ast::Expression::Parenthesized { inner, .. } => {
+            resolve_expr_type_from_context(inner, target)
+        }
+        _ => None,
+    }
+}
+
+/// Find a named field's type within a struct/union CType.
+fn find_struct_field_type(
+    cty: &CType,
+    member: &crate::common::string_interner::Symbol,
+) -> Option<CType> {
+    let fields = match cty {
+        CType::Struct { fields, .. } | CType::Union { fields, .. } => fields,
+        _ => return None,
+    };
+    super::NAME_TABLE.with(|nt| {
+        let nt_borrow = nt.borrow();
+        if let Some(ref table) = *nt_borrow {
+            let member_idx = member.as_u32() as usize;
+            let member_name = if member_idx < table.len() {
+                &table[member_idx]
+            } else {
+                return None;
+            };
+            for f in fields {
+                if let Some(ref fname) = f.name {
+                    if fname == member_name {
+                        return Some(f.ty.clone());
+                    }
+                }
+            }
+        }
+        None
+    })
 }
 
 /// Apply abstract declarator (pointer/array/function) layers to a base type

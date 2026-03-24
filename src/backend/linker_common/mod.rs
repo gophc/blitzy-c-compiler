@@ -630,6 +630,143 @@ pub fn link(
     }
 
     // -----------------------------------------------------------------------
+    // Detect if `atexit` is referenced but cannot be resolved from shared
+    // libraries (glibc ≥ 2.34 moved it into libc_nonshared.a).  When
+    // detected we synthesise a tiny wrapper: atexit(fn) → __cxa_atexit(fn, 0, 0).
+    // -----------------------------------------------------------------------
+    let need_synthetic_atexit = config.is_executable() && !config.needed_libs.is_empty() && {
+        let has_atexit_ref = inputs
+            .iter()
+            .any(|inp| inp.relocations.iter().any(|r| r.symbol_name == "atexit"));
+        let has_atexit_def = sym_table
+            .symbols
+            .iter()
+            .any(|s| s.name == "atexit" && s.section_index != symbol_resolver::SHN_UNDEF);
+        has_atexit_ref && !has_atexit_def
+    };
+
+    // If we need synthetic atexit, ensure __cxa_atexit is imported.
+    if need_synthetic_atexit && !symbol_address_map.contains_key("__cxa_atexit") {
+        let cxa_sym = symbol_resolver::OutputSymbol {
+            name: "__cxa_atexit".to_string(),
+            value: 0,
+            size: 0,
+            binding: 1,  // STB_GLOBAL
+            sym_type: 2, // STT_FUNC
+            visibility: 0,
+            section_index: symbol_resolver::SHN_UNDEF,
+        };
+        sym_table.symbols.push(cxa_sym);
+        symbol_address_map.insert(
+            "__cxa_atexit".to_string(),
+            symbol_resolver::ResolvedSymbol {
+                name: "__cxa_atexit".to_string(),
+                final_address: 0,
+                size: 0,
+                binding: 1,
+                sym_type: 2,
+                visibility: 0,
+                section_name: String::new(),
+                is_defined: false,
+                from_object: 0,
+                export_dynamic: false,
+            },
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 5.4: Synthetic atexit stub (glibc ≥ 2.34 compatibility)
+    // -----------------------------------------------------------------------
+    // In glibc ≥ 2.34, `atexit` is no longer in `libc.so.6`; it lives in the
+    // static `libc_nonshared.a`.  We synthesise a small wrapper that calls
+    // `__cxa_atexit(fn, 0, 0)` — injected into .text with a known address
+    // BEFORE dynamic section generation so that:
+    //   • atexit becomes a *defined* symbol (excluded from .dynsym imports)
+    //   • relocation processing (Phase 6) can resolve references to atexit
+    //   • the wrapper's call to __cxa_atexit will be patched after PLT is built
+    if need_synthetic_atexit {
+        let text_vaddr = address_map
+            .section_addresses
+            .get(".text")
+            .map(|a| a.virtual_address)
+            .unwrap_or(0x401000);
+        let text_size = section_data_map
+            .get(".text")
+            .map(|d| d.len() as u64)
+            .unwrap_or(0);
+
+        // Align stub to 16 bytes within .text.
+        let padding = ((16 - (text_size % 16)) % 16) as usize;
+        let atexit_offset = text_size + padding as u64;
+        let atexit_vaddr = text_vaddr + atexit_offset;
+
+        // Generate a *placeholder* stub.  We fill the __cxa_atexit address
+        // field with zeros for now; it will be patched in Phase 7b after PLT
+        // addresses are known.
+        let placeholder_code = generate_synthetic_atexit(config.target, atexit_vaddr, 0);
+        let atexit_len = placeholder_code.len() as u64;
+
+        // Extend .text section data.
+        if let Some(text_data) = section_data_map.get_mut(".text") {
+            text_data.extend(std::iter::repeat(0xCC).take(padding));
+            text_data.extend_from_slice(&placeholder_code);
+        } else {
+            let mut data = vec![0xCC; padding];
+            data.extend_from_slice(&placeholder_code);
+            section_data_map.insert(".text".to_string(), data);
+        }
+
+        // Update .text section size.
+        if let Some(text_addr) = address_map.section_addresses.get_mut(".text") {
+            text_addr.size = atexit_offset + atexit_len;
+            text_addr.mem_size = atexit_offset + atexit_len;
+        }
+
+        // Replace any existing UND `atexit` entry with the DEFINED version.
+        // This prevents the dynamic section generator from creating a PLT
+        // stub for atexit that would fail resolution at runtime (since atexit
+        // is not in libc.so.6 on glibc ≥ 2.34).
+        let mut replaced = false;
+        for sym in sym_table.symbols.iter_mut() {
+            if sym.name == "atexit" && sym.section_index == symbol_resolver::SHN_UNDEF {
+                sym.value = atexit_vaddr;
+                sym.size = atexit_len;
+                sym.section_index = symbol_resolver::SHN_ABS;
+                replaced = true;
+                break;
+            }
+        }
+        if !replaced {
+            sym_table.symbols.push(symbol_resolver::OutputSymbol {
+                name: "atexit".to_string(),
+                value: atexit_vaddr,
+                size: atexit_len,
+                binding: 1,    // STB_GLOBAL
+                sym_type: 2,   // STT_FUNC
+                visibility: 0, // STV_DEFAULT
+                section_index: symbol_resolver::SHN_ABS,
+            });
+        }
+
+        // Also register in symbol_address_map so relocation processing finds it.
+        symbol_address_map.insert(
+            "atexit".to_string(),
+            symbol_resolver::ResolvedSymbol {
+                name: "atexit".to_string(),
+                final_address: atexit_vaddr,
+                size: atexit_len,
+                binding: 1,
+                sym_type: 2,
+                visibility: 0,
+                section_name: ".text".to_string(),
+                is_defined: true,
+                from_object: 0,
+                export_dynamic: false,
+            },
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Phase 5.5: Pre-generate Dynamic Sections (PLT/GOT) BEFORE relocations
     // -----------------------------------------------------------------------
     // For dynamically-linked executables and shared libraries, we must
@@ -767,6 +904,16 @@ pub fn link(
         // The synthetic _start stub calls exit via PLT.
         if need_synthetic_start {
             plt_needed_symbols.insert("exit".to_string());
+        }
+
+        // When synthesising atexit, add __cxa_atexit to PLT and keep atexit out.
+        if need_synthetic_atexit {
+            // atexit is defined by us (synthetic) — remove from PLT/import set.
+            plt_needed_symbols.remove("atexit");
+            referenced_symbols.remove("atexit");
+            // __cxa_atexit (in libc.so.6) must be importable via PLT.
+            plt_needed_symbols.insert("__cxa_atexit".to_string());
+            referenced_symbols.insert("__cxa_atexit".to_string());
         }
 
         // Generate all dynamic linking sections (PLT, GOT, .dynamic, etc.).
@@ -1177,30 +1324,41 @@ pub fn link(
             }
 
             // Add PLT stubs for synthetic imports (e.g. `exit` injected for
-            // the synthetic _start stub) that were assigned PLT addresses in
-            // the first PLT assignment pass but were NOT covered by the
-            // relocation-based loop above.
+            // the synthetic _start stub, `__cxa_atexit` for the synthetic
+            // atexit wrapper) that were assigned PLT addresses in the first
+            // PLT assignment pass but were NOT covered by the relocation-based
+            // loop above.  Without this, the re-encoded .plt/.got.plt will
+            // have fewer entries than the initial layout, causing an address
+            // mismatch that shifts all GOT.PLT lazy-binding targets.
+            let mut synthetic_imports: Vec<String> = Vec::new();
             if need_synthetic_start {
-                let name = "exit".to_string();
-                if !seen_stubs.contains(&name) {
-                    if let Some(sym) = symbol_address_map.get(&name) {
-                        let expected_addr = plt_va + plt0_sz + stub_idx as u64 * pltn_sz;
-                        if sym.final_address == expected_addr {
-                            seen_stubs.insert(name.clone());
-                            let gp_off = (reserved + stub_idx as u64) * pw;
-                            let stub = dynamic::PltStub {
-                                symbol_name: name.clone(),
-                                got_plt_offset: gp_off,
-                                index: stub_idx,
-                            };
-                            let off = plt0_sz + stub_idx as u64 * pltn_sz;
-                            plt_buf.extend_from_slice(
-                                &plt_table.generate_plt_entry(&stub, got_plt_va, plt_va, off),
-                            );
-                            ordered_plt_syms.push((name, gp_off));
-                            stub_idx += 1;
-                        }
+                synthetic_imports.push("exit".to_string());
+            }
+            if need_synthetic_atexit {
+                synthetic_imports.push("__cxa_atexit".to_string());
+            }
+            for name in synthetic_imports {
+                if !seen_stubs.contains(&name) && symbol_address_map.contains_key(&name) {
+                    seen_stubs.insert(name.clone());
+                    let gp_off = (reserved + stub_idx as u64) * pw;
+                    let stub = dynamic::PltStub {
+                        symbol_name: name.clone(),
+                        got_plt_offset: gp_off,
+                        index: stub_idx,
+                    };
+                    let off = plt0_sz + stub_idx as u64 * pltn_sz;
+                    plt_buf.extend_from_slice(
+                        &plt_table.generate_plt_entry(&stub, got_plt_va, plt_va, off),
+                    );
+                    // Update the symbol address to the re-encoded
+                    // PLT position (may differ from the original
+                    // assignment in build_dynamic_sections).
+                    let actual_addr = plt_va + plt0_sz + stub_idx as u64 * pltn_sz;
+                    if let Some(sym) = symbol_address_map.get_mut(&name) {
+                        sym.final_address = actual_addr;
                     }
+                    ordered_plt_syms.push((name, gp_off));
+                    stub_idx += 1;
                 }
             }
 
@@ -1566,10 +1724,10 @@ pub fn link(
                         name: "_start".to_string(),
                         value: stub_vaddr,
                         size: stub_len,
-                        binding: 1,       // STB_GLOBAL
-                        sym_type: 2,      // STT_FUNC
-                        visibility: 0,    // STV_DEFAULT
-                        section_index: 0, // absolute
+                        binding: 1,    // STB_GLOBAL
+                        sym_type: 2,   // STT_FUNC
+                        visibility: 0, // STV_DEFAULT
+                        section_index: symbol_resolver::SHN_ABS,
                     });
 
                     stub_vaddr
@@ -1585,6 +1743,47 @@ pub fn link(
     } else {
         0
     };
+
+    // -----------------------------------------------------------------------
+    // Phase 7b: Patch synthetic atexit stub (glibc ≥ 2.34 compatibility)
+    // -----------------------------------------------------------------------
+    // The placeholder was injected in Phase 5.4 with __cxa_atexit address = 0.
+    // Now that PLT stubs are built and relocated, patch in the real address.
+    if need_synthetic_atexit {
+        // Build updated address map including PLT stubs.
+        let mut sa: FxHashMap<String, u64> = FxHashMap::default();
+        for sym in sym_table.symbols.iter() {
+            sa.insert(sym.name.clone(), sym.value);
+        }
+        for (name, resolved) in &symbol_address_map {
+            if resolved.is_defined && resolved.final_address != 0 {
+                sa.insert(name.clone(), resolved.final_address);
+            }
+        }
+
+        let cxa_addr = sa.get("__cxa_atexit").copied();
+        let atexit_addr = sa.get("atexit").copied();
+
+        if let (Some(cxa_target), Some(atexit_vaddr)) = (cxa_addr, atexit_addr) {
+            let text_vaddr = address_map
+                .section_addresses
+                .get(".text")
+                .map(|a| a.virtual_address)
+                .unwrap_or(0x401000);
+
+            // Re-generate the stub with the real __cxa_atexit address.
+            let patched_code = generate_synthetic_atexit(config.target, atexit_vaddr, cxa_target);
+
+            // Locate the stub within .text and overwrite the placeholder.
+            if let Some(text_data) = section_data_map.get_mut(".text") {
+                let offset_in_text = (atexit_vaddr - text_vaddr) as usize;
+                if offset_in_text + patched_code.len() <= text_data.len() {
+                    text_data[offset_in_text..offset_in_text + patched_code.len()]
+                        .copy_from_slice(&patched_code);
+                }
+            }
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Phase 8: ELF Output Writing
@@ -1937,6 +2136,128 @@ fn generate_synthetic_start(
     }
 }
 
+/// Synthesise a tiny `atexit` wrapper that forwards to `__cxa_atexit`.
+///
+/// In glibc ≥ 2.34 the `atexit` symbol is no longer exported from `libc.so.6`;
+/// it lives in the static `libc_nonshared.a` archive.  Rather than requiring
+/// the user to supply CRT objects we emit an equivalent stub inline:
+///
+/// ```asm
+/// atexit:            ; fn already in %rdi (x86-64) / x0 (AArch64) / a0 (RV64)
+///   xor %esi, %esi   ; arg  = NULL
+///   xor %edx, %edx   ; dso  = 0  (main executable)
+///   jmp __cxa_atexit  ; tail-call
+/// ```
+fn generate_synthetic_atexit(target: Target, _stub_vaddr: u64, cxa_addr: u64) -> Vec<u8> {
+    match target {
+        Target::X86_64 => {
+            // fn already in %rdi
+            // xor %esi, %esi       → 31 f6
+            // xor %edx, %edx       → 31 d2
+            // movabs $cxa, %rax    → 48 b8 <imm64>
+            // jmp  *%rax           → ff e0
+            let mut code = Vec::with_capacity(16);
+            code.extend_from_slice(&[0x31, 0xf6]); // xor %esi, %esi
+            code.extend_from_slice(&[0x31, 0xd2]); // xor %edx, %edx
+            code.extend_from_slice(&[0x48, 0xb8]); // movabs $imm64, %rax
+            code.extend_from_slice(&cxa_addr.to_le_bytes());
+            code.extend_from_slice(&[0xff, 0xe0]); // jmp *%rax
+            code
+        }
+        Target::I686 => {
+            // cdecl: arg is on stack at [esp+4].  We need to push three args
+            // for __cxa_atexit(fn, NULL, 0) then jump.
+            // push $0                ; __dso_handle = 0
+            // push $0                ; arg = NULL
+            // push [esp+8+4]         ; fn (original arg, now at esp+8 due to 2 pushes)
+            // Actually simpler: rewrite stack frame.  But a movabs+jmp is simplest
+            // for a stub.  Since i686 uses the stack, let's do:
+            //   mov 4(%esp), %eax     ; fn
+            //   push $0               ; __dso_handle
+            //   push $0               ; arg
+            //   push %eax             ; fn
+            //   mov $cxa, %eax
+            //   jmp *%eax             ; tail-call (caller will ret past our pushes)
+            // Actually for a proper tailcall we need to adjust the stack.
+            // Simplest correct approach: just call __cxa_atexit and ret.
+            let mut code = Vec::with_capacity(24);
+            // mov 4(%esp), %eax
+            code.extend_from_slice(&[0x8b, 0x44, 0x24, 0x04]);
+            // sub $12, %esp  (align + space for 3 args)
+            // Actually, for i686 cdecl __cxa_atexit(fn, arg, dso):
+            // The caller already set up the stack with fn at [esp+4].
+            // We need to set up [esp+4]=fn, [esp+8]=0, [esp+12]=0 then call.
+            // Easiest: push 0, push 0, push fn (from [esp+4+8]), call, add $12 esp, ret
+            // But that's not a tailcall. Let's just do call+ret:
+            code.clear();
+            // push $0                  ; dso_handle = 0
+            code.extend_from_slice(&[0x6a, 0x00]);
+            // push $0                  ; arg = NULL
+            code.extend_from_slice(&[0x6a, 0x00]);
+            // push [esp+4+8]           ; fn (offset 4 for ret addr + 8 for our pushes = 12)
+            code.extend_from_slice(&[0xff, 0x74, 0x24, 0x0c]);
+            // mov $cxa_addr, %eax
+            code.push(0xb8);
+            code.extend_from_slice(&(cxa_addr as u32).to_le_bytes());
+            // call *%eax
+            code.extend_from_slice(&[0xff, 0xd0]);
+            // add $12, %esp
+            code.extend_from_slice(&[0x83, 0xc4, 0x0c]);
+            // ret
+            code.push(0xc3);
+            code
+        }
+        Target::AArch64 => {
+            // fn already in x0
+            // mov x1, #0       ; arg = NULL
+            // mov x2, #0       ; dso = 0
+            // br  x16 or b cxa ; jump to __cxa_atexit
+            let mut code = Vec::with_capacity(20);
+            // mov x1, #0: 0xD2800001
+            code.extend_from_slice(&0xD280_0001u32.to_le_bytes());
+            // mov x2, #0: 0xD2800002
+            code.extend_from_slice(&0xD280_0002u32.to_le_bytes());
+            // ldr x16, [pc, #8]: load cxa_addr from literal pool after next instr
+            // 0x58000050  → ldr x16, .+8
+            code.extend_from_slice(&0x5800_0050u32.to_le_bytes());
+            // br x16: 0xD61F0200
+            code.extend_from_slice(&0xD61F_0200u32.to_le_bytes());
+            // Literal pool: cxa_addr (8 bytes)
+            code.extend_from_slice(&cxa_addr.to_le_bytes());
+            code
+        }
+        Target::RiscV64 => {
+            // fn already in a0
+            // li a1, 0         ; arg = NULL
+            // li a2, 0         ; dso = 0
+            // load cxa_addr into t1 via AUIPC+LD, then jr t1
+            let mut code = Vec::with_capacity(28);
+            // li a1, 0 → addi a1, zero, 0 : 0x00000593
+            code.extend_from_slice(&0x0000_0593u32.to_le_bytes());
+            // li a2, 0 → addi a2, zero, 0 : 0x00000613
+            code.extend_from_slice(&0x0000_0613u32.to_le_bytes());
+            // Load cxa_addr into t1 (x6) using lui+addi+jalr pattern:
+            // lui  t1, hi20(cxa_addr)
+            // jalr zero, t1, lo12(cxa_addr)  (i.e. jr with offset)
+            let addr = cxa_addr;
+            let lo12 = (addr & 0xFFF) as i32;
+            let mut hi20 = ((addr >> 12) & 0xFFFFF) as u32;
+            // Adjust for sign-extension of lo12
+            if lo12 >= 0x800 {
+                hi20 = hi20.wrapping_add(1) & 0xFFFFF;
+            }
+            // lui t1, hi20 : imm[31:12] | rd=6 | opcode=0110111
+            let lui_instr = (hi20 << 12) | (6 << 7) | 0x37;
+            code.extend_from_slice(&lui_instr.to_le_bytes());
+            // jalr zero, lo12(t1) : imm[11:0] | rs1=6 | funct3=0 | rd=0 | opcode=1100111
+            let lo12_u = (lo12 as u32) & 0xFFF;
+            let jalr_instr = (lo12_u << 20) | (6 << 15) | 0x67;
+            code.extend_from_slice(&jalr_instr.to_le_bytes());
+            code
+        }
+    }
+}
+
 /// Generate dynamic linking sections for shared library output.
 ///
 /// Populates section data buffers with `.dynamic`, `.dynsym`, `.dynstr`,
@@ -2101,6 +2422,22 @@ fn write_elf_output(
             (0, 0)
         };
 
+        // For SHT_NOBITS sections (.bss) the data vec is empty but the
+        // in-memory size is non-zero.  Use the address-map mem_size so
+        // that the ELF writer emits the correct sh_size and the
+        // corresponding LOAD segment p_memsz covers the full BSS area.
+        let logical_size = if output_section.section_type
+            == crate::backend::linker_common::section_merger::SHT_NOBITS
+        {
+            if let Some(addr_info) = address_map.section_addresses.get(&output_section.name) {
+                addr_info.mem_size
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
         let elf_section = Section {
             name: output_section.name.clone(),
             sh_type: output_section.section_type,
@@ -2110,7 +2447,7 @@ fn write_elf_output(
             sh_info: 0,
             sh_addralign: output_section.alignment,
             sh_entsize: 0,
-            logical_size: 0,
+            logical_size,
             virtual_address: vaddr,
             file_offset_hint: foff,
         };
@@ -2279,6 +2616,15 @@ fn write_elf_output(
                 }
                 if let Some(&(va, _, _)) = dyn_section_vaddrs.get(".got.plt") {
                     patch_map.push((crate::backend::linker_common::dynamic::DT_PLTGOT, va));
+                }
+                // Patch PLTRELSZ and RELASZ to match actual section sizes,
+                // which may differ from the initial encoding after PLT/GOT
+                // regeneration (e.g. when synthetic atexit removed an entry).
+                if let Some(&(_, _, sz)) = dyn_section_vaddrs.get(".rela.plt") {
+                    patch_map.push((crate::backend::linker_common::dynamic::DT_PLTRELSZ, sz));
+                }
+                if let Some(&(_, _, sz)) = dyn_section_vaddrs.get(".rela.dyn") {
+                    patch_map.push((crate::backend::linker_common::dynamic::DT_RELASZ, sz));
                 }
                 // Iterate over each .dynamic entry and patch matching tags.
                 let num_entries = data.len() / entry_size;
@@ -2461,13 +2807,16 @@ fn build_program_headers(
     // Use updated sizes from address_map when available — the address map
     // is patched after late additions (e.g. synthetic _start stub appended
     // to .text), whereas ordered_sections retains original pre-stub sizes.
+    // CRITICAL: use mem_size (not file size) because compute_layout treats
+    // InputSectionInfo.size as the *memory* size.  For SHT_NOBITS sections
+    // like .bss, file size is 0 but mem_size is the actual allocation size.
     let section_infos: Vec<linker_script::InputSectionInfo> = ordered_sections
         .iter()
         .map(|sec| {
             let size = address_map
                 .section_addresses
                 .get(&sec.name)
-                .map(|a| a.size)
+                .map(|a| a.mem_size)
                 .unwrap_or(sec.total_size);
             linker_script::InputSectionInfo {
                 name: sec.name.clone(),

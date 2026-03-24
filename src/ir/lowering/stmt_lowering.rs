@@ -27,7 +27,7 @@
 //! - Calls into `asm_lowering` for inline assembly statements
 
 use crate::common::diagnostics::{Diagnostic, DiagnosticEngine, Span};
-use crate::common::fx_hash::FxHashMap;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::target::Target;
 use crate::common::type_builder::TypeBuilder;
 use crate::common::types::CType;
@@ -175,6 +175,15 @@ pub struct StmtLoweringContext<'a> {
     /// VLA allocation in the same scope, the stack is restored to this point
     /// so that VLAs in loops don't leak stack space.
     pub vla_stack_save: Option<Value>,
+    /// Set of variable names whose first actual declaration has been
+    /// processed in the current or an enclosing scope.  Used by
+    /// `ensure_allocas_for_declaration` to detect variable shadowing:
+    /// if a name is already "claimed" when a new declaration for it is
+    /// encountered, the new declaration shadows an outer variable and
+    /// needs its own alloca.  Saved/restored with compound-statement
+    /// scope boundaries so that sequential (non-overlapping) scopes
+    /// can safely share the pre-scan alloca.
+    pub claimed_vars: FxHashSet<String>,
 }
 
 // ===========================================================================
@@ -328,6 +337,21 @@ fn lower_compound_statement(
     ctx: &mut StmtLoweringContext<'_>,
     compound: &ast::CompoundStatement,
 ) -> Option<BlockId> {
+    // ── Block Scope: save local variable bindings ────────────────────────
+    //
+    // C11 §6.2.1: Each compound statement (block) introduces a new scope.
+    // Variables declared inside the block shadow identically-named variables
+    // from outer scopes (including function parameters).  When the block
+    // ends, the outer bindings must be restored.
+    //
+    // We snapshot the current `local_vars` and `scope_type_overrides` maps
+    // before processing the block's items.  After lowering, we restore both
+    // maps so that names declared inside the block don't leak into the
+    // enclosing scope and any shadowed outer names are recovered.
+    let saved_local_vars = ctx.local_vars.clone();
+    let saved_scope_type_overrides = ctx.scope_type_overrides.clone();
+    let saved_claimed_vars = ctx.claimed_vars.clone();
+
     let mut current_block = ctx.builder.get_insert_block();
 
     for item in &compound.items {
@@ -364,6 +388,15 @@ fn lower_compound_statement(
             }
         }
     }
+
+    // ── Block Scope: restore outer variable bindings ─────────────────────
+    //
+    // Restore the local_vars and scope_type_overrides maps to their state
+    // before this compound statement.  This ensures that any shadowing
+    // declarations inside the block do not persist into the enclosing scope.
+    *ctx.local_vars = saved_local_vars;
+    ctx.scope_type_overrides = saved_scope_type_overrides;
+    ctx.claimed_vars = saved_claimed_vars;
 
     current_block
 }
@@ -724,23 +757,31 @@ pub fn ensure_allocas_for_declaration(ctx: &mut StmtLoweringContext<'_>, decl: &
                     continue;
                 }
             }
-            let effective_type = ctx
-                .scope_type_overrides
-                .get(&var_name)
-                .or_else(|| ctx.local_types.get(&var_name));
-            let types_match = effective_type.map_or(false, |et| {
-                // Use structural compatibility that treats named
-                // structs/unions with the same tag as equivalent,
-                // avoiding false positives when resolve_declaration_type
-                // returns an incomplete struct reference (empty fields)
-                // while the pre-scan resolved the full definition.
-                ctypes_compatible_for_scope_shadowing(et, &c_type, ctx.target)
-            });
-            if !types_match {
-                // Scope shadowing: create a new alloca with the correct type
-                // and update both local_vars and scope_type_overrides.
-                // Resolve forward-referenced struct/union tags so the alloca
-                // gets the correct struct field layout and size.
+
+            // --- Block-scope variable shadowing (C11 §6.2.1) ---
+            //
+            // Detect whether this declaration shadows an outer variable.
+            // A name is "claimed" the first time its actual source-level
+            // declaration is lowered.  If a name is already claimed when a
+            // new declaration for it is encountered, that new declaration
+            // must shadow the outer one and needs its own alloca.
+            //
+            // Similarly, if the name belongs to a function parameter, a
+            // new alloca is always required to avoid overwriting the
+            // parameter's storage.
+            //
+            // For sequential (non-overlapping) scopes that re-use the same
+            // variable name, the `claimed_vars` set is restored on scope
+            // exit, so the name becomes "unclaimed" again and the pre-scan
+            // alloca is safely reused.  This avoids the code-size blowup
+            // that would occur if every nested declaration got a fresh
+            // alloca unconditionally.
+            let is_param_shadow = ctx.param_values.contains_key(&var_name)
+                && ctx.param_values.get(&var_name) == ctx.local_vars.get(&var_name);
+            let is_local_shadow = ctx.claimed_vars.contains(&var_name);
+
+            if is_param_shadow || is_local_shadow {
+                // Shadowing an outer variable — create a new alloca.
                 let sized_c_type = infer_array_size_from_init(
                     &c_type,
                     init_decl.initializer.as_ref(),
@@ -749,8 +790,6 @@ pub fn ensure_allocas_for_declaration(ctx: &mut StmtLoweringContext<'_>, decl: &
                 let resolved_c_type =
                     decl_lowering::resolve_sizeof_struct_ref_pub(sized_c_type.clone(), ctx.target);
                 let ir_type = IrType::from_ctype(&resolved_c_type, ctx.target);
-                // Round up non-power-of-2 struct allocas so whole-struct register
-                // stores (e.g. 3-byte struct stored via 4-byte movl) don't overflow.
                 let alloca_ir_type = {
                     let sz = ir_type.size_bytes(ctx.target);
                     if sz > 0 && sz <= 8 && !sz.is_power_of_two() {
@@ -764,6 +803,45 @@ pub fn ensure_allocas_for_declaration(ctx: &mut StmtLoweringContext<'_>, decl: &
                 ctx.local_vars.insert(var_name.clone(), alloca_val);
                 ctx.scope_type_overrides
                     .insert(var_name.clone(), sized_c_type);
+            } else {
+                // First encounter of this variable — "claim" it and
+                // reuse the pre-scan alloca if the type matches.
+                ctx.claimed_vars.insert(var_name.clone());
+
+                let effective_type = ctx
+                    .scope_type_overrides
+                    .get(&var_name)
+                    .or_else(|| ctx.local_types.get(&var_name));
+                let types_match = effective_type.map_or(false, |et| {
+                    ctypes_compatible_for_scope_shadowing(et, &c_type, ctx.target)
+                });
+                if !types_match {
+                    // Different type — create new alloca even for first encounter.
+                    let sized_c_type = infer_array_size_from_init(
+                        &c_type,
+                        init_decl.initializer.as_ref(),
+                        ctx.name_table,
+                    );
+                    let resolved_c_type = decl_lowering::resolve_sizeof_struct_ref_pub(
+                        sized_c_type.clone(),
+                        ctx.target,
+                    );
+                    let ir_type = IrType::from_ctype(&resolved_c_type, ctx.target);
+                    let alloca_ir_type = {
+                        let sz = ir_type.size_bytes(ctx.target);
+                        if sz > 0 && sz <= 8 && !sz.is_power_of_two() {
+                            IrType::Array(Box::new(IrType::I8), sz.next_power_of_two())
+                        } else {
+                            ir_type
+                        }
+                    };
+                    let (alloca_val, alloca_inst) =
+                        ctx.builder.build_alloca(alloca_ir_type, decl.span);
+                    ctx.function.entry_block_mut().push_alloca(alloca_inst);
+                    ctx.local_vars.insert(var_name.clone(), alloca_val);
+                    ctx.scope_type_overrides
+                        .insert(var_name.clone(), sized_c_type);
+                }
             }
             continue;
         }
@@ -1486,6 +1564,14 @@ fn lower_for_loop(
     body: &ast::Statement,
     span: Span,
 ) -> Option<BlockId> {
+    // C11 §6.8.5p5: The for-loop's init-clause declaration has scope
+    // limited to the for statement (including body).  Save local_vars
+    // so that any variable declared in the init clause doesn't leak
+    // into the enclosing scope after the for-loop completes.
+    let saved_local_vars = ctx.local_vars.clone();
+    let saved_scope_type_overrides = ctx.scope_type_overrides.clone();
+    let saved_claimed_vars = ctx.claimed_vars.clone();
+
     // Lower init clause in the current block.
     if let Some(for_init) = init {
         match for_init {
@@ -1573,6 +1659,13 @@ fn lower_for_loop(
 
     // Continue at exit block.
     ctx.builder.set_insert_point(exit_block);
+
+    // Restore local variable scope — variables declared in the for-loop's
+    // init clause must not be visible after the loop.
+    *ctx.local_vars = saved_local_vars;
+    ctx.scope_type_overrides = saved_scope_type_overrides;
+    ctx.claimed_vars = saved_claimed_vars;
+
     Some(exit_block)
 }
 

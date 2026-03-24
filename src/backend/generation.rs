@@ -2685,11 +2685,38 @@ fn resolve_call_arg_conflicts(mf: &mut MachineFunction, target: &Target) {
                                     });
                                 if next_reads_scratch {
                                     if let Some(eff_dst) = next_dst {
-                                        // Compound pair found (load + immediate move).
-                                        let chain = vec![si.clone(), next_si.clone()];
-                                        consumed.insert(j);
-                                        compound_moves.push((chain, eff_dst));
-                                        found_pair = true;
+                                        // Only form a compound pair when the
+                                        // memory load targets a KNOWN spill
+                                        // scratch register (R11 on x86-64,
+                                        // X16/X17 on AArch64, X5/X6 on RISC-V,
+                                        // ECX on i686).  Spill reloads inserted
+                                        // by the register allocator ALWAYS use
+                                        // these designated scratch registers.
+                                        //
+                                        // Memory loads into OTHER registers
+                                        // (like argument registers RDX, RSI)
+                                        // are codegen-generated direct argument
+                                        // placements (e.g., struct-pair loads)
+                                        // that participate independently in the
+                                        // parallel-move resolution.  Merging
+                                        // them into a compound hides write-read
+                                        // conflicts: when reg R is both the
+                                        // direct argument target (written by the
+                                        // mem load) and a live source for an
+                                        // independent reg-to-reg move, the
+                                        // compound collapses them into one unit,
+                                        // bypasses conflict detection, preserves
+                                        // the original (wrong) order, and causes
+                                        // the reg-to-reg move to read the newly
+                                        // loaded value instead of the old one.
+                                        let is_spill_scratch = d_scratch == scratch_reg
+                                            || d_scratch == float_scratch_reg;
+                                        if is_spill_scratch {
+                                            let chain = vec![si.clone(), next_si.clone()];
+                                            consumed.insert(j);
+                                            compound_moves.push((chain, eff_dst));
+                                            found_pair = true;
+                                        }
                                     }
                                 }
                             }
@@ -2719,9 +2746,37 @@ fn resolve_call_arg_conflicts(mf: &mut MachineFunction, target: &Target) {
                 let reg_srcs: crate::common::fx_hash::FxHashSet<u16> =
                     reg_moves.iter().map(|m| m.1).collect();
                 let compound_vs_reg = compound_moves.iter().any(|cm| reg_srcs.contains(&cm.1));
-                let non_reg_vs_reg = non_reg_move_insts.iter().any(|nrm| match &nrm.result {
-                    Some(MachineOperand::Register(r)) => reg_srcs.contains(r),
-                    _ => false,
+                let non_reg_vs_reg = non_reg_move_insts.iter().any(|nrm| {
+                    // Get destination register from `result` or — on
+                    // x86-64 where MOV may encode dst in operands[0]
+                    // with result = None — from the first operand if
+                    // it is a Register AND another operand is Memory.
+                    let dst_r = match &nrm.result {
+                        Some(MachineOperand::Register(r)) => Some(*r),
+                        _ => {
+                            // Fallback: check if operands[0] is Register
+                            // and there is a Memory operand elsewhere
+                            // (typical x86 MOV dst, [mem] encoding).
+                            let op0_reg = nrm.operands.first().and_then(|op| {
+                                if let MachineOperand::Register(r) = op {
+                                    Some(*r)
+                                } else {
+                                    None
+                                }
+                            });
+                            let has_mem = nrm
+                                .operands
+                                .iter()
+                                .skip(1)
+                                .any(|op| matches!(op, MachineOperand::Memory { .. }));
+                            if has_mem {
+                                op0_reg
+                            } else {
+                                None
+                            }
+                        }
+                    };
+                    dst_r.map_or(false, |r| reg_srcs.contains(&r))
                 });
                 // Check if any non-reg-move instruction (e.g., PUSH) READS
                 // from a register that is a DESTINATION of a reg-to-reg

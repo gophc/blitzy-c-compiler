@@ -35,7 +35,7 @@
 //! - `crate::common::*` — Types, diagnostics, target
 
 use crate::common::diagnostics::{DiagnosticEngine, Span};
-use crate::common::fx_hash::FxHashMap;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::target::Target;
 use crate::common::type_builder::{self, TypeBuilder};
 use crate::common::types::{self, CType, TypeQualifiers};
@@ -3158,17 +3158,27 @@ fn lower_unary(
         ast::UnaryOp::Deref => {
             let p = lower_expr_inner(ctx, operand);
             let pt = pointee_of(&p.ty);
+            // Resolve typedefs on the pointee so that patterns like
+            //   `typedef void MyFunc(int); MyFunc *f; (*f)(42);`
+            // correctly recognise the function type underneath the
+            // typedef wrapper.  Without this, pt would be
+            // CType::Typedef("MyFunc", Function{..}) and the
+            // `matches!(CType::Function{..})` check below would miss
+            // it, causing an erroneous Load instruction that reads
+            // the first bytes of machine code instead of using the
+            // pointer as a callable address.
+            let resolved_pt = types::resolve_typedef(&pt);
             // In C, dereferencing a function pointer is an identity
             // operation — `(*fptr)(args)` is equivalent to `fptr(args)`.
             // The function pointer value IS the callable address; emitting
             // a Load would read the first bytes of the function's machine
             // code instead of using the pointer as an address.  Skip the
             // Load for function and function-pointer pointee types.
-            if matches!(&pt, CType::Function { .. }) {
+            if matches!(resolved_pt, CType::Function { .. }) {
                 // Return the pointer value unchanged with function type.
                 // The call lowering will use this value directly.
                 TypedValue::new(p.value, pt)
-            } else if matches!(&pt, CType::Array(_, _)) {
+            } else if matches!(resolved_pt, CType::Array(_, _)) {
                 // Dereferencing a pointer-to-array yields an array lvalue
                 // at the same address.  In C, this lvalue decays to a
                 // pointer-to-first-element.  We must NOT emit a Load —
@@ -5297,14 +5307,49 @@ fn try_lower_builtin_call(
     }
 }
 
+/// Strip `*` (Deref) and parenthesized wrappers from a function-call
+/// callee expression.  In C, `(*fptr)(args)` is identical to
+/// `fptr(args)` — dereferencing a function pointer yields a function
+/// designator that immediately decays back to a pointer.  Multiple
+/// levels of dereference are also legal: `(***fptr)(args)`.
+///
+/// This stripping MUST happen before IR lowering because by that point
+/// the C-level function type has been erased to an opaque
+/// `Pointer(Void)` and the generic Deref handler would emit a real
+/// memory load (reading machine-code bytes rather than using the
+/// pointer as a callable address).
+fn strip_fn_ptr_deref(expr: &ast::Expression) -> &ast::Expression {
+    match expr {
+        ast::Expression::Parenthesized { inner, .. } => strip_fn_ptr_deref(inner),
+        ast::Expression::UnaryOp {
+            op: ast::UnaryOp::Deref,
+            operand,
+            ..
+        } => strip_fn_ptr_deref(operand),
+        other => other,
+    }
+}
+
 fn lower_function_call(
     ctx: &mut ExprLoweringContext<'_>,
     callee: &ast::Expression,
     args: &[ast::Expression],
     span: Span,
 ) -> TypedValue {
+    // In C, dereferencing a function pointer is a no-op in call context:
+    //   `(*fptr)(args)` ≡ `fptr(args)` ≡ `(**fptr)(args)`.
+    // The function designator decays back to a function pointer.
+    //
+    // We must strip Deref (and Parenthesized) wrappers here because by the
+    // time lower_expr_inner evaluates the operand, the C-level function-
+    // pointer type has been erased to `Pointer(Void)` in the IR, so the
+    // generic Deref handler cannot distinguish `*fptr` (identity) from
+    // `*p` (actual memory load) and emits an incorrect Load instruction
+    // that reads machine-code bytes from the function's address.
+    let effective_callee = strip_fn_ptr_deref(callee);
+
     // Lower callee (may be an identifier or a function pointer expression).
-    let callee_tv = lower_expr_inner(ctx, callee);
+    let callee_tv = lower_expr_inner(ctx, effective_callee);
 
     // Determine return type from the callee's function type.
     // For direct function calls, lower_identifier returns a void pointer,
@@ -6471,7 +6516,15 @@ fn expr_is_natural_lvalue(expr: &ast::Expression) -> bool {
             ..
         } => true,
         ast::Expression::Parenthesized { inner, .. } => expr_is_natural_lvalue(inner),
-        ast::Expression::Cast { operand, .. } => expr_is_natural_lvalue(operand),
+        // Cast expressions produce rvalues in standard C (C11 §6.5.4).
+        // Even if the operand is an lvalue, the cast result is an rvalue.
+        // Treating casts as lvalues caused aggregate struct copies to
+        // treat the loaded struct VALUE as a pointer (extra dereference),
+        // corrupting struct fields.  The lower_lvalue_inner handler for
+        // Cast already falls through to lower_expr_inner, which returns
+        // a VALUE not a pointer — so callers that expect an address
+        // (like the aggregate copy path in lower_assignment) would break.
+        ast::Expression::Cast { .. } => false,
         _ => false,
     }
 }
@@ -7209,6 +7262,7 @@ fn lower_statement_expression(
         layout_cache: inherited_layout_cache,
         vla_sizes: FxHashMap::default(),
         vla_stack_save: None,
+        claimed_vars: FxHashSet::default(), // Fresh scope for statement expression.
     };
 
     // Second pass: lower each block item. Track the value of the last
@@ -10408,6 +10462,17 @@ fn compute_offset_in_type(
                         }
                         return compute_offset_in_type(&field.ty, &member_chain[1..], type_builder);
                     }
+                    // Recurse into anonymous struct/union members to find
+                    // fields promoted into the enclosing union's namespace.
+                    if field_name.is_empty() {
+                        let inner = compute_offset_in_type(&field.ty, member_chain, type_builder);
+                        // Distinguish "found at offset 0" from "not found" by
+                        // checking if the anonymous member actually contains
+                        // the target field.
+                        if anon_member_contains_field(&field.ty, target_name) {
+                            return inner;
+                        }
+                    }
                 }
                 0
             } else {
@@ -10424,11 +10489,44 @@ fn compute_offset_in_type(
                         return field_offset
                             + compute_offset_in_type(&field.ty, &member_chain[1..], type_builder);
                     }
+                    // Recurse into anonymous struct/union members to find
+                    // fields promoted into the enclosing struct's namespace.
+                    // The anonymous member's own offset must be added.
+                    if field_name.is_empty() && anon_member_contains_field(&field.ty, target_name) {
+                        let anon_offset = layout.fields[i].offset;
+                        let inner = compute_offset_in_type(&field.ty, member_chain, type_builder);
+                        return anon_offset + inner;
+                    }
                 }
                 0
             }
         }
     }
+}
+
+/// Check whether a (possibly anonymous) struct or union type contains
+/// a field with the given name, recursing into nested anonymous members.
+///
+/// This is used by `compute_offset_in_type` to distinguish between
+/// "field found at offset 0" and "field not found" when searching
+/// anonymous members that might return 0 for either case.
+fn anon_member_contains_field(ctype: &CType, target_name: &str) -> bool {
+    let unwrapped = unwrap_type(ctype);
+    let fields = match unwrapped {
+        CType::Struct { fields, .. } | CType::Union { fields, .. } => fields,
+        _ => return false,
+    };
+    for field in fields {
+        let field_name = field.name.as_deref().unwrap_or("");
+        if field_name == target_name {
+            return true;
+        }
+        // Recurse into nested anonymous struct/union members.
+        if field_name.is_empty() && anon_member_contains_field(&field.ty, target_name) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Unwrap Typedef / Qualified wrappers to reach the underlying type.
