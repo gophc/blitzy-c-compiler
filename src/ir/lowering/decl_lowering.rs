@@ -2451,7 +2451,7 @@ fn constant_to_le_bytes(
             buf
         }
         Constant::Array(elems) => {
-            let elem_ty = match ctype {
+            let elem_ty = match resolved {
                 CType::Array(et, _) => et.as_ref(),
                 _ => &CType::Char,
             };
@@ -2471,12 +2471,12 @@ fn constant_to_le_bytes(
         }
         Constant::Struct(field_constants) => {
             let mut buf = vec![0u8; expected_size];
-            let fields = match ctype {
+            let fields = match resolved {
                 CType::Struct { fields, .. } => fields,
                 CType::Union { fields, .. } => fields,
                 _ => return buf,
             };
-            let (is_packed, explicit_align) = match ctype {
+            let (is_packed, explicit_align) = match resolved {
                 CType::Struct {
                     packed, aligned, ..
                 } => (*packed, *aligned),
@@ -2953,7 +2953,98 @@ fn lower_designated_initializer(
                     }
                 }
 
-                Some(Constant::String(bytes))
+                // -----------------------------------------------------------
+                // Post-processing: when any non-bitfield field holds a
+                // GlobalRef / GlobalRefOffset (function-pointer initializer),
+                // the flat byte buffer loses the relocation info (because
+                // constant_to_le_bytes writes zeros for GlobalRef).
+                //
+                // Detect this and produce a Constant::Struct matching the
+                // IR type's allocation-unit layout so that
+                // collect_constant_relocs in generation.rs can find the
+                // references and emit proper R_*_64 / R_*_32 relocations.
+                // -----------------------------------------------------------
+                let has_relocatable_fields = field_constants.iter().enumerate().any(|(fi, fc)| {
+                    if let Some(ref c) = fc {
+                        // Only care about non-bitfield fields
+                        if let Some(fl) = layout.fields.get(fi) {
+                            if fl.bitfield_info.is_none() {
+                                return matches!(
+                                    c,
+                                    Constant::GlobalRef(_) | Constant::GlobalRefOffset(_, _)
+                                ) || constant_tree_has_global_ref(c);
+                            }
+                        }
+                    }
+                    false
+                });
+
+                if has_relocatable_fields {
+                    // Build a Constant::Struct whose elements correspond to
+                    // the IR struct's allocation units (I64, I32, etc.).
+                    // The IR type for a bitfield struct is
+                    //   Struct([unit_ty; unit_count])
+                    // where unit_ty/unit_size are chosen to match the struct's
+                    // alignment.
+                    let struct_align = type_builder.alignof_type(resolved);
+                    let (unit_size, _unit_ty_unused) = if struct_align >= 8 && struct_size % 8 == 0
+                    {
+                        (8usize, ())
+                    } else if struct_align >= 4 && struct_size % 4 == 0 {
+                        (4usize, ())
+                    } else if struct_align >= 2 && struct_size % 2 == 0 {
+                        (2usize, ())
+                    } else {
+                        (1usize, ())
+                    };
+                    let unit_count = if unit_size > 0 && struct_size > 0 {
+                        struct_size / unit_size
+                    } else {
+                        0
+                    };
+
+                    // Map: byte_offset → (GlobalRef constant) for non-bitfield
+                    // relocatable fields.
+                    let mut reloc_map: Vec<(usize, Constant)> = Vec::new();
+                    for (fi, fc) in field_constants.iter().enumerate() {
+                        if let Some(ref c) = fc {
+                            if let Some(fl) = layout.fields.get(fi) {
+                                if fl.bitfield_info.is_none()
+                                    && (matches!(
+                                        c,
+                                        Constant::GlobalRef(_) | Constant::GlobalRefOffset(_, _)
+                                    ) || constant_tree_has_global_ref(c))
+                                {
+                                    reloc_map.push((fl.offset, c.clone()));
+                                }
+                            }
+                        }
+                    }
+
+                    let mut struct_elems: Vec<Constant> = Vec::with_capacity(unit_count);
+                    for ui in 0..unit_count {
+                        let unit_start = ui * unit_size;
+                        // Check if a relocatable field starts at this unit.
+                        if let Some((_off, ref reloc_const)) =
+                            reloc_map.iter().find(|(off, _)| *off == unit_start)
+                        {
+                            struct_elems.push(reloc_const.clone());
+                        } else {
+                            // Pack the bytes into an integer constant.
+                            let mut val: u64 = 0;
+                            for b in 0..unit_size {
+                                let byte_idx = unit_start + b;
+                                if byte_idx < bytes.len() {
+                                    val |= (bytes[byte_idx] as u64) << (b * 8);
+                                }
+                            }
+                            struct_elems.push(Constant::Integer(val as i128));
+                        }
+                    }
+                    Some(Constant::Struct(struct_elems))
+                } else {
+                    Some(Constant::String(bytes))
+                }
             } else {
                 // Non-bitfield struct — use per-field constants, with brace
                 // elision support for aggregate (array/struct) sub-fields.
@@ -3034,6 +3125,34 @@ fn lower_designated_initializer(
                             if let Some(c) = lower_designated_initializer(
                                 &sub_inits,
                                 resolved_ft,
+                                target,
+                                type_builder,
+                                diagnostics,
+                                name_table,
+                                enum_constants,
+                            ) {
+                                field_values[current_idx] = c;
+                            }
+                        } else if desig_init.designators.len() > 1 {
+                            // Chained designator such as `.data.string = { ... }`.
+                            // `resolve_field_designator` only consumed the first
+                            // designator (`.data`).  The remaining designators
+                            // (`.string`) must be forwarded to the recursive call
+                            // so the union/struct member selection works correctly.
+                            let remaining_desigs = desig_init.designators[1..].to_vec();
+                            let synthetic_item = ast::DesignatedInitializer {
+                                designators: remaining_desigs,
+                                initializer: desig_init.initializer.clone(),
+                                span: desig_init.span,
+                            };
+                            let synthetic_init = ast::Initializer::List {
+                                designators_and_initializers: vec![synthetic_item],
+                                trailing_comma: false,
+                                span: desig_init.span,
+                            };
+                            if let Some(c) = evaluate_initializer_constant(
+                                &synthetic_init,
+                                field_type,
                                 target,
                                 type_builder,
                                 diagnostics,

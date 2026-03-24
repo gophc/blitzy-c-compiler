@@ -6479,11 +6479,12 @@ impl X86_64CodeGen {
                     }],
                 ));
 
-                // Step 3: Allocate 24 bytes on stack for the new va_list block
+                // Step 3: Allocate 32 bytes on stack for the new va_list block
+                // (24 bytes needed, rounded up to 32 for 16-byte stack alignment)
                 out.push(Self::mk_inst(
                     X86Opcode::Sub,
                     Some(rsp_op.clone()),
-                    &[rsp_op.clone(), MachineOperand::Immediate(24)],
+                    &[rsp_op.clone(), MachineOperand::Immediate(32)],
                 ));
 
                 // Step 4: Copy all 3 fields to new block
