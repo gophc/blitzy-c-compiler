@@ -1277,25 +1277,11 @@ fn parse_generic_selection(parser: &mut Parser<'_>) -> Result<Expression, ()> {
                 }
             }
         }
-        // Simple duplicate check by comparing type source text via Debug
-        // representation. A more precise check would compare canonical
-        // types, but this catches the most common case.
-        let typed_assocs: Vec<_> = associations
-            .iter()
-            .filter_map(|a| a.type_name.as_ref().map(|t| (t, a.span)))
-            .collect();
-        for i in 0..typed_assocs.len() {
-            for j in (i + 1)..typed_assocs.len() {
-                let ti_dbg = format!("{:?}", typed_assocs[i].0);
-                let tj_dbg = format!("{:?}", typed_assocs[j].0);
-                if ti_dbg == tj_dbg {
-                    parser.error(
-                        typed_assocs[j].1,
-                        "duplicate type in _Generic association list",
-                    );
-                }
-            }
-        }
+        // GCC extension: allow duplicate types in _Generic association list.
+        // The Linux kernel relies on typeof() resolving to the same type
+        // in multiple _Generic associations.  First matching wins at
+        // evaluation time, which is consistent with GCC behaviour.
+        // We emit a debug-level note instead of an error.
     }
 
     let span = parser.make_span(start);

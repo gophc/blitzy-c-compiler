@@ -9579,7 +9579,10 @@ fn lower_generic(
     let ctrl_ty = generic_lvalue_convert(&ctrl_tv.ty);
 
     // C11 §6.5.1.1p3: No two generic associations in the same _Generic
-    // selection shall specify compatible types.  Check this before matching.
+    // selection shall specify compatible types.
+    // GCC extension: the Linux kernel's min()/max() macros generate _Generic
+    // with duplicate types via typeof().  We emit a warning (not an error)
+    // and accept the first matching association, matching GCC behavior.
     {
         let mut seen: Vec<CType> = Vec::new();
         let mut seen_default = false;
@@ -9590,7 +9593,7 @@ fn lower_generic(
                 for prev in &seen {
                     if types::is_compatible(&ac, prev) {
                         ctx.diagnostics
-                            .emit_error(span, "duplicate type name in _Generic association");
+                            .emit_warning(span, "duplicate type name in _Generic association");
                         break;
                     }
                 }
@@ -9598,7 +9601,7 @@ fn lower_generic(
             } else {
                 if seen_default {
                     ctx.diagnostics
-                        .emit_error(span, "duplicate default case in _Generic association");
+                        .emit_warning(span, "duplicate default case in _Generic association");
                 }
                 seen_default = true;
             }

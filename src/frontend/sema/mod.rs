@@ -2345,9 +2345,13 @@ impl<'a> SemanticAnalyzer<'a> {
                     let assoc_stripped = self.strip_qualifiers(&assoc_type).clone();
                     for prev in &seen_types {
                         if self.types_match_generic(&assoc_stripped, prev) {
+                            // GCC extension: allow duplicate types in _Generic
+                            // (Linux kernel relies on this when typeof() resolves
+                            // to the same type in multiple associations).
+                            // Downgrade to warning; first matching association wins.
                             self.diagnostics
-                                .emit_error(span, "duplicate type name in _Generic association");
-                            return Err(());
+                                .emit_warning(span, "duplicate type name in _Generic association");
+                            break;
                         }
                     }
                     seen_types.push(assoc_stripped);

@@ -704,11 +704,18 @@ impl RiscV64Codegen {
                 // actual constant evaluation would produce real bytes).
                 data_bytes.extend(std::iter::repeat(0u8).take(type_size));
 
+                // Respect the IR-level linkage: compound literals and static
+                // variables use Internal linkage → STB_LOCAL.
+                let binding = match global.linkage {
+                    crate::ir::module::Linkage::Internal => STB_LOCAL,
+                    crate::ir::module::Linkage::Weak => crate::backend::elf_writer_common::STB_WEAK,
+                    _ => STB_GLOBAL,
+                };
                 symbols.push(ElfSymbol {
                     name: global.name.clone(),
                     value: data_offset as u64,
                     size: type_size as u64,
-                    binding: STB_GLOBAL,
+                    binding,
                     sym_type: elf_writer_common::STT_OBJECT,
                     section_index: 2, // .data section
                     visibility: elf_writer_common::STV_DEFAULT,
@@ -721,11 +728,16 @@ impl RiscV64Codegen {
                 let bss_offset = bss_size;
                 bss_size += type_size;
 
+                let binding = match global.linkage {
+                    crate::ir::module::Linkage::Internal => STB_LOCAL,
+                    crate::ir::module::Linkage::Weak => crate::backend::elf_writer_common::STB_WEAK,
+                    _ => STB_GLOBAL,
+                };
                 symbols.push(ElfSymbol {
                     name: global.name.clone(),
                     value: bss_offset as u64,
                     size: type_size as u64,
-                    binding: STB_GLOBAL,
+                    binding,
                     sym_type: elf_writer_common::STT_OBJECT,
                     section_index: 4, // .bss section
                     visibility: elf_writer_common::STV_DEFAULT,

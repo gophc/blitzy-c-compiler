@@ -1115,14 +1115,19 @@ pub fn lower_translation_unit(
     });
 
     // Drain anonymous compound literal globals created during Pass 1 constant evaluation.
+    // Compound literals are anonymous and local to the translation unit — they must
+    // use internal (static) linkage to avoid multiple-definition errors when linking
+    // multiple object files that each contain compound literals with the same generated
+    // name pattern (`__compound_literal.N`).
     COMPOUND_LITERAL_GLOBALS.with(|cl| {
         let globals = cl.borrow_mut().drain(..).collect::<Vec<_>>();
         for (anon_name, ir_type, initializer, c_type) in globals {
-            let gv = crate::ir::module::GlobalVariable::new(
+            let mut gv = crate::ir::module::GlobalVariable::new(
                 anon_name.clone(),
                 ir_type,
                 Some(initializer),
             );
+            gv.linkage = crate::ir::module::Linkage::Internal;
             module.add_global(gv);
             module.global_c_types.insert(anon_name, c_type);
         }
@@ -1199,14 +1204,17 @@ pub fn lower_translation_unit(
     // Drain anonymous compound literal / string globals created during Pass 2
     // function lowering (e.g. static locals with string-pointer initializers
     // like `static const char *p = "hello" + 1;`).
+    // Same as Pass 1: compound literals use internal linkage to prevent
+    // cross-TU symbol collisions.
     COMPOUND_LITERAL_GLOBALS.with(|cl| {
         let globals = cl.borrow_mut().drain(..).collect::<Vec<_>>();
         for (anon_name, ir_type, initializer, c_type) in globals {
-            let gv = crate::ir::module::GlobalVariable::new(
+            let mut gv = crate::ir::module::GlobalVariable::new(
                 anon_name.clone(),
                 ir_type,
                 Some(initializer),
             );
+            gv.linkage = crate::ir::module::Linkage::Internal;
             module.add_global(gv);
             module.global_c_types.insert(anon_name, c_type);
         }

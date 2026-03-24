@@ -1005,7 +1005,13 @@ impl SymbolTable {
             // Union compatibility: same as struct — tag-name match suffices.
             (CType::Union { name: Some(na), .. }, CType::Union { name: Some(nb), .. }) => na == nb,
 
-            // Enum compatible with its underlying type.
+            // Enum compatibility: named enums with the same tag are compatible,
+            // mirroring the struct/union treatment.  This covers cases like:
+            //   extern enum system_states { ... } system_state;
+            //   enum system_states system_state;  // re-declaration
+            (CType::Enum { name: Some(na), .. }, CType::Enum { name: Some(nb), .. }) => na == nb,
+
+            // Enum compatible with its underlying type (e.g. `int`).
             (
                 CType::Enum {
                     underlying_type, ..
