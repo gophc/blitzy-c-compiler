@@ -1089,8 +1089,7 @@ pub fn lower_declaration_initializers(ctx: &mut StmtLoweringContext<'_>, decl: &
                 };
                 // Extract ALL array dimension expressions from the
                 // declarator.  For `int a[n][m]` this gives [n, m].
-                let all_dims =
-                    decl_lowering::extract_all_vla_dims(&init_decl.declarator);
+                let all_dims = decl_lowering::extract_all_vla_dims(&init_decl.declarator);
                 // Start with base element size as the running product.
                 let mut running_total = {
                     use crate::ir::instructions::BinOp as IrBinOp;
@@ -1138,10 +1137,7 @@ pub fn lower_declaration_initializers(ctx: &mut StmtLoweringContext<'_>, decl: &
                 // Collect lowered dimension Values for stride computation.
                 let mut dim_lowered_vals: Vec<Value> = Vec::new();
                 for dim_expr in &dim_exprs {
-                    let tv = super::expr_lowering::lower_expression_typed(
-                        &mut expr_ctx,
-                        dim_expr,
-                    );
+                    let tv = super::expr_lowering::lower_expression_typed(&mut expr_ctx, dim_expr);
                     let dim_val = tv.value;
                     // ZExt to pointer width if needed.
                     let dim_wide = {
@@ -1155,12 +1151,10 @@ pub fn lower_declaration_initializers(ctx: &mut StmtLoweringContext<'_>, decl: &
                         v
                     };
                     dim_lowered_vals.push(dim_wide);
-                    let (product, mul_inst) = expr_ctx.builder.build_mul(
-                        running_total,
-                        dim_wide,
-                        ptr_ty.clone(),
-                        span,
-                    );
+                    let (product, mul_inst) =
+                        expr_ctx
+                            .builder
+                            .build_mul(running_total, dim_wide, ptr_ty.clone(), span);
                     push_inst_to_block(&mut expr_ctx, mul_inst);
                     running_total = product;
                 }

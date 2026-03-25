@@ -1635,6 +1635,66 @@ fn lower_aggregate_local_init(
                                 span,
                             );
                         }
+                    } else if first.designators.len() > 1 {
+                        // Chained designator such as `.f.b = 42` — the
+                        // first designator (`.f`) selected the union member;
+                        // forward remaining designators (`.b`) into the
+                        // sub-aggregate initialization.
+                        let resolved_member_ty =
+                            crate::common::types::resolve_typedef(&fields[field_idx].ty);
+                        if let CType::Struct {
+                            fields: ref sub_fields,
+                            packed: sub_packed,
+                            aligned: sub_aligned,
+                            ..
+                        } = resolved_member_ty
+                        {
+                            let sub_layout = ctx.type_builder.compute_struct_layout_with_fields(
+                                sub_fields,
+                                *sub_packed,
+                                *sub_aligned,
+                            );
+                            let inner_offsets: Vec<usize> =
+                                sub_layout.fields.iter().map(|fl| fl.offset).collect();
+                            lower_designated_struct_init(
+                                base_alloca,
+                                &first.designators[1..],
+                                &first.initializer,
+                                sub_fields,
+                                &inner_offsets,
+                                &sub_layout.fields,
+                                0, // union members always start at byte 0
+                                0,
+                                ctx,
+                                span,
+                            );
+                        } else if let CType::Union { .. } = resolved_member_ty {
+                            // Nested union within union — recurse
+                            let synthetic_item = ast::DesignatedInitializer {
+                                designators: first.designators[1..].to_vec(),
+                                initializer: first.initializer.clone(),
+                                span: first.span,
+                            };
+                            let synthetic_init = ast::Initializer::List {
+                                designators_and_initializers: vec![synthetic_item],
+                                trailing_comma: false,
+                                span: first.span,
+                            };
+                            lower_single_init_element(
+                                base_alloca,
+                                &synthetic_init,
+                                &fields[field_idx].ty,
+                                ctx,
+                            );
+                        } else {
+                            // Non-aggregate sub-field — treat as plain store
+                            lower_single_init_element(
+                                base_alloca,
+                                &first.initializer,
+                                &fields[field_idx].ty,
+                                ctx,
+                            );
+                        }
                     } else {
                         lower_single_init_element(
                             base_alloca,
@@ -1664,6 +1724,31 @@ fn lower_single_init_element(
 ) {
     match init {
         ast::Initializer::Expression(expr) => {
+            // ---------------------------------------------------------------
+            // Special case: char array member initialized from a string
+            // literal — `struct S { char c[8]; }; struct S a = { "hello" };`
+            //
+            // The expression evaluates to a *pointer* to .rodata, but C
+            // semantics require *copying* the string bytes into the member
+            // array.  We detect this and emit byte-level stores.
+            // ---------------------------------------------------------------
+            let mut resolved_elem = elem_type.clone();
+            expr_lowering::resolve_forward_ref_type(&mut resolved_elem, ctx.struct_defs);
+            if let Some((char_elem_ty, arr_size)) = is_char_array_type(&resolved_elem) {
+                if let Some(str_bytes) = extract_string_literal_bytes(expr) {
+                    let elem_bsz = wide_char_elem_size(&char_elem_ty);
+                    let arr_byte_size = arr_size * elem_bsz;
+                    lower_char_array_from_string(
+                        ptr,
+                        &str_bytes,
+                        arr_byte_size,
+                        &char_elem_ty,
+                        ctx,
+                    );
+                    return;
+                }
+            }
+
             let tv = expr_lowering::lower_expression_typed(ctx, expr);
             // Insert an implicit conversion when the expression value's type
             // differs from the target element type. This handles both
@@ -1828,12 +1913,10 @@ fn evaluate_constant_expr(
         ast::Expression::FloatLiteral { value, suffix, .. } => {
             // GCC imaginary suffix: `2.0i` → _Complex constant {0.0, 2.0}
             match suffix {
-                ast::FloatSuffix::I | ast::FloatSuffix::FI => {
-                    Some(Constant::Array(vec![
-                        Constant::Float(0.0),
-                        Constant::Float(*value),
-                    ]))
-                }
+                ast::FloatSuffix::I | ast::FloatSuffix::FI => Some(Constant::Array(vec![
+                    Constant::Float(0.0),
+                    Constant::Float(*value),
+                ])),
                 ast::FloatSuffix::LI => {
                     // _Complex long double imaginary: convert both parts
                     // to long double byte representation.
@@ -2782,6 +2865,89 @@ fn evaluate_const_binop(op: &ast::BinaryOp, lhs: &Constant, rhs: &Constant) -> O
                 ])),
                 _ => Some(Constant::Undefined),
             }
+        }
+        // Integer + Complex → promote integer to float, then complex add
+        (Constant::Integer(a), Constant::Array(b_parts)) if b_parts.len() == 2 => {
+            let af = *a as f64;
+            let br = const_as_f64(&b_parts[0]);
+            let bi = const_as_f64(&b_parts[1]);
+            match op {
+                ast::BinaryOp::Add => Some(Constant::Array(vec![
+                    Constant::Float(af + br),
+                    Constant::Float(bi),
+                ])),
+                ast::BinaryOp::Sub => Some(Constant::Array(vec![
+                    Constant::Float(af - br),
+                    Constant::Float(-bi),
+                ])),
+                ast::BinaryOp::Mul => {
+                    // (af+0i)(br+bi*i) = (af*br) + (af*bi)i
+                    Some(Constant::Array(vec![
+                        Constant::Float(af * br),
+                        Constant::Float(af * bi),
+                    ]))
+                }
+                ast::BinaryOp::Div if br != 0.0 || bi != 0.0 => {
+                    let denom = br * br + bi * bi;
+                    Some(Constant::Array(vec![
+                        Constant::Float((af * br) / denom),
+                        Constant::Float((-af * bi) / denom),
+                    ]))
+                }
+                _ => Some(Constant::Undefined),
+            }
+        }
+        // Complex + Integer → promote integer to float, then complex add
+        (Constant::Array(a_parts), Constant::Integer(b)) if a_parts.len() == 2 => {
+            let ar = const_as_f64(&a_parts[0]);
+            let ai = const_as_f64(&a_parts[1]);
+            let bf = *b as f64;
+            match op {
+                ast::BinaryOp::Add => Some(Constant::Array(vec![
+                    Constant::Float(ar + bf),
+                    Constant::Float(ai),
+                ])),
+                ast::BinaryOp::Sub => Some(Constant::Array(vec![
+                    Constant::Float(ar - bf),
+                    Constant::Float(ai),
+                ])),
+                ast::BinaryOp::Mul => {
+                    // (ar+ai*i)(bf+0i) = (ar*bf) + (ai*bf)i
+                    Some(Constant::Array(vec![
+                        Constant::Float(ar * bf),
+                        Constant::Float(ai * bf),
+                    ]))
+                }
+                ast::BinaryOp::Div if *b != 0 => Some(Constant::Array(vec![
+                    Constant::Float(ar / bf),
+                    Constant::Float(ai / bf),
+                ])),
+                _ => Some(Constant::Undefined),
+            }
+        }
+        // Integer + Float → promote integer, compute float result
+        (Constant::Integer(a), Constant::Float(b)) => {
+            let af = *a as f64;
+            let result = match op {
+                ast::BinaryOp::Add => af + b,
+                ast::BinaryOp::Sub => af - b,
+                ast::BinaryOp::Mul => af * b,
+                ast::BinaryOp::Div if *b != 0.0 => af / b,
+                _ => return Some(Constant::Undefined),
+            };
+            Some(Constant::Float(result))
+        }
+        // Float + Integer → promote integer, compute float result
+        (Constant::Float(a), Constant::Integer(b)) => {
+            let bf = *b as f64;
+            let result = match op {
+                ast::BinaryOp::Add => a + bf,
+                ast::BinaryOp::Sub => a - bf,
+                ast::BinaryOp::Mul => a * bf,
+                ast::BinaryOp::Div if *b != 0 => a / bf,
+                _ => return Some(Constant::Undefined),
+            };
+            Some(Constant::Float(result))
         }
         _ => Some(Constant::Undefined),
     }

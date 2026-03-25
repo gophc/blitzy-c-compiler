@@ -3192,6 +3192,18 @@ fn constant_to_bytes_typed(
                 result.resize(16, 0);
                 result
             }
+            // When the target type is an integer (e.g., _Complex char
+            // has element type I8), truncate the float to the integer
+            // width.  This handles complex-constant initializers where
+            // the constant is stored as Float but the destination type
+            // is an integer.
+            Some(IrType::I1) | Some(IrType::I8) => {
+                vec![(*v as i8) as u8]
+            }
+            Some(IrType::I16) => (*v as i16).to_le_bytes().to_vec(),
+            Some(IrType::I32) => (*v as i32).to_le_bytes().to_vec(),
+            Some(IrType::I64) => (*v as i64).to_le_bytes().to_vec(),
+            Some(IrType::I128) => (*v as i128).to_le_bytes().to_vec(),
             _ => v.to_le_bytes().to_vec(),
         },
         Constant::LongDouble(bytes) => {

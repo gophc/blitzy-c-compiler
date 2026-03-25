@@ -484,14 +484,24 @@ fn compute_struct_size(
 
     // Bit-level offset tracking for proper bitfield packing.
     // `bit_offset` tracks position in bits; for non-bitfield members we
-    // round up to a byte boundary first.
-    let mut bit_offset: usize = 0;
+    // round up to a byte boundary first.  We use u128 to avoid overflow
+    // on intentionally huge structs (e.g. `short buf[(1<<62)-256]`).
+    let mut bit_offset: u128 = 0;
     let mut max_field_align: usize = 1;
+
+    // Helper: align a u128 value up to alignment boundary.
+    let align_up_u128 = |val: u128, align: usize| -> u128 {
+        if align <= 1 {
+            return val;
+        }
+        let a = align as u128;
+        (val + a - 1) / a * a
+    };
 
     for field in fields {
         if let Some(bits) = field.bit_width {
-            let bits = bits as usize;
-            let unit_size_bytes = sizeof_ctype(&field.ty, target);
+            let bits = bits as u128;
+            let unit_size_bytes = sizeof_ctype(&field.ty, target) as u128;
             let unit_size_bits = unit_size_bytes * 8;
             let field_align = if packed {
                 1
@@ -502,9 +512,9 @@ fn compute_struct_size(
             if bits == 0 {
                 // Zero-width bitfield: pad to next alignment boundary of the
                 // underlying type, then close the current storage unit.
-                let align_bits = field_align * 8;
+                let align_bits = (field_align as u128) * 8;
                 if align_bits > 0 {
-                    bit_offset = align_up(bit_offset, align_bits);
+                    bit_offset = align_up_u128(bit_offset, field_align * 8);
                 }
                 if field_align > max_field_align {
                     max_field_align = field_align;
@@ -513,10 +523,7 @@ fn compute_struct_size(
             }
 
             // Check if this bitfield fits in the current storage unit.
-            // The storage unit is aligned to field_align and is
-            // unit_size_bits wide. If the bitfield would cross the next
-            // unit boundary, start a new unit.
-            let unit_align_bits = if packed { 8 } else { field_align * 8 };
+            let unit_align_bits: u128 = if packed { 8 } else { (field_align as u128) * 8 };
             let unit_start = if unit_align_bits > 0 {
                 (bit_offset / unit_align_bits) * unit_align_bits
             } else {
@@ -529,7 +536,7 @@ fn compute_struct_size(
                 bit_offset = unit_start + unit_size_bits;
                 // Re-align for the new unit.
                 let byte_offset = (bit_offset + 7) / 8;
-                let aligned_byte = align_up(byte_offset, field_align);
+                let aligned_byte = align_up_u128(byte_offset, field_align);
                 bit_offset = aligned_byte * 8;
             }
 
@@ -542,7 +549,7 @@ fn compute_struct_size(
             // Non-bitfield member: round up to byte boundary first.
             let byte_offset = (bit_offset + 7) / 8;
 
-            let field_size = sizeof_ctype(&field.ty, target);
+            let field_size = sizeof_ctype(&field.ty, target) as u128;
             let field_align = if packed {
                 1
             } else {
@@ -550,13 +557,10 @@ fn compute_struct_size(
             };
 
             // Align the byte offset.
-            let aligned_byte = align_up(byte_offset, field_align);
+            let aligned_byte = align_up_u128(byte_offset, field_align);
 
             // Advance past this field.
-            // Use wrapping_add / wrapping_mul to avoid overflow panics on
-            // intentionally huge structs (e.g. torture test 991014-1 where
-            // `short buf[(1<<62)-256]` is declared).
-            bit_offset = aligned_byte.wrapping_add(field_size).wrapping_mul(8);
+            bit_offset = (aligned_byte + field_size) * 8;
 
             if field_align > max_field_align {
                 max_field_align = field_align;
@@ -565,7 +569,8 @@ fn compute_struct_size(
     }
 
     // Convert final bit offset to bytes (round up).
-    let byte_size = (bit_offset + 7) / 8;
+    let byte_size_u128 = (bit_offset + 7) / 8;
+    let byte_size = byte_size_u128 as usize;
 
     // Apply explicit alignment override.
     let struct_align = match aligned {
@@ -925,13 +930,22 @@ fn compute_struct_size_resolved(
         return if let Some(a) = aligned { a.max(1) } else { 0 };
     }
 
-    let mut bit_offset: usize = 0;
+    // Use u128 to avoid overflow on intentionally huge structs.
+    let mut bit_offset: u128 = 0;
     let mut max_field_align: usize = 1;
+
+    let align_up_u128 = |val: u128, align: usize| -> u128 {
+        if align <= 1 {
+            return val;
+        }
+        let a = align as u128;
+        (val + a - 1) / a * a
+    };
 
     for field in fields {
         if let Some(bits) = field.bit_width {
-            let bits = bits as usize;
-            let unit_size_bytes = sizeof_ctype_resolved(&field.ty, target, tag_types);
+            let bits = bits as u128;
+            let unit_size_bytes = sizeof_ctype_resolved(&field.ty, target, tag_types) as u128;
             let unit_size_bits = unit_size_bytes * 8;
             let field_align = if packed {
                 1
@@ -940,9 +954,9 @@ fn compute_struct_size_resolved(
             };
 
             if bits == 0 {
-                let align_bits = field_align * 8;
+                let align_bits = (field_align as u128) * 8;
                 if align_bits > 0 {
-                    bit_offset = align_up(bit_offset, align_bits);
+                    bit_offset = align_up_u128(bit_offset, field_align * 8);
                 }
                 if field_align > max_field_align {
                     max_field_align = field_align;
@@ -950,7 +964,7 @@ fn compute_struct_size_resolved(
                 continue;
             }
 
-            let unit_align_bits = if packed { 8 } else { field_align * 8 };
+            let unit_align_bits: u128 = if packed { 8 } else { (field_align as u128) * 8 };
             let unit_start = if unit_align_bits > 0 {
                 (bit_offset / unit_align_bits) * unit_align_bits
             } else {
@@ -961,7 +975,7 @@ fn compute_struct_size_resolved(
             if bits_used_in_unit + bits > unit_size_bits {
                 bit_offset = unit_start + unit_size_bits;
                 let byte_offset = (bit_offset + 7) / 8;
-                let aligned_byte = align_up(byte_offset, field_align);
+                let aligned_byte = align_up_u128(byte_offset, field_align);
                 bit_offset = aligned_byte * 8;
             }
 
@@ -972,21 +986,21 @@ fn compute_struct_size_resolved(
             }
         } else {
             let byte_offset = (bit_offset + 7) / 8;
-            let field_size = sizeof_ctype_resolved(&field.ty, target, tag_types);
+            let field_size = sizeof_ctype_resolved(&field.ty, target, tag_types) as u128;
             let field_align = if packed {
                 1
             } else {
                 alignof_ctype_resolved(&field.ty, target, tag_types)
             };
-            let aligned_byte = align_up(byte_offset, field_align);
-            bit_offset = aligned_byte.wrapping_add(field_size).wrapping_mul(8);
+            let aligned_byte = align_up_u128(byte_offset, field_align);
+            bit_offset = (aligned_byte + field_size) * 8;
             if field_align > max_field_align {
                 max_field_align = field_align;
             }
         }
     }
 
-    let byte_size = (bit_offset + 7) / 8;
+    let byte_size = ((bit_offset + 7) / 8) as usize;
     let struct_align = match aligned {
         Some(a) => a.max(max_field_align),
         None => {

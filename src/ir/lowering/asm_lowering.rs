@@ -591,13 +591,19 @@ pub fn lower_inline_asm(
     // With a single-result InlineAsm, all outputs share the same result value.
     // The backend is responsible for extracting individual output values
     // from the constraint specification.
+    // For memory constraints ("=m", "+m"), the value is already in memory
+    // — the asm operates on the memory location directly, so no post-store
+    // from the asm result register is needed.
     for (idx, constraint) in output_constraints.iter().enumerate() {
         if idx < output_ptrs.len() && constraint.is_output {
-            let store_inst = builder.build_store(result_val, output_ptrs[idx], span);
-            if let Some(block_id) = builder.get_insert_block() {
-                let block_idx = block_id.index();
-                if block_idx < function.blocks.len() {
-                    function.blocks[block_idx].push_instruction(store_inst);
+            let is_memory_constraint = constraint.constraint_code.contains('m');
+            if !is_memory_constraint {
+                let store_inst = builder.build_store(result_val, output_ptrs[idx], span);
+                if let Some(block_id) = builder.get_insert_block() {
+                    let block_idx = block_id.index();
+                    if block_idx < function.blocks.len() {
+                        function.blocks[block_idx].push_instruction(store_inst);
+                    }
                 }
             }
         }

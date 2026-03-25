@@ -309,12 +309,9 @@ impl TypeBuilder {
     ) -> StructLayout {
         let mut field_layouts = Vec::with_capacity(fields.len());
         // Track position as absolute bit offset from the struct start.
-        // This matches the algorithm in `compute_struct_size` (types.rs)
-        // which correctly handles bitfield packing per the System V ABI:
-        // bitfields are placed at the current bit position within a
-        // natural-alignment region of their storage unit type, without
-        // forcing alignment of the storage unit itself.
-        let mut abs_bit: usize = 0;
+        // Use u128 to avoid overflow on huge structs (e.g. arrays with
+        // (1<<62) elements where byte_size * 8 would overflow usize).
+        let mut abs_bit: u128 = 0;
         let mut max_field_align: usize = 1;
         let mut has_flexible_array = false;
 
@@ -325,8 +322,17 @@ impl TypeBuilder {
                 has_flexible_array = true;
             }
 
+            // Helper: align a u128 value up to an alignment boundary.
+            let align_u128 = |val: u128, a: usize| -> u128 {
+                if a <= 1 {
+                    return val;
+                }
+                let a = a as u128;
+                (val + a - 1) / a * a
+            };
+
             if let Some(bits) = field.bit_width {
-                let bits = bits as usize;
+                let bits = bits as u128;
                 // ----- Bitfield handling -----
                 let unit_type_size = sizeof_ctype(&field.ty, &self.target);
                 let unit_type_align = if packed {
@@ -334,7 +340,7 @@ impl TypeBuilder {
                 } else {
                     alignof_ctype(&field.ty, &self.target)
                 };
-                let unit_size_bits = unit_type_size * 8;
+                let unit_size_bits = (unit_type_size as u128) * 8;
 
                 if bits == 0 {
                     // Zero-width bitfield: pad to next alignment boundary
@@ -342,12 +348,12 @@ impl TypeBuilder {
                     // storage unit.
                     let align_bits = unit_type_align * 8;
                     if align_bits > 0 {
-                        abs_bit = align_up(abs_bit, align_bits);
+                        abs_bit = align_u128(abs_bit, align_bits);
                     }
                     if unit_type_align > max_field_align {
                         max_field_align = unit_type_align;
                     }
-                    let byte_off = abs_bit / 8;
+                    let byte_off = (abs_bit / 8) as usize;
                     field_layouts.push(FieldLayout {
                         offset: byte_off,
                         size: 0,
@@ -358,11 +364,12 @@ impl TypeBuilder {
                 }
 
                 // Determine the natural-alignment region that contains the
-                // current bit position.  Regions are sized to the storage
-                // unit type (e.g. 32 bits for `unsigned int`) and start at
-                // multiples of `unit_type_align * 8` bits from the struct
-                // start.
-                let unit_align_bits = if packed { 8 } else { unit_type_align * 8 };
+                // current bit position.
+                let unit_align_bits: u128 = if packed {
+                    8
+                } else {
+                    (unit_type_align as u128) * 8
+                };
                 let unit_start = if unit_align_bits > 0 {
                     (abs_bit / unit_align_bits) * unit_align_bits
                 } else {
@@ -376,22 +383,27 @@ impl TypeBuilder {
                     abs_bit = unit_start + unit_size_bits;
                     // Re-align for the new unit.
                     let byte_offset = (abs_bit + 7) / 8;
-                    let aligned_byte = align_up(byte_offset, unit_type_align);
+                    let aligned_byte = align_u128(byte_offset, unit_type_align);
                     abs_bit = aligned_byte * 8;
                 }
 
                 // The byte offset of the storage unit containing this
                 // bitfield.  Compute as the aligned-down byte position.
-                let bf_byte = (abs_bit / 8) & !(unit_type_align - 1).max(0);
+                let mask = if unit_type_align > 0 {
+                    !((unit_type_align as u128) - 1)
+                } else {
+                    !0u128
+                };
+                let bf_byte = ((abs_bit / 8) & mask) as usize;
 
                 // Compute the bit offset within the storage unit.
-                let bit_offset_in_unit = abs_bit - bf_byte * 8;
+                let bit_offset_in_unit = (abs_bit - (bf_byte as u128) * 8) as usize;
 
                 field_layouts.push(FieldLayout {
                     offset: bf_byte,
                     size: unit_type_size,
                     alignment: unit_type_align,
-                    bitfield_info: Some((bit_offset_in_unit, bits)),
+                    bitfield_info: Some((bit_offset_in_unit, bits as usize)),
                 });
 
                 abs_bit += bits;
@@ -417,7 +429,7 @@ impl TypeBuilder {
                     alignof_ctype(&field.ty, &self.target)
                 };
 
-                let aligned_byte = align_up(byte_offset, field_align);
+                let aligned_byte = align_u128(byte_offset, field_align) as usize;
 
                 field_layouts.push(FieldLayout {
                     offset: aligned_byte,
@@ -426,7 +438,7 @@ impl TypeBuilder {
                     bitfield_info: None,
                 });
 
-                abs_bit = aligned_byte.wrapping_add(field_size).wrapping_mul(8);
+                abs_bit = ((aligned_byte as u128) + (field_size as u128)) * 8;
 
                 if field_align > max_field_align {
                     max_field_align = field_align;
@@ -435,7 +447,7 @@ impl TypeBuilder {
         }
 
         // Convert final bit offset to bytes (round up).
-        let final_byte = (abs_bit + 7) / 8;
+        let final_byte = ((abs_bit + 7) / 8) as usize;
 
         let struct_align = compute_aggregate_alignment(max_field_align, packed, explicit_align);
         let total_size = align_up(final_byte, struct_align);

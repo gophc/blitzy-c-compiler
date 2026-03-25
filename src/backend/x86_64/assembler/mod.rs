@@ -1101,16 +1101,20 @@ fn assemble_inline_asm_x86_64(
     // Replace %% with a placeholder that won't conflict with %N patterns.
     let template = template.replace("%%", "\x01\x01");
 
-    // Substitute %N operand references with physical register names.
-    // Process HIGHER indices first to avoid %1 matching inside %10.
+    // Substitute %N operand references with physical register names or
+    // memory operand syntax.  Process HIGHER indices first to avoid %1
+    // matching inside %10.
     let total_operands = num_outputs + input_operands.len();
     let mut substituted = template.to_string();
     for idx in (0..total_operands).rev() {
         let placeholder = format!("%{}", idx);
-        let reg_name = if idx < num_outputs {
-            // Output operand → use result register
+        let operand_text = if idx < num_outputs {
+            // Output operand → use result register or memory operand
             match result_op {
                 Some(crate::backend::traits::MachineOperand::Register(r)) => x86_64_reg_name_32(*r),
+                Some(crate::backend::traits::MachineOperand::Memory {
+                    base, displacement, ..
+                }) => format_memory_operand_att(*base, *displacement),
                 _ => format!("%{}", idx),
             }
         } else {
@@ -1122,13 +1126,16 @@ fn assemble_inline_asm_x86_64(
                     crate::backend::traits::MachineOperand::Immediate(imm) => {
                         format!("${}", imm)
                     }
+                    crate::backend::traits::MachineOperand::Memory {
+                        base, displacement, ..
+                    } => format_memory_operand_att(*base, *displacement),
                     _ => format!("%{}", idx),
                 }
             } else {
                 format!("%{}", idx)
             }
         };
-        substituted = substituted.replace(&placeholder, &reg_name);
+        substituted = substituted.replace(&placeholder, &operand_text);
     }
 
     // Restore %% escapes to single %.
@@ -1285,6 +1292,86 @@ fn parse_att_register(s: &str) -> Option<u8> {
     }
 }
 
+/// Format a `MachineOperand::Memory` as AT&T syntax (e.g., `-8(%rbp)`).
+fn format_memory_operand_att(base: Option<u16>, displacement: i64) -> String {
+    match base {
+        Some(r) => {
+            let base_name = reg_name_64(r);
+            if displacement != 0 {
+                format!("{}(%{})", displacement, base_name)
+            } else {
+                format!("(%{})", base_name)
+            }
+        }
+        None => {
+            // Absolute address (rare, but handle it)
+            format!("{}", displacement)
+        }
+    }
+}
+
+/// Parse an AT&T memory operand of the form `disp(%reg)` or `(%reg)`.
+///
+/// Returns `(base_register_number, displacement)` on success.
+fn parse_att_memory(s: &str) -> Option<(u8, i32)> {
+    let s = s.trim();
+    let paren_pos = s.find('(')?;
+    let disp_str = &s[..paren_pos];
+    let reg_part = &s[paren_pos + 1..];
+    let reg_str = reg_part.trim_end_matches(')');
+    let disp: i32 = if disp_str.is_empty() {
+        0
+    } else {
+        disp_str.parse::<i32>().ok()?
+    };
+    let reg = parse_att_register(reg_str)?;
+    Some((reg, disp))
+}
+
+/// Encode ModR/M (and optional SIB + displacement) for a memory operand
+/// with the given base register and displacement.
+///
+/// `reg_opext` is the register field / opcode extension (/0../7) placed in
+/// the reg bits of the ModR/M byte.
+fn encode_modrm_memory(bytes: &mut Vec<u8>, reg_opext: u8, base_reg: u8, disp: i32) {
+    let rm = base_reg & 7;
+
+    if rm == 4 {
+        // RSP/R12 (rm=100) requires a SIB byte
+        if disp == 0 && rm != 5 {
+            // mod=00, rm=100 (SIB follows)
+            bytes.push(((reg_opext & 7) << 3) | 4);
+            bytes.push(0x24); // SIB: scale=00, index=100 (none), base=100 (RSP)
+        } else if (-128..=127).contains(&disp) {
+            // mod=01, rm=100 (SIB follows), disp8
+            bytes.push(0x40 | ((reg_opext & 7) << 3) | 4);
+            bytes.push(0x24);
+            bytes.push(disp as u8);
+        } else {
+            // mod=10, rm=100 (SIB follows), disp32
+            bytes.push(0x80 | ((reg_opext & 7) << 3) | 4);
+            bytes.push(0x24);
+            bytes.extend_from_slice(&disp.to_le_bytes());
+        }
+    } else if rm == 5 && disp == 0 {
+        // RBP/R13 (rm=101) with zero disp needs explicit disp8=0 (mod=01)
+        // because mod=00 rm=101 means RIP-relative, not [RBP].
+        bytes.push(0x40 | ((reg_opext & 7) << 3) | 5);
+        bytes.push(0x00);
+    } else if disp == 0 {
+        // mod=00 (no displacement)
+        bytes.push(((reg_opext & 7) << 3) | rm);
+    } else if (-128..=127).contains(&disp) {
+        // mod=01 (disp8)
+        bytes.push(0x40 | ((reg_opext & 7) << 3) | rm);
+        bytes.push(disp as u8);
+    } else {
+        // mod=10 (disp32)
+        bytes.push(0x80 | ((reg_opext & 7) << 3) | rm);
+        bytes.extend_from_slice(&disp.to_le_bytes());
+    }
+}
+
 /// Split AT&T operands (src, dst) with comma separator.
 fn split_att_operands(s: &str) -> (&str, &str) {
     if let Some(pos) = s.find(',') {
@@ -1303,7 +1390,21 @@ fn modrm_rr(reg: u8, rm: u8) -> u8 {
 fn assemble_mov_l(operands: &str) -> Vec<u8> {
     let (src, dst) = split_att_operands(operands);
 
-    // movl $imm, %reg
+    // movl $imm, disp(%reg) — store immediate to memory
+    if let Some(imm) = parse_att_immediate(src) {
+        if let Some((base_reg, disp)) = parse_att_memory(dst) {
+            let mut bytes = Vec::new();
+            if base_reg >= 8 {
+                bytes.push(0x41); // REX.B
+            }
+            bytes.push(0xC7); // MOV r/m32, imm32
+            encode_modrm_memory(&mut bytes, 0, base_reg, disp);
+            bytes.extend_from_slice(&(imm as u32).to_le_bytes());
+            return bytes;
+        }
+    }
+
+    // movl $imm, %reg — move immediate to register
     if let Some(imm) = parse_att_immediate(src) {
         if let Some(dst_reg) = parse_att_register(dst) {
             let mut bytes = Vec::new();
@@ -1316,7 +1417,47 @@ fn assemble_mov_l(operands: &str) -> Vec<u8> {
         }
     }
 
-    // movl %reg, %reg
+    // movl %reg, disp(%reg) — store register to memory
+    if let Some(src_reg) = parse_att_register(src) {
+        if let Some((base_reg, disp)) = parse_att_memory(dst) {
+            let mut bytes = Vec::new();
+            let mut rex = 0u8;
+            if src_reg >= 8 {
+                rex |= 0x44; // REX.R
+            }
+            if base_reg >= 8 {
+                rex |= 0x41; // REX.B
+            }
+            if rex != 0 {
+                bytes.push(rex);
+            }
+            bytes.push(0x89); // MOV r/m32, r32
+            encode_modrm_memory(&mut bytes, src_reg, base_reg, disp);
+            return bytes;
+        }
+    }
+
+    // movl disp(%reg), %reg — load from memory to register
+    if let Some((base_reg, disp)) = parse_att_memory(src) {
+        if let Some(dst_reg) = parse_att_register(dst) {
+            let mut bytes = Vec::new();
+            let mut rex = 0u8;
+            if dst_reg >= 8 {
+                rex |= 0x44; // REX.R
+            }
+            if base_reg >= 8 {
+                rex |= 0x41; // REX.B
+            }
+            if rex != 0 {
+                bytes.push(rex);
+            }
+            bytes.push(0x8B); // MOV r32, r/m32
+            encode_modrm_memory(&mut bytes, dst_reg, base_reg, disp);
+            return bytes;
+        }
+    }
+
+    // movl %reg, %reg — register-to-register
     if let (Some(src_reg), Some(dst_reg)) = (parse_att_register(src), parse_att_register(dst)) {
         let mut bytes = Vec::new();
         let mut rex = 0u8;
@@ -1345,6 +1486,22 @@ fn assemble_mov_l(operands: &str) -> Vec<u8> {
 fn assemble_mov_q(operands: &str) -> Vec<u8> {
     let (src, dst) = split_att_operands(operands);
 
+    // movq $imm, disp(%reg) — store immediate to memory (64-bit context)
+    if let Some(imm) = parse_att_immediate(src) {
+        if let Some((base_reg, disp)) = parse_att_memory(dst) {
+            let mut bytes = Vec::new();
+            let mut rex = 0x48u8; // REX.W
+            if base_reg >= 8 {
+                rex |= 0x01; // REX.B
+            }
+            bytes.push(rex);
+            bytes.push(0xC7); // MOV r/m64, imm32 (sign-extended to 64-bit)
+            encode_modrm_memory(&mut bytes, 0, base_reg, disp);
+            bytes.extend_from_slice(&(imm as i32).to_le_bytes());
+            return bytes;
+        }
+    }
+
     // movq $imm, %reg
     if let Some(imm) = parse_att_immediate(src) {
         if let Some(dst_reg) = parse_att_register(dst) {
@@ -1368,7 +1525,43 @@ fn assemble_mov_q(operands: &str) -> Vec<u8> {
         }
     }
 
-    // movq %reg, %reg
+    // movq %reg, disp(%reg) — store register to memory
+    if let Some(src_reg) = parse_att_register(src) {
+        if let Some((base_reg, disp)) = parse_att_memory(dst) {
+            let mut bytes = Vec::new();
+            let mut rex = 0x48u8; // REX.W
+            if src_reg >= 8 {
+                rex |= 0x04; // REX.R
+            }
+            if base_reg >= 8 {
+                rex |= 0x01; // REX.B
+            }
+            bytes.push(rex);
+            bytes.push(0x89); // MOV r/m64, r64
+            encode_modrm_memory(&mut bytes, src_reg, base_reg, disp);
+            return bytes;
+        }
+    }
+
+    // movq disp(%reg), %reg — load from memory to register
+    if let Some((base_reg, disp)) = parse_att_memory(src) {
+        if let Some(dst_reg) = parse_att_register(dst) {
+            let mut bytes = Vec::new();
+            let mut rex = 0x48u8; // REX.W
+            if dst_reg >= 8 {
+                rex |= 0x04; // REX.R
+            }
+            if base_reg >= 8 {
+                rex |= 0x01; // REX.B
+            }
+            bytes.push(rex);
+            bytes.push(0x8B); // MOV r64, r/m64
+            encode_modrm_memory(&mut bytes, dst_reg, base_reg, disp);
+            return bytes;
+        }
+    }
+
+    // movq %reg, %reg — register-to-register
     if let (Some(src_reg), Some(dst_reg)) = (parse_att_register(src), parse_att_register(dst)) {
         let mut bytes = Vec::new();
         let mut rex = 0x48u8; // REX.W

@@ -30,8 +30,8 @@ use crate::backend::x86_64::abi::{
     RED_ZONE_SIZE, SSE_ARG_REGS,
 };
 use crate::backend::x86_64::registers::{
-    self, CALLEE_SAVED_GPRS, R10, R11, R8, R9, RAX, RBP, RCX, RDI, RDX, RSI, RSP, XMM0, XMM1, XMM2,
-    XMM3, XMM4, XMM5, XMM6, XMM7,
+    self, CALLEE_SAVED_GPRS, R10, R11, R8, R9, RAX, RBP, RCX, RDI, RDX, RSI, RSP, XMM0, XMM1,
+    XMM15, XMM2, XMM3, XMM4, XMM5, XMM6, XMM7,
 };
 use crate::common::diagnostics::{DiagnosticEngine, Span};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
@@ -1228,6 +1228,14 @@ impl X86_64CodeGen {
                         // via the hidden pointer mechanism.
                         let alloc_size = ((ret_size + 7) & !7) as i64; // 8-byte align
                         current_offset -= alloc_size;
+                        current_offset &= !15; // 16-byte alignment
+                        struct_temp_offsets.insert(*result, current_offset as i32);
+                    } else if matches!(return_type, IrType::F80) {
+                        // F80 (long double) is MEMORY-class per AMD64 ABI.
+                        // Allocate a 16-byte temp slot for the hidden return
+                        // pointer mechanism (callee writes via hidden ptr,
+                        // caller reads from this slot).
+                        current_offset -= 16;
                         current_offset &= !15; // 16-byte alignment
                         struct_temp_offsets.insert(*result, current_offset as i32);
                     }
@@ -3403,7 +3411,7 @@ impl X86_64CodeGen {
                         };
                         let is_float = matches!(
                             self.value_types.get(value),
-                            Some(IrType::F32) | Some(IrType::F64)
+                            Some(IrType::F32) | Some(IrType::F64) | Some(IrType::F80)
                         );
                         if self.pic {
                             // PIC mode: store through GOT indirection.
@@ -3935,15 +3943,78 @@ impl X86_64CodeGen {
                                 out.push(Self::mk_inst(
                                     X86Opcode::Mov,
                                     Some(MachineOperand::Register(R10)),
-                                    &[ret_ptr_mem],
+                                    &[ret_ptr_mem.clone()],
                                 ));
 
-                                // Determine the source address of the return
-                                // value.  Check struct_load_source first
-                                // (stable RBP-relative memory operand), then
-                                // fall back to dereferencing the value as
-                                // a pointer.
-                                if let Some(mem_base) = self.struct_load_source.get(val).cloned() {
+                                // F80 (long double) is MEMORY-class but BCC
+                                // keeps the value in an XMM register (as F64).
+                                // Store it directly via MOVSD to the hidden
+                                // return pointer instead of treating it as a
+                                // struct pointer copy.
+                                let is_f80_ret = matches!(func.return_type, IrType::F80);
+                                if is_f80_ret {
+                                    let dst_mem = MachineOperand::Memory {
+                                        base: Some(R10),
+                                        index: None,
+                                        scale: 1,
+                                        displacement: 0,
+                                    };
+                                    if let Some(mem_base) =
+                                        self.struct_load_source.get(val).cloned()
+                                    {
+                                        // Load from memory source into XMM15,
+                                        // then store to hidden return buffer.
+                                        out.push(Self::mk_inst(
+                                            X86Opcode::Movsd,
+                                            Some(MachineOperand::Register(XMM15)),
+                                            &[mem_base],
+                                        ));
+                                        out.push(Self::mk_inst(
+                                            X86Opcode::Movsd,
+                                            None,
+                                            &[dst_mem, MachineOperand::Register(XMM15)],
+                                        ));
+                                    } else {
+                                        // Value is in a vreg (XMM).
+                                        out.push(Self::mk_inst(
+                                            X86Opcode::Movsd,
+                                            None,
+                                            &[dst_mem, src.clone()],
+                                        ));
+                                    }
+                                    // Zero the upper 8 bytes (10-byte F80
+                                    // padded to 16 bytes).
+                                    let dst_hi = MachineOperand::Memory {
+                                        base: Some(R10),
+                                        index: None,
+                                        scale: 1,
+                                        displacement: 8,
+                                    };
+                                    out.push(Self::mk_inst(
+                                        X86Opcode::Mov,
+                                        None,
+                                        &[dst_hi, MachineOperand::Immediate(0)],
+                                    ));
+                                    // RAX = hidden return pointer (ABI
+                                    // requirement — same as struct returns).
+                                    out.push(Self::mk_inst(
+                                        X86Opcode::Mov,
+                                        Some(MachineOperand::Register(RAX)),
+                                        &[ret_ptr_mem],
+                                    ));
+                                    // Fall through to the normal Ret at the
+                                    // bottom of the Return handler.  The
+                                    // standard epilogue (Leave + Ret) will be
+                                    // inserted before that Ret by
+                                    // insert_prologue_epilogue.
+                                } else if let Some(mem_base) =
+                                    self.struct_load_source.get(val).cloned()
+                                {
+                                    // Determine the source address of the return
+                                    // value.  Check struct_load_source first
+                                    // (stable RBP-relative memory operand), then
+                                    // fall back to dereferencing the value as
+                                    // a pointer.
                                     // Copy each 8-byte chunk from the source
                                     // memory to the hidden return buffer.
                                     for i in 0..eightbytes {
@@ -4030,16 +4101,21 @@ impl X86_64CodeGen {
                                 }
 
                                 // RAX = hidden return pointer (ABI requirement).
-                                out.push(Self::mk_inst(
-                                    X86Opcode::Mov,
-                                    Some(MachineOperand::Register(RAX)),
-                                    &[MachineOperand::Memory {
-                                        base: Some(RBP),
-                                        index: None,
-                                        scale: 1,
-                                        displacement: ret_ptr_off as i64,
-                                    }],
-                                ));
+                                // (F80 already set RAX above, but duplicating
+                                // this harmless assignment keeps the logic
+                                // uniform for the struct return case.)
+                                if !is_f80_ret {
+                                    out.push(Self::mk_inst(
+                                        X86Opcode::Mov,
+                                        Some(MachineOperand::Register(RAX)),
+                                        &[MachineOperand::Memory {
+                                            base: Some(RBP),
+                                            index: None,
+                                            scale: 1,
+                                            displacement: ret_ptr_off as i64,
+                                        }],
+                                    ));
+                                }
                             }
                         }
                         RetLocation::Void => {}
@@ -4732,9 +4808,56 @@ impl X86_64CodeGen {
                 // Create output vregs: output 0 = dst, outputs 1+ = extra vregs.
                 // Multi-output asm needs separate destination registers for
                 // each output so template %0, %1, etc. map to distinct regs.
-                let mut output_vregs: Vec<MachineOperand> = vec![dst.clone()];
-                for _ in 1..num_outputs {
-                    output_vregs.push(self.new_vreg());
+                //
+                // MEMORY CONSTRAINTS ("=m", "+m"): For memory constraints,
+                // the asm template %N should expand to a memory operand
+                // (e.g., -8(%rbp)), not a register. We look up the
+                // alloca offset of the output variable and use a Memory
+                // operand instead of a virtual register.
+                let mut output_vregs: Vec<MachineOperand> = Vec::new();
+                for (oi, cp) in constraint_parts.iter().enumerate() {
+                    if oi >= num_outputs {
+                        break;
+                    }
+                    let t = cp.trim();
+                    let body = t.trim_start_matches(|ch: char| ch == '=' || ch == '+');
+                    let is_mem = body.contains('m');
+                    if is_mem {
+                        // Memory constraint: use the alloca memory operand
+                        // for this output variable. The IR operands[oi] is
+                        // the pointer (alloca) for this output.
+                        let ptr_val = operands[oi];
+                        let mem_op = if let Some(ref frame) = self.frame {
+                            if let Some(&off) = frame.alloca_offsets.get(&ptr_val) {
+                                MachineOperand::Memory {
+                                    base: Some(RBP),
+                                    index: None,
+                                    scale: 1,
+                                    displacement: off as i64,
+                                }
+                            } else {
+                                // Fallback: use a vreg (may not produce ideal code)
+                                if oi == 0 {
+                                    dst.clone()
+                                } else {
+                                    self.new_vreg()
+                                }
+                            }
+                        } else if oi == 0 {
+                            dst.clone()
+                        } else {
+                            self.new_vreg()
+                        };
+                        output_vregs.push(mem_op);
+                    } else if oi == 0 {
+                        output_vregs.push(dst.clone());
+                    } else {
+                        output_vregs.push(self.new_vreg());
+                    }
+                }
+                // If no output constraints were parsed, default to dst.
+                if output_vregs.is_empty() {
+                    output_vregs.push(dst.clone());
                 }
 
                 // Build the operand list for the MachineInstruction.
@@ -4803,8 +4926,13 @@ impl X86_64CodeGen {
                         if t.starts_with('+') && ci < num_outputs {
                             // Read-write output: pre-load from appended RW
                             // input value into this output's vreg.
+                            // Skip pre-move for memory constraints (+m) since
+                            // the operand stays in memory — no register copy needed.
+                            let constraint_body =
+                                t.trim_start_matches(|ch: char| ch == '+' || ch == '=');
+                            let is_memory_constraint = constraint_body.contains('m');
                             let op_idx = rw_start + rw_idx;
-                            if op_idx < operands.len() {
+                            if !is_memory_constraint && op_idx < operands.len() {
                                 let src_op = self.get_value(operands[op_idx]);
                                 let target = &output_vregs[ci];
                                 let mut mov = MachineInstruction::new(X86Opcode::Mov.as_u32());
@@ -4833,7 +4961,8 @@ impl X86_64CodeGen {
                 }
 
                 let mut inst = MachineInstruction::new(X86Opcode::InlineAsm.as_u32());
-                inst.result = Some(dst);
+                // Use the first output operand (may be memory for '=m')
+                inst.result = Some(output_vregs[0].clone());
                 for op in &asm_operands {
                     inst.operands.push(op.clone());
                 }
@@ -6618,15 +6747,22 @@ impl X86_64CodeGen {
             Fp,
             F80,
         }
-        let mut stack_args: Vec<(MachineOperand, StackArgKind)> = Vec::new();
+        // Unified stack argument entry — all stack-passed arguments
+        // (scalars, F80, MEMORY-class structs) are collected here in
+        // LEFT-TO-RIGHT parameter order, then emitted in REVERSE
+        // (right-to-left) per the SysV AMD64 ABI.
+        #[allow(clippy::enum_variant_names)]
+        enum StackArgEntry {
+            /// Scalar (int/ptr) or FP (F32/F64) or F80 stack argument.
+            Scalar(MachineOperand, StackArgKind),
+            /// MEMORY-class struct: push operands for each eightbyte
+            /// (already in high-to-low order within the group).
+            MemClassDirect(Vec<MachineOperand>),
+            /// MEMORY-class struct via pointer load: (ptr_op, eightbyte_count).
+            MemClassPtr(MachineOperand, usize),
+        }
+        let mut unified_stack_args: Vec<StackArgEntry> = Vec::new();
         let mut reg_arg_setup: Vec<MachineInstruction> = Vec::new();
-        // For MEMORY-class (>16 byte) struct arguments: each inner Vec is
-        // one argument's push operands. Outer Vec is in argument order;
-        // groups are emitted in REVERSE (right-to-left) per SysV ABI.
-        let mut memory_class_push_groups: Vec<Vec<MachineOperand>> = Vec::new();
-        // Fallback: (pointer_op, eightbyte_count) pairs for pointer-based
-        // loads. Also emitted in reverse argument order.
-        let mut memory_class_ptr_load_groups: Vec<(MachineOperand, usize)> = Vec::new();
 
         // If this call returns a MEMORY-class struct, pass the hidden
         // return pointer as the first GPR argument (RDI).
@@ -6721,7 +6857,7 @@ impl X86_64CodeGen {
                             reg_arg_setup.push(inst);
                             gpr_idx += 1;
                         } else {
-                            stack_args.push((
+                            unified_stack_args.push(StackArgEntry::Scalar(
                                 mem_base,
                                 if cls == AbiClass::Sse {
                                     StackArgKind::Fp
@@ -6836,8 +6972,8 @@ impl X86_64CodeGen {
                             },
                             _ => arg_op.clone(),
                         };
-                        stack_args.push((mem_base, StackArgKind::Int));
-                        stack_args.push((mem_hi, StackArgKind::Int));
+                        unified_stack_args.push(StackArgEntry::Scalar(mem_base, StackArgKind::Int));
+                        unified_stack_args.push(StackArgEntry::Scalar(mem_hi, StackArgKind::Int));
                         stack_offset += 16;
                     }
                     continue;
@@ -6896,7 +7032,7 @@ impl X86_64CodeGen {
                 } else {
                     // Same lo-before-hi ordering as struct_load_source path:
                     // lo at higher index → pushed first in reverse → lowest addr.
-                    stack_args.push((
+                    unified_stack_args.push(StackArgEntry::Scalar(
                         arg_op,
                         if pair_is_sse {
                             StackArgKind::Fp
@@ -6904,7 +7040,7 @@ impl X86_64CodeGen {
                             StackArgKind::Int
                         },
                     ));
-                    stack_args.push((
+                    unified_stack_args.push(StackArgEntry::Scalar(
                         hi_op,
                         if pair_is_sse {
                             StackArgKind::Fp
@@ -6961,7 +7097,7 @@ impl X86_64CodeGen {
                             };
                             arg_group.push(chunk_mem);
                         }
-                        memory_class_push_groups.push(arg_group);
+                        unified_stack_args.push(StackArgEntry::MemClassDirect(arg_group));
                     } else {
                         // Look harder: check if arg_val's producing Load
                         // instruction has a ptr operand backed by an alloca
@@ -7004,7 +7140,8 @@ impl X86_64CodeGen {
                                                     };
                                                     grp.push(chunk_mem);
                                                 }
-                                                memory_class_push_groups.push(grp);
+                                                unified_stack_args
+                                                    .push(StackArgEntry::MemClassDirect(grp));
                                                 found_alloca_base = true;
                                                 break 'outer_scan;
                                             }
@@ -7014,7 +7151,7 @@ impl X86_64CodeGen {
                                         let ptr_op = self.get_value(*load_ptr);
                                         if let MachineOperand::GlobalSymbol(ref sym) = ptr_op {
                                             let sym_clone = sym.clone();
-                                            memory_class_ptr_load_groups.push((
+                                            unified_stack_args.push(StackArgEntry::MemClassPtr(
                                                 MachineOperand::GlobalSymbol(sym_clone),
                                                 eightbytes,
                                             ));
@@ -7043,7 +7180,8 @@ impl X86_64CodeGen {
                                                 };
                                                 grp.push(chunk_mem);
                                             }
-                                            memory_class_push_groups.push(grp);
+                                            unified_stack_args
+                                                .push(StackArgEntry::MemClassDirect(grp));
                                             found_alloca_base = true;
                                             break 'outer_scan;
                                         }
@@ -7054,7 +7192,8 @@ impl X86_64CodeGen {
                         }
                         if !found_alloca_base {
                             // Final fallback: use pointer-based loads.
-                            memory_class_ptr_load_groups.push((arg_op.clone(), eightbytes));
+                            unified_stack_args
+                                .push(StackArgEntry::MemClassPtr(arg_op.clone(), eightbytes));
                         }
                     }
                     stack_offset += (eightbytes * 8) as i32;
@@ -7078,7 +7217,7 @@ impl X86_64CodeGen {
                 // F80 arguments are collected for stack pushing later.
                 // The arg_op holds the XMM register or memory operand
                 // containing the double value.
-                stack_args.push((arg_op, StackArgKind::F80));
+                unified_stack_args.push(StackArgEntry::Scalar(arg_op, StackArgKind::F80));
                 stack_offset += 16; // 16 bytes for long double on stack
                 continue;
             }
@@ -7140,7 +7279,7 @@ impl X86_64CodeGen {
                 gpr_idx += 1;
             } else {
                 // Collect stack arguments for reverse-order pushing.
-                stack_args.push((
+                unified_stack_args.push(StackArgEntry::Scalar(
                     arg_op,
                     if is_fp {
                         StackArgKind::Fp
@@ -7170,155 +7309,155 @@ impl X86_64CodeGen {
             stack_offset += 8;
         }
 
-        // Emit MEMORY-class (>16 byte) struct pushes.
-        // Emit in REVERSE argument order (right-to-left) so the leftmost
-        // argument ends up at the lowest stack address per SysV ABI.
-        for grp in memory_class_push_groups.into_iter().rev() {
-            for mc_op in grp.into_iter() {
-                let mut ld_inst = Self::mk_inst(
-                    X86Opcode::Mov,
-                    Some(MachineOperand::Register(R11)),
-                    &[mc_op],
-                );
-                ld_inst.is_call_arg_setup = true;
-                out.push(ld_inst);
-                let mut push_inst =
-                    Self::mk_inst(X86Opcode::Push, None, &[MachineOperand::Register(R11)]);
-                push_inst.is_call_arg_setup = true;
-                out.push(push_inst);
-            }
-        }
-        for (ptr_op, eightbytes) in memory_class_ptr_load_groups.into_iter().rev() {
-            // Use LEA for GlobalSymbol (address of global), MOV for registers.
-            let ptr_opcode = if matches!(&ptr_op, MachineOperand::GlobalSymbol(_)) {
-                X86Opcode::Lea
-            } else {
-                X86Opcode::Mov
-            };
-            let mut ptr_inst =
-                Self::mk_inst(ptr_opcode, Some(MachineOperand::Register(R10)), &[ptr_op]);
-            ptr_inst.is_call_arg_setup = true;
-            out.push(ptr_inst);
-            for i in (0..eightbytes).rev() {
-                let src_mem = MachineOperand::Memory {
-                    base: Some(R10),
-                    index: None,
-                    scale: 1,
-                    displacement: (i as i64) * 8,
-                };
-                let mut ld_inst = Self::mk_inst(
-                    X86Opcode::Mov,
-                    Some(MachineOperand::Register(R11)),
-                    &[src_mem],
-                );
-                ld_inst.is_call_arg_setup = true;
-                out.push(ld_inst);
-                let mut push_inst =
-                    Self::mk_inst(X86Opcode::Push, None, &[MachineOperand::Register(R11)]);
-                push_inst.is_call_arg_setup = true;
-                out.push(push_inst);
-            }
-        }
-
-        // Push stack arguments in reverse order (right-to-left) so the
+        // Emit ALL stack arguments in reverse order (right-to-left) so the
         // first stack argument (leftmost in the source) ends up at the
-        // lowest stack address as the ABI requires.
-        for (arg_op, arg_kind) in stack_args.into_iter().rev() {
-            match arg_kind {
-                StackArgKind::F80 => {
-                    // ---- Long double (F80) stack argument ----
-                    // Per AMD64 ABI, long double occupies 16 bytes on the
-                    // stack in 80-bit x87 extended precision format.
-                    // BCC internally stores long double as a 64-bit double.
-                    // Conversion sequence:
-                    //   1. SUB RSP, 16          — allocate 16-byte stack slot
-                    //   2. MOVSD [RSP], xmmN    — store double to [RSP]
-                    //   3. FLD QWORD [RSP]      — load double into x87 ST(0)
-                    //      (auto-converts to 80-bit extended internally)
-                    //   4. FSTP TWORD [RSP]     — store 80-bit extended to [RSP]
-                    //      (10 bytes of data + 6 bytes padding = 16 bytes)
-                    let sub_inst = Self::mk_inst(
-                        X86Opcode::Sub,
-                        Some(MachineOperand::Register(RSP)),
-                        &[MachineOperand::Register(RSP), MachineOperand::Immediate(16)],
-                    );
-                    out.push(sub_inst);
-                    // Store the double value from XMM register to [RSP]
-                    let mut store_inst = MachineInstruction::new(X86Opcode::Movsd.as_u32());
-                    store_inst.operands.push(MachineOperand::Memory {
-                        base: Some(RSP),
-                        index: None,
-                        scale: 1,
-                        displacement: 0,
-                    });
-                    store_inst.operands.push(arg_op);
-                    store_inst.is_call_arg_setup = true;
-                    out.push(store_inst);
-                    // FLD QWORD [RSP] — load double into x87, converts to 80-bit
-                    let mut fld_inst = MachineInstruction::new(X86Opcode::FldMem64.as_u32());
-                    fld_inst.operands.push(MachineOperand::Memory {
-                        base: Some(RSP),
-                        index: None,
-                        scale: 1,
-                        displacement: 0,
-                    });
-                    fld_inst.is_call_arg_setup = true;
-                    out.push(fld_inst);
-                    // FSTP TWORD [RSP] — store 80-bit extended to stack slot
-                    let mut fstp_inst = MachineInstruction::new(X86Opcode::FstpMem80.as_u32());
-                    fstp_inst.operands.push(MachineOperand::Memory {
-                        base: Some(RSP),
-                        index: None,
-                        scale: 1,
-                        displacement: 0,
-                    });
-                    fstp_inst.is_call_arg_setup = true;
-                    out.push(fstp_inst);
-                }
-                StackArgKind::Fp => {
-                    // Floating-point (F32/F64) values live in XMM registers
-                    // and CANNOT be pushed with the PUSH instruction.
-                    // Strategy: SUB RSP, 8 then MOVSD [RSP], xmmN.
-                    let sub_inst = Self::mk_inst(
-                        X86Opcode::Sub,
-                        Some(MachineOperand::Register(RSP)),
-                        &[MachineOperand::Register(RSP), MachineOperand::Immediate(8)],
-                    );
-                    out.push(sub_inst);
-                    // MOVSD [RSP], xmm (store float to newly allocated stack slot)
-                    let mut store_inst = MachineInstruction::new(X86Opcode::Movsd.as_u32());
-                    store_inst.operands.push(MachineOperand::Memory {
-                        base: Some(RSP),
-                        index: None,
-                        scale: 1,
-                        displacement: 0,
-                    });
-                    store_inst.operands.push(arg_op);
-                    store_inst.is_call_arg_setup = true;
-                    out.push(store_inst);
-                }
-                StackArgKind::Int => {
-                    match &arg_op {
-                        MachineOperand::GlobalSymbol(_) => {
-                            // The x86-64 PUSH instruction cannot encode a 64-bit
-                            // address operand directly. Materialize the address
-                            // into R11 via LEA, then push R11.
-                            let r11 = MachineOperand::Register(R11);
-                            let mut lea_inst =
-                                Self::mk_inst(X86Opcode::Lea, Some(r11.clone()), &[arg_op]);
-                            lea_inst.is_call_arg_setup = true;
-                            out.push(lea_inst);
-                            let mut push_inst = Self::mk_inst(X86Opcode::Push, None, &[r11]);
-                            push_inst.is_call_arg_setup = true;
-                            out.push(push_inst);
-                        }
-                        _ => {
-                            let mut push_inst = Self::mk_inst(X86Opcode::Push, None, &[arg_op]);
-                            push_inst.is_call_arg_setup = true;
-                            out.push(push_inst);
-                        }
+        // lowest stack address as the SysV AMD64 ABI requires.
+        // This unified loop correctly interleaves MEMORY-class struct
+        // pushes with scalar/F80 pushes based on their original
+        // parameter position.
+        for entry in unified_stack_args.into_iter().rev() {
+            match entry {
+                StackArgEntry::MemClassDirect(grp) => {
+                    for mc_op in grp.into_iter() {
+                        let mut ld_inst = Self::mk_inst(
+                            X86Opcode::Mov,
+                            Some(MachineOperand::Register(R11)),
+                            &[mc_op],
+                        );
+                        ld_inst.is_call_arg_setup = true;
+                        out.push(ld_inst);
+                        let mut push_inst =
+                            Self::mk_inst(X86Opcode::Push, None, &[MachineOperand::Register(R11)]);
+                        push_inst.is_call_arg_setup = true;
+                        out.push(push_inst);
                     }
                 }
+                StackArgEntry::MemClassPtr(ptr_op, eightbytes) => {
+                    let ptr_opcode = if matches!(&ptr_op, MachineOperand::GlobalSymbol(_)) {
+                        X86Opcode::Lea
+                    } else {
+                        X86Opcode::Mov
+                    };
+                    let mut ptr_inst =
+                        Self::mk_inst(ptr_opcode, Some(MachineOperand::Register(R10)), &[ptr_op]);
+                    ptr_inst.is_call_arg_setup = true;
+                    out.push(ptr_inst);
+                    for i in (0..eightbytes).rev() {
+                        let src_mem = MachineOperand::Memory {
+                            base: Some(R10),
+                            index: None,
+                            scale: 1,
+                            displacement: (i as i64) * 8,
+                        };
+                        let mut ld_inst = Self::mk_inst(
+                            X86Opcode::Mov,
+                            Some(MachineOperand::Register(R11)),
+                            &[src_mem],
+                        );
+                        ld_inst.is_call_arg_setup = true;
+                        out.push(ld_inst);
+                        let mut push_inst =
+                            Self::mk_inst(X86Opcode::Push, None, &[MachineOperand::Register(R11)]);
+                        push_inst.is_call_arg_setup = true;
+                        out.push(push_inst);
+                    }
+                }
+                StackArgEntry::Scalar(arg_op, arg_kind) => match arg_kind {
+                    StackArgKind::F80 => {
+                        // ---- Long double (F80) stack argument ----
+                        // Per AMD64 ABI, long double occupies 16 bytes on the
+                        // stack in 80-bit x87 extended precision format.
+                        // BCC internally stores long double as a 64-bit double.
+                        // Conversion sequence:
+                        //   1. SUB RSP, 16          — allocate 16-byte stack slot
+                        //   2. MOVSD [RSP], xmmN    — store double to [RSP]
+                        //   3. FLD QWORD [RSP]      — load double into x87 ST(0)
+                        //      (auto-converts to 80-bit extended internally)
+                        //   4. FSTP TWORD [RSP]     — store 80-bit extended to [RSP]
+                        //      (10 bytes of data + 6 bytes padding = 16 bytes)
+                        let sub_inst = Self::mk_inst(
+                            X86Opcode::Sub,
+                            Some(MachineOperand::Register(RSP)),
+                            &[MachineOperand::Register(RSP), MachineOperand::Immediate(16)],
+                        );
+                        out.push(sub_inst);
+                        // Store the double value from XMM register to [RSP]
+                        let mut store_inst = MachineInstruction::new(X86Opcode::Movsd.as_u32());
+                        store_inst.operands.push(MachineOperand::Memory {
+                            base: Some(RSP),
+                            index: None,
+                            scale: 1,
+                            displacement: 0,
+                        });
+                        store_inst.operands.push(arg_op);
+                        store_inst.is_call_arg_setup = true;
+                        out.push(store_inst);
+                        // FLD QWORD [RSP] — load double into x87, converts to 80-bit
+                        let mut fld_inst = MachineInstruction::new(X86Opcode::FldMem64.as_u32());
+                        fld_inst.operands.push(MachineOperand::Memory {
+                            base: Some(RSP),
+                            index: None,
+                            scale: 1,
+                            displacement: 0,
+                        });
+                        fld_inst.is_call_arg_setup = true;
+                        out.push(fld_inst);
+                        // FSTP TWORD [RSP] — store 80-bit extended to stack slot
+                        let mut fstp_inst = MachineInstruction::new(X86Opcode::FstpMem80.as_u32());
+                        fstp_inst.operands.push(MachineOperand::Memory {
+                            base: Some(RSP),
+                            index: None,
+                            scale: 1,
+                            displacement: 0,
+                        });
+                        fstp_inst.is_call_arg_setup = true;
+                        out.push(fstp_inst);
+                    }
+                    StackArgKind::Fp => {
+                        // Floating-point (F32/F64) values live in XMM registers
+                        // and CANNOT be pushed with the PUSH instruction.
+                        // Strategy: SUB RSP, 8 then MOVSD [RSP], xmmN.
+                        let sub_inst = Self::mk_inst(
+                            X86Opcode::Sub,
+                            Some(MachineOperand::Register(RSP)),
+                            &[MachineOperand::Register(RSP), MachineOperand::Immediate(8)],
+                        );
+                        out.push(sub_inst);
+                        // MOVSD [RSP], xmm (store float to newly allocated stack slot)
+                        let mut store_inst = MachineInstruction::new(X86Opcode::Movsd.as_u32());
+                        store_inst.operands.push(MachineOperand::Memory {
+                            base: Some(RSP),
+                            index: None,
+                            scale: 1,
+                            displacement: 0,
+                        });
+                        store_inst.operands.push(arg_op);
+                        store_inst.is_call_arg_setup = true;
+                        out.push(store_inst);
+                    }
+                    StackArgKind::Int => {
+                        match &arg_op {
+                            MachineOperand::GlobalSymbol(_) => {
+                                // The x86-64 PUSH instruction cannot encode a 64-bit
+                                // address operand directly. Materialize the address
+                                // into R11 via LEA, then push R11.
+                                let r11 = MachineOperand::Register(R11);
+                                let mut lea_inst =
+                                    Self::mk_inst(X86Opcode::Lea, Some(r11.clone()), &[arg_op]);
+                                lea_inst.is_call_arg_setup = true;
+                                out.push(lea_inst);
+                                let mut push_inst = Self::mk_inst(X86Opcode::Push, None, &[r11]);
+                                push_inst.is_call_arg_setup = true;
+                                out.push(push_inst);
+                            }
+                            _ => {
+                                let mut push_inst = Self::mk_inst(X86Opcode::Push, None, &[arg_op]);
+                                push_inst.is_call_arg_setup = true;
+                                out.push(push_inst);
+                            }
+                        }
+                    }
+                },
             }
         }
 
@@ -7539,11 +7678,9 @@ impl X86_64CodeGen {
                 }
             }
             RetLocation::Indirect => {
-                // MEMORY-class struct return: the return value is in the
-                // pre-allocated buffer whose address was passed as hidden
-                // first argument.  Map the result value to that buffer's
-                // memory operand so subsequent code (Store, Return, Call)
-                // can access the struct data directly.
+                // MEMORY-class return: the callee wrote the return value
+                // into the pre-allocated buffer whose address was passed as
+                // hidden first argument.
                 if let Some(slot_off) = indirect_ret_slot {
                     let mem_base = MachineOperand::Memory {
                         base: Some(RBP),
@@ -7551,10 +7688,18 @@ impl X86_64CodeGen {
                         scale: 1,
                         displacement: slot_off as i64,
                     };
-                    self.struct_load_source.insert(result, mem_base.clone());
-                    // Map the result to an LEA of the buffer so that
-                    // get_value returns a pointer to the struct data.
-                    out.push(Self::mk_inst(X86Opcode::Lea, Some(dst), &[mem_base]));
+                    // F80 (long double) is MEMORY-class but the value is
+                    // a scalar float — load it into an XMM vreg via Movsd
+                    // instead of LEA (which would give a pointer).
+                    if matches!(return_type, IrType::F80) {
+                        self.struct_load_source.insert(result, mem_base.clone());
+                        out.push(Self::mk_inst(X86Opcode::Movsd, Some(dst), &[mem_base]));
+                    } else {
+                        self.struct_load_source.insert(result, mem_base.clone());
+                        // Map the result to an LEA of the buffer so that
+                        // get_value returns a pointer to the struct data.
+                        out.push(Self::mk_inst(X86Opcode::Lea, Some(dst), &[mem_base]));
+                    }
                 }
             }
             RetLocation::Void => {

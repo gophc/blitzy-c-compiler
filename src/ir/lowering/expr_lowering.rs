@@ -6333,7 +6333,10 @@ fn lower_bitfield_read(
     // (defaulting to Int) because struct collection (pass 0) runs before
     // enum underlying type computation (pass 0.5).  Look up the
     // authoritative underlying type from the ENUM_UNDERLYING_TYPES map.
-    let effective_unsigned = match field_ty {
+    // IMPORTANT: field_ty may be a Typedef wrapping an Enum, so resolve
+    // typedefs first before checking for Enum.
+    let resolved_field_ty = crate::common::types::resolve_typedef(field_ty);
+    let effective_unsigned = match resolved_field_ty {
         CType::Enum {
             name: Some(ref en), ..
         } => super::ENUM_UNDERLYING_TYPES.with(|m| {
@@ -6342,9 +6345,9 @@ fn lower_bitfield_read(
                 .as_ref()
                 .and_then(|map| map.get(en).cloned())
                 .map(|ut| is_unsigned(&ut))
-                .unwrap_or_else(|| is_unsigned(field_ty))
+                .unwrap_or_else(|| is_unsigned(resolved_field_ty))
         }),
-        _ => is_unsigned(field_ty),
+        _ => is_unsigned(resolved_field_ty),
     };
     if std::env::var("BCC_DEBUG_BF").is_ok() {
         eprintln!(
@@ -6808,19 +6811,25 @@ fn lower_array_subscript(
     span: Span,
 ) -> TypedValue {
     let lv = lower_array_subscript_lvalue(ctx, base, index, span);
-    // If the element type is an array, the subscript yields an array lvalue
-    // which decays to a pointer.  We must NOT load from the address because
-    // the address itself IS the decayed pointer value (a `T (*)[N]` →
-    // `T *` implicit conversion).  E.g., for `int a[3][4]; a[i]` — the
-    // result is a pointer to the first element of the i-th inner array,
-    // NOT a load of 4 integers from memory.
-    if matches!(&lv.ty, CType::Array(_, _)) {
+    // If the element type is an array (possibly behind a typedef), the
+    // subscript yields an array lvalue which decays to a pointer.  We must
+    // NOT load from the address because the address itself IS the decayed
+    // pointer value (a `T (*)[N]` → `T *` implicit conversion).
+    //
+    // E.g., for `int a[3][4]; a[i]` — the result is a pointer to the first
+    // element of the i-th inner array, NOT a load of 4 integers from memory.
+    //
+    // CRITICAL: resolve typedefs before checking — `typedef char A4[4];
+    // A4 a[3]; a[i]` has lv.ty == Typedef{A4, Array(Char,4)}, which must
+    // still be recognized as an array element type.
+    let resolved_ty = types::resolve_typedef(&lv.ty);
+    if matches!(resolved_ty, CType::Array(_, _)) {
         // Return the pointer (address) directly, with the type set to a
         // pointer-to-element-type so that subsequent subscripting
         // (e.g., `a[i][j]`) indexes individual elements.
         // This implements C array-to-pointer decay: `T a[N][M]; a[i]`
         // yields a `T*` pointing at the first element of row i.
-        let inner_elem = match &lv.ty {
+        let inner_elem = match resolved_ty {
             CType::Array(elem, _) => elem.as_ref().clone(),
             _ => unreachable!(),
         };
@@ -7488,8 +7497,15 @@ fn lower_builtin(
         // ----- Branch prediction hint -----
         ast::BuiltinKind::Expect => {
             // __builtin_expect(expr, expected) — return expr as-is.
+            // The second argument (hint) is lowered for its side effects
+            // (e.g. `z++`) but its value is discarded.
             if let Some(arg) = args.first() {
-                lower_expr_inner(ctx, arg)
+                let result = lower_expr_inner(ctx, arg);
+                // Lower the second argument for side effects only.
+                if args.len() > 1 {
+                    let _ = lower_expr_inner(ctx, &args[1]);
+                }
+                result
             } else {
                 TypedValue::void()
             }

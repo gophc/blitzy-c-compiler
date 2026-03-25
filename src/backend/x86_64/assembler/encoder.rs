@@ -540,6 +540,15 @@ fn build_opcode_table() -> FxHashMap<u32, OpcodeEntry> {
         },
     );
     table.insert(
+        X86Opcode::Leave.as_u32(),
+        OpcodeEntry {
+            opcode: &[0xC9],
+            reg_opext: None,
+            default_64bit: false,
+            form: EncodingForm::NoOperands,
+        },
+    );
+    table.insert(
         X86Opcode::Neg.as_u32(),
         OpcodeEntry {
             opcode: &[0xF7],
@@ -861,6 +870,7 @@ impl X86_64Encoder {
             | X86Opcode::Endbr64
             | X86Opcode::Pause
             | X86Opcode::Lfence
+            | X86Opcode::Leave
             | X86Opcode::Ud2 => {
                 if let Some(entry) = self.opcode_table.get(&inst.opcode) {
                     let mut bytes = Vec::new();
