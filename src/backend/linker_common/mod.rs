@@ -1756,7 +1756,12 @@ pub fn link(
             sa.insert(sym.name.clone(), sym.value);
         }
         for (name, resolved) in &symbol_address_map {
-            if resolved.is_defined && resolved.final_address != 0 {
+            // Include both defined symbols AND undefined symbols that have
+            // a non-zero final_address (i.e. they have a PLT stub assigned).
+            // This is critical for __cxa_atexit which is an imported symbol
+            // resolved through PLT — its PLT stub address must be used when
+            // patching the synthetic atexit wrapper.
+            if resolved.final_address != 0 {
                 sa.insert(name.clone(), resolved.final_address);
             }
         }

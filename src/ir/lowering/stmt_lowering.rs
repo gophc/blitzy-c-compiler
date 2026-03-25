@@ -801,8 +801,13 @@ pub fn ensure_allocas_for_declaration(ctx: &mut StmtLoweringContext<'_>, decl: &
                 let (alloca_val, alloca_inst) = ctx.builder.build_alloca(alloca_ir_type, decl.span);
                 ctx.function.entry_block_mut().push_alloca(alloca_inst);
                 ctx.local_vars.insert(var_name.clone(), alloca_val);
+                // Store the RESOLVED type (with full struct field definitions)
+                // so that lower_declaration_initializers can properly emit
+                // struct field stores.  Using sized_c_type here would store a
+                // forward-declared struct with empty fields, causing
+                // initializers to be silently skipped.
                 ctx.scope_type_overrides
-                    .insert(var_name.clone(), sized_c_type);
+                    .insert(var_name.clone(), resolved_c_type);
             } else {
                 // First encounter of this variable — "claim" it and
                 // reuse the pre-scan alloca if the type matches.
@@ -839,8 +844,11 @@ pub fn ensure_allocas_for_declaration(ctx: &mut StmtLoweringContext<'_>, decl: &
                         ctx.builder.build_alloca(alloca_ir_type, decl.span);
                     ctx.function.entry_block_mut().push_alloca(alloca_inst);
                     ctx.local_vars.insert(var_name.clone(), alloca_val);
+                    // Store the RESOLVED type (with full struct field
+                    // definitions) so that lower_declaration_initializers
+                    // can properly emit struct field stores.
                     ctx.scope_type_overrides
-                        .insert(var_name.clone(), sized_c_type);
+                        .insert(var_name.clone(), resolved_c_type);
                 }
             }
             continue;
