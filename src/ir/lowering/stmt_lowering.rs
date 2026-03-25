@@ -1025,25 +1025,41 @@ pub fn lower_declaration_initializers(ctx: &mut StmtLoweringContext<'_>, decl: &
         // during allocate_local_variables.
         if let Some(vla_expr) = decl_lowering::extract_vla_size_expr_pub(&init_decl.declarator) {
             // VLA variable detected — emit runtime stack allocation.
-            // Determine the element type from the Pointer type stored in
-            // local_types (which was set from the original Array element).
-            let elem_from_ptr = {
+            //
+            // Multi-dimensional VLA support: for `int a[n][m]`, we need to
+            // compute `total = n * m * sizeof(int)` at runtime.  We extract
+            // ALL array dimension expressions from the declarator and
+            // multiply them together with the base element size.
+            //
+            // Determine the innermost non-array element type by peeling
+            // through Pointer(Array(...)) layers in the local type.
+            let base_elem = {
                 let vty = ctx
                     .local_types
                     .get(&var_name)
                     .cloned()
                     .unwrap_or(CType::Int);
-                match vty {
+                let mut cur = match vty {
                     CType::Pointer(inner, _) => (*inner).clone(),
                     _ => CType::Int,
+                };
+                // Peel off Array layers to find the innermost element type.
+                // For `int a[n][m]`, type is Pointer(Array(Int, None)):
+                //   first peel: Array(Int, None) → inner = Int
+                // For `int a[n][m][k]`, type is Pointer(Array(Array(Int, None), None)):
+                //   first peel: Array(Array(Int, None), None) → Array(Int, None)
+                //   second peel: Array(Int, None) → Int
+                while let CType::Array(inner, _) = cur {
+                    cur = (*inner).clone();
                 }
+                cur
             };
-            let elem = elem_from_ptr;
             // Look up the pointer-sized alloca for this VLA.
             if let Some(&alloca_val) = ctx.local_vars.get(&var_name) {
                 let span = decl.span;
-                let elem_size = crate::common::types::sizeof_ctype(&elem, ctx.target) as i64;
-                // Build an expression context to evaluate the size expression.
+                let base_elem_size =
+                    crate::common::types::sizeof_ctype(&base_elem, ctx.target) as i64;
+                // Build an expression context to evaluate size expressions.
                 let mut expr_ctx = ExprLoweringContext {
                     builder: ctx.builder,
                     function: ctx.function,
@@ -1066,30 +1082,17 @@ pub fn lower_declaration_initializers(ctx: &mut StmtLoweringContext<'_>, decl: &
                     layout_cache: &mut ctx.layout_cache,
                     vla_sizes: &ctx.vla_sizes,
                 };
-                // Evaluate the VLA size expression at runtime.
-                let tv = super::expr_lowering::lower_expression_typed(&mut expr_ctx, &vla_expr);
-                let n_val = tv.value;
-                // Compute total byte count: n * elem_size.
                 let ptr_ty = if ctx.target.pointer_width() == 8 {
                     IrType::I64
                 } else {
                     IrType::I32
                 };
-                // ZExt the count to pointer width if needed.
-                // The VLA size expression is typically int (I32) but
-                // we need pointer-width (I64) for the multiply.
-                let n_wide = {
-                    let (v, inst) =
-                        expr_ctx
-                            .builder
-                            .build_zext_from(n_val, IrType::I32, ptr_ty.clone(), span);
-                    push_inst_to_block(&mut expr_ctx, inst);
-                    v
-                };
-                // Emit element-size constant using the
-                // Add-result-UNDEF sentinel pattern (same as
-                // emit_int_const in expr_lowering).
-                let elem_const = {
+                // Extract ALL array dimension expressions from the
+                // declarator.  For `int a[n][m]` this gives [n, m].
+                let all_dims =
+                    decl_lowering::extract_all_vla_dims(&init_decl.declarator);
+                // Start with base element size as the running product.
+                let mut running_total = {
                     use crate::ir::instructions::BinOp as IrBinOp;
                     use crate::ir::module as ir_module;
                     use crate::ir::module::{Constant, GlobalVariable};
@@ -1098,7 +1101,7 @@ pub fn lower_declaration_initializers(ctx: &mut StmtLoweringContext<'_>, decl: &
                     let mut gv = GlobalVariable::new(
                         gname,
                         ptr_ty.clone(),
-                        Some(Constant::Integer(elem_size as i128)),
+                        Some(Constant::Integer(base_elem_size as i128)),
                     );
                     gv.linkage = ir_module::Linkage::Internal;
                     gv.is_constant = true;
@@ -1113,12 +1116,79 @@ pub fn lower_declaration_initializers(ctx: &mut StmtLoweringContext<'_>, decl: &
                         span,
                     };
                     push_inst_to_block(&mut expr_ctx, inst);
-                    expr_ctx.function.constant_values.insert(result, elem_size);
+                    expr_ctx
+                        .function
+                        .constant_values
+                        .insert(result, base_elem_size);
                     result
                 };
-                let (total, mul_inst) =
-                    expr_ctx.builder.build_mul(n_wide, elem_const, ptr_ty, span);
-                push_inst_to_block(&mut expr_ctx, mul_inst);
+                // Multiply each dimension expression into the running total.
+                // For `int a[n][m]`: total = base_elem_size * n * m
+                // We use all_dims if non-empty, otherwise fall back to the
+                // single vla_expr extracted earlier.
+                let dim_exprs: Vec<crate::frontend::parser::ast::Expression> =
+                    if all_dims.is_empty() {
+                        vec![*vla_expr]
+                    } else {
+                        all_dims
+                    };
+                // Save the base element size Value before the loop
+                // modifies running_total — needed for stride computation.
+                let base_elem_size_val = running_total;
+                // Collect lowered dimension Values for stride computation.
+                let mut dim_lowered_vals: Vec<Value> = Vec::new();
+                for dim_expr in &dim_exprs {
+                    let tv = super::expr_lowering::lower_expression_typed(
+                        &mut expr_ctx,
+                        dim_expr,
+                    );
+                    let dim_val = tv.value;
+                    // ZExt to pointer width if needed.
+                    let dim_wide = {
+                        let (v, inst) = expr_ctx.builder.build_zext_from(
+                            dim_val,
+                            IrType::I32,
+                            ptr_ty.clone(),
+                            span,
+                        );
+                        push_inst_to_block(&mut expr_ctx, inst);
+                        v
+                    };
+                    dim_lowered_vals.push(dim_wide);
+                    let (product, mul_inst) = expr_ctx.builder.build_mul(
+                        running_total,
+                        dim_wide,
+                        ptr_ty.clone(),
+                        span,
+                    );
+                    push_inst_to_block(&mut expr_ctx, mul_inst);
+                    running_total = product;
+                }
+                let total = running_total;
+                // Compute per-dimension row strides for multi-dimensional
+                // VLA subscript lowering. For `int a[n][m]`:
+                //   stride_0 = m * sizeof(int)  (row stride for a[i])
+                //   stride_1 = sizeof(int)      (element stride for a[i][j])
+                // Strides are computed right-to-left from the innermost
+                // dimension outward.
+                let mut stride_entries: Vec<(String, Value)> = Vec::new();
+                if dim_lowered_vals.len() > 1 {
+                    let mut row_stride = base_elem_size_val;
+                    for d in (0..dim_lowered_vals.len()).rev() {
+                        let key = format!("{}\0stride_{}", var_name, d);
+                        stride_entries.push((key, row_stride));
+                        if d > 0 {
+                            let (product, mul_inst) = expr_ctx.builder.build_mul(
+                                row_stride,
+                                dim_lowered_vals[d],
+                                ptr_ty.clone(),
+                                span,
+                            );
+                            push_inst_to_block(&mut expr_ctx, mul_inst);
+                            row_stride = product;
+                        }
+                    }
+                }
                 // VLA stack management: save/restore RSP so that VLAs
                 // inside loops or goto-loops don't exhaust the stack.
                 //
@@ -1154,6 +1224,10 @@ pub fn lower_declaration_initializers(ctx: &mut StmtLoweringContext<'_>, decl: &
                 // Record the total byte size so that sizeof(vla) works at runtime.
                 drop(expr_ctx);
                 ctx.vla_sizes.insert(var_name.clone(), total);
+                // Store per-dimension strides for subscript lowering.
+                for (key, val) in stride_entries {
+                    ctx.vla_sizes.insert(key, val);
+                }
             }
             continue; // VLA handled, skip normal init path.
         }

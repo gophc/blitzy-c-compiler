@@ -5911,11 +5911,11 @@ fn lower_sizeof_expr(
     TypedValue::new(val, size_ctype(ctx.target))
 }
 
-/// Try to resolve `sizeof(expr)` as a VLA sizeof. If the operand is an
-/// identifier (possibly parenthesized) whose name is in `vla_sizes`, return
-/// the runtime size Value. For expressions like `sizeof(*vla_ptr)` or nested
-/// dereferences, the VLA entry stores the total byte count for the declared
-/// array, so only direct identifier references need matching.
+/// Try to resolve `sizeof(expr)` as a VLA sizeof. Handles:
+///   - `sizeof(vla_name)` → total byte size from `vla_sizes`
+///   - `sizeof(vla_name[i])` → row stride from `vla_sizes` (stride at
+///     subscript depth), i.e., the byte size of one "row" of the VLA.
+///   - `sizeof(vla_name[i][j])` → stride at depth+1, etc.
 fn try_resolve_vla_sizeof(
     ctx: &mut ExprLoweringContext<'_>,
     expr: &ast::Expression,
@@ -5925,6 +5925,22 @@ fn try_resolve_vla_sizeof(
         ast::Expression::Identifier { name, .. } => {
             let sym_name = resolve_sym(ctx, name.as_u32());
             ctx.vla_sizes.get(sym_name).copied()
+        }
+        ast::Expression::ArraySubscript { base, .. } => {
+            // sizeof(a[i]) for VLA `int a[n][m]`: the size of one row is
+            // the stride stored as "a\0stride_0". For sizeof(a[i][j]) the
+            // size is stride_1, etc.
+            //
+            // Strategy: find the base VLA name and depth via the same
+            // helper used by subscript lowering, but add 1 because the
+            // subscript itself consumes one level.
+            if let Some((vla_name, depth)) = find_vla_subscript_info(ctx, base) {
+                let stride_key = format!("{}\0stride_{}", vla_name, depth);
+                if let Some(&stride_val) = ctx.vla_sizes.get(&stride_key) {
+                    return Some(stride_val);
+                }
+            }
+            None
         }
         _ => None,
     }
@@ -6837,9 +6853,37 @@ fn lower_array_subscript_lvalue(
     // Scale index by element size.
     let idx_val =
         insert_implicit_conversion(ctx, idx_tv.value, &idx_tv.ty, &size_ctype(ctx.target), span);
-    let sc = emit_int_const(ctx, elem_size, si.clone(), span);
-    let (byte_off, mi) = ctx.builder.build_mul(idx_val, sc, si, span);
-    emit_inst(ctx, mi);
+
+    // For VLA element types (e.g., Array(Int, None) from `int a[n][m]`),
+    // sizeof_resolved returns 0 because the inner dimension is unknown at
+    // compile time. Use the runtime stride stored during VLA allocation.
+    let byte_off = if elem_size == 0 {
+        if let Some((vla_name, depth)) = find_vla_subscript_info(ctx, base) {
+            let stride_key = format!("{}\0stride_{}", vla_name, depth);
+            if let Some(&stride_val) = ctx.vla_sizes.get(&stride_key) {
+                let (off, mi) = ctx.builder.build_mul(idx_val, stride_val, si.clone(), span);
+                emit_inst(ctx, mi);
+                off
+            } else {
+                // Fallback: stride not found — emit zero offset.
+                let sc = emit_int_const(ctx, 0, si.clone(), span);
+                let (off, mi) = ctx.builder.build_mul(idx_val, sc, si.clone(), span);
+                emit_inst(ctx, mi);
+                off
+            }
+        } else {
+            // Not a VLA subscript — emit zero offset.
+            let sc = emit_int_const(ctx, 0, si.clone(), span);
+            let (off, mi) = ctx.builder.build_mul(idx_val, sc, si.clone(), span);
+            emit_inst(ctx, mi);
+            off
+        }
+    } else {
+        let sc = emit_int_const(ctx, elem_size, si.clone(), span);
+        let (off, mi) = ctx.builder.build_mul(idx_val, sc, si.clone(), span);
+        emit_inst(ctx, mi);
+        off
+    };
 
     let (ptr, gi) = ctx
         .builder
@@ -6847,6 +6891,34 @@ fn lower_array_subscript_lvalue(
     emit_inst(ctx, gi);
 
     TypedValue::new(ptr, elem_ty)
+}
+
+/// Walk the AST expression to find the base VLA variable name and the
+/// subscript depth for stride lookup. For `a` returns ("a", 0); for
+/// `a[i]` (when used as base of a further subscript) returns ("a", 1).
+fn find_vla_subscript_info(
+    ctx: &ExprLoweringContext<'_>,
+    expr: &ast::Expression,
+) -> Option<(String, usize)> {
+    match expr {
+        ast::Expression::Identifier { name, .. } => {
+            let sym_name = resolve_sym(ctx, name.as_u32());
+            if ctx.vla_sizes.contains_key(sym_name) {
+                Some((sym_name.to_string(), 0))
+            } else {
+                None
+            }
+        }
+        ast::Expression::Parenthesized { inner, .. } => find_vla_subscript_info(ctx, inner),
+        ast::Expression::ArraySubscript { base, .. } => {
+            if let Some((name, depth)) = find_vla_subscript_info(ctx, base) {
+                Some((name, depth + 1))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 // =========================================================================

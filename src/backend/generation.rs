@@ -3157,10 +3157,12 @@ fn constant_to_bytes_typed(
                     return fv.to_le_bytes().to_vec();
                 }
                 Some(IrType::F80) => {
+                    // Store integer-initialized long double globals as f64
+                    // representation so that the codegen's `movsd` (SSE
+                    // double load) reads the correct value.  Pad to 16
+                    // bytes for sizeof(long double) == 16.
                     let fv = *v as f64;
-                    let ld = crate::common::long_double::LongDouble::from_f64(fv);
-                    let raw = ld.to_bytes();
-                    let mut result = raw.to_vec();
+                    let mut result = fv.to_le_bytes().to_vec();
                     result.resize(16, 0);
                     return result;
                 }
@@ -3180,11 +3182,34 @@ fn constant_to_bytes_typed(
         }
         Constant::Float(v) => match ir_ty {
             Some(IrType::F32) => (*v as f32).to_le_bytes().to_vec(),
+            Some(IrType::F80) => {
+                // The codegen loads F80 globals with `movsd` (8-byte SSE
+                // double load) because all long-double arithmetic is done at
+                // f64 precision internally.  Store the f64 bytes in the low
+                // 8 bytes so `movsd` reads the correct double value, and pad
+                // to 16 bytes to maintain `sizeof(long double) == 16`.
+                let mut result = v.to_le_bytes().to_vec();
+                result.resize(16, 0);
+                result
+            }
             _ => v.to_le_bytes().to_vec(),
         },
         Constant::LongDouble(bytes) => {
-            // 80-bit extended precision — 10 raw bytes, padded to 16.
-            let mut result = bytes.to_vec();
+            // 80-bit extended precision — 10 raw bytes.  Convert to f64
+            // representation for the low 8 bytes so that the codegen's
+            // `movsd` (SSE double load) reads the correct value.  All
+            // long-double arithmetic in BCC is performed at f64 precision
+            // internally, so this conversion is consistent.
+            let raw: [u8; 10] = {
+                let mut arr = [0u8; 10];
+                for (i, &b) in bytes.iter().enumerate().take(10) {
+                    arr[i] = b;
+                }
+                arr
+            };
+            let ld = crate::common::long_double::LongDouble::from_bytes(&raw);
+            let f64_val = ld.to_f64();
+            let mut result = f64_val.to_le_bytes().to_vec();
             result.resize(16, 0);
             result
         }

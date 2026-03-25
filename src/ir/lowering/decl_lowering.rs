@@ -1828,11 +1828,28 @@ fn evaluate_constant_expr(
         ast::Expression::FloatLiteral { value, suffix, .. } => {
             // GCC imaginary suffix: `2.0i` → _Complex constant {0.0, 2.0}
             match suffix {
-                ast::FloatSuffix::I | ast::FloatSuffix::FI | ast::FloatSuffix::LI => {
+                ast::FloatSuffix::I | ast::FloatSuffix::FI => {
                     Some(Constant::Array(vec![
                         Constant::Float(0.0),
                         Constant::Float(*value),
                     ]))
+                }
+                ast::FloatSuffix::LI => {
+                    // _Complex long double imaginary: convert both parts
+                    // to long double byte representation.
+                    let zero_ld = crate::common::long_double::LongDouble::from_f64(0.0);
+                    let val_ld = crate::common::long_double::LongDouble::from_f64(*value);
+                    Some(Constant::Array(vec![
+                        Constant::LongDouble(zero_ld.to_bytes()),
+                        Constant::LongDouble(val_ld.to_bytes()),
+                    ]))
+                }
+                ast::FloatSuffix::L => {
+                    // Long double literal (e.g. `2.0L`): convert the f64
+                    // value to 80-bit extended precision bytes so the
+                    // global initializer emits the correct representation.
+                    let ld = crate::common::long_double::LongDouble::from_f64(*value);
+                    Some(Constant::LongDouble(ld.to_bytes()))
                 }
                 _ => Some(Constant::Float(*value)),
             }
@@ -2402,16 +2419,15 @@ fn constant_to_le_bytes(
                     return buf;
                 }
                 CType::LongDouble => {
-                    // Use the software long-double conversion for 80-bit
-                    // extended precision (10 or 12 or 16 byte representation).
+                    // Store integer-initialized long double as f64
+                    // representation so that the codegen's `movsd` (SSE
+                    // double load) reads the correct value.  The codegen
+                    // treats F80 internally at f64 precision.
                     let fv = *v as f64;
-                    let ld = crate::common::long_double::LongDouble::from_f64(fv);
-                    let raw = ld.to_bytes();
+                    let f64_bits = fv.to_bits();
                     let mut buf = vec![0u8; expected_size];
-                    for (i, &byte) in raw.iter().enumerate() {
-                        if i < buf.len() {
-                            buf[i] = byte;
-                        }
+                    for b in 0..expected_size.min(8) {
+                        buf[b] = ((f64_bits >> (b * 8)) & 0xFF) as u8;
                     }
                     return buf;
                 }
@@ -2425,6 +2441,12 @@ fn constant_to_le_bytes(
             buf
         }
         Constant::Float(v) => {
+            // When the declared C type is long double but the constant
+            // was stored as Constant::Float (e.g. `long double G = 2.0;`
+            // without the `L` suffix), store the f64 representation in
+            // the first 8 bytes and zero-pad to expected_size.  The
+            // codegen loads F80 globals with `movsd` (SSE double load),
+            // so the f64 bytes must be in the low 8 bytes.
             let bits = v.to_bits();
             let mut buf = vec![0u8; expected_size];
             for b in 0..expected_size.min(8) {
@@ -2433,11 +2455,23 @@ fn constant_to_le_bytes(
             buf
         }
         Constant::LongDouble(raw) => {
-            let mut buf = vec![0u8; expected_size];
-            for (i, &byte) in raw.iter().enumerate() {
-                if i < buf.len() {
-                    buf[i] = byte;
+            // 80-bit extended precision.  Convert to f64 representation
+            // for storage so that the codegen's `movsd` (SSE double load)
+            // reads the correct value.  All long-double arithmetic in BCC
+            // is performed at f64 precision internally.
+            let raw_arr: [u8; 10] = {
+                let mut arr = [0u8; 10];
+                for (i, &b) in raw.iter().enumerate().take(10) {
+                    arr[i] = b;
                 }
+                arr
+            };
+            let ld = crate::common::long_double::LongDouble::from_bytes(&raw_arr);
+            let f64_val = ld.to_f64();
+            let f64_bits = f64_val.to_bits();
+            let mut buf = vec![0u8; expected_size];
+            for b in 0..expected_size.min(8) {
+                buf[b] = ((f64_bits >> (b * 8)) & 0xFF) as u8;
             }
             buf
         }
@@ -3923,6 +3957,34 @@ fn extract_vla_from_direct_decl(dd: &ast::DirectDeclarator) -> Option<Box<ast::E
         }
         ast::DirectDeclarator::Parenthesized(inner) => extract_vla_size_expr(inner),
         _ => None,
+    }
+}
+
+/// Extract ALL VLA dimension expressions from a (possibly multi-dimensional)
+/// array declarator.  For `int a[n][m]`, returns `vec![n, m]` (outermost to
+/// innermost).  Constant dimensions contribute their numeric value as an
+/// integer literal expression.  Returns an empty Vec if no VLA dims found.
+pub fn extract_all_vla_dims(declarator: &ast::Declarator) -> Vec<ast::Expression> {
+    let mut dims = Vec::new();
+    collect_array_dims(&declarator.direct, &mut dims);
+    dims
+}
+
+fn collect_array_dims(dd: &ast::DirectDeclarator, dims: &mut Vec<ast::Expression>) {
+    match dd {
+        ast::DirectDeclarator::Array { base, size, .. } => {
+            // Recurse into the base first (inner dimensions come first in
+            // the AST: `a[outer][inner]` is parsed as Array(Array(Ident, inner), outer)).
+            collect_array_dims(base, dims);
+            // Then add this dimension.
+            if let Some(expr) = size {
+                dims.push(*expr.clone());
+            }
+        }
+        ast::DirectDeclarator::Parenthesized(inner) => {
+            collect_array_dims(&inner.direct, dims);
+        }
+        _ => {}
     }
 }
 
