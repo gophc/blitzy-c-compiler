@@ -365,48 +365,76 @@ impl TypeBuilder {
 
                 // Determine the natural-alignment region that contains the
                 // current bit position.
-                let unit_align_bits: u128 = if packed {
-                    8
-                } else {
-                    (unit_type_align as u128) * 8
-                };
-                let unit_start = if unit_align_bits > 0 {
-                    (abs_bit / unit_align_bits) * unit_align_bits
-                } else {
-                    abs_bit
-                };
-                let bits_used_in_unit = abs_bit - unit_start;
+                if packed {
+                    // Packed structs: bitfields are laid out contiguously
+                    // with no padding, even when spanning storage unit
+                    // boundaries.  Use byte-level alignment (align=1).
+                    let bf_byte = (abs_bit / 8) as usize;
+                    let bit_offset_in_unit = (abs_bit % 8) as usize;
 
-                if bits_used_in_unit + bits > unit_size_bits {
-                    // Doesn't fit in the current storage unit — advance to
-                    // the next unit boundary.
-                    abs_bit = unit_start + unit_size_bits;
-                    // Re-align for the new unit.
-                    let byte_offset = (abs_bit + 7) / 8;
-                    let aligned_byte = align_u128(byte_offset, unit_type_align);
-                    abs_bit = aligned_byte * 8;
+                    // Determine the access size: must cover all bits from
+                    // the start bit within the byte through the last bit.
+                    let needed_bytes = ((bit_offset_in_unit + bits as usize) + 7) / 8;
+                    // Round up to the next power-of-two load size (1/2/4/8).
+                    let access_size = if needed_bytes <= 1 {
+                        1
+                    } else if needed_bytes <= 2 {
+                        2
+                    } else if needed_bytes <= 4 {
+                        4
+                    } else {
+                        8
+                    };
+
+                    field_layouts.push(FieldLayout {
+                        offset: bf_byte,
+                        size: access_size,
+                        alignment: 1,
+                        bitfield_info: Some((bit_offset_in_unit, bits as usize)),
+                    });
+
+                    abs_bit += bits;
+                } else {
+                    let unit_align_bits: u128 = (unit_type_align as u128) * 8;
+                    let unit_start = if unit_align_bits > 0 {
+                        (abs_bit / unit_align_bits) * unit_align_bits
+                    } else {
+                        abs_bit
+                    };
+                    let bits_used_in_unit = abs_bit - unit_start;
+
+                    if bits_used_in_unit + bits > unit_size_bits {
+                        // Doesn't fit in the current storage unit — advance to
+                        // the next unit boundary.
+                        abs_bit = unit_start + unit_size_bits;
+                        // Re-align for the new unit.
+                        let byte_offset = (abs_bit + 7) / 8;
+                        let aligned_byte = align_u128(byte_offset, unit_type_align);
+                        abs_bit = aligned_byte * 8;
+                    }
+
+                    // The byte offset of the storage unit containing this
+                    // bitfield.  Compute as the aligned-down byte position.
+                    let mask = if unit_type_align > 0 {
+                        !((unit_type_align as u128) - 1)
+                    } else {
+                        !0u128
+                    };
+                    let bf_byte = ((abs_bit / 8) & mask) as usize;
+
+                    // Compute the bit offset within the storage unit.
+                    let bit_offset_in_unit =
+                        (abs_bit - (bf_byte as u128) * 8) as usize;
+
+                    field_layouts.push(FieldLayout {
+                        offset: bf_byte,
+                        size: unit_type_size,
+                        alignment: unit_type_align,
+                        bitfield_info: Some((bit_offset_in_unit, bits as usize)),
+                    });
+
+                    abs_bit += bits;
                 }
-
-                // The byte offset of the storage unit containing this
-                // bitfield.  Compute as the aligned-down byte position.
-                let mask = if unit_type_align > 0 {
-                    !((unit_type_align as u128) - 1)
-                } else {
-                    !0u128
-                };
-                let bf_byte = ((abs_bit / 8) & mask) as usize;
-
-                // Compute the bit offset within the storage unit.
-                let bit_offset_in_unit = (abs_bit - (bf_byte as u128) * 8) as usize;
-
-                field_layouts.push(FieldLayout {
-                    offset: bf_byte,
-                    size: unit_type_size,
-                    alignment: unit_type_align,
-                    bitfield_info: Some((bit_offset_in_unit, bits as usize)),
-                });
-
-                abs_bit += bits;
 
                 if unit_type_align > max_field_align {
                     max_field_align = unit_type_align;

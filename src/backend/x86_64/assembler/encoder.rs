@@ -1639,6 +1639,29 @@ impl X86_64Encoder {
                     _ => EncodedInstruction::new(vec![0x0F, 0x0B]), // UD2 fallback
                 }
             }
+            // FLD TBYTE [mem] — load 80-bit extended precision into ST(0)
+            // Opcode: 0xDB /5  (ModRM reg field = 5)
+            X86Opcode::FldMem80 => {
+                match inst.operands.first() {
+                    Some(MachineOperand::Memory {
+                        base,
+                        index,
+                        scale,
+                        displacement,
+                    }) => {
+                        self.encode_reg_mem_op(
+                            &[0xDB],
+                            5, // /5 = FLD m80
+                            *base,
+                            *index,
+                            *scale,
+                            *displacement,
+                            0, // no REX.W needed for x87
+                        )
+                    }
+                    _ => EncodedInstruction::new(vec![0x0F, 0x0B]), // UD2 fallback
+                }
+            }
             // FSTP TWORD [mem] — store 80-bit extended from ST(0), pop stack
             // Opcode: 0xDB /7  (ModRM reg field = 7)
             X86Opcode::FstpMem80 => {

@@ -523,24 +523,32 @@ fn compute_struct_size(
             }
 
             // Check if this bitfield fits in the current storage unit.
-            let unit_align_bits: u128 = if packed { 8 } else { (field_align as u128) * 8 };
-            let unit_start = if unit_align_bits > 0 {
-                (bit_offset / unit_align_bits) * unit_align_bits
+            if packed {
+                // Packed structs: bitfields are laid out contiguously with
+                // no padding, even when they cross storage unit boundaries.
+                // GCC packs bitfields sequentially regardless of the
+                // declared type's storage-unit size.
+                bit_offset += bits;
             } else {
-                bit_offset
-            };
-            let bits_used_in_unit = bit_offset - unit_start;
+                let unit_align_bits: u128 = (field_align as u128) * 8;
+                let unit_start = if unit_align_bits > 0 {
+                    (bit_offset / unit_align_bits) * unit_align_bits
+                } else {
+                    bit_offset
+                };
+                let bits_used_in_unit = bit_offset - unit_start;
 
-            if bits_used_in_unit + bits > unit_size_bits {
-                // Doesn't fit — advance to next storage unit boundary.
-                bit_offset = unit_start + unit_size_bits;
-                // Re-align for the new unit.
-                let byte_offset = (bit_offset + 7) / 8;
-                let aligned_byte = align_up_u128(byte_offset, field_align);
-                bit_offset = aligned_byte * 8;
+                if bits_used_in_unit + bits > unit_size_bits {
+                    // Doesn't fit — advance to next storage unit boundary.
+                    bit_offset = unit_start + unit_size_bits;
+                    // Re-align for the new unit.
+                    let byte_offset = (bit_offset + 7) / 8;
+                    let aligned_byte = align_up_u128(byte_offset, field_align);
+                    bit_offset = aligned_byte * 8;
+                }
+
+                bit_offset += bits;
             }
-
-            bit_offset += bits;
 
             if field_align > max_field_align {
                 max_field_align = field_align;

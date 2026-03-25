@@ -8693,7 +8693,41 @@ fn lower_va_builtin(
         let cty_resolved = crate::common::types::resolve_typedef(&cty_raw).clone();
         let ir_ty = match &cty_resolved {
             CType::Float => IrType::F32,
-            CType::Double | CType::LongDouble => IrType::F64,
+            CType::Double => IrType::F64,
+            CType::LongDouble => {
+                // x86-64 SysV ABI: long double is class X87/X87UP
+                // → passed entirely in the overflow_arg_area (stack)
+                // in 80-bit x87 extended precision format (16-byte slot).
+                //
+                // The dedicated __builtin_va_arg_f80 intrinsic:
+                //   1. Reads overflow_arg_area from the va_list
+                //   2. Uses x87 FLDT to load 80-bit extended from it
+                //   3. Uses FSTP QWORD to convert to f64 into the alloca
+                //   4. Advances overflow_arg_area by 16
+                //
+                // This is necessary because the 80-bit format cannot
+                // simply be reinterpreted as f64 — an x87 conversion
+                // step is required.
+                let alloca_ir = IrType::F64;
+                let (alloca_val, alloca_i) =
+                    ctx.builder.build_alloca(alloca_ir.clone(), span);
+                emit_inst(ctx, alloca_i);
+
+                let f80_name = "__builtin_va_arg_f80".to_string();
+                let callee = emit_global_ref(ctx, &f80_name, span);
+                let (_, ci) = ctx.builder.build_call(
+                    callee,
+                    vec![arg_vals[0], alloca_val],
+                    IrType::Void,
+                    span,
+                );
+                emit_inst(ctx, ci);
+
+                let (loaded, li) = ctx.builder.build_load(alloca_val, alloca_ir, span);
+                emit_inst(ctx, li);
+
+                return TypedValue::new(loaded, cty_resolved);
+            }
             CType::Struct { .. } | CType::Union { .. } => {
                 // For struct/union va_arg, use an IR type that matches
                 // the struct's actual size to prevent oversized stores

@@ -262,6 +262,9 @@ pub enum X86Opcode {
     /// automatically converting to 80-bit extended precision internally.
     /// Opcode: 0xDD /0 (ModRM.reg = 0).
     FldMem64,
+    /// `FLD TBYTE [mem]` — load 80-bit extended precision from memory into
+    /// x87 ST(0).  Opcode: 0xDB /5 (ModRM.reg = 5).
+    FldMem80,
     /// `FSTP TWORD [mem]` — store 80-bit extended precision from x87 ST(0)
     /// to 10-byte memory location, then pop the FPU stack.
     /// Opcode: 0xDB /7 (ModRM.reg = 7).
@@ -403,6 +406,7 @@ impl X86Opcode {
             X86Opcode::InlineAsm,
             X86Opcode::InternalLabelDef,
             X86Opcode::FldMem64,
+            X86Opcode::FldMem80,
             X86Opcode::FstpMem80,
             X86Opcode::FstpMem64,
         ];
@@ -6554,6 +6558,136 @@ impl X86_64CodeGen {
                 ));
                 Some(out)
             }
+            // va_arg_f80: long double va_arg.
+            // Long double is X87/X87UP class on x86-64 SysV ABI,
+            // passed in the overflow_arg_area as 80-bit extended
+            // precision in a 16-byte slot.
+            // args: [0] = va_list ptr, [1] = dest alloca (for f64 result)
+            //
+            // Strategy:
+            //   1. R8  = va_list pointer (from arg slot/alloca)
+            //   2. R10 = [R8+8] (overflow_arg_area)
+            //   3. FLD TBYTE [R10]  — load 80-bit from overflow area
+            //   4. Compute dest address in RDI
+            //   5. FSTP QWORD [RDI] — convert to f64, store in alloca
+            //   6. [R8+8] += 16     — advance overflow_arg_area
+            "__builtin_va_arg_f80" => {
+                if args.len() < 2 {
+                    return None;
+                }
+                let ap_slot = self.get_value(args[0]);
+                let dst_slot = self.get_value(args[1]);
+                let mut out = Vec::new();
+
+                let r8_op = MachineOperand::Register(R8);
+                let r10_op = MachineOperand::Register(R10);
+                let rdi_op = MachineOperand::Register(RDI);
+
+                // R8 = va_list pointer (load address from alloca/slot)
+                out.push(va_load_from_slot(&ap_slot, r8_op.clone()));
+
+                // R10 = [R8+8] (overflow_arg_area)
+                out.push(Self::mk_inst(
+                    X86Opcode::Mov,
+                    Some(r10_op.clone()),
+                    &[MachineOperand::Memory {
+                        base: Some(R8),
+                        index: None,
+                        scale: 1,
+                        displacement: 8,
+                    }],
+                ));
+
+                // FLD TBYTE [R10] — load 80-bit extended from overflow area
+                let mut fld_inst = MachineInstruction::new(X86Opcode::FldMem80.as_u32());
+                fld_inst.operands.push(MachineOperand::Memory {
+                    base: Some(R10),
+                    index: None,
+                    scale: 1,
+                    displacement: 0,
+                });
+                out.push(fld_inst);
+
+                // Compute destination address (RDI = alloca address)
+                match &dst_slot {
+                    MachineOperand::FrameSlot(off) => {
+                        out.push(Self::mk_inst(
+                            X86Opcode::Lea,
+                            Some(rdi_op.clone()),
+                            &[MachineOperand::Memory {
+                                base: Some(RBP),
+                                index: None,
+                                scale: 1,
+                                displacement: *off as i64,
+                            }],
+                        ));
+                    }
+                    MachineOperand::Memory {
+                        base,
+                        index,
+                        scale,
+                        displacement,
+                    } => {
+                        out.push(Self::mk_inst(
+                            X86Opcode::Lea,
+                            Some(rdi_op.clone()),
+                            &[MachineOperand::Memory {
+                                base: *base,
+                                index: *index,
+                                scale: *scale,
+                                displacement: *displacement,
+                            }],
+                        ));
+                    }
+                    _ => {
+                        out.push(Self::mk_inst(
+                            X86Opcode::Mov,
+                            Some(rdi_op.clone()),
+                            &[dst_slot.clone()],
+                        ));
+                    }
+                }
+
+                // FSTP QWORD [RDI] — convert 80-bit to 64-bit double, store
+                let mut fstp_inst = MachineInstruction::new(X86Opcode::FstpMem64.as_u32());
+                fstp_inst.operands.push(MachineOperand::Memory {
+                    base: Some(RDI),
+                    index: None,
+                    scale: 1,
+                    displacement: 0,
+                });
+                out.push(fstp_inst);
+
+                // Advance overflow_arg_area: [R8+8] += 16
+                out.push(Self::mk_inst(
+                    X86Opcode::Add,
+                    Some(r10_op.clone()),
+                    &[r10_op.clone(), MachineOperand::Immediate(16)],
+                ));
+                out.push(Self::mk_inst(
+                    X86Opcode::Mov,
+                    None,
+                    &[
+                        MachineOperand::Memory {
+                            base: Some(R8),
+                            index: None,
+                            scale: 1,
+                            displacement: 8,
+                        },
+                        r10_op,
+                    ],
+                ));
+
+                // Result is void; set a dummy value for the SSA result
+                let dst = self.new_vreg();
+                self.set_value(result, dst.clone());
+                out.push(Self::mk_inst(
+                    X86Opcode::Mov,
+                    Some(dst),
+                    &[MachineOperand::Immediate(0)],
+                ));
+                Some(out)
+            }
             // va_end: no-op.
             "__builtin_va_end" => {
                 let dst = self.new_vreg();
@@ -8119,6 +8253,7 @@ impl std::fmt::Display for X86Opcode {
             X86Opcode::StoreInd16 => "movw_ind_store",
             X86Opcode::StoreInd8 => "movb_ind_store",
             X86Opcode::FldMem64 => "fld_qword",
+            X86Opcode::FldMem80 => "fld_tword",
             X86Opcode::FstpMem80 => "fstp_tword",
             X86Opcode::FstpMem64 => "fstp_qword",
         };
