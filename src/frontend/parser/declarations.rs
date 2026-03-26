@@ -1149,6 +1149,7 @@ fn is_declarator_start(parser: &mut Parser<'_>) -> bool {
     if parser.check(&TokenKind::LeftParen) {
         let lookahead = parser.peek_nth(0);
         return lookahead.is(&TokenKind::Star)
+            || lookahead.is(&TokenKind::LeftParen)
             || matches!(lookahead.kind, TokenKind::Identifier(_));
     }
 

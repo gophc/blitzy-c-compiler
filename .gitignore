@@ -26,3 +26,4 @@ Thumbs.db
 /external/
 *.core
 platform.info
+dump.rdb
