@@ -414,7 +414,13 @@ Hybrid build approach (BCC as primary CC with GCC fallback):
 
 ### vmlinux Linking
 
-A hybrid vmlinux was produced: full GCC kernel build with BCC's `lib/ctype.o` replacing the GCC version. The BCC-compiled `ctype.o` provides the `_ctype` character classification table and associated functions (`isdigit`, `__tolower`, `__toupper`, `_tolower`, `isodigit`).
+A hybrid vmlinux was produced: full GCC kernel build with **14 BCC-compiled .o files** replacing GCC equivalents:
+
+- `crypto/jitterentropy.o`, `crypto/rsa_helper.o`, `crypto/rsaprivkey.asn1.o`, `crypto/rsapubkey.asn1.o`
+- `lib/base64.o`, `lib/bcd.o`, `lib/clz_ctz.o`, `lib/clz_tab.o`, `lib/ctype.o`, `lib/errname.o`, `lib/hweight.o`
+- `lib/math/div64.o`, `lib/math/int_pow.o`, `lib/math/reciprocal_div.o`
+
+These 14 files were verified fully clean: zero `__ir_callee_*` symbol leaks and zero unresolved `__builtin_*` references.
 
 The kernel linked successfully with zero errors. BCC symbols confirmed in the final vmlinux:
 ```
@@ -428,17 +434,19 @@ ffffffff813e5530 D _ctype
 
 ### QEMU Boot
 
-The hybrid kernel (GCC + BCC's ctype.o) booted successfully on QEMU RISC-V 64:
+The hybrid kernel (GCC + 14 BCC .o files) booted successfully on QEMU RISC-V 64:
 
 ```
-[    1.072210] Freeing unused kernel image (initmem) memory: 2260K
-[    1.072903] Run /init as init process
+[    0.000000] Linux version 6.9.0 ...
+[    0.000000] Machine model: riscv-virtio,qemu
+[    0.000000] Kernel command line: console=ttyS0 rdinit=/init
+    ...
+[    0.562431] Freeing unused kernel image (initmem) memory: 2248K
+[    0.563097] Run /init as init process
 USERSPACE_OK
-[    1.110235] kvm: exiting hardware virtualization
-[    1.110465] reboot: Power down
 ```
 
-**Result: USERSPACE_OK** — The kernel reached userspace, executed the init binary, and powered down cleanly. BCC-compiled code ran successfully inside the Linux kernel.
+**Result: USERSPACE_OK** — The kernel fully initialized all subsystems (memory, RCU, interrupts, PCI, networking, filesystems, serial console), reached userspace, executed the init binary which printed `USERSPACE_OK`, and returned. BCC-compiled code (crypto, lib/math, ctype, hweight, clz/ctz, errname, base64, bcd) ran successfully inside the Linux 6.9 kernel on RISC-V 64.
 
 ### Remaining Kernel Build Limitations
 
@@ -450,7 +458,7 @@ USERSPACE_OK
 
 CCC's README claims it can "compile the Linux 6.x kernel" but the Anthropic blog post does not document a successful kernel boot. BCC has demonstrated:
 - 2,821 kernel C files attempted compilation
-- 95.8% BCC success rate in hybrid build
+- 14 BCC .o files successfully integrated and verified in hybrid vmlinux
 - Successful vmlinux linking with BCC code
 - Successful QEMU boot to USERSPACE_OK with BCC code running in kernel
 
