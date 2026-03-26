@@ -3575,23 +3575,43 @@ fn lower_assignment(
                 // and we must spill it to a temporary alloca first.
                 let rhs_ptr = if expr_is_natural_lvalue(value) {
                     lower_lvalue_inner(ctx, value)
-                } else {
-                    // Evaluate the RHS as an rvalue.  For aggregate types
-                    // (structs/unions), BCC's IR convention is that the
-                    // "value" returned by lower_expr_inner is actually a
-                    // *pointer* to the aggregate data (e.g. an alloca, a
-                    // hidden-pointer return slot, or the destination of a
-                    // nested assignment).  We must NOT spill that pointer
-                    // into a new alloca and then try to copy from the
-                    // alloca — that would copy the pointer bytes, not the
-                    // struct data.  Instead, use the returned pointer
-                    // directly as the source for the byte-by-byte copy.
-                    //
-                    // For non-aggregate rvalues this path is unreachable
-                    // (they go through the scalar assignment path below).
+                } else if rhs_expr_returns_aggregate_pointer(value) {
+                    // The RHS is an expression whose lowered result is
+                    // already a *pointer* to the aggregate data (e.g. a
+                    // chained assignment `(*p = x)` returns the LHS
+                    // address).  Use the pointer directly as the copy
+                    // source — do NOT spill it into a new alloca (that
+                    // would copy the 8-byte pointer bytes, not the
+                    // struct data).
                     let rhs_val = lower_expr_inner(ctx, value);
                     TypedValue::new(
                         rhs_val.value,
+                        CType::Pointer(
+                            Box::new(resolved_lhs_ty.clone()),
+                            crate::common::types::TypeQualifiers {
+                                is_const: false,
+                                is_volatile: false,
+                                is_restrict: false,
+                                is_atomic: false,
+                            },
+                        ),
+                    )
+                } else {
+                    // The RHS is an expression that produces aggregate
+                    // DATA (function call returning a struct, va_arg,
+                    // conditional, etc.).  The backend holds this data
+                    // in a temp slot or register pair.  We must spill
+                    // into a temporary alloca so we can GEP into the
+                    // memory representation for the byte-by-byte copy.
+                    let rhs_val = lower_expr_inner(ctx, value);
+                    let struct_ir_ty = IrType::from_ctype(&resolved_lhs_ty, ctx.target);
+                    let (tmp_alloca, tmp_inst) =
+                        ctx.builder.build_alloca(struct_ir_ty.clone(), span);
+                    emit_inst(ctx, tmp_inst);
+                    let si = ctx.builder.build_store(rhs_val.value, tmp_alloca, span);
+                    emit_inst(ctx, si);
+                    TypedValue::new(
+                        tmp_alloca,
                         CType::Pointer(
                             Box::new(resolved_lhs_ty.clone()),
                             crate::common::types::TypeQualifiers {
@@ -6627,6 +6647,38 @@ fn expr_is_natural_lvalue(expr: &ast::Expression) -> bool {
         // a VALUE not a pointer — so callers that expect an address
         // (like the aggregate copy path in lower_assignment) would break.
         ast::Expression::Cast { .. } => false,
+        _ => false,
+    }
+}
+
+/// Check whether an rvalue expression, when lowered, produces a *pointer*
+/// to aggregate data rather than the aggregate data itself.
+///
+/// In BCC's IR, most aggregate rvalues (function calls, va_arg, etc.)
+/// return the struct data held in a backend temp slot.  However, some
+/// expressions — specifically assignment expressions and comma expressions
+/// ending in an assignment — return the LHS *address* from
+/// `lower_assignment`, which is a pointer.
+///
+/// This distinction matters for the aggregate copy path: pointer results
+/// can be used directly as the copy source, while data results must be
+/// spilled to a temporary alloca first.
+fn rhs_expr_returns_aggregate_pointer(expr: &ast::Expression) -> bool {
+    match expr {
+        // Assignment expressions return the LHS address (a pointer).
+        ast::Expression::Assignment { .. } => true,
+        // Parenthesized: check the inner expression.
+        ast::Expression::Parenthesized { inner, .. } => rhs_expr_returns_aggregate_pointer(inner),
+        // Comma expression: the result is the last element.
+        ast::Expression::Comma { exprs, .. } => {
+            if let Some(last) = exprs.last() {
+                rhs_expr_returns_aggregate_pointer(last)
+            } else {
+                false
+            }
+        }
+        // Everything else (function calls, va_arg, conditionals,
+        // statement expressions, casts, etc.) returns struct data.
         _ => false,
     }
 }

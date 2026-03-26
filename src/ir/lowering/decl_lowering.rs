@@ -1234,18 +1234,30 @@ pub fn lower_local_initializer(
                     // Rvalue expression returning a struct (function call,
                     // conditional, statement expression, va_arg, chained
                     // assignment, etc.).
-                    //
-                    // In BCC's IR convention, aggregate "values" returned
-                    // by lower_expression_typed are actually *pointers* to
-                    // the aggregate data (an alloca, a hidden return slot,
-                    // or the destination of a nested assignment).  We must
-                    // NOT spill that pointer into a new alloca and then
-                    // copy from it — that copies the pointer bytes, not
-                    // the struct data.  Instead, use the returned pointer
-                    // directly as the source for the chunk-by-chunk copy.
                     let typed_val = expr_lowering::lower_expression_typed(ctx, expr);
                     let span_dummy = Span::dummy();
-                    let src_ptr = typed_val.value;
+
+                    // Check if the expression returns a pointer to the
+                    // aggregate data (e.g. chained assignment) vs actual
+                    // struct data (function call, va_arg).
+                    let is_assign_ptr = expr_returns_aggregate_pointer(expr);
+
+                    let src_ptr = if is_assign_ptr {
+                        // Value is already a pointer — use directly.
+                        typed_val.value
+                    } else {
+                        // Value is struct data — spill to a temp alloca
+                        // so we can GEP into the memory representation.
+                        let struct_ir_ty = expr_lowering::ctype_to_ir(&resolved_var_ty, ctx.target);
+                        let (tmp_alloca, tmp_inst) =
+                            ctx.builder.build_alloca(struct_ir_ty.clone(), span_dummy);
+                        emit_inst_to_ctx(ctx, tmp_inst);
+                        let si = ctx
+                            .builder
+                            .build_store(typed_val.value, tmp_alloca, span_dummy);
+                        emit_inst_to_ctx(ctx, si);
+                        tmp_alloca
+                    };
 
                     // Copy chunk-by-chunk from source pointer to var_alloca.
                     let mut offset: usize = 0;
@@ -7661,6 +7673,24 @@ fn push_inst_to_entry(function: &mut IrFunction, inst: Instruction) {
 }
 
 /// Emit an instruction into the current insertion point of the builder context.
+/// Check whether an rvalue expression, when lowered, produces a *pointer*
+/// to aggregate data rather than the aggregate data itself.
+/// Mirrors `rhs_expr_returns_aggregate_pointer` in expr_lowering.
+fn expr_returns_aggregate_pointer(expr: &ast::Expression) -> bool {
+    match expr {
+        ast::Expression::Assignment { .. } => true,
+        ast::Expression::Parenthesized { inner, .. } => expr_returns_aggregate_pointer(inner),
+        ast::Expression::Comma { exprs, .. } => {
+            if let Some(last) = exprs.last() {
+                expr_returns_aggregate_pointer(last)
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
 fn emit_inst_to_ctx(ctx: &mut expr_lowering::ExprLoweringContext<'_>, inst: Instruction) {
     if let Some(block_id) = ctx.builder.get_insert_block() {
         let block_idx = block_id.0 as usize;
