@@ -3460,6 +3460,12 @@ impl X86_64CodeGen {
                                 IrType::I32 => 4,
                                 IrType::F32 => 4,
                                 IrType::F64 => 8,
+                                // Struct and Array types: use their actual byte
+                                // size to avoid overwriting adjacent globals.
+                                IrType::Struct(_) | IrType::Array(_, _) => {
+                                    let sz = vty.size_bytes(&self.target);
+                                    if sz <= 8 { sz as u8 } else { 8 }
+                                }
                                 _ => 8,
                             }
                         } else {

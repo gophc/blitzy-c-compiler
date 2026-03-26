@@ -6379,7 +6379,8 @@ fn resolve_nested_array_elem_size(
             if let Some(ref map) = *borrow {
                 if let Some(raw_ty) = map.get(&root_name) {
                     let mut ty = crate::common::types::resolve_and_strip(raw_ty);
-                    // Peel `depth` Array layers
+                    // Peel `depth` Array layers to reach the type at
+                    // the current subscript nesting level.
                     for _ in 0..depth {
                         if let CType::Array(elem, _) = ty {
                             ty = crate::common::types::resolve_and_strip(elem);
@@ -6387,7 +6388,13 @@ fn resolve_nested_array_elem_size(
                             return None;
                         }
                     }
-                    // `ty` is now the element type at this subscript level.
+                    // `ty` is the array type at this subscript level.
+                    // We need the *element* size (one more peel) since
+                    // subscript `[j]` strides by sizeof(element), not
+                    // sizeof(the-whole-row).
+                    if let CType::Array(elem, _) = ty {
+                        ty = crate::common::types::resolve_and_strip(elem);
+                    }
                     return Some(crate::common::types::sizeof_ctype(ty, target) as i64);
                 }
             }
@@ -6717,26 +6724,27 @@ fn evaluate_member_field_offset(
         let resolved = resolve_sizeof_struct_ref(sty, target);
         // Get fields from the resolved type
         if let CType::Struct {
-            ref fields, packed, ..
+            ref fields,
+            packed,
+            aligned,
+            ..
         } = &resolved
         {
-            let mut offset: i64 = 0;
-            for field in fields {
+            // Use TypeBuilder::compute_struct_layout_with_fields to get
+            // accurate byte offsets that correctly handle bitfield packing,
+            // alignment, and storage unit sharing.  The naive manual walk
+            // that previously lived here treated every bitfield as occupying
+            // sizeof(underlying_type) bytes, which over-counted when
+            // non-bitfield members shared a storage unit's tail bytes.
+            let tb = crate::common::type_builder::TypeBuilder::new(*target);
+            let layout = tb.compute_struct_layout_with_fields(fields, *packed, *aligned);
+            // Walk fields and layout entries in parallel to match by name.
+            for (field, fl) in fields.iter().zip(layout.fields.iter()) {
                 if let Some(ref fname) = field.name {
-                    // Align the offset for non-packed structs
-                    if !packed {
-                        let field_align =
-                            crate::common::types::alignof_ctype(&field.ty, target) as i64;
-                        if field_align > 0 {
-                            offset = (offset + field_align - 1) & !(field_align - 1);
-                        }
-                    }
                     if fname == member_name {
-                        return Some(offset);
+                        return Some(fl.offset as i64);
                     }
                 }
-                let field_sz = crate::common::types::sizeof_ctype(&field.ty, target) as i64;
-                offset += field_sz;
             }
         } else if let CType::Union { .. } = &resolved {
             // Union members are all at offset 0
@@ -6792,6 +6800,24 @@ fn infer_struct_type_from_expr(expr: &ast::Expression, name_table: &[String]) ->
                 }
             }
             None
+        }
+        ast::Expression::ArraySubscript { base, .. } => {
+            // For arr[i], the result type is the element type of arr.
+            // Recursively get the array's type from its base, then peel
+            // one Array layer to get the element type.
+            let base_ty = infer_struct_type_from_expr(base, name_table)?;
+            let resolved =
+                crate::common::types::resolve_and_strip(&base_ty);
+            match resolved {
+                CType::Array(elem, _) => {
+                    let elem_resolved = crate::common::types::resolve_and_strip(elem);
+                    Some(elem_resolved.clone())
+                }
+                // If already peeled to a struct (base is already array-subscripted),
+                // return it as-is.
+                CType::Struct { .. } | CType::Union { .. } => Some(resolved.clone()),
+                _ => Some(resolved.clone()),
+            }
         }
         _ => None,
     }

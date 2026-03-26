@@ -934,12 +934,31 @@ pub fn lower_translation_unit(
 
     // After collecting all struct definitions, resolve forward-referenced
     // typedef field types so that sizeof_ctype returns correct sizes.
+    //
+    // CRITICAL: A single pass is insufficient because the HashMap iteration
+    // order is non-deterministic.  If struct S2 contains field of type S1,
+    // and S1 contains field of type S0, and S2 is resolved *before* S1,
+    // then S2 gets the UNRESOLVED S1 (with S0 still as a forward-ref).
+    // Iterating until convergence ensures that nested forward references
+    // are fully resolved regardless of iteration order.
     {
-        let tags_to_resolve: Vec<String> = struct_defs.keys().cloned().collect();
-        for tag in tags_to_resolve {
-            if let Some(mut def) = struct_defs.remove(&tag) {
-                resolve_struct_field_forward_refs(&mut def, &struct_defs);
-                struct_defs.insert(tag, def);
+        let max_passes = 8; // depth limit to prevent infinite loops in pathological cases
+        for _pass in 0..max_passes {
+            let mut changed = false;
+            let tags_to_resolve: Vec<String> = struct_defs.keys().cloned().collect();
+            for tag in tags_to_resolve {
+                if let Some(mut def) = struct_defs.remove(&tag) {
+                    let had_empty = has_empty_struct_refs(&def);
+                    resolve_struct_field_forward_refs(&mut def, &struct_defs);
+                    let still_empty = has_empty_struct_refs(&def);
+                    if had_empty && !still_empty {
+                        changed = true;
+                    }
+                    struct_defs.insert(tag, def);
+                }
+            }
+            if !changed {
+                break;
             }
         }
     }
@@ -1621,35 +1640,108 @@ fn collect_enum_constants_from_statement(
 /// field types of a struct or union definition.  This ensures that
 /// `sizeof_ctype` returns the correct size for typedef fields whose
 /// underlying struct was forward-declared at typedef creation time.
+/// Check if a CType (struct/union) has any fields that are forward-
+/// referenced struct/union types (i.e., named struct/union with 0 fields),
+/// including nested fields up to a reasonable depth.
+/// Used to detect convergence during multi-pass forward-ref resolution.
+fn has_empty_struct_refs(ty: &CType) -> bool {
+    has_empty_struct_refs_inner(ty, 0)
+}
+
+fn has_empty_struct_refs_inner(ty: &CType, depth: usize) -> bool {
+    if depth > 8 {
+        return false; // prevent infinite recursion
+    }
+    match ty {
+        CType::Struct { ref fields, .. } | CType::Union { ref fields, .. } => {
+            for field in fields {
+                if has_empty_type_ref(&field.ty, depth + 1) {
+                    return true;
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+fn has_empty_type_ref(ty: &CType, depth: usize) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    match ty {
+        CType::Struct {
+            name: Some(_),
+            fields,
+            ..
+        }
+        | CType::Union {
+            name: Some(_),
+            fields,
+            ..
+        } if fields.is_empty() => true,
+        CType::Struct { fields, .. } | CType::Union { fields, .. } => {
+            for field in fields {
+                if has_empty_type_ref(&field.ty, depth + 1) {
+                    return true;
+                }
+            }
+            false
+        }
+        CType::Pointer(inner, _)
+        | CType::Array(inner, _)
+        | CType::Atomic(inner)
+        | CType::Qualified(inner, _)
+        | CType::Typedef { underlying: inner, .. } => has_empty_type_ref(inner, depth + 1),
+        _ => false,
+    }
+}
+
 fn resolve_struct_field_forward_refs(ty: &mut CType, tags: &FxHashMap<String, CType>) {
+    resolve_struct_field_forward_refs_inner(ty, tags, 0);
+}
+
+fn resolve_struct_field_forward_refs_inner(
+    ty: &mut CType,
+    tags: &FxHashMap<String, CType>,
+    depth: usize,
+) {
+    // Limit recursion depth to prevent quadratic expansion on large
+    // codebases like the Linux kernel.  Depth 6 covers the vast
+    // majority of real-world struct nesting (typically 3-4 levels).
+    if depth > 6 {
+        return;
+    }
     match ty {
         CType::Struct { ref mut fields, .. } | CType::Union { ref mut fields, .. } => {
             for field in fields.iter_mut() {
-                // Resolve only the immediate field type (depth 1).
-                // Don't recursively expand nested struct fields — they
-                // will be resolved on-demand during function lowering
-                // via resolve_struct_forward_ref or sizeof_resolved.
-                // This prevents quadratic type-tree expansion on large
-                // codebases like the Linux kernel.
-                resolve_type_forward_refs_shallow(&mut field.ty, tags);
+                resolve_type_forward_refs_deep(&mut field.ty, tags, depth + 1);
             }
         }
         _ => {}
     }
 }
 
-/// Shallow forward-reference resolution: resolve only the outermost
-/// lightweight tag reference without recursing into the resolved
-/// definition's fields.  Nested lightweight references are resolved
-/// lazily by the function lowering code.
-fn resolve_type_forward_refs_shallow(ty: &mut CType, tags: &FxHashMap<String, CType>) {
+/// Deep forward-reference resolution: resolve the outermost lightweight
+/// tag reference and then recurse into the resolved definition's fields
+/// to resolve nested forward references.  Depth-limited to prevent
+/// quadratic expansion on large codebases.
+fn resolve_type_forward_refs_deep(
+    ty: &mut CType,
+    tags: &FxHashMap<String, CType>,
+    depth: usize,
+) {
+    if depth > 6 {
+        return;
+    }
     match ty {
         CType::Struct {
             name: Some(ref tag),
             ref fields,
             ..
         } if fields.is_empty() => {
-            if let Some(full_def) = tags.get(tag) {
+            let tag_owned = tag.clone();
+            if let Some(full_def) = tags.get(&tag_owned) {
                 let has_fields = match full_def {
                     CType::Struct { fields: f, .. } | CType::Union { fields: f, .. } => {
                         !f.is_empty()
@@ -1658,6 +1750,9 @@ fn resolve_type_forward_refs_shallow(ty: &mut CType, tags: &FxHashMap<String, CT
                 };
                 if has_fields {
                     *ty = full_def.clone();
+                    // Recurse into the newly-resolved struct's fields
+                    // to resolve nested forward refs (e.g., S2 → S1 → S0).
+                    resolve_struct_field_forward_refs_inner(ty, tags, depth + 1);
                 }
             }
         }
@@ -1666,7 +1761,8 @@ fn resolve_type_forward_refs_shallow(ty: &mut CType, tags: &FxHashMap<String, CT
             ref fields,
             ..
         } if fields.is_empty() => {
-            if let Some(full_def) = tags.get(tag) {
+            let tag_owned = tag.clone();
+            if let Some(full_def) = tags.get(&tag_owned) {
                 let has_fields = match full_def {
                     CType::Struct { fields: f, .. } | CType::Union { fields: f, .. } => {
                         !f.is_empty()
@@ -1675,27 +1771,40 @@ fn resolve_type_forward_refs_shallow(ty: &mut CType, tags: &FxHashMap<String, CT
                 };
                 if has_fields {
                     *ty = full_def.clone();
+                    resolve_struct_field_forward_refs_inner(ty, tags, depth + 1);
                 }
+            }
+        }
+        CType::Struct { ref mut fields, .. } | CType::Union { ref mut fields, .. } => {
+            // Not a forward ref, but still recurse into fields
+            // to resolve nested forward refs.
+            for field in fields.iter_mut() {
+                resolve_type_forward_refs_deep(&mut field.ty, tags, depth + 1);
             }
         }
         CType::Typedef {
             ref mut underlying, ..
         } => {
-            resolve_type_forward_refs_shallow(underlying, tags);
+            resolve_type_forward_refs_deep(underlying, tags, depth + 1);
         }
         CType::Array(ref mut inner, _) => {
-            resolve_type_forward_refs_shallow(inner, tags);
+            resolve_type_forward_refs_deep(inner, tags, depth + 1);
         }
         CType::Qualified(ref mut inner, _) => {
-            resolve_type_forward_refs_shallow(inner, tags);
+            resolve_type_forward_refs_deep(inner, tags, depth + 1);
         }
         CType::Atomic(ref mut inner) => {
-            resolve_type_forward_refs_shallow(inner, tags);
+            resolve_type_forward_refs_deep(inner, tags, depth + 1);
         }
-        _ => {} // Don't recurse into Pointer, Function, etc.
+        CType::Pointer(ref mut inner, _) => {
+            resolve_type_forward_refs_deep(inner, tags, depth + 1);
+        }
+        _ => {}
     }
 }
 
+/// Shallow forward-reference resolution: resolve only the outermost
+/// lightweight tag reference without recursing into the resolved
 /// Recursively collect struct/union definitions from within a compound
 /// statement (function body). This handles function-local struct definitions
 /// like `void f() { struct S { int x; char y; }; ... }` which are not
