@@ -161,11 +161,17 @@ pub fn eliminate_phi_nodes(func: &mut IrFunction) {
                 if is_critical_edge(func, pred_idx, block_idx)
                     && !edges_to_split.contains(&(pred_idx, block_idx))
                 {
-                    // Skip splitting if predecessor ends with IndirectBranch.
-                    let pred_is_indirect = func
-                        .get_block(pred_idx)
-                        .and_then(|b| b.terminator())
-                        .map_or(false, |t| matches!(t, Instruction::IndirectBranch { .. }));
+                    // Skip splitting if predecessor contains an IndirectBranch.
+                    // We check ALL instructions (not just the last terminator)
+                    // because a block may have an IndirectBranch followed by
+                    // dead code (e.g., a loop back-edge branch emitted after
+                    // a computed goto). The dead branch is the last instruction,
+                    // so `terminator()` would miss the IndirectBranch.
+                    let pred_is_indirect = func.get_block(pred_idx).map_or(false, |b| {
+                        b.instructions
+                            .iter()
+                            .any(|inst| matches!(inst, Instruction::IndirectBranch { .. }))
+                    });
                     if !pred_is_indirect {
                         edges_to_split.push((pred_idx, block_idx));
                     }
@@ -670,15 +676,21 @@ fn insert_copies_before_terminator(block: &mut BasicBlock, copies: &[PhiCopy]) {
         return;
     }
 
-    // Determine the insertion point: right before the terminator.
-    // If the block has a terminator, it's the last instruction.
-    let has_terminator = block.terminator().is_some();
-    let insert_base = if has_terminator {
-        block.instructions().len() - 1
-    } else {
-        // Defensive: no terminator — append at the end.
-        block.instructions().len()
-    };
+    // Determine the insertion point: right before the FIRST terminator
+    // in the block.  A well-formed block has exactly one terminator as
+    // its last instruction, but after IR lowering a block may contain
+    // dead code after an IndirectBranch (computed goto) — e.g. an
+    // unconditional branch emitted by the for-loop lowering that follows
+    // the computed goto.  Using `block.terminator()` (which returns the
+    // LAST instruction if it is a terminator) would place copies between
+    // the IndirectBranch and the dead branch, making them dead code too.
+    // Instead, we scan forward to find the first terminator and insert
+    // copies before it, ensuring they execute on all outgoing edges.
+    let insert_base = block
+        .instructions()
+        .iter()
+        .position(|inst| inst.is_terminator())
+        .unwrap_or(block.instructions().len());
 
     // Insert each copy at incrementing positions to maintain order.
     // After inserting at position P, the next insert at P+1 places the

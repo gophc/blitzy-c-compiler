@@ -1153,6 +1153,18 @@ fn propagate_phi_for_chain(
 pub fn run_simplify_cfg(func: &mut IrFunction) -> bool {
     let mut any_changed = false;
 
+    // First, strip dead code after the first terminator in each block.
+    // This is essential for correctness: after lowering, a block may contain
+    // an IndirectBranch followed by a dead unconditional Branch (from the
+    // while(1) back-edge in computed-goto patterns).  Every function that
+    // calls `block.terminator()` — which returns the LAST terminator —
+    // would see the dead Branch instead of the IndirectBranch, computing
+    // wrong successor edges and causing phi copies to be missing for some
+    // targets.  By stripping dead post-terminator instructions first, we
+    // guarantee that every block has exactly one terminator as its last
+    // instruction, making all subsequent passes correct.
+    any_changed |= strip_dead_code_after_first_terminator(func);
+
     any_changed |= recompute_cfg_and_cleanup_phis(func);
     any_changed |= simplify_trivial_phis(func);
     any_changed |= merge_blocks(func);
@@ -1160,6 +1172,29 @@ pub fn run_simplify_cfg(func: &mut IrFunction) -> bool {
     any_changed |= simplify_branch_chains(func);
 
     any_changed
+}
+
+/// Removes all instructions that follow the first terminator in each basic
+/// block.  In well-formed IR a block should end with exactly one terminator,
+/// but the lowering phase can produce blocks where an `IndirectBranch` is
+/// immediately followed by a dead `Branch` (e.g., the back-edge of a
+/// `while(1)` loop enclosing a computed-goto dispatch).  The dead trailing
+/// instructions are unreachable and confuse later analyses that use
+/// `block.terminator()` (which returns the *last* instruction).
+fn strip_dead_code_after_first_terminator(func: &mut IrFunction) -> bool {
+    let mut changed = false;
+    for block_idx in 0..func.block_count() {
+        let instructions = func.blocks[block_idx].instructions_mut();
+        // Find the position of the first terminator instruction.
+        if let Some(first_term_pos) = instructions.iter().position(|inst| inst.is_terminator()) {
+            // If there are instructions after the first terminator, remove them.
+            if first_term_pos + 1 < instructions.len() {
+                instructions.truncate(first_term_pos + 1);
+                changed = true;
+            }
+        }
+    }
+    changed
 }
 
 // ===========================================================================
