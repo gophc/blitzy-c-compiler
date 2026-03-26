@@ -275,3 +275,39 @@ fn test_fuzz_global_ptr_union_member_offset_aarch64() {
         stdout
     );
 }
+
+// ===================================================================
+// Bug I: Multi-dim array global initializer brace-elision symbol size
+// ===================================================================
+#[test]
+fn test_bug_i_array_brace_elision_x86_64() {
+    let output = compile_and_run(
+        "tests/fixtures/fuzz_regressions/bug_i_array_brace_elision.c",
+        "x86-64",
+    );
+    assert_exit_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("bug_i_array_brace_elision OK"),
+        "bug_i test failed (x86-64). stdout: {}",
+        stdout
+    );
+}
+
+// ===================================================================
+// Bug J: Sub-register truncation for promoted I8/I16 arithmetic
+// ===================================================================
+#[test]
+fn test_bug_j_uint8_shortcircuit_x86_64() {
+    let output = compile_and_run(
+        "tests/fixtures/fuzz_regressions/bug_j_uint8_shortcircuit.c",
+        "x86-64",
+    );
+    assert_exit_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("bug_j_uint8_shortcircuit OK"),
+        "bug_j test failed (x86-64). stdout: {}",
+        stdout
+    );
+}

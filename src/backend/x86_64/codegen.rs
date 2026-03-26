@@ -5213,6 +5213,9 @@ impl X86_64CodeGen {
         let mut rhs_op = self.get_value(rhs);
         let dst = self.new_vreg();
         self.set_value(result, dst.clone());
+        // Keep a clone of dst for the sub-register truncation step
+        // that runs after the match block (the match arms move `dst`).
+        let dst_for_trunc = dst.clone();
         let mut out = Vec::new();
 
         // GlobalSymbol operands representing function pointers or global
@@ -5578,6 +5581,40 @@ impl X86_64CodeGen {
                     mov_op,
                     Some(dst),
                     &[MachineOperand::Register(XMM0)],
+                ));
+            }
+        }
+
+        // -----------------------------------------------------------
+        // Sub-register truncation for promoted I8/I16 operations
+        // -----------------------------------------------------------
+        // BCC promotes I8/I16 arithmetic to 32-bit for efficiency,
+        // but the result in the register may exceed the original
+        // width (e.g. uint8_t 255 + 1 = 256 in 32-bit register).
+        // Mask the result back to the correct width so that
+        // subsequent comparisons and uses see the truncated value.
+        let needs_trunc = matches!(
+            op,
+            BinOp::Add
+                | BinOp::Sub
+                | BinOp::Mul
+                | BinOp::Shl
+                | BinOp::SDiv
+                | BinOp::UDiv
+                | BinOp::SRem
+                | BinOp::URem
+        );
+        if needs_trunc {
+            let mask: Option<i64> = match ty {
+                IrType::I8 => Some(0xFF),
+                IrType::I16 => Some(0xFFFF),
+                _ => None,
+            };
+            if let Some(m) = mask {
+                out.push(Self::mk_inst(
+                    X86Opcode::And,
+                    Some(dst_for_trunc.clone()),
+                    &[MachineOperand::Immediate(m)],
                 ));
             }
         }

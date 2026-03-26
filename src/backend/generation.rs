@@ -3286,12 +3286,37 @@ fn constant_to_bytes_typed(
         }
         Constant::Array(elements) => {
             let mut result = Vec::new();
-            let elem_ty = match ir_ty {
-                Some(IrType::Array(et, _)) => Some(et.as_ref()),
-                _ => None,
+            let (elem_ty, declared_len) = match ir_ty {
+                Some(IrType::Array(et, n)) => (Some(et.as_ref()), Some(*n)),
+                _ => (None, None),
             };
+            // Compute expected element byte size from the declared element type.
+            // When brace-elision occurs in multi-dimensional array initializers,
+            // a scalar constant (e.g. Integer(1)) may appear where a sub-array
+            // constant is expected.  The serialized bytes of the scalar will be
+            // shorter than the element type size, so we must zero-pad each
+            // element to the correct ABI size.
+            let expected_elem_size = elem_ty.map(|t| ir_type_size(t) as usize);
             for elem in elements {
+                let before = result.len();
                 result.extend_from_slice(&constant_to_bytes_typed(elem, elem_ty));
+                let emitted = result.len() - before;
+                if let Some(exp) = expected_elem_size {
+                    if emitted < exp {
+                        // Zero-pad to the full element size (handles brace
+                        // elision where a scalar fills only the first bytes
+                        // of a sub-array slot).
+                        result.resize(result.len() + (exp - emitted), 0);
+                    }
+                }
+            }
+            // If the Constant::Array has fewer elements than the declared
+            // array length (e.g. partial initializer), zero-pad the tail.
+            if let (Some(decl), Some(esz)) = (declared_len, expected_elem_size) {
+                let total_expected = decl * esz;
+                if result.len() < total_expected {
+                    result.resize(total_expected, 0);
+                }
             }
             result
         }
