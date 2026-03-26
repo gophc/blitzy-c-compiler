@@ -528,11 +528,25 @@ impl IrType {
                         .iter()
                         .map(|f| IrType::from_ctype(&f.ty, target))
                         .collect();
-                    IrType::Struct(StructType {
+                    let mut st = StructType {
                         fields: field_types,
                         packed: *packed,
                         name: name.clone(),
-                    })
+                    };
+                    // Check if C-level alignment (e.g. __attribute__((aligned(N))))
+                    // makes the C sizeof larger than the IR struct's natural size.
+                    // If so, add a tail-padding array to match the C sizeof.
+                    // This prevents stack corruption when the alloca uses the IR
+                    // type's size_bytes() — it must be at least as large as the
+                    // C type's sizeof.
+                    let ir_struct_tmp = IrType::Struct(st.clone());
+                    let ir_sz = ir_struct_tmp.size_bytes(target);
+                    let c_sz = sizeof_ctype(ctype, target);
+                    if c_sz > ir_sz {
+                        let pad = c_sz - ir_sz;
+                        st.fields.push(IrType::Array(Box::new(IrType::I8), pad));
+                    }
+                    IrType::Struct(st)
                 }
             }
 

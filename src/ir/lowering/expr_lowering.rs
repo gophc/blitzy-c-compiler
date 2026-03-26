@@ -351,7 +351,7 @@ fn maybe_truncate_bitfield(
     tv
 }
 
-fn emit_int_const(
+pub fn emit_int_const(
     ctx: &mut ExprLoweringContext<'_>,
     value: i128,
     ir_ty: IrType,
@@ -2670,6 +2670,47 @@ fn extract_complex_parts_from_value(
     load_complex_parts(ctx, alloca, elem_ir, elem_size, span)
 }
 
+/// Lower `__builtin_conjf`, `__builtin_conj`, `__builtin_conjl`:
+/// complex conjugate — negate the imaginary part.
+fn lower_complex_conj(
+    ctx: &mut ExprLoweringContext<'_>,
+    args: &[ast::Expression],
+    elem_ctype: CType,
+    elem_ir: IrType,
+    span: Span,
+) -> Option<TypedValue> {
+    if args.is_empty() {
+        return None;
+    }
+    let complex_ctype = CType::Complex(Box::new(elem_ctype.clone()));
+    let complex_ir = ctype_to_ir(&complex_ctype, ctx.target);
+    let elem_size = complex_elem_size(&elem_ir);
+
+    let inner_tv = lower_expr_inner(ctx, &args[0]);
+    let (real, imag) = extract_complex_parts_from_value(
+        ctx,
+        inner_tv.value,
+        &complex_ir,
+        &elem_ir,
+        elem_size,
+        span,
+    );
+
+    // Negate the imaginary part: 0 - imag.
+    let zero = if matches!(elem_ir, IrType::F32 | IrType::F64 | IrType::F80) {
+        emit_float_const(ctx, 0.0, elem_ir.clone(), span)
+    } else {
+        emit_int_const(ctx, 0, elem_ir.clone(), span)
+    };
+    let (neg_imag, neg_inst) = ctx.builder.build_sub(zero, imag, elem_ir.clone(), span);
+    emit_inst(ctx, neg_inst);
+
+    let result = store_complex_result(ctx, real, neg_imag, &complex_ir, elem_size, span);
+    let (loaded, ld) = ctx.builder.build_load(result, complex_ir, span);
+    emit_inst(ctx, ld);
+    Some(TypedValue::new(loaded, complex_ctype))
+}
+
 /// Convert a scalar value to the target floating-point element type
 /// of a `_Complex`.  Delegates to `lower_cast` for the actual
 /// instruction emission (int→fp, fp→fp, etc.).
@@ -3320,13 +3361,22 @@ fn lower_unary(
             if let CType::Complex(base) = resolved {
                 let elem_ctype = base.as_ref().clone();
                 let elem_ir = ctype_to_ir(&elem_ctype, ctx.target);
-                // Get pointer to the complex value's storage.
-                let ptr = lower_lvalue(ctx, operand);
+                let complex_ir = ctype_to_ir(resolved, ctx.target);
+                // Store the already-lowered complex value into a
+                // temporary alloca so we can extract the real part via
+                // pointer arithmetic.  Do NOT re-lower the operand with
+                // lower_lvalue — that would re-evaluate the expression
+                // (calling functions twice) and return a raw value
+                // instead of a pointer, causing SEGFAULT on GEP.
+                let (tmp_alloca, ai) = ctx.builder.build_alloca(complex_ir.clone(), span);
+                emit_inst(ctx, ai);
+                let st = ctx.builder.build_store(inner.value, tmp_alloca, span);
+                emit_inst(ctx, st);
                 // Real part is at offset 0.
                 let zero_idx = emit_int_const_for_index(ctx, 0);
-                let (real_ptr, gep) = ctx
-                    .builder
-                    .build_gep(ptr, vec![zero_idx], IrType::Ptr, span);
+                let (real_ptr, gep) =
+                    ctx.builder
+                        .build_gep(tmp_alloca, vec![zero_idx], IrType::Ptr, span);
                 emit_inst(ctx, gep);
                 let (real_val, ld) = ctx.builder.build_load(real_ptr, elem_ir, span);
                 emit_inst(ctx, ld);
@@ -3344,11 +3394,19 @@ fn lower_unary(
                 let elem_ctype = base.as_ref().clone();
                 let elem_ir = ctype_to_ir(&elem_ctype, ctx.target);
                 let elem_size: i64 = complex_elem_size(&elem_ir);
-                // Get pointer to the complex value's storage.
-                let ptr = lower_lvalue(ctx, operand);
+                let complex_ir = ctype_to_ir(resolved, ctx.target);
+                // Store the already-lowered complex value into a
+                // temporary alloca so we can extract the imaginary part
+                // via pointer arithmetic.  See RealPart comment above.
+                let (tmp_alloca, ai) = ctx.builder.build_alloca(complex_ir.clone(), span);
+                emit_inst(ctx, ai);
+                let st = ctx.builder.build_store(inner.value, tmp_alloca, span);
+                emit_inst(ctx, st);
                 // Imaginary part is at offset elem_size.
                 let off_idx = emit_int_const_for_index(ctx, elem_size);
-                let (imag_ptr, gep) = ctx.builder.build_gep(ptr, vec![off_idx], IrType::Ptr, span);
+                let (imag_ptr, gep) =
+                    ctx.builder
+                        .build_gep(tmp_alloca, vec![off_idx], IrType::Ptr, span);
                 emit_inst(ctx, gep);
                 let (imag_val, ld) = ctx.builder.build_load(imag_ptr, elem_ir, span);
                 emit_inst(ctx, ld);
@@ -3495,7 +3553,17 @@ fn lower_assignment(
                         return TypedValue::new(lhs.value, lhs.ty);
                     }
                 }
-                // Same-type Complex: fall through to normal Store path.
+                // Same-type Complex→Complex assignment: store the already-
+                // evaluated RHS value directly. We must NOT fall through to
+                // the generic scalar Store path below because that would call
+                // lower_expr_inner(value) a SECOND time, re-executing any
+                // side effects (e.g. pointer post-increments in `*p++ * s`).
+                let si = ctx.builder.build_store(rhs_tv.value, lhs.value, span);
+                emit_inst(ctx, si);
+                // C11 §6.5.16p3: the value of an assignment expression is
+                // the value of the left operand after the assignment, i.e.
+                // the stored RHS rvalue — NOT the LHS pointer/lvalue.
+                return TypedValue::new(rhs_tv.value, lhs.ty);
             }
 
             if is_agg && struct_size > 8 {
@@ -5300,6 +5368,18 @@ fn try_lower_builtin_call(
                 CType::Double,
                 span,
             ))
+        }
+
+        // ── __builtin_conjf / __builtin_conj / __builtin_conjl ──
+        // Complex conjugate: negate the imaginary part.
+        "__builtin_conjf" | "conjf" => {
+            lower_complex_conj(ctx, args, CType::Float, IrType::F32, span)
+        }
+        "__builtin_conj" | "conj" => {
+            lower_complex_conj(ctx, args, CType::Double, IrType::F64, span)
+        }
+        "__builtin_conjl" | "conjl" => {
+            lower_complex_conj(ctx, args, CType::LongDouble, IrType::F80, span)
         }
 
         // Not a recognized builtin — fall through.
@@ -8577,7 +8657,9 @@ fn classify_struct_va_arg_eightbytes(cty: &CType, target: &Target) -> Vec<IrType
             } else {
                 start_eb
             };
-            // Recurse into nested structs
+            // Classify each eightbyte by field type: Float/Double ⇒ SSE,
+            // nested structs ⇒ recurse, Array(Float/Double) ⇒ SSE per
+            // element, everything else ⇒ INTEGER.
             match &field.ty {
                 CType::Float | CType::Double => {
                     for item in has_field
@@ -8603,8 +8685,54 @@ fn classify_struct_va_arg_eightbytes(cty: &CType, target: &Target) -> Vec<IrType
                         has_field,
                     );
                 }
+                CType::Array(elem_ty, count) => {
+                    // Walk each array element individually so that
+                    // Array(Float, N) properly classifies eightbytes
+                    // as SSE instead of falling into the INTEGER arm.
+                    let elem_sz = crate::common::types::sizeof_ctype(elem_ty, target);
+                    let elem_align = crate::common::types::alignof_ctype(elem_ty, target);
+                    let n = count.unwrap_or(0);
+                    let mut arr_off = offset;
+                    for _ in 0..n {
+                        if elem_align > 0 {
+                            arr_off = (arr_off + elem_align - 1) & !(elem_align - 1);
+                        }
+                        let e_start = arr_off / 8;
+                        let e_end = if elem_sz > 0 {
+                            (arr_off + elem_sz - 1) / 8
+                        } else {
+                            e_start
+                        };
+                        match elem_ty.as_ref() {
+                            CType::Float | CType::Double => {
+                                for item in has_field
+                                    .iter_mut()
+                                    .take(e_end.min(num_eb.saturating_sub(1)) + 1)
+                                    .skip(e_start)
+                                {
+                                    *item = true;
+                                    // stays SSE
+                                }
+                            }
+                            CType::Struct {
+                                fields: sf,
+                                packed: sp,
+                                ..
+                            } => {
+                                walk_fields(sf, *sp, arr_off, target, is_sse, has_field);
+                            }
+                            _ => {
+                                for eb in e_start..=e_end.min(num_eb.saturating_sub(1)) {
+                                    is_sse[eb] = false;
+                                    has_field[eb] = true;
+                                }
+                            }
+                        }
+                        arr_off += elem_sz;
+                    }
+                }
                 _ => {
-                    // Integer, pointer, array-of-int, etc. → INTEGER class
+                    // Integer, pointer, etc. → INTEGER class
                     for eb in start_eb..=end_eb.min(num_eb - 1) {
                         is_sse[eb] = false;
                         has_field[eb] = true;
@@ -8709,8 +8837,7 @@ fn lower_va_builtin(
                 // simply be reinterpreted as f64 — an x87 conversion
                 // step is required.
                 let alloca_ir = IrType::F64;
-                let (alloca_val, alloca_i) =
-                    ctx.builder.build_alloca(alloca_ir.clone(), span);
+                let (alloca_val, alloca_i) = ctx.builder.build_alloca(alloca_ir.clone(), span);
                 emit_inst(ctx, alloca_i);
 
                 let f80_name = "__builtin_va_arg_f80".to_string();
@@ -8746,9 +8873,15 @@ fn lower_va_builtin(
                         // into a temp alloca and return it.
                         let eb_types = classify_struct_va_arg_eightbytes(&cty_resolved, ctx.target);
                         let struct_ir = ctype_to_ir(&cty_resolved, ctx.target);
-                        // Alloca for the temporary struct
-                        let (alloca_val, alloca_i) =
-                            ctx.builder.build_alloca(struct_ir.clone(), span);
+                        // Alloca for the temporary that holds two
+                        // eightbyte halves.  The struct may be smaller
+                        // than 16 bytes (e.g. 12-byte `struct {float a[3];}`)
+                        // but we store two 8-byte values at offsets 0 and 8,
+                        // so the alloca must be at least 16 bytes to prevent
+                        // the second store from overflowing into adjacent
+                        // stack memory and corrupting other variables.
+                        let alloca_ir = IrType::Array(Box::new(IrType::I64), 2);
+                        let (alloca_val, alloca_i) = ctx.builder.build_alloca(alloca_ir, span);
                         emit_inst(ctx, alloca_i);
 
                         let intrinsic_name_local = "__builtin_va_arg".to_string();

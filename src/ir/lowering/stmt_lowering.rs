@@ -740,6 +740,43 @@ pub fn ensure_allocas_for_declaration(ctx: &mut StmtLoweringContext<'_>, decl: &
             ctx.name_table,
         );
 
+        // C11 §6.7.1p7 / §6.2.2p5: A function declaration at block scope
+        // (without `static`) has external linkage. Treat it like `extern`.
+        // For example, `float fx();` inside main() declares fx as an
+        // externally-defined function — it must NOT get a stack alloca.
+        if matches!(c_type, CType::Function { .. }) {
+            ctx.local_vars.remove(&var_name);
+            // Only add a function declaration if the function is not
+            // already known to the module (as a definition or declaration).
+            let already_known = ctx.module.get_function(&var_name).is_some()
+                || ctx.module.declarations().iter().any(|d| d.name == var_name);
+            if !already_known {
+                // Extract return type and param types from the CType::Function.
+                let (ret_cty, param_ctypes) = match &c_type {
+                    CType::Function {
+                        return_type,
+                        params,
+                        ..
+                    } => {
+                        let ret_ir = IrType::from_ctype(return_type, ctx.target);
+                        let param_irs: Vec<IrType> = params
+                            .iter()
+                            .map(|p| IrType::from_ctype(p, ctx.target))
+                            .collect();
+                        (ret_ir, param_irs)
+                    }
+                    _ => (IrType::I32, vec![]),
+                };
+                let decl = crate::ir::module::FunctionDeclaration::new(
+                    var_name.clone(),
+                    ret_cty,
+                    param_ctypes,
+                );
+                ctx.module.add_declaration(decl);
+            }
+            continue;
+        }
+
         // If the variable already has an alloca, check if the type matches.
         // In C, different block scopes can declare variables with the same
         // name but different types (e.g. `u32 t` in one case block and

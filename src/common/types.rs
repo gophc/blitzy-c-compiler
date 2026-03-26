@@ -479,7 +479,10 @@ fn compute_struct_size(
 ) -> usize {
     if fields.is_empty() {
         // Empty structs have size 0 (GCC extension; ISO C forbids them).
-        return if let Some(a) = aligned { a.max(1) } else { 0 };
+        // `__attribute__((aligned(N)))` increases alignment but does NOT
+        // increase size — GCC produces sizeof == 0 for empty structs
+        // regardless of explicit alignment attributes.
+        return 0;
     }
 
     // Bit-level offset tracking for proper bitfield packing.
@@ -604,7 +607,9 @@ fn compute_union_size(
     target: &Target,
 ) -> usize {
     if fields.is_empty() {
-        return if let Some(a) = aligned { a.max(1) } else { 0 };
+        // Empty unions have size 0 (GCC extension).
+        // `__attribute__((aligned(N)))` increases alignment but NOT size.
+        return 0;
     }
 
     let mut max_size: usize = 0;
@@ -935,7 +940,8 @@ fn compute_struct_size_resolved(
     tag_types: &std::collections::HashMap<String, CType>,
 ) -> usize {
     if fields.is_empty() {
-        return if let Some(a) = aligned { a.max(1) } else { 0 };
+        // Empty structs have size 0; aligned attribute does NOT increase size.
+        return 0;
     }
 
     // Use u128 to avoid overflow on intentionally huge structs.
@@ -1031,7 +1037,8 @@ fn compute_union_size_resolved(
     tag_types: &std::collections::HashMap<String, CType>,
 ) -> usize {
     if fields.is_empty() {
-        return if let Some(a) = aligned { a.max(1) } else { 0 };
+        // Empty unions have size 0; aligned attribute does NOT increase size.
+        return 0;
     }
 
     let mut max_size: usize = 0;

@@ -1350,11 +1350,26 @@ fn lower_aggregate_local_init(
             // Detect brace elision: if element type is a struct and ALL
             // initializers are flat scalar expressions (no nested init-lists
             // or designators), we consume multiple scalars per element.
+            //
+            // CRITICAL: When the element type is a char array (e.g.
+            // `char[3]`) and an initializer is a string literal, it
+            // should NOT be treated as brace-elided scalars.  The string
+            // literal initializes the entire char-array element directly
+            // via `lower_single_init_element` → `lower_char_array_from_string`.
             let elem_resolved = crate::common::types::resolve_typedef(element_type);
             let scalars_per_elem = count_aggregate_scalar_fields(elem_resolved, ctx.type_builder);
             let has_any_designators = init_list.iter().any(|di| !di.designators.is_empty());
+            let elem_is_char_array = is_char_array_type(elem_resolved).is_some();
+            let has_string_literal_init = init_list.iter().any(|di| {
+                if let ast::Initializer::Expression(ref expr) = di.initializer {
+                    extract_string_literal_bytes(expr).is_some()
+                } else {
+                    false
+                }
+            });
             let all_flat_scalars = scalars_per_elem > 1
                 && !has_any_designators
+                && !(elem_is_char_array && has_string_literal_init)
                 && init_list
                     .iter()
                     .all(|di| matches!(di.initializer, ast::Initializer::Expression(_)));
@@ -4018,6 +4033,16 @@ fn collect_locals_from_declaration(
         return;
     }
 
+    // C11 §6.7.1p7 / §6.2.2p5: A function declaration at block scope has
+    // external linkage. Skip collecting it as a local variable — the actual
+    // function definition exists at file scope. This prevents `float fx();`
+    // inside a function body from getting a stack alloca.
+    if !matches!(storage_class, Some(ast::StorageClass::Typedef)) {
+        // Check if ALL declarators in this declaration resolve to function types.
+        // A mixed declaration like `float fx(), a;` should skip fx but keep a.
+        // We'll handle this per-declarator below instead.
+    }
+
     let mut is_static = matches!(storage_class, Some(ast::StorageClass::Static))
         || matches!(storage_class, Some(ast::StorageClass::ThreadLocal));
 
@@ -4045,6 +4070,14 @@ fn collect_locals_from_declaration(
 
         let mut c_type =
             resolve_declaration_type(specifiers, declarator, &Target::X86_64, name_table);
+
+        // C11 §6.7.1p7: block-scope function declarations have external
+        // linkage and should not receive stack allocas.  Skip them so that
+        // `float fx(), a;` collects `a` but not `fx`.
+        if matches!(c_type, CType::Function { .. }) {
+            continue;
+        }
+
         let alignment = extract_alignment_attribute(&specifiers.attributes, name_table);
 
         // Infer array size from initializer for incomplete array types (`T arr[] = { ... }`).
@@ -6296,6 +6329,78 @@ pub fn evaluate_const_int_expr_pub(expr: &ast::Expression) -> Option<usize> {
 /// Handles patterns like `&sqlite3UpperToLower[210]` which produce a
 /// GlobalRefOffset relocation.  Recursively handles nested subscripts
 /// for multi-dimensional arrays.
+/// Given a nested `ArraySubscript` base and its inner subscript index,
+/// determine the element size at the *outer* subscript level.
+///
+/// For example, given `a[i][j]` where `a : Array(Array(Array(Char,28),3),2)`:
+///   - `a[i]` peels one layer → type becomes `Array(Array(Char,28),3)`
+///   - elements of `a[i]` are `Array(Char,28)` with sizeof=28
+///   - so `j` multiplies by 28
+///
+/// This walks up to the root identifier, counts how many subscript layers
+/// have been peeled, then strips that many `Array(...)` layers from the
+/// type stored in TYPEOF_CONTEXT and returns `sizeof(elem)` at that depth.
+fn resolve_nested_array_elem_size(
+    inner_base: &ast::Expression,
+    _inner_index: &ast::Expression,
+    target: &Target,
+    name_table: &[String],
+) -> i64 {
+    // Walk up through nested ArraySubscript/Parenthesized/Cast to find the
+    // root Identifier and count the total subscript depth.
+    fn find_root_and_depth(
+        expr: &ast::Expression,
+        depth: usize,
+        name_table: &[String],
+    ) -> Option<(String, usize)> {
+        match expr {
+            ast::Expression::Identifier { name, .. } => {
+                let name_str = resolve_sym(name_table, name).to_string();
+                Some((name_str, depth))
+            }
+            ast::Expression::ArraySubscript { base, .. } => {
+                find_root_and_depth(base, depth + 1, name_table)
+            }
+            ast::Expression::Parenthesized { inner, .. } => {
+                find_root_and_depth(inner, depth, name_table)
+            }
+            ast::Expression::Cast { operand, .. } => {
+                find_root_and_depth(operand, depth, name_table)
+            }
+            _ => None,
+        }
+    }
+
+    // The inner_base already accounts for one subscript, so start depth=1.
+    let root_info = find_root_and_depth(inner_base, 1, name_table);
+    if let Some((root_name, depth)) = root_info {
+        let result = super::TYPEOF_CONTEXT.with(|ctx| {
+            let borrow = ctx.borrow();
+            if let Some(ref map) = *borrow {
+                if let Some(raw_ty) = map.get(&root_name) {
+                    let mut ty = crate::common::types::resolve_and_strip(raw_ty);
+                    // Peel `depth` Array layers
+                    for _ in 0..depth {
+                        if let CType::Array(elem, _) = ty {
+                            ty = crate::common::types::resolve_and_strip(elem);
+                        } else {
+                            return None;
+                        }
+                    }
+                    // `ty` is now the element type at this subscript level.
+                    return Some(crate::common::types::sizeof_ctype(ty, target) as i64);
+                }
+            }
+            None
+        });
+        if let Some(sz) = result {
+            return sz;
+        }
+    }
+    // Fallback for byte arrays or when type info is unavailable.
+    1
+}
+
 fn evaluate_address_of_subscript(
     base: &ast::Expression,
     index: &ast::Expression,
@@ -6309,11 +6414,16 @@ fn evaluate_address_of_subscript(
             let name_str = resolve_sym(name_table, name).to_string();
             // Determine element size.  For a bare identifier used as an
             // array base, look up its type from the TYPEOF_CONTEXT.
+            // Must strip Qualified/Typedef/Atomic wrappers before matching
+            // the Array variant.
             let elem_size = super::TYPEOF_CONTEXT.with(|ctx| {
                 let borrow = ctx.borrow();
                 if let Some(ref map) = *borrow {
-                    if let Some(CType::Array(elem, _)) = map.get(&name_str) {
-                        return Some(crate::common::types::sizeof_ctype(elem, target) as i64);
+                    if let Some(raw_ty) = map.get(&name_str) {
+                        let stripped = crate::common::types::resolve_and_strip(raw_ty);
+                        if let CType::Array(elem, _) = stripped {
+                            return Some(crate::common::types::sizeof_ctype(elem, target) as i64);
+                        }
                     }
                 }
                 // Default: try sizeof_ctype on the type itself.
@@ -6331,9 +6441,11 @@ fn evaluate_address_of_subscript(
             // Nested subscript: &arr[i][j] — compute inner offset first.
             let (sym, inner_off) =
                 evaluate_address_of_subscript(inner_base, inner_index, target, name_table)?;
-            // For nested subscripts, element size is harder to determine.
-            // Default to 1 for byte arrays.
-            Some((sym, inner_off + idx_val))
+            // Determine element size at THIS subscript level by resolving
+            // the base identifier and peeling off array layers.
+            let elem_sz =
+                resolve_nested_array_elem_size(inner_base, inner_index, target, name_table);
+            Some((sym, inner_off + idx_val * elem_sz))
         }
         ast::Expression::StringLiteral {
             segments, prefix, ..
@@ -7731,8 +7843,12 @@ fn lower_char_array_from_string(
             v as i128
         };
 
-        // Create the constant value.
-        let const_val = expr_lowering::emit_int_const_for_index(ctx, chunk_val as i64);
+        // Create the constant value **with the correct chunk width**.
+        // Previous bug: `emit_int_const_for_index` always produced an I64
+        // constant, so the backend would emit an 8-byte store regardless of
+        // chunk_sz.  This overwrote adjacent stack memory when two local
+        // char arrays were next to each other (only the last survived).
+        let const_val = expr_lowering::emit_int_const(ctx, chunk_val, ir_ty.clone(), Span::dummy());
 
         // Compute the destination address: var_alloca + offset
         let dst_addr = if offset == 0 {

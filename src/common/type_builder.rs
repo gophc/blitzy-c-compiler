@@ -423,8 +423,7 @@ impl TypeBuilder {
                     let bf_byte = ((abs_bit / 8) & mask) as usize;
 
                     // Compute the bit offset within the storage unit.
-                    let bit_offset_in_unit =
-                        (abs_bit - (bf_byte as u128) * 8) as usize;
+                    let bit_offset_in_unit = (abs_bit - (bf_byte as u128) * 8) as usize;
 
                     field_layouts.push(FieldLayout {
                         offset: bf_byte,
