@@ -6798,11 +6798,17 @@ fn infer_struct_type_from_expr(expr: &ast::Expression, name_table: &[String]) ->
         }
         ast::Expression::PointerMemberAccess { object, member, .. }
         | ast::Expression::MemberAccess { object, member, .. } => {
-            // After member access, the result type is the member's type
+            // After member access, the result type is the member's type.
+            // Must handle both Struct and Union containers — a union's
+            // member fields are looked up the same way as a struct's.
             let struct_ty = infer_struct_type_from_expr(object, name_table)?;
             let resolved =
                 resolve_sizeof_struct_ref(struct_ty, &crate::common::target::Target::X86_64);
-            if let CType::Struct { ref fields, .. } = resolved {
+            let fields_opt = match &resolved {
+                CType::Struct { ref fields, .. } | CType::Union { ref fields, .. } => Some(fields),
+                _ => None,
+            };
+            if let Some(fields) = fields_opt {
                 let member_name = resolve_sym(name_table, member).to_string();
                 for f in fields {
                     if f.name.as_deref() == Some(&member_name) {
