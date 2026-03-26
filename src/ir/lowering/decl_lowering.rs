@@ -1232,23 +1232,22 @@ pub fn lower_local_initializer(
                     }
                 } else {
                     // Rvalue expression returning a struct (function call,
-                    // conditional, statement expression, va_arg, etc.).
-                    // Evaluate the expression, spill into a temp alloca,
-                    // then copy chunk-by-chunk to the destination.
-                    // A single Store cannot move >8-byte structs through
-                    // the backend's register-based pipeline correctly.
+                    // conditional, statement expression, va_arg, chained
+                    // assignment, etc.).
+                    //
+                    // In BCC's IR convention, aggregate "values" returned
+                    // by lower_expression_typed are actually *pointers* to
+                    // the aggregate data (an alloca, a hidden return slot,
+                    // or the destination of a nested assignment).  We must
+                    // NOT spill that pointer into a new alloca and then
+                    // copy from it — that copies the pointer bytes, not
+                    // the struct data.  Instead, use the returned pointer
+                    // directly as the source for the chunk-by-chunk copy.
                     let typed_val = expr_lowering::lower_expression_typed(ctx, expr);
                     let span_dummy = Span::dummy();
-                    let struct_ir_ty = expr_lowering::ctype_to_ir(&resolved_var_ty, ctx.target);
-                    let (tmp_alloca, tmp_inst) =
-                        ctx.builder.build_alloca(struct_ir_ty.clone(), span_dummy);
-                    emit_inst_to_ctx(ctx, tmp_inst);
-                    let si = ctx
-                        .builder
-                        .build_store(typed_val.value, tmp_alloca, span_dummy);
-                    emit_inst_to_ctx(ctx, si);
+                    let src_ptr = typed_val.value;
 
-                    // Copy chunk-by-chunk from temp alloca to var_alloca.
+                    // Copy chunk-by-chunk from source pointer to var_alloca.
                     let mut offset: usize = 0;
                     while offset < struct_size {
                         let remaining = struct_size - offset;
@@ -1262,11 +1261,11 @@ pub fn lower_local_initializer(
                             (1, IrType::I8)
                         };
                         let src = if offset == 0 {
-                            tmp_alloca
+                            src_ptr
                         } else {
                             let off_val = make_index_value(ctx, offset as i64);
                             let (gep, gi) = ctx.builder.build_gep(
-                                tmp_alloca,
+                                src_ptr,
                                 vec![off_val],
                                 chunk_ir.clone(),
                                 span_dummy,
@@ -6806,8 +6805,7 @@ fn infer_struct_type_from_expr(expr: &ast::Expression, name_table: &[String]) ->
             // Recursively get the array's type from its base, then peel
             // one Array layer to get the element type.
             let base_ty = infer_struct_type_from_expr(base, name_table)?;
-            let resolved =
-                crate::common::types::resolve_and_strip(&base_ty);
+            let resolved = crate::common::types::resolve_and_strip(&base_ty);
             match resolved {
                 CType::Array(elem, _) => {
                     let elem_resolved = crate::common::types::resolve_and_strip(elem);

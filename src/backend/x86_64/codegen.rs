@@ -3325,13 +3325,19 @@ impl X86_64CodeGen {
                             let remaining = struct_sz - 8;
                             // Load high 8 bytes from source into R11
                             out.push(Self::mk_inst(X86Opcode::Mov, Some(r11.clone()), &[src_hi]));
-                            // R10 still holds dest ptr; add 8 for high word
-                            out.push(Self::mk_inst(
-                                X86Opcode::Add,
-                                Some(r10.clone()),
-                                &[r10.clone(), MachineOperand::Immediate(8)],
-                            ));
-                            let mut st = Self::mk_inst(X86Opcode::StoreInd, None, &[r10, r11]);
+                            // Store high 8 bytes at [R10+8] using a
+                            // displacement-based Memory operand instead of
+                            // mutating R10 via ADD.  This is CRITICAL
+                            // because R10 is allocatable — the register
+                            // allocator may have assigned other live values
+                            // to R10, and ADD R10,8 would corrupt them.
+                            let dest_hi = MachineOperand::Memory {
+                                base: Some(R10),
+                                index: None,
+                                scale: 1,
+                                displacement: 8,
+                            };
+                            let mut st = Self::mk_inst(X86Opcode::Mov, None, &[dest_hi, r11]);
                             if remaining <= 4 {
                                 st.operand_size = remaining as u8;
                             }
@@ -3464,7 +3470,11 @@ impl X86_64CodeGen {
                                 // size to avoid overwriting adjacent globals.
                                 IrType::Struct(_) | IrType::Array(_, _) => {
                                     let sz = vty.size_bytes(&self.target);
-                                    if sz <= 8 { sz as u8 } else { 8 }
+                                    if sz <= 8 {
+                                        sz as u8
+                                    } else {
+                                        8
+                                    }
                                 }
                                 _ => 8,
                             }

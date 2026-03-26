@@ -153,7 +153,6 @@ pub fn run_copy_propagation(func: &mut IrFunction) -> bool {
 mod tests {
     use super::*;
     use crate::common::diagnostics::Span;
-    use crate::ir::basic_block::BasicBlock;
     use crate::ir::function::IrFunction;
     use crate::ir::instructions::{BinOp, Instruction, Value};
     use crate::ir::types::IrType;

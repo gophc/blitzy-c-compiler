@@ -704,6 +704,29 @@ pub fn is_complete_type(ty: &CType) -> bool {
 /// | 6    | `long long`, `unsigned long long`           |
 ///
 /// Returns `0` for non-integer types.
+/// Return the bit-width of a promoted integer type on the LP64 data model
+/// used by x86-64, aarch64, and riscv64 (and ILP32 for i686 where long=32).
+///
+/// This is used by `usual_arithmetic_conversion` step 4d to determine whether
+/// a signed type can actually represent all values of an unsigned type — which
+/// requires the signed type to have strictly more bits, not just higher rank.
+fn integer_bit_width(ty: &CType) -> u32 {
+    let resolved = resolve_and_strip(ty);
+    match resolved {
+        CType::Bool => 1,
+        CType::Char | CType::SChar | CType::UChar => 8,
+        CType::Short | CType::UShort => 16,
+        CType::Int | CType::UInt => 32,
+        // LP64: long = 64-bit, long long = 64-bit (both have same width)
+        CType::Long | CType::ULong => 64,
+        CType::LongLong | CType::ULongLong => 64,
+        CType::Enum {
+            underlying_type, ..
+        } => integer_bit_width(underlying_type),
+        _ => 0,
+    }
+}
+
 pub fn integer_rank(ty: &CType) -> u8 {
     let resolved = resolve_and_strip(ty);
     match resolved {
@@ -792,12 +815,13 @@ pub fn usual_arithmetic_conversion(lhs: &CType, rhs: &CType) -> CType {
     }
 
     // 4d. If signed type can represent all values of unsigned type, use signed.
-    // In practice this is true when the signed type has strictly higher rank
-    // (and thus wider representation). E.g., `long` (signed) can represent
-    // all `unsigned int` values on LP64 targets.
-    // We conservatively check: signed_rank > unsigned_rank already holds here.
-    // For the BCC data model this is always true since we reached this point.
-    if signed_rank > unsigned_rank {
+    // This is only true when the signed type has strictly MORE bits than the
+    // unsigned type.  On LP64, `long` and `long long` are both 64-bit, so
+    // `long long` (rank 6) vs `unsigned long` (rank 5): rank differs but
+    // bit-width is the same → signed long long CANNOT represent all unsigned
+    // long values.  We must fall through to 4e in that case.
+    if signed_rank > unsigned_rank && integer_bit_width(signed_ty) > integer_bit_width(unsigned_ty)
+    {
         return signed_ty.clone();
     }
 

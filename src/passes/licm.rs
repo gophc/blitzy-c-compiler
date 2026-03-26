@@ -344,7 +344,7 @@ mod tests {
     use crate::common::diagnostics::Span;
     use crate::ir::basic_block::BasicBlock;
     use crate::ir::function::IrFunction;
-    use crate::ir::instructions::{BinOp, BlockId, Instruction, Value};
+    use crate::ir::instructions::{BlockId, Instruction};
     use crate::ir::types::IrType;
 
     #[test]

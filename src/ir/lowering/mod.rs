@@ -1692,7 +1692,9 @@ fn has_empty_type_ref(ty: &CType, depth: usize) -> bool {
         | CType::Array(inner, _)
         | CType::Atomic(inner)
         | CType::Qualified(inner, _)
-        | CType::Typedef { underlying: inner, .. } => has_empty_type_ref(inner, depth + 1),
+        | CType::Typedef {
+            underlying: inner, ..
+        } => has_empty_type_ref(inner, depth + 1),
         _ => false,
     }
 }
@@ -1726,11 +1728,7 @@ fn resolve_struct_field_forward_refs_inner(
 /// tag reference and then recurse into the resolved definition's fields
 /// to resolve nested forward references.  Depth-limited to prevent
 /// quadratic expansion on large codebases.
-fn resolve_type_forward_refs_deep(
-    ty: &mut CType,
-    tags: &FxHashMap<String, CType>,
-    depth: usize,
-) {
+fn resolve_type_forward_refs_deep(ty: &mut CType, tags: &FxHashMap<String, CType>, depth: usize) {
     if depth > 6 {
         return;
     }

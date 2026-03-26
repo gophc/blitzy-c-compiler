@@ -3576,19 +3576,22 @@ fn lower_assignment(
                 let rhs_ptr = if expr_is_natural_lvalue(value) {
                     lower_lvalue_inner(ctx, value)
                 } else {
-                    // Evaluate the RHS as an rvalue — this yields the struct
-                    // data packed in registers / as a value, not a pointer.
+                    // Evaluate the RHS as an rvalue.  For aggregate types
+                    // (structs/unions), BCC's IR convention is that the
+                    // "value" returned by lower_expr_inner is actually a
+                    // *pointer* to the aggregate data (e.g. an alloca, a
+                    // hidden-pointer return slot, or the destination of a
+                    // nested assignment).  We must NOT spill that pointer
+                    // into a new alloca and then try to copy from the
+                    // alloca — that would copy the pointer bytes, not the
+                    // struct data.  Instead, use the returned pointer
+                    // directly as the source for the byte-by-byte copy.
+                    //
+                    // For non-aggregate rvalues this path is unreachable
+                    // (they go through the scalar assignment path below).
                     let rhs_val = lower_expr_inner(ctx, value);
-                    // Create a temp alloca to hold the struct data.
-                    let struct_ir_ty = IrType::from_ctype(&resolved_lhs_ty, ctx.target);
-                    let (tmp_alloca, tmp_inst) =
-                        ctx.builder.build_alloca(struct_ir_ty.clone(), span);
-                    emit_inst(ctx, tmp_inst);
-                    // Store the rvalue into the temporary.
-                    let si = ctx.builder.build_store(rhs_val.value, tmp_alloca, span);
-                    emit_inst(ctx, si);
                     TypedValue::new(
-                        tmp_alloca,
+                        rhs_val.value,
                         CType::Pointer(
                             Box::new(resolved_lhs_ty.clone()),
                             crate::common::types::TypeQualifiers {
