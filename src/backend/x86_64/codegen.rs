@@ -499,6 +499,11 @@ pub struct FrameLayout {
     /// Number of named (non-variadic) FP parameters.  Used by va_start
     /// to compute the address of the first variadic FP argument.
     pub named_fp_count: usize,
+    /// Total stack bytes consumed by named MEMORY-class parameters
+    /// (long double, large structs) that are passed on the stack but are
+    /// NOT register-passed.  Used by va_start to compute the correct
+    /// overflow_arg_area pointer past all named stack parameters.
+    pub named_memory_stack_bytes: usize,
     /// Pre-allocated frame slots for non-alloca 16-byte struct loads.
     /// Maps Load result IR Value → RBP-relative offset of the 16-byte
     /// temporary storage.  Populated during `compute_frame_layout` for
@@ -1108,6 +1113,7 @@ impl X86_64CodeGen {
         let mut va_control_offset: Option<i32> = None;
         let mut named_gpr_count: usize = 0;
         let mut named_fp_count: usize = 0;
+        let mut named_memory_stack_bytes: usize = 0;
         if func.is_variadic {
             // Count named GPR and FP parameters.
             // MEMORY-class parameters (structs/arrays > 16 bytes) are
@@ -1120,12 +1126,17 @@ impl X86_64CodeGen {
                     param_size > 16 && matches!(&p.ty, IrType::Struct(_) | IrType::Array(_, _));
                 if is_memory_class {
                     // MEMORY-class: pushed on stack by caller, doesn't
-                    // consume a register.
+                    // consume a register.  Track stack bytes for va_start
+                    // overflow_arg_area calculation.
+                    named_memory_stack_bytes += (param_size + 7) & !7; // 8-byte aligned
                     continue;
                 }
                 // F80 (long double) is MEMORY-class per AMD64 ABI — does not
                 // consume a register slot. It is passed on the stack.
                 if matches!(p.ty, IrType::F80) {
+                    // Long double takes 16 bytes on the stack (10 bytes
+                    // padded to 16 for alignment per ABI).
+                    named_memory_stack_bytes += 16;
                     continue;
                 }
                 // Detect SSE-class scalars and small SSE arrays (e.g. _Complex float).
@@ -1312,6 +1323,7 @@ impl X86_64CodeGen {
             va_control_offset,
             named_gpr_count,
             named_fp_count,
+            named_memory_stack_bytes,
             struct_temp_offsets,
             indirect_ret_ptr_offset,
         }
@@ -1509,9 +1521,15 @@ impl X86_64CodeGen {
             store_fp_off.operand_size = 4;
             prologue.push(store_fp_off);
             // [+8] overflow_arg_area = RBP + 16 + fixed_stack_bytes
+            // Must account for ALL named parameters on the stack:
+            // - GPR args that spill (named_gpr_count > 6)
+            // - FP args that spill (named_fp_count > 8)
+            // - MEMORY-class args (long double, large structs) always on stack
             let gp_stack_fixed = mf.named_gpr_count.saturating_sub(6);
             let fp_stack_fixed = mf.named_fp_count.saturating_sub(8);
-            let overflow_disp = 16 + ((gp_stack_fixed + fp_stack_fixed) * 8) as i64;
+            let overflow_disp = 16
+                + ((gp_stack_fixed + fp_stack_fixed) * 8) as i64
+                + mf.named_memory_stack_bytes as i64;
             prologue.push(Self::mk_inst(
                 X86Opcode::Lea,
                 Some(rax.clone()),
@@ -2676,6 +2694,7 @@ impl X86_64CodeGen {
             mf.va_control_offset = frame.va_control_offset;
             mf.named_gpr_count = frame.named_gpr_count;
             mf.named_fp_count = frame.named_fp_count;
+            mf.named_memory_stack_bytes = frame.named_memory_stack_bytes;
         }
 
         // Mark calls.
@@ -6245,10 +6264,12 @@ impl X86_64CodeGen {
                         }
 
                         // Step 4: [RSP+8] overflow_arg_area = RBP + 16 + fixed_stack
+                        // Must include MEMORY-class params (long double, large structs)
                         let gp_stack_fixed = frame.named_gpr_count.saturating_sub(6);
                         let fp_stack_fixed = frame.named_fp_count.saturating_sub(8);
-                        let overflow_disp: i64 =
-                            16 + ((gp_stack_fixed + fp_stack_fixed) * 8) as i64;
+                        let overflow_disp: i64 = 16
+                            + ((gp_stack_fixed + fp_stack_fixed) * 8) as i64
+                            + frame.named_memory_stack_bytes as i64;
                         out.push(Self::mk_inst(
                             X86Opcode::Lea,
                             Some(rcx.clone()),

@@ -815,6 +815,12 @@ pub struct MachineFunction {
     /// to compute the address of the first variadic FP argument.
     pub named_fp_count: usize,
 
+    /// Total stack bytes consumed by named MEMORY-class parameters
+    /// (long double, large structs) that are passed on the stack but are
+    /// NOT register-passed.  Used by va_start to compute the correct
+    /// overflow_arg_area pointer past all named stack parameters.
+    pub named_memory_stack_bytes: usize,
+
     /// Number of parameter-loading MOV instructions injected at the start
     /// of the entry block during instruction selection.
     ///
@@ -849,6 +855,7 @@ impl MachineFunction {
             va_control_offset: None,
             named_gpr_count: 0,
             named_fp_count: 0,
+            named_memory_stack_bytes: 0,
             num_param_moves: 0,
         }
     }
