@@ -29,3 +29,4 @@ platform.info
 dump.rdb
 /.opencode
 /graphify-out
+/vendor
