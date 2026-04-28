@@ -52,6 +52,7 @@ const (
 	CTypeDouble
 	CTypeLongDouble
 	CTypeEnum_
+	CTypeUInt8
 )
 
 func (CTypeBase) isCType() {}
