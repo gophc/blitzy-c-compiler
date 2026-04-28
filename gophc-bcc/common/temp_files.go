@@ -9,7 +9,7 @@ import (
 
 var (
 	tempCounter uint64
-	tempMu     sync.Mutex
+	tempMu      sync.Mutex
 )
 
 func uniqueName(prefix, suffix string) string {
@@ -25,7 +25,7 @@ func uniqueName(prefix, suffix string) string {
 }
 
 type TempFile struct {
-	FilePath    string
+	FilePath     string
 	DeleteOnDrop bool
 }
 
@@ -45,7 +45,7 @@ func NewTempFileIn(dir string, suffix string) (*TempFile, error) {
 	file.Close()
 
 	return &TempFile{
-		FilePath:    path,
+		FilePath:     path,
 		DeleteOnDrop: true,
 	}, nil
 }
@@ -71,7 +71,7 @@ func (tf *TempFile) Remove() error {
 }
 
 type TempDir struct {
-	DirPath     string
+	DirPath      string
 	DeleteOnDrop bool
 }
 
@@ -90,7 +90,7 @@ func NewTempDirIn(parent string) (*TempDir, error) {
 	}
 
 	return &TempDir{
-		DirPath:     path,
+		DirPath:      path,
 		DeleteOnDrop: true,
 	}, nil
 }
@@ -109,7 +109,7 @@ func (td *TempDir) CreateFile(name string) (*TempFile, error) {
 	file.Close()
 
 	return &TempFile{
-		FilePath:    path,
+		FilePath:     path,
 		DeleteOnDrop: false,
 	}, nil
 }

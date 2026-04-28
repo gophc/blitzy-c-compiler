@@ -28,7 +28,7 @@ func parseIntegerValue(digits string, radix uint64) (uint64, bool) {
 		if d >= radix {
 			continue
 		}
-		newValue, ok := value*radix + d, true
+		newValue, ok := value*radix+d, true
 		if !ok || newValue < value {
 			overflowed = true
 			value = ^uint64(0)
@@ -170,7 +170,7 @@ func maybeConvertToImaginary(scanner *Scanner, tok TokenKind) TokenKind {
 		}
 
 		return FloatLiteralToken{
-			Value: valueStr,
+			Value:  valueStr,
 			Suffix: suffix,
 			Base:   NumericBaseDecimal,
 		}
@@ -273,9 +273,9 @@ func lexHexLiteral(scanner *Scanner, diagnostics *common.DiagnosticEngine, fileI
 		span := common.NewSpan(fileID, startOffset, scanner.Offset())
 		diagnostics.EmitError(span, "no digits after '0x' in hexadecimal literal")
 		return IntegerLiteralToken{
-			Value:   0,
-			Suffix:  IntegerSuffixNone,
-			Base:    NumericBaseHexadecimal,
+			Value:  0,
+			Suffix: IntegerSuffixNone,
+			Base:   NumericBaseHexadecimal,
 		}
 	}
 
@@ -290,9 +290,9 @@ func lexHexLiteral(scanner *Scanner, diagnostics *common.DiagnosticEngine, fileI
 
 	suffix := parseIntegerSuffix(scanner, diagnostics, fileID)
 	intTok := IntegerLiteralToken{
-		Value:   value,
-		Suffix:  suffix,
-		Base:    NumericBaseHexadecimal,
+		Value:  value,
+		Suffix: suffix,
+		Base:   NumericBaseHexadecimal,
 	}
 	tok := maybeConvertToImaginary(scanner, intTok)
 	checkTrailingInvalidChars(scanner, diagnostics, fileID, startOffset)
@@ -376,9 +376,9 @@ func lexBinaryLiteral(scanner *Scanner, diagnostics *common.DiagnosticEngine, fi
 		span := common.NewSpan(fileID, startOffset, scanner.Offset())
 		diagnostics.EmitError(span, "no digits after '0b' in binary literal")
 		return IntegerLiteralToken{
-			Value:   0,
-			Suffix:  IntegerSuffixNone,
-			Base:    NumericBaseBinary,
+			Value:  0,
+			Suffix: IntegerSuffixNone,
+			Base:   NumericBaseBinary,
 		}
 	}
 
@@ -393,9 +393,9 @@ func lexBinaryLiteral(scanner *Scanner, diagnostics *common.DiagnosticEngine, fi
 
 	suffix := parseIntegerSuffix(scanner, diagnostics, fileID)
 	intTok := IntegerLiteralToken{
-		Value:   value,
-		Suffix:  suffix,
-		Base:    NumericBaseBinary,
+		Value:  value,
+		Suffix: suffix,
+		Base:   NumericBaseBinary,
 	}
 	tok := maybeConvertToImaginary(scanner, intTok)
 	checkTrailingInvalidChars(scanner, diagnostics, fileID, startOffset)
@@ -448,9 +448,9 @@ func lexAfterLeadingZero(scanner *Scanner, diagnostics *common.DiagnosticEngine,
 
 	suffix := parseIntegerSuffix(scanner, diagnostics, fileID)
 	intTok := IntegerLiteralToken{
-		Value:   value,
-		Suffix:  suffix,
-		Base:    NumericBaseOctal,
+		Value:  value,
+		Suffix: suffix,
+		Base:   NumericBaseOctal,
 	}
 	tok := maybeConvertToImaginary(scanner, intTok)
 	checkTrailingInvalidChars(scanner, diagnostics, fileID, startOffset)
@@ -486,9 +486,9 @@ func lexDecimalLiteral(scanner *Scanner, diagnostics *common.DiagnosticEngine, f
 
 	suffix := parseIntegerSuffix(scanner, diagnostics, fileID)
 	intTok := IntegerLiteralToken{
-		Value:   value,
-		Suffix:  suffix,
-		Base:    NumericBaseDecimal,
+		Value:  value,
+		Suffix: suffix,
+		Base:   NumericBaseDecimal,
 	}
 	tok := maybeConvertToImaginary(scanner, intTok)
 	checkTrailingInvalidChars(scanner, diagnostics, fileID, startOffset)

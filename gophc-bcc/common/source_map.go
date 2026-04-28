@@ -15,7 +15,7 @@ type LineDirective struct {
 	FileID          uint32
 	DirectiveOffset uint32
 	NewLine         uint32
-	NewFilename    *string
+	NewFilename     *string
 }
 
 type SourceFile struct {
@@ -29,8 +29,8 @@ func NewSourceFile(id uint32, filename string, content string) *SourceFile {
 	lineOffsets := computeLineOffsets(content)
 	return &SourceFile{
 		ID:          id,
-		Filename:   filename,
-		Content:    content,
+		Filename:    filename,
+		Content:     content,
 		LineOffsets: lineOffsets,
 	}
 }
@@ -85,13 +85,13 @@ func (sf *SourceFile) LineCount() int {
 }
 
 type SourceMap struct {
-	files           []*SourceFile
+	files          []*SourceFile
 	lineDirectives map[uint32][]LineDirective
 }
 
 func NewSourceMap() *SourceMap {
 	return &SourceMap{
-		files:           make([]*SourceFile, 0),
+		files:          make([]*SourceFile, 0),
 		lineDirectives: make(map[uint32][]LineDirective),
 	}
 }
@@ -120,7 +120,7 @@ func (sm *SourceMap) LookupLocation(fileID uint32, byteOffset uint32) *SourceLoc
 		FileID:   fileID,
 		Filename: file.Filename,
 		Line:     line,
-		Column:  column,
+		Column:   column,
 	}
 }
 
@@ -164,7 +164,7 @@ func (sm *SourceMap) ResolveLocation(fileID uint32, byteOffset uint32) *SourceLo
 			FileID:   fileID,
 			Filename: "<unknown>",
 			Line:     0,
-			Column:  0,
+			Column:   0,
 		}
 	}
 
@@ -190,7 +190,7 @@ func (sm *SourceMap) ResolveLocation(fileID uint32, byteOffset uint32) *SourceLo
 		FileID:   fileID,
 		Filename: resolvedFilename,
 		Line:     resolvedLine,
-		Column:  column,
+		Column:   column,
 	}
 }
 

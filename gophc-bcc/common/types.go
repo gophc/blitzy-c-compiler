@@ -331,6 +331,168 @@ func AlignofCType(ty CType, target *Target) int {
 	return 1
 }
 
+func SizeofCTypeResolved(ty CType, target *Target, tagTypes map[string]CType) int {
+	switch v := ty.(type) {
+	case *CTypeStruct:
+		if v.Name != nil && len(v.Fields) == 0 {
+			if resolved, ok := tagTypes[*v.Name]; ok {
+				return SizeofCTypeResolved(resolved, target, tagTypes)
+			}
+			return 0
+		}
+		return computeStructSizeResolved(v.Fields, v.Packed, v.Aligned, target, tagTypes)
+	case *CTypeUnion:
+		if v.Name != nil && len(v.Fields) == 0 {
+			if resolved, ok := tagTypes[*v.Name]; ok {
+				return SizeofCTypeResolved(resolved, target, tagTypes)
+			}
+			return 0
+		}
+		return computeUnionSizeResolved(v.Fields, v.Packed, v.Aligned, target, tagTypes)
+	case *CTypeArray:
+		if v.Size != nil {
+			return SizeofCTypeResolved(v.Elem, target, tagTypes) * *v.Size
+		}
+		return 0
+	case *CTypeComplex:
+		return 2 * SizeofCTypeResolved(v.Base, target, tagTypes)
+	case *CTypeAtomic:
+		return SizeofCTypeResolved(v.Inner, target, tagTypes)
+	case *CTypTypedef:
+		return SizeofCTypeResolved(v.Underlying, target, tagTypes)
+	case *CTypeQualified:
+		return SizeofCTypeResolved(v.Inner, target, tagTypes)
+	case *CTypeEnum:
+		return SizeofCTypeResolved(v.UnderlyingType, target, tagTypes)
+	default:
+		return SizeofCType(ty, target)
+	}
+}
+
+func AlignofCTypeResolved(ty CType, target *Target, tagTypes map[string]CType) int {
+	switch v := ty.(type) {
+	case *CTypeStruct:
+		if v.Name != nil && len(v.Fields) == 0 {
+			if resolved, ok := tagTypes[*v.Name]; ok {
+				return AlignofCTypeResolved(resolved, target, tagTypes)
+			}
+			return 1
+		}
+		return computeStructOrUnionAlignResolved(v.Fields, v.Packed, v.Aligned, target, tagTypes)
+	case *CTypeUnion:
+		if v.Name != nil && len(v.Fields) == 0 {
+			if resolved, ok := tagTypes[*v.Name]; ok {
+				return AlignofCTypeResolved(resolved, target, tagTypes)
+			}
+			return 1
+		}
+		return computeStructOrUnionAlignResolved(v.Fields, v.Packed, v.Aligned, target, tagTypes)
+	case *CTypeArray:
+		return AlignofCTypeResolved(v.Elem, target, tagTypes)
+	case *CTypeComplex:
+		return AlignofCTypeResolved(v.Base, target, tagTypes)
+	case *CTypeAtomic:
+		return AlignofCTypeResolved(v.Inner, target, tagTypes)
+	case *CTypTypedef:
+		return AlignofCTypeResolved(v.Underlying, target, tagTypes)
+	case *CTypeQualified:
+		return AlignofCTypeResolved(v.Inner, target, tagTypes)
+	case *CTypeEnum:
+		return AlignofCTypeResolved(v.UnderlyingType, target, tagTypes)
+	default:
+		return AlignofCType(ty, target)
+	}
+}
+
+func computeStructSizeResolved(fields []StructField, packed bool, aligned *int, target *Target, tagTypes map[string]CType) int {
+	if len(fields) == 0 {
+		return 0
+	}
+
+	offset := 0
+	maxAlign := 1
+
+	for _, field := range fields {
+		fieldSize := SizeofCTypeResolved(field.Ty, target, tagTypes)
+		fieldAlign := 1
+		if !packed {
+			fieldAlign = AlignofCTypeResolved(field.Ty, target, tagTypes)
+		}
+
+		offset = alignUp(offset, fieldAlign)
+		offset += fieldSize
+
+		if fieldAlign > maxAlign {
+			maxAlign = fieldAlign
+		}
+	}
+
+	structAlign := maxAlign
+	if aligned != nil {
+		if *aligned > structAlign {
+			structAlign = *aligned
+		}
+	} else if packed {
+		structAlign = 1
+	}
+
+	return alignUp(offset, structAlign)
+}
+
+func computeUnionSizeResolved(fields []StructField, packed bool, aligned *int, target *Target, tagTypes map[string]CType) int {
+	if len(fields) == 0 {
+		return 0
+	}
+
+	maxSize := 0
+	maxAlign := 1
+
+	for _, field := range fields {
+		fieldSize := SizeofCTypeResolved(field.Ty, target, tagTypes)
+		fieldAlign := 1
+		if !packed {
+			fieldAlign = AlignofCTypeResolved(field.Ty, target, tagTypes)
+		}
+
+		if fieldSize > maxSize {
+			maxSize = fieldSize
+		}
+		if fieldAlign > maxAlign {
+			maxAlign = fieldAlign
+		}
+	}
+
+	unionAlign := maxAlign
+	if aligned != nil {
+		if *aligned > unionAlign {
+			unionAlign = *aligned
+		}
+	} else if packed {
+		unionAlign = 1
+	}
+
+	return alignUp(maxSize, unionAlign)
+}
+
+func computeStructOrUnionAlignResolved(fields []StructField, packed bool, aligned *int, target *Target, tagTypes map[string]CType) int {
+	natural := 1
+	if !packed {
+		for _, field := range fields {
+			fa := AlignofCTypeResolved(field.Ty, target, tagTypes)
+			if fa > natural {
+				natural = fa
+			}
+		}
+	}
+
+	if aligned != nil {
+		if *aligned > natural {
+			return *aligned
+		}
+	}
+	return natural
+}
+
 func computeStructOrUnionAlign(fields []StructField, packed bool, aligned *int, target *Target) int {
 	natural := 1
 	if !packed {
@@ -503,7 +665,87 @@ func IntegerRank(ty CType) uint8 {
 	case CTypeInt128, CTypeUInt128:
 		return 7
 	case CTypeEnum_:
-		return IntegerRank(resolved.(*CTypeEnum).UnderlyingType)
+		if e, ok := resolved.(*CTypeEnum); ok && e != nil {
+			return IntegerRank(e.UnderlyingType)
+		}
 	}
 	return 0
+}
+
+func IsCompatible(a, b CType) bool {
+	a = ResolveAndStrip(a)
+	b = ResolveAndStrip(b)
+	return isCompatibleInner(a, b)
+}
+
+func isCompatibleInner(a, b CType) bool {
+	switch ta := a.(type) {
+	case CTypeBase:
+		switch tb := b.(type) {
+		case CTypeBase:
+			return ta == tb
+		}
+	case *CTypeComplex:
+		if tb, ok := b.(*CTypeComplex); ok {
+			return isCompatibleInner(ta.Base, tb.Base)
+		}
+	case *CTypePointer:
+		if tb, ok := b.(*CTypePointer); ok {
+			return isCompatibleInner(ta.Pointee, tb.Pointee)
+		}
+	case *CTypeArray:
+		if tb, ok := b.(*CTypeArray); ok {
+			if !isCompatibleInner(ta.Elem, tb.Elem) {
+				return false
+			}
+			if ta.Size != nil && tb.Size != nil {
+				return *ta.Size == *tb.Size
+			}
+			return true
+		}
+	case *CTypeFunction:
+		if tb, ok := b.(*CTypeFunction); ok {
+			if ta.Variadic != tb.Variadic {
+				return false
+			}
+			if !isCompatibleInner(ta.ReturnType, tb.ReturnType) {
+				return false
+			}
+			if len(ta.Params) != len(tb.Params) {
+				return false
+			}
+			for i := range ta.Params {
+				if !isCompatibleInner(ta.Params[i], tb.Params[i]) {
+					return false
+				}
+			}
+			return true
+		}
+	case *CTypeStruct:
+		if tb, ok := b.(*CTypeStruct); ok {
+			if ta.Name != nil && tb.Name != nil {
+				return *ta.Name == *tb.Name
+			}
+			return false
+		}
+	case *CTypeUnion:
+		if tb, ok := b.(*CTypeUnion); ok {
+			if ta.Name != nil && tb.Name != nil {
+				return *ta.Name == *tb.Name
+			}
+			return false
+		}
+	case *CTypeEnum:
+		if tb, ok := b.(*CTypeEnum); ok {
+			if ta.Name != nil && tb.Name != nil {
+				return *ta.Name == *tb.Name
+			}
+			return false
+		}
+	case *CTypeAtomic:
+		if tb, ok := b.(*CTypeAtomic); ok {
+			return isCompatibleInner(ta.Inner, tb.Inner)
+		}
+	}
+	return false
 }

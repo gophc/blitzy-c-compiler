@@ -13,9 +13,9 @@ type BitfieldInfo struct {
 }
 
 type StructLayout struct {
-	Fields            []FieldLayout
-	Size              int
-	Alignment         int
+	Fields           []FieldLayout
+	Size             int
+	Alignment        int
 	HasFlexibleArray bool
 }
 
@@ -34,7 +34,7 @@ func (tb *TypeBuilder) Target() *Target {
 func (tb *TypeBuilder) PointerTo(pointee CType) CType {
 	return &CTypePointer{
 		Pointee: pointee,
-		Quals:  TypeQualifiers{},
+		Quals:   TypeQualifiers{},
 	}
 }
 
@@ -108,9 +108,10 @@ func (tb *TypeBuilder) ComputeStructLayout(fieldTypes []CType, packed bool, expl
 
 		offset = alignUp(offset, fieldAlign)
 		fields[i] = FieldLayout{
-			Offset:    offset,
-			Size:     fieldSize,
-			Alignment: fieldAlign,
+			Offset:       offset,
+			Size:         fieldSize,
+			Alignment:    fieldAlign,
+			BitfieldInfo: nil,
 		}
 
 		offset += fieldSize
@@ -130,9 +131,128 @@ func (tb *TypeBuilder) ComputeStructLayout(fieldTypes []CType, packed bool, expl
 
 	totalSize := alignUp(offset, structAlign)
 	return &StructLayout{
-		Fields: fields,
-		Size: totalSize,
-		Alignment: structAlign,
+		Fields:           fields,
+		Size:             totalSize,
+		Alignment:        structAlign,
+		HasFlexibleArray: hasFlexibleArray,
+	}
+}
+
+func (tb *TypeBuilder) ComputeStructLayoutWithFields(fields []StructField, packed bool, explicitAlign *int) *StructLayout {
+	fieldLayouts := make([]FieldLayout, len(fields))
+	absBit := uint64(0)
+	maxFieldAlign := 1
+	hasFlexibleArray := false
+
+	var explicitAlignOpt *int
+	if explicitAlign != nil {
+		explicitAlignOpt = explicitAlign
+	}
+
+	alignU128 := func(val uint64, a uint64) uint64 {
+		if a <= 1 {
+			return val
+		}
+		return (val + a - 1) / a * a
+	}
+
+	for i := range fields {
+		field := &fields[i]
+		isLast := i == len(fields)-1
+		isFlex := isLast && isArrayWithNilSize(field.Ty)
+		if isFlex {
+			hasFlexibleArray = true
+		}
+
+		if field.BitWidth != nil {
+			bits := uint64(*field.BitWidth)
+			unitTypeSize := SizeofCType(field.Ty, &tb.target)
+			unitTypeAlign := 1
+			if !packed {
+				unitTypeAlign = AlignofCType(field.Ty, &tb.target)
+			}
+			unitSizeBits := uint64(unitTypeSize) * 8
+
+			if bits == 0 {
+				absBit = alignU128(absBit, uint64(unitTypeAlign*8))
+				unitByteOffset := absBit / 8
+				fieldLayouts[i] = FieldLayout{
+					Offset:       int(unitByteOffset),
+					Size:         unitTypeSize,
+					Alignment:    unitTypeAlign,
+					BitfieldInfo: nil,
+				}
+				continue
+			}
+
+			absBit = alignU128(absBit, 8)
+			bitOffset := absBit % 8
+			unitByteOffset := absBit / 8
+
+			if bitOffset+bits > unitSizeBits {
+				absBit = alignU128(absBit, unitSizeBits)
+				unitByteOffset = absBit / 8
+				bitOffset = 0
+			}
+
+			fieldLayouts[i] = FieldLayout{
+				Offset:    int(unitByteOffset),
+				Size:      int((bits + 7) / 8),
+				Alignment: unitTypeAlign,
+				BitfieldInfo: &BitfieldInfo{
+					BitOffset: int(bitOffset),
+					BitWidth:  int(bits),
+				},
+			}
+
+			absBit += bits
+			if unitTypeAlign > maxFieldAlign {
+				maxFieldAlign = unitTypeAlign
+			}
+			continue
+		}
+
+		fieldSize := 0
+		if !isFlex {
+			fieldSize = SizeofCType(field.Ty, &tb.target)
+		}
+
+		fieldAlign := 1
+		if !packed {
+			fieldAlign = AlignofCType(field.Ty, &tb.target)
+		}
+
+		absBit = alignU128(absBit, uint64(fieldAlign*8))
+		unitByteOffset := absBit / 8
+
+		fieldLayouts[i] = FieldLayout{
+			Offset:       int(unitByteOffset),
+			Size:         fieldSize,
+			Alignment:    fieldAlign,
+			BitfieldInfo: nil,
+		}
+
+		absBit += uint64(fieldSize) * 8
+		if fieldAlign > maxFieldAlign {
+			maxFieldAlign = fieldAlign
+		}
+	}
+
+	structAlign := maxFieldAlign
+	if explicitAlignOpt != nil {
+		if *explicitAlignOpt > structAlign {
+			structAlign = *explicitAlignOpt
+		}
+	} else if packed {
+		structAlign = 1
+	}
+
+	totalSize := alignUp(int(alignU128(absBit, uint64(structAlign*8))/8), structAlign)
+
+	return &StructLayout{
+		Fields:           fieldLayouts,
+		Size:             totalSize,
+		Alignment:        structAlign,
 		HasFlexibleArray: hasFlexibleArray,
 	}
 }
@@ -152,7 +272,7 @@ func (tb *TypeBuilder) ComputeUnionLayout(fieldTypes []CType, packed bool, expli
 
 		fields[i] = FieldLayout{
 			Offset:    0,
-			Size:     fieldSize,
+			Size:      fieldSize,
 			Alignment: fieldAlign,
 		}
 
@@ -177,9 +297,9 @@ func (tb *TypeBuilder) ComputeUnionLayout(fieldTypes []CType, packed bool, expli
 
 	totalSize := alignUp(maxSize, unionAlign)
 	return &StructLayout{
-		Fields: fields,
-		Size: totalSize,
-		Alignment: unionAlign,
+		Fields:           fields,
+		Size:             totalSize,
+		Alignment:        unionAlign,
 		HasFlexibleArray: false,
 	}
 }

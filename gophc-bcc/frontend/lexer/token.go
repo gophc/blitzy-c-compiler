@@ -205,25 +205,25 @@ type IdentifierToken struct {
 }
 
 type IntegerLiteralToken struct {
-	Value   uint64
-	Suffix  IntegerSuffix
-	Base    NumericBase
+	Value  uint64
+	Suffix IntegerSuffix
+	Base   NumericBase
 }
 
 type FloatLiteralToken struct {
-	Value   string
-	Suffix  FloatSuffix
-	Base    NumericBase
+	Value  string
+	Suffix FloatSuffix
+	Base   NumericBase
 }
 
 type StringLiteralToken struct {
-	Value   string
-	Prefix  StringPrefix
+	Value  string
+	Prefix StringPrefix
 }
 
 type CharLiteralToken struct {
-	Value   uint32
-	Prefix  StringPrefix
+	Value  uint32
+	Prefix StringPrefix
 }
 
 type OperatorToken int

@@ -36,10 +36,18 @@ func (fh *FxHasher) Sum() []byte {
 	return fh.h.Sum([]byte{})
 }
 
+func (fh *FxHasher) Reset() {
+	fh.h.Reset()
+}
+
 type FxHashMap map[interface{}]interface{}
 
 func NewFxHashMap() FxHashMap {
 	return make(FxHashMap)
+}
+
+func NewFxHashMapWithCapacity(cap int) FxHashMap {
+	return make(FxHashMap, cap)
 }
 
 func (m FxHashMap) Put(key, value interface{}) {
@@ -59,10 +67,20 @@ func (m FxHashMap) Delete(key interface{}) {
 	delete(m, key)
 }
 
+func (m FxHashMap) Clear() {
+	for k := range m {
+		delete(m, k)
+	}
+}
+
 type FxHashSet map[interface{}]struct{}
 
 func NewFxHashSet() FxHashSet {
 	return make(FxHashSet)
+}
+
+func NewFxHashSetWithCapacity(cap int) FxHashSet {
+	return make(FxHashSet, cap)
 }
 
 func (s FxHashSet) Add(key interface{}) {
@@ -80,4 +98,10 @@ func (s FxHashSet) Len() int {
 
 func (s FxHashSet) Delete(key interface{}) {
 	delete(s, key)
+}
+
+func (s FxHashSet) Clear() {
+	for k := range s {
+		delete(s, k)
+	}
 }

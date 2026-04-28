@@ -23,15 +23,15 @@ func (s Severity) String() string {
 
 type Span struct {
 	FileID uint32
-	Start uint32
-	End   uint32
+	Start  uint32
+	End    uint32
 }
 
 func NewSpan(fileID uint32, start uint32, end uint32) Span {
 	return Span{
 		FileID: fileID,
-		Start: start,
-		End:   end,
+		Start:  start,
+		End:    end,
 	}
 }
 
@@ -45,8 +45,8 @@ func (s Span) Merge(other Span) Span {
 	}
 	return Span{
 		FileID: s.FileID,
-		Start: minUint32(s.Start, other.Start),
-		End:   maxUint32(s.End, other.End),
+		Start:  minUint32(s.Start, other.Start),
+		End:    maxUint32(s.End, other.End),
 	}
 }
 
@@ -62,23 +62,23 @@ type SubDiagnostic struct {
 type FixSuggestion struct {
 	Span        Span
 	Replacement string
-	Message    string
+	Message     string
 }
 
 type Diagnostic struct {
 	Severity      Severity
-	Span         Span
-	Message      string
-	Notes        []SubDiagnostic
+	Span          Span
+	Message       string
+	Notes         []SubDiagnostic
 	FixSuggestion *FixSuggestion
 }
 
 func NewDiagnostic(severity Severity, span Span, message string) *Diagnostic {
 	return &Diagnostic{
 		Severity: severity,
-		Span:    span,
-		Message: message,
-		Notes:  make([]SubDiagnostic, 0),
+		Span:     span,
+		Message:  message,
+		Notes:    make([]SubDiagnostic, 0),
 	}
 }
 
@@ -106,15 +106,15 @@ func (d *Diagnostic) WithFix(span Span, replacement string, message string) *Dia
 	d.FixSuggestion = &FixSuggestion{
 		Span:        span,
 		Replacement: replacement,
-		Message:    message,
+		Message:     message,
 	}
 	return d
 }
 
 type DiagnosticEngine struct {
-	diagnostics  []*Diagnostic
-	errorCount   int
-	warningCount int
+	diagnostics   []*Diagnostic
+	errorCount    int
+	warningCount  int
 	suppressDepth int
 }
 
