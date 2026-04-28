@@ -456,6 +456,14 @@ func (l *Lexer) Diagnostics() *common.DiagnosticEngine {
 	return l.diagnostics
 }
 
+func (l *Lexer) DiagnosticsMut() *common.DiagnosticEngine {
+	return l.diagnostics
+}
+
 func (l *Lexer) Interner() *common.Interner {
+	return l.interner
+}
+
+func (l *Lexer) InternerMut() *common.Interner {
 	return l.interner
 }

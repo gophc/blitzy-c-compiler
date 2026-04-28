@@ -515,3 +515,91 @@ func LookupKeyword(s string) TokenKind {
 		return nil
 	}
 }
+
+func IsKeyword(kind TokenKind) bool {
+	switch kind.(type) {
+	case KeywordToken:
+		return true
+	}
+	return false
+}
+
+func IsLiteral(kind TokenKind) bool {
+	switch kind.(type) {
+	case IntegerLiteralToken, FloatLiteralToken, StringLiteralToken, CharLiteralToken:
+		return true
+	}
+	return false
+}
+
+func IsOperator(kind TokenKind) bool {
+	switch kind.(type) {
+	case OperatorToken:
+		return true
+	}
+	return false
+}
+
+func IsAssignmentOperator(kind TokenKind) bool {
+	switch kind.(type) {
+	case OperatorToken:
+		tok := kind.(OperatorToken)
+		return tok >= TokenEqual && tok <= TokenGreaterGreaterEqual
+	}
+	return false
+}
+
+func IsComparisonOperator(kind TokenKind) bool {
+	switch kind.(type) {
+	case OperatorToken:
+		tok := kind.(OperatorToken)
+		return tok == TokenEqualEqual || tok == TokenBangEqual || tok == TokenLess || tok == TokenGreater || tok == TokenLessEqual || tok == TokenGreaterEqual
+	}
+	return false
+}
+
+func IsUnaryOperator(kind TokenKind) bool {
+	switch kind.(type) {
+	case OperatorToken:
+		tok := kind.(OperatorToken)
+		return tok == TokenPlus || tok == TokenMinus || tok == TokenBang || tok == TokenTilde || tok == TokenStar || tok == TokenAmpersand || tok == TokenPlusPlus || tok == TokenMinusMinus
+	}
+	return false
+}
+
+func KeywordStr(kind TokenKind) string {
+	switch kind.(type) {
+	case KeywordToken:
+		tok := kind.(KeywordToken)
+		names := []string{
+			"auto", "extern", "register", "static", "typedef", "void", "char", "short", "int", "long",
+			"float", "double", "signed", "unsigned", "const", "volatile", "restrict", "inline",
+			"_Bool", "_Complex", "_Atomic", "_Alignas", "_Alignof", "_Generic", "_Noreturn",
+			"_Static_assert", "_Thread_local", "if", "else", "switch", "case", "default", "while", "do", "for",
+			"break", "continue", "return", "goto", "struct", "union", "enum", "sizeof",
+			"__attribute__", "typeof", "__extension__", "asm", "__volatile__", "__label__",
+			"__real__", "__imag__", "__int128", "_Float128", "_Float16", "_Float32", "_Float64",
+			"__auto_type",
+		}
+		if tok >= 0 && int(tok) < len(names) {
+			return names[tok]
+		}
+	case OperatorToken:
+		tok := kind.(OperatorToken)
+		ops := []string{
+			"+", "-", "*", "/", "%", "&", "|", "^", "~", "<<", ">>",
+			"==", "!=", "<", ">", "<=", ">=", "&&", "||", "!",
+			"=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=",
+			"++", "--", ".", "->", "?", ":", ",", ";", "...", "#", "##",
+			"(", ")", "[", "]", "{", "}",
+		}
+		if tok >= 0 && int(tok) < len(ops) {
+			return ops[tok]
+		}
+	}
+	return ""
+}
+
+func PunctuatorStr(kind TokenKind) string {
+	return KeywordStr(kind)
+}
