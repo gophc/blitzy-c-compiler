@@ -27,3 +27,5 @@ Thumbs.db
 *.core
 platform.info
 dump.rdb
+/.opencode
+/graphify-out
