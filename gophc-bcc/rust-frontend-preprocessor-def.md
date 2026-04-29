@@ -1,15 +1,14 @@
-# Rust 前端预处理器定义文档
+# BCC Rust 前端预处理器定义
 
 本文档按文件整理 `src/frontend/preprocessor/` 下所有类型、函数和方法签名（私有），按定义出现顺序，不包括测试。
 
 ---
 
-## 1. mod.rs
+## 1. src/frontend/preprocessor/mod.rs
 
-### 类型定义
+### PPTokenKind 类型定义
 
 ```rust
-// PPTokenKind — 预处理标记分类
 pub enum PPTokenKind {
     Identifier,
     Number,
@@ -24,8 +23,9 @@ pub enum PPTokenKind {
 }
 ```
 
+### PPToken 类型定义
+
 ```rust
-// PPToken — 预处理标记
 pub struct PPToken {
     pub kind: PPTokenKind,
     pub text: String,
@@ -35,16 +35,18 @@ pub struct PPToken {
 }
 ```
 
+### MacroKind 类型定义
+
 ```rust
-// MacroKind — 宏种类
 pub enum MacroKind {
     ObjectLike,
     FunctionLike { params: Vec<String>, variadic: bool },
 }
 ```
 
+### MacroDef 类型定义
+
 ```rust
-// MacroDef — 宏定义
 pub struct MacroDef {
     pub name: String,
     pub kind: MacroKind,
@@ -54,8 +56,9 @@ pub struct MacroDef {
 }
 ```
 
+### ConditionalState 类型定义
+
 ```rust
-// ConditionalState — 条件编译状态
 pub struct ConditionalState {
     pub active: bool,
     pub seen_active: bool,
@@ -64,8 +67,9 @@ pub struct ConditionalState {
 }
 ```
 
+### Preprocessor<'a> 类型定义
+
 ```rust
-// Preprocessor — 预处理器主状态机
 pub struct Preprocessor<'a> {
     pub source_map: &'a mut SourceMap,
     pub diagnostics: &'a mut DiagnosticEngine,
@@ -85,20 +89,7 @@ pub struct Preprocessor<'a> {
 }
 ```
 
-### 函数签名
-
-```rust
-// Phase 1: 三字符替换
-pub fn phase1_trigraphs(input: &str) -> String
-
-// Phase 1: 行拼接
-pub fn phase1_line_splice(input: &str) -> String
-
-// 预处理标记化
-pub fn tokenize_preprocessing(input: &str, file_id: u32) -> Vec<PPToken>
-```
-
-### impl PPToken 方法
+### PPToken 方法
 
 ```rust
 impl PPToken {
@@ -111,7 +102,7 @@ impl PPToken {
 }
 ```
 
-### impl ConditionalState 方法
+### ConditionalState 方法
 
 ```rust
 impl ConditionalState {
@@ -119,16 +110,11 @@ impl ConditionalState {
 }
 ```
 
-### impl Preprocessor 方法
+### Preprocessor<'a> 方法
 
 ```rust
 impl<'a> Preprocessor<'a> {
-    pub fn new(
-        source_map: &'a mut SourceMap,
-        diagnostics: &'a mut DiagnosticEngine,
-        target: Target,
-        interner: &'a mut Interner,
-    ) -> Self
+    pub fn new(source_map: &'a mut SourceMap, diagnostics: &'a mut DiagnosticEngine, target: Target, interner: &'a mut Interner) -> Self
     pub fn add_include_path(&mut self, path: &str)
     pub fn add_system_include_path(&mut self, path: &str)
     pub fn add_define(&mut self, name: &str, value: &str)
@@ -136,11 +122,7 @@ impl<'a> Preprocessor<'a> {
     pub fn preprocess_file(&mut self, filename: &str) -> Result<Vec<PPToken>, ()>
     fn process_tokens(&mut self, tokens: &[PPToken]) -> Vec<PPToken>
     fn is_active(&self) -> bool
-    fn process_directive_line(
-        &mut self,
-        _hash_token: &PPToken,
-        tokens: &[PPToken],
-    ) -> Option<Vec<PPToken>>
+    fn process_directive_line(&mut self, _hash_token: &PPToken, tokens: &[PPToken]) -> Option<Vec<PPToken>>
     fn process_define(&mut self, tokens: &[PPToken])
     fn process_undef(&mut self, tokens: &[PPToken])
     fn process_include(&mut self, tokens: &[PPToken]) -> Result<Vec<PPToken>, ()>
@@ -153,7 +135,15 @@ impl<'a> Preprocessor<'a> {
 }
 ```
 
-### 私有辅助函数
+### 公共函数
+
+```rust
+pub fn phase1_trigraphs(input: &str) -> String
+pub fn phase1_line_splice(input: &str) -> String
+pub fn tokenize_preprocessing(input: &str, file_id: u32) -> Vec<PPToken>
+```
+
+### 私有函数
 
 ```rust
 fn is_string_prefix(bytes: &[u8], pos: usize) -> bool
@@ -167,32 +157,26 @@ fn get_char_at(s: &str, pos: usize) -> char
 
 ---
 
-## 2. token_paster.rs
+## 2. src/frontend/preprocessor/token_paster.rs
 
-### 类型定义
+### PasteError 类型定义
 
 ```rust
-// PasteError — ## 连接错误
 #[derive(Debug)]
 pub enum PasteError {
     InvalidToken(String),
 }
 ```
 
-### 函数签名
+### 公共函数
 
 ```rust
-// paste_tokens — ## 操作符
 pub fn paste_tokens(left: &PPToken, right: &PPToken) -> Result<PPToken, PasteError>
-
-// process_concatenation — 处理所有 ## 连接符
 pub fn process_concatenation(tokens: &[PPToken]) -> (Vec<PPToken>, Vec<Diagnostic>)
-
-// stringify_tokens — # 操作符
 pub fn stringify_tokens(tokens: &[PPToken]) -> PPToken
 ```
 
-### 私有辅助函数
+### 私有函数
 
 ```rust
 fn classify_concatenated_token(text: &str) -> Option<PPTokenKind>
@@ -214,12 +198,11 @@ fn is_hashhash(token: &PPToken) -> bool
 
 ---
 
-## 3. predefined.rs
+## 3. src/frontend/preprocessor/predefined.rs
 
-### 类型定义
+### MagicMacro 类型定义
 
 ```rust
-// MagicMacro — 魔法宏
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MagicMacro {
     File,
@@ -230,37 +213,29 @@ pub enum MagicMacro {
 }
 ```
 
-### 函数签名
+### 公共函数
 
 ```rust
-// is_magic_macro — 检测魔法宏
 pub fn is_magic_macro(name: &str) -> Option<MagicMacro>
-
-// capture_compilation_timestamp — 捕获编译时间戳
 pub fn capture_compilation_timestamp() -> (String, String)
-
-// unix_timestamp_to_components — Unix 时间戳转日期时间组件
-fn unix_timestamp_to_components(total_secs: u64) -> (i32, u32, u32, u32, u32, u64)
-
-// register_predefined_macros — 注册预定义宏
 pub fn register_predefined_macros(macro_defs: &mut FxHashMap<String, MacroDef>, target: &Target)
 ```
 
-### 私有辅助函数
+### 私有函数
 
 ```rust
+fn unix_timestamp_to_components(total_secs: u64) -> (i32, u32, u32, u32, u32, u64)
 fn register_object_macro(macro_defs: &mut FxHashMap<String, MacroDef>, name: &str, value: &str)
 fn tokenize_value(value: &str) -> Vec<PPToken>
 ```
 
 ---
 
-## 4. paint_marker.rs
+## 4. src/frontend/preprocessor/paint_marker.rs
 
-### 类型定义
+### PaintState 类型定义
 
 ```rust
-// PaintState — 标记状态
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PaintState {
     Unpainted,
@@ -268,14 +243,15 @@ pub enum PaintState {
 }
 ```
 
+### PaintMarker 类型定义
+
 ```rust
-// PaintMarker — 宏展开递归跟踪器
 pub struct PaintMarker {
     active_expansions: FxHashSet<String>,
 }
 ```
 
-### impl PaintState 方法
+### PaintState 方法
 
 ```rust
 impl Default for PaintState {
@@ -287,7 +263,7 @@ impl fmt::Display for PaintState {
 }
 ```
 
-### impl PaintMarker 方法
+### PaintMarker 方法
 
 ```rust
 impl Default for PaintMarker {
@@ -318,12 +294,11 @@ impl fmt::Debug for PaintMarker {
 
 ---
 
-## 5. macro_expander.rs
+## 5. src/frontend/preprocessor/macro_expander.rs
 
-### 类型定义
+### MacroExpander<'a> 类型定义
 
 ```rust
-// MacroExpander — 宏展开引擎
 pub struct MacroExpander<'a> {
     macro_defs: &'a FxHashMap<String, MacroDef>,
     paint_marker: PaintMarker,
@@ -335,83 +310,34 @@ pub struct MacroExpander<'a> {
 }
 ```
 
-### impl MacroExpander 方法
+### MacroExpander<'a> 方法
 
 ```rust
 impl<'a> MacroExpander<'a> {
-    pub fn new(
-        macro_defs: &'a FxHashMap<String, MacroDef>,
-        diagnostics: &'a mut DiagnosticEngine,
-        max_depth: usize,
-        counter: &'a mut u64,
-    ) -> Self
-    pub fn new_with_source_map(
-        macro_defs: &'a FxHashMap<String, MacroDef>,
-        diagnostics: &'a mut DiagnosticEngine,
-        max_depth: usize,
-        counter: &'a mut u64,
-        source_map: &'a SourceMap,
-    ) -> Self
+    pub fn new(macro_defs: &'a FxHashMap<String, MacroDef>, diagnostics: &'a mut DiagnosticEngine, max_depth: usize, counter: &'a mut u64) -> Self
+    pub fn new_with_source_map(macro_defs: &'a FxHashMap<String, MacroDef>, diagnostics: &'a mut DiagnosticEngine, max_depth: usize, counter: &'a mut u64, source_map: &'a SourceMap) -> Self
     pub fn expand_tokens(&mut self, tokens: &[PPToken]) -> Vec<PPToken>
-    fn prepare_object_replacement(
-        &mut self,
-        macro_def: &MacroDef,
-        invocation_span: Span,
-    ) -> Vec<PPToken>
-    fn perform_function_substitution(
-        &mut self,
-        macro_def: &MacroDef,
-        args: Vec<Vec<PPToken>>,
-        invocation_span: Span,
-    ) -> Vec<PPToken>
-    fn validate_arg_count(
-        &mut self,
-        macro_name: &str,
-        is_predefined: bool,
-        params: &[String],
-        variadic: bool,
-        args: &[Vec<PPToken>],
-        span: Span,
-    ) -> bool
-    fn substitute_params(
-        &mut self,
-        replacement: &[PPToken],
-        params: &[String],
-        unexpanded_args: &[Vec<PPToken>],
-        expanded_args: &[Vec<PPToken>],
-        variadic: bool,
-        invocation_span: Span,
-    ) -> Vec<PPToken>
+    fn prepare_object_replacement(&mut self, macro_def: &MacroDef, invocation_span: Span) -> Vec<PPToken>
+    fn perform_function_substitution(&mut self, macro_def: &MacroDef, args: Vec<Vec<PPToken>>, invocation_span: Span) -> Vec<PPToken>
+    fn validate_arg_count(&mut self, macro_name: &str, is_predefined: bool, params: &[String], variadic: bool, args: &[Vec<PPToken>], span: Span) -> bool
+    fn substitute_params(&mut self, replacement: &[PPToken], params: &[String], unexpanded_args: &[Vec<PPToken>], expanded_args: &[Vec<PPToken>], variadic: bool, invocation_span: Span) -> Vec<PPToken>
     fn process_paste(&mut self, tokens: &[PPToken], invocation_span: Span) -> Vec<PPToken>
-    fn collect_arguments(
-        &mut self,
-        tokens: &[PPToken],
-        start: usize,
-    ) -> Result<(Vec<Vec<PPToken>>, usize), ()>
-    fn find_param_or_va_index(
-        &self,
-        name: &str,
-        params: &[String],
-        variadic: bool,
-    ) -> Option<usize>
-    fn get_argument_tokens(
-        &self,
-        param_idx: usize,
-        args: &[Vec<PPToken>],
-        params: &[String],
-        variadic: bool,
-    ) -> Vec<PPToken>
+    fn collect_arguments(&mut self, tokens: &[PPToken], start: usize) -> Result<(Vec<Vec<PPToken>>, usize), ()>
+    fn find_param_or_va_index(&self, name: &str, params: &[String], variadic: bool) -> Option<usize>
+    fn get_argument_tokens(&self, param_idx: usize, args: &[Vec<PPToken>], params: &[String], variadic: bool) -> Vec<PPToken>
     fn get_va_args_tokens(&self, args: &[Vec<PPToken>], params: &[String]) -> Vec<PPToken>
 }
 ```
 
-### 自由辅助函数
+### 常量
 
 ```rust
-// 常量
 const VA_ARGS_INDEX: usize = usize::MAX
+```
 
-// 自由函数
+### 私有函数
+
+```rust
 fn find_lparen(tokens: &[PPToken], start: usize) -> Option<usize>
 fn find_named_param_index(name: &str, params: &[String]) -> Option<usize>
 #[inline]
@@ -424,12 +350,11 @@ fn collect_va_opt_content(tokens: &[PPToken], start: usize) -> (Vec<PPToken>, us
 
 ---
 
-## 6. include_handler.rs
+## 6. src/frontend/preprocessor/include_handler.rs
 
-### 类型定义
+### IncludeError 类型定义
 
 ```rust
-// IncludeError — #include 错误的类型
 #[derive(Debug)]
 pub enum IncludeError {
     Circular(PathBuf),
@@ -439,8 +364,9 @@ pub enum IncludeError {
 }
 ```
 
+### IncludeHandler 类型定义
+
 ```rust
-// IncludeHandler — #include 处理器
 pub struct IncludeHandler {
     user_paths: Vec<PathBuf>,
     system_paths: Vec<PathBuf>,
@@ -451,7 +377,7 @@ pub struct IncludeHandler {
 }
 ```
 
-### impl IncludeError 方法
+### IncludeError 方法
 
 ```rust
 impl fmt::Display for IncludeError {
@@ -472,47 +398,26 @@ impl IncludeError {
 }
 ```
 
-### impl IncludeHandler 方法
+### IncludeHandler 方法
 
 ```rust
 impl IncludeHandler {
     pub fn new(user_paths: Vec<PathBuf>, system_paths: Vec<PathBuf>) -> Self
     pub fn add_user_path(&mut self, path: PathBuf)
     pub fn add_system_path(&mut self, path: PathBuf)
-    pub fn resolve_include(
-        &self,
-        header: &str,
-        is_system: bool,
-        including_file: &Path,
-    ) -> Option<PathBuf>
+    pub fn resolve_include(&self, header: &str, is_system: bool, including_file: &Path) -> Option<PathBuf>
     pub fn resolve_include_next(&self, header: &str, including_file: &Path) -> Option<PathBuf>
     fn search_paths(&self, paths: &[PathBuf], header: &str) -> Option<PathBuf>
     pub fn push_include(&mut self, path: &Path) -> Result<(), IncludeError>
     pub fn pop_include(&mut self)
     pub fn register_guard(&mut self, path: &Path, guard_macro: String)
-    pub fn should_skip_guarded(
-        &self,
-        path: &Path,
-        defined_macros: &FxHashMap<String, MacroDef>,
-    ) -> bool
+    pub fn should_skip_guarded(&self, path: &Path, defined_macros: &FxHashMap<String, MacroDef>) -> bool
     pub fn mark_pragma_once(&mut self, path: &Path)
     pub fn is_pragma_once(&self, path: &Path) -> bool
-    pub fn should_skip_file(
-        &self,
-        path: &Path,
-        defined_macros: &FxHashMap<String, MacroDef>,
-    ) -> bool
+    pub fn should_skip_file(&self, path: &Path, defined_macros: &FxHashMap<String, MacroDef>) -> bool
     pub fn read_include_file(&self, path: &Path) -> Result<String, IncludeError>
-    pub fn read_and_register(
-        &self,
-        path: &Path,
-        source_map: &mut SourceMap,
-    ) -> Result<(u32, String), IncludeError>
-    pub fn get_filename_from_source_map<'a>(
-        &self,
-        source_map: &'a SourceMap,
-        file_id: u32,
-    ) -> Option<&'a str>
+    pub fn read_and_register(&self, path: &Path, source_map: &mut SourceMap) -> Result<(u32, String), IncludeError>
+    pub fn get_filename_from_source_map<'a>(&self, source_map: &'a SourceMap, file_id: u32) -> Option<&'a str>
     #[inline]
     pub fn depth(&self) -> usize
     #[inline]
@@ -520,13 +425,13 @@ impl IncludeHandler {
 }
 ```
 
-### 私有辅助函数
+### 私有函数
 
 ```rust
 fn canonicalize_path(path: &Path) -> PathBuf
 ```
 
-### 公开函数
+### 公共函数
 
 ```rust
 pub fn detect_include_guard(tokens: &[PPToken]) -> Option<String>
@@ -534,12 +439,11 @@ pub fn detect_include_guard(tokens: &[PPToken]) -> Option<String>
 
 ---
 
-## 7. expression.rs
+## 7. src/frontend/preprocessor/expression.rs
 
-### 类型定义
+### ShiftDir 类型定义（私有）
 
 ```rust
-// 内部类型：移位方向
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ShiftDir {
     Left,
@@ -547,8 +451,9 @@ enum ShiftDir {
 }
 ```
 
+### PPValue 类型定义
+
 ```rust
-// PPValue — 预处理表达式值
 #[derive(Debug, Clone, Copy)]
 pub enum PPValue {
     Signed(i64),
@@ -556,8 +461,9 @@ pub enum PPValue {
 }
 ```
 
+### ExprParser<'a> 类型定义（私有）
+
 ```rust
-// ExprParser — 表达式解析器内部状态
 struct ExprParser<'a> {
     tokens: &'a [&'a PPToken],
     pos: usize,
@@ -565,7 +471,7 @@ struct ExprParser<'a> {
 }
 ```
 
-### impl PPValue 方法
+### PPValue 方法
 
 ```rust
 impl PPValue {
@@ -580,18 +486,14 @@ impl PPValue {
 }
 ```
 
-### 函数签名
+### 公共函数
 
 ```rust
-// 评估预处理 #if / #elif 常量表达式
 #[allow(clippy::result_unit_err)]
-pub fn evaluate_pp_expression(
-    tokens: &[PPToken],
-    diagnostics: &mut DiagnosticEngine,
-) -> Result<PPValue, ()>
+pub fn evaluate_pp_expression(tokens: &[PPToken], diagnostics: &mut DiagnosticEngine) -> Result<PPValue, ()>
 ```
 
-### impl ExprParser 方法
+### ExprParser<'a> 方法
 
 ```rust
 impl<'a> ExprParser<'a> {
@@ -616,22 +518,10 @@ impl<'a> ExprParser<'a> {
     fn parse_equality(&mut self) -> Result<PPValue, ()>
     fn parse_relational(&mut self) -> Result<PPValue, ()>
     fn parse_shift(&mut self) -> Result<PPValue, ()>
-    fn apply_shift(
-        &mut self,
-        left: PPValue,
-        right: PPValue,
-        dir: ShiftDir,
-        span: Span,
-    ) -> Result<PPValue, ()>
+    fn apply_shift(&mut self, left: PPValue, right: PPValue, dir: ShiftDir, span: Span) -> Result<PPValue, ()>
     fn parse_additive(&mut self) -> Result<PPValue, ()>
     fn parse_multiplicative(&mut self) -> Result<PPValue, ()>
-    fn apply_division(
-        &mut self,
-        left: PPValue,
-        right: PPValue,
-        is_modulo: bool,
-        span: Span,
-    ) -> Result<PPValue, ()>
+    fn apply_division(&mut self, left: PPValue, right: PPValue, is_modulo: bool, span: Span) -> Result<PPValue, ()>
     fn parse_unary(&mut self) -> Result<PPValue, ()>
     fn parse_primary(&mut self) -> Result<PPValue, ()>
     fn parse_defined_operator(&mut self, _kw_span: Span) -> Result<PPValue, ()>
@@ -642,28 +532,16 @@ impl<'a> ExprParser<'a> {
 }
 ```
 
-### 私有辅助函数
+### 私有函数
 
 ```rust
 fn is_supported_attribute(name: &str) -> bool
 fn is_supported_builtin(name: &str) -> bool
-fn parse_integer_literal(
-    text: &str,
-    span: Span,
-    diagnostics: &mut DiagnosticEngine,
-) -> Result<PPValue, ()>
+fn parse_integer_literal(text: &str, span: Span, diagnostics: &mut DiagnosticEngine) -> Result<PPValue, ()>
 fn strip_integer_suffix(text: &str) -> (&str, bool)
-fn parse_char_constant(
-    text: &str,
-    span: Span,
-    diagnostics: &mut DiagnosticEngine,
-) -> Result<PPValue, ()>
+fn parse_char_constant(text: &str, span: Span, diagnostics: &mut DiagnosticEngine) -> Result<PPValue, ()>
 fn strip_char_prefix_and_quotes(text: &str) -> &str
-fn parse_escape_sequence(
-    input: &str,
-    span: Span,
-    diagnostics: &mut DiagnosticEngine,
-) -> Result<Vec<u8>, ()>
+fn parse_escape_sequence(input: &str, span: Span, diagnostics: &mut DiagnosticEngine) -> Result<Vec<u8>, ()>
 #[inline]
 fn is_hex_digit(b: u8) -> bool
 #[inline]
@@ -675,12 +553,11 @@ where
 
 ---
 
-## 8. directives.rs
+## 8. src/frontend/preprocessor/directives.rs
 
-### 类型定义
+### DirectiveResult 类型定义
 
 ```rust
-// DirectiveResult — 指令处理结果
 pub enum DirectiveResult {
     Tokens(Vec<PPToken>),
     None,
@@ -688,18 +565,15 @@ pub enum DirectiveResult {
 }
 ```
 
-### 函数签名
+### 公共函数
 
 ```rust
-// process_directive — 处理预处理器指令行
-pub fn process_directive(
-    pp: &mut Preprocessor,
-    directive_token: &PPToken,
-    tokens: &[PPToken],
-) -> Result<DirectiveResult, ()>
+pub fn process_directive(pp: &mut Preprocessor, directive_token: &PPToken, tokens: &[PPToken]) -> Result<DirectiveResult, ()>
+pub fn resolve_defined_operators(tokens: &[PPToken], macro_defs: &FxHashMap<String, MacroDef>) -> Vec<PPToken>
+pub fn verify_no_unterminated_conditionals(pp: &mut Preprocessor)
 ```
 
-### 私有辅助函数
+### 私有函数
 
 ```rust
 fn is_preprocessing_active(pp: &Preprocessor) -> bool
@@ -707,243 +581,25 @@ fn skip_whitespace(tokens: &[PPToken]) -> &[PPToken]
 fn tokens_to_message(tokens: &[PPToken]) -> String
 fn trim_trailing_whitespace(mut tokens: Vec<PPToken>) -> Vec<PPToken>
 fn warn_extra_tokens(diagnostics: &mut DiagnosticEngine, tokens: &[PPToken])
-```
-
-### 指令处理函数
-
-```rust
-fn process_define(
-    pp: &mut Preprocessor,
-    tokens: &[PPToken],
-    directive_span: Span,
-) -> Result<(), ()>
-fn parse_function_like_params<'a>(
-    pp: &mut Preprocessor,
-    tokens: &'a [PPToken],
-    directive_span: Span,
-) -> Result<(MacroKind, &'a [PPToken]), ()>
-fn macro_definitions_equivalent(
-    existing: &MacroDef,
-    new_kind: &MacroKind,
-    new_replacement: &[PPToken],
-) -> bool
-fn process_undef(
-    pp: &mut Preprocessor,
-    tokens: &[PPToken],
-    directive_span: Span,
-) -> Result<(), ()>
-fn process_include(
-    pp: &mut Preprocessor,
-    tokens: &[PPToken],
-    directive_span: Span,
-) -> Result<Vec<PPToken>, ()>
-fn parse_include_header(
-    pp: &mut Preprocessor,
-    tokens: &[PPToken],
-    directive_span: Span,
-) -> Result<(String, bool), ()>
-fn detect_and_register_guard(
-    handler: &mut IncludeHandler,
-    path: &Path,
-    macro_defs: &FxHashMap<String, MacroDef>,
-)
-```
-
-### 条件编译指令处理函数
-
-```rust
-pub fn resolve_defined_operators(
-    tokens: &[PPToken],
-    macro_defs: &FxHashMap<String, MacroDef>,
-) -> Vec<PPToken>
+fn process_define(pp: &mut Preprocessor, tokens: &[PPToken], directive_span: Span) -> Result<(), ()>
+fn parse_function_like_params<'a>(pp: &mut Preprocessor, tokens: &'a [PPToken], directive_span: Span) -> Result<(MacroKind, &'a [PPToken]), ()>
+fn macro_definitions_equivalent(existing: &MacroDef, new_kind: &MacroKind, new_replacement: &[PPToken]) -> bool
+fn process_undef(pp: &mut Preprocessor, tokens: &[PPToken], directive_span: Span) -> Result<(), ()>
+fn process_include(pp: &mut Preprocessor, tokens: &[PPToken], directive_span: Span) -> Result<Vec<PPToken>, ()>
+fn parse_include_header(pp: &mut Preprocessor, tokens: &[PPToken], directive_span: Span) -> Result<(String, bool), ()>
+fn detect_and_register_guard(handler: &mut IncludeHandler, path: &Path, macro_defs: &FxHashMap<String, MacroDef>)
 fn process_if(pp: &mut Preprocessor, tokens: &[PPToken], directive_span: Span) -> Result<(), ()>
-fn process_ifdef(
-    pp: &mut Preprocessor,
-    tokens: &[PPToken],
-    directive_span: Span,
-) -> Result<(), ()>
-fn process_ifndef(
-    pp: &mut Preprocessor,
-    tokens: &[PPToken],
-    directive_span: Span,
-) -> Result<(), ()>
-fn process_elif(
-    pp: &mut Preprocessor,
-    tokens: &[PPToken],
-    directive_span: Span,
-) -> Result<DirectiveResult, ()>
-fn process_else(
-    pp: &mut Preprocessor,
-    tokens: &[PPToken],
-    directive_span: Span,
-) -> Result<DirectiveResult, ()>
-fn process_endif(
-    pp: &mut Preprocessor,
-    tokens: &[PPToken],
-    directive_span: Span,
-) -> Result<DirectiveResult, ()>
-```
-
-### #pragma 指令处理函数
-
-```rust
-fn process_pragma(
-    pp: &mut Preprocessor,
-    tokens: &[PPToken],
-    directive_span: Span,
-) -> Result<(), ()>
-fn process_pragma_pack(
-    _pp: &mut Preprocessor,
-    tokens: &[PPToken],
-    _directive_span: Span,
-) -> Result<(), ()>
+fn process_ifdef(pp: &mut Preprocessor, tokens: &[PPToken], directive_span: Span) -> Result<(), ()>
+fn process_ifndef(pp: &mut Preprocessor, tokens: &[PPToken], directive_span: Span) -> Result<(), ()>
+fn process_elif(pp: &mut Preprocessor, tokens: &[PPToken], directive_span: Span) -> Result<DirectiveResult, ()>
+fn process_else(pp: &mut Preprocessor, tokens: &[PPToken], directive_span: Span) -> Result<DirectiveResult, ()>
+fn process_endif(pp: &mut Preprocessor, tokens: &[PPToken], directive_span: Span) -> Result<DirectiveResult, ()>
+fn process_pragma(pp: &mut Preprocessor, tokens: &[PPToken], directive_span: Span) -> Result<(), ()>
+fn process_pragma_pack(_pp: &mut Preprocessor, tokens: &[PPToken], _directive_span: Span) -> Result<(), ()>
 fn extract_pragma_macro_name(tokens: &[PPToken]) -> Option<String>
 fn process_pragma_push_macro(pp: &mut Preprocessor, tokens: &[PPToken]) -> Result<(), ()>
 fn process_pragma_pop_macro(pp: &mut Preprocessor, tokens: &[PPToken]) -> Result<(), ()>
-```
-
-### #error / #warning / #line 指令处理函数
-
-```rust
 fn process_error(pp: &mut Preprocessor, tokens: &[PPToken], directive_span: Span)
 fn process_warning(pp: &mut Preprocessor, tokens: &[PPToken], directive_span: Span)
 fn process_line(pp: &mut Preprocessor, tokens: &[PPToken], directive_span: Span) -> Result<(), ()>
 ```
-
-### 公开工具函数
-
-```rust
-pub fn verify_no_unterminated_conditionals(pp: &mut Preprocessor)
-```
-
----
-
-## 附录: 按文件整理的完整签名列表
-
-### mod.rs
-- `pub enum PPTokenKind`
-- `pub struct PPToken`
-- `impl PPToken`
-- `pub enum MacroKind`
-- `pub struct MacroDef`
-- `pub struct ConditionalState`
-- `impl ConditionalState`
-- `pub struct Preprocessor<'a>`
-- `impl<'a> Preprocessor<'a>`
-- `pub fn phase1_trigraphs(input: &str) -> String`
-- `pub fn phase1_line_splice(input: &str) -> String`
-- `pub fn tokenize_preprocessing(input: &str, file_id: u32) -> Vec<PPToken>`
-- `fn is_string_prefix(bytes: &[u8], pos: usize) -> bool`
-- `fn is_char_prefix(bytes: &[u8], pos: usize) -> bool`
-- `fn lex_string_literal(input: &str, pos: usize, file_id: u32) -> (PPToken, usize)`
-- `fn lex_char_literal(input: &str, pos: usize, file_id: u32) -> (PPToken, usize)`
-- `fn match_punctuator(bytes: &[u8], pos: usize) -> Option<(&'static str, usize)>`
-- `fn get_char_at(s: &str, pos: usize) -> char`
-
-### token_paster.rs
-- `pub enum PasteError`
-- `pub fn paste_tokens(left: &PPToken, right: &PPToken) -> Result<PPToken, PasteError>`
-- `pub fn process_concatenation(tokens: &[PPToken]) -> (Vec<PPToken>, Vec<Diagnostic>)`
-- `pub fn stringify_tokens(tokens: &[PPToken]) -> PPToken`
-- `fn classify_concatenated_token(text: &str) -> Option<PPTokenKind>`
-- `fn is_valid_preprocessing_token(text: &str) -> bool`
-- `fn is_identifier_start(b: u8) -> bool`
-- `fn is_identifier_continue(b: u8) -> bool`
-- `fn is_valid_pp_number(text: &str) -> bool`
-- `fn is_valid_punctuator(text: &str) -> bool`
-- `fn is_valid_string_literal(text: &str) -> bool`
-- `fn is_valid_char_literal(text: &str) -> bool`
-- `fn escape_for_string_literal(text: &str) -> String`
-- `fn normalize_whitespace_for_stringify(tokens: &[PPToken]) -> String`
-- `fn is_hashhash(token: &PPToken) -> bool`
-
-### predefined.rs
-- `pub enum MagicMacro`
-- `pub fn is_magic_macro(name: &str) -> Option<MagicMacro>`
-- `pub fn capture_compilation_timestamp() -> (String, String)`
-- `fn unix_timestamp_to_components(total_secs: u64) -> (i32, u32, u32, u32, u32, u64)`
-- `pub fn register_predefined_macros(macro_defs: &mut FxHashMap<String, MacroDef>, target: &Target)`
-- `fn register_object_macro(macro_defs: &mut FxHashMap<String, MacroDef>, name: &str, value: &str)`
-- `fn tokenize_value(value: &str) -> Vec<PPToken>`
-
-### paint_marker.rs
-- `pub enum PaintState`
-- `impl Default for PaintState`
-- `impl fmt::Display for PaintState`
-- `pub struct PaintMarker`
-- `impl Default for PaintMarker`
-- `impl PaintMarker`
-- `impl fmt::Debug for PaintMarker`
-
-### macro_expander.rs
-- `pub struct MacroExpander<'a>`
-- `impl<'a> MacroExpander<'a>`
-- `const VA_ARGS_INDEX: usize`
-- `fn find_lparen(tokens: &[PPToken], start: usize) -> Option<usize>`
-- `fn find_named_param_index(name: &str, params: &[String]) -> Option<usize>`
-- `fn is_hashhash_token(tok: &PPToken) -> bool`
-- `fn followed_by_hashhash(tokens: &[PPToken], pos: usize) -> bool`
-- `fn preceded_by_hashhash(tokens: &[PPToken], pos: usize) -> bool`
-- `fn is_arg_empty(arg: &[PPToken]) -> bool`
-- `fn collect_va_opt_content(tokens: &[PPToken], start: usize) -> (Vec<PPToken>, usize)`
-
-### include_handler.rs
-- `pub enum IncludeError`
-- `impl fmt::Display for IncludeError`
-- `impl std::error::Error for IncludeError`
-- `impl From<std::io::Error> for IncludeError`
-- `impl IncludeError`
-- `pub struct IncludeHandler`
-- `impl IncludeHandler`
-- `fn canonicalize_path(path: &Path) -> PathBuf`
-- `pub fn detect_include_guard(tokens: &[PPToken]) -> Option<String>`
-
-### expression.rs
-- `enum ShiftDir`
-- `pub enum PPValue`
-- `impl PPValue`
-- `struct ExprParser<'a>`
-- `impl<'a> ExprParser<'a>`
-- `#[allow(clippy::result_unit_err)] pub fn evaluate_pp_expression(tokens: &[PPToken], diagnostics: &mut DiagnosticEngine) -> Result<PPValue, ()>`
-- `fn is_supported_attribute(name: &str) -> bool`
-- `fn is_supported_builtin(name: &str) -> bool`
-- `fn parse_integer_literal(text: &str, span: Span, diagnostics: &mut DiagnosticEngine) -> Result<PPValue, ()>`
-- `fn strip_integer_suffix(text: &str) -> (&str, bool)`
-- `fn parse_char_constant(text: &str, span: Span, diagnostics: &mut DiagnosticEngine) -> Result<PPValue, ()>`
-- `fn strip_char_prefix_and_quotes(text: &str) -> &str`
-- `fn parse_escape_sequence(input: &str, span: Span, diagnostics: &mut DiagnosticEngine) -> Result<Vec<u8>, ()>`
-- `fn is_hex_digit(b: u8) -> bool`
-- `fn hex_digit_value(b: u8) -> u8`
-- `fn apply_binary_bitwise<F>(left: PPValue, right: PPValue, op: F) -> PPValue`
-
-### directives.rs
-- `pub enum DirectiveResult`
-- `pub fn process_directive(pp: &mut Preprocessor, directive_token: &PPToken, tokens: &[PPToken]) -> Result<DirectiveResult, ()>`
-- `fn is_preprocessing_active(pp: &Preprocessor) -> bool`
-- `fn skip_whitespace(tokens: &[PPToken]) -> &[PPToken]`
-- `fn tokens_to_message(tokens: &[PPToken]) -> String`
-- `fn trim_trailing_whitespace(mut tokens: Vec<PPToken>) -> Vec<PPToken>`
-- `fn warn_extra_tokens(diagnostics: &mut DiagnosticEngine, tokens: &[PPToken])`
-- `fn process_define(pp: &mut Preprocessor, tokens: &[PPToken], directive_span: Span) -> Result<(), ()>`
-- `fn parse_function_like_params<'a>(pp: &mut Preprocessor, tokens: &'a [PPToken], directive_span: Span) -> Result<(MacroKind, &'a [PPToken]), ()>`
-- `fn macro_definitions_equivalent(existing: &MacroDef, new_kind: &MacroKind, new_replacement: &[PPToken]) -> bool`
-- `fn process_undef(pp: &mut Preprocessor, tokens: &[PPToken], directive_span: Span) -> Result<(), ()>`
-- `fn process_include(pp: &mut Preprocessor, tokens: &[PPToken], directive_span: Span) -> Result<Vec<PPToken>, ()>`
-- `fn parse_include_header(pp: &mut Preprocessor, tokens: &[PPToken], directive_span: Span) -> Result<(String, bool), ()>`
-- `fn detect_and_register_guard(handler: &mut IncludeHandler, path: &Path, macro_defs: &FxHashMap<String, MacroDef>)`
-- `pub fn resolve_defined_operators(tokens: &[PPToken], macro_defs: &FxHashMap<String, MacroDef>) -> Vec<PPToken>`
-- `fn process_if(pp: &mut Preprocessor, tokens: &[PPToken], directive_span: Span) -> Result<(), ()>`
-- `fn process_ifdef(pp: &mut Preprocessor, tokens: &[PPToken], directive_span: Span) -> Result<(), ()>`
-- `fn process_ifndef(pp: &mut Preprocessor, tokens: &[PPToken], directive_span: Span) -> Result<(), ()>`
-- `fn process_elif(pp: &mut Preprocessor, tokens: &[PPToken], directive_span: Span) -> Result<DirectiveResult, ()>`
-- `fn process_else(pp: &mut Preprocessor, tokens: &[PPToken], directive_span: Span) -> Result<DirectiveResult, ()>`
-- `fn process_endif(pp: &mut Preprocessor, tokens: &[PPToken], directive_span: Span) -> Result<DirectiveResult, ()>`
-- `fn process_pragma(pp: &mut Preprocessor, tokens: &[PPToken], directive_span: Span) -> Result<(), ()>`
-- `fn process_pragma_pack(_pp: &mut Preprocessor, tokens: &[PPToken], _directive_span: Span) -> Result<(), ()>`
-- `fn extract_pragma_macro_name(tokens: &[PPToken]) -> Option<String>`
-- `fn process_pragma_push_macro(pp: &mut Preprocessor, tokens: &[PPToken]) -> Result<(), ()>`
-- `fn process_pragma_pop_macro(pp: &mut Preprocessor, tokens: &[PPToken]) -> Result<(), ()>`
-- `fn process_error(pp: &mut Preprocessor, tokens: &[PPToken], directive_span: Span)`
-- `fn process_warning(pp: &mut Preprocessor, tokens: &[PPToken], directive_span: Span)`
-- `fn process_line(pp: &mut Preprocessor, tokens: &[PPToken], directive_span: Span) -> Result<(), ()>`
-- `pub fn verify_no_unterminated_conditionals(pp: &mut Preprocessor)`
