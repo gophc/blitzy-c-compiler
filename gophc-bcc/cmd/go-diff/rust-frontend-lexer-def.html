@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Rust Frontend Lexer vs Go Frontend Lexer 对比</title>
+    <style>
+        * { box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }
+        h1 { text-align: center; color: #333; }
+        .file-section { margin-bottom: 20px; border: 1px solid #ddd; border-radius: 8px; overflow: hidden; background: #fff; }
+        .file-header { background: #4a90d9; color: white; padding: 12px 20px; cursor: pointer; display: flex; justify-content: space-between; align-items: center; user-select: none; }
+        .file-header:hover { background: #3a7bc8; }
+        .file-header::after { content: '▼'; transition: transform 0.3s; }
+        .file-section.collapsed .file-header::after { transform: rotate(-90deg); }
+        .file-section.collapsed .file-content { display: none; }
+        .file-content { padding: 15px; }
+        .type-section { margin: 15px 0; border: 1px solid #e0e0e0; border-radius: 6px; overflow: hidden; }
+        .type-header { background: #e8f4fc; color: #2c5aa0; padding: 10px 15px; cursor: pointer; display: flex; justify-content: space-between; align-items: center; user-select: none; font-weight: 600; }
+        .type-header:hover { background: #d8e8f0; }
+        .type-header::after { content: '▼'; font-size: 12px; transition: transform 0.3s; }
+        .type-section.collapsed .type-header::after { transform: rotate(-90deg); }
+        .type-section.collapsed .type-content { display: none; }
+        .type-content { padding: 10px 15px; }
+        table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid #eee; }
+        th { background: #f8f8f8; font-weight: 600; color: #444; }
+        tr:hover { background: #fafafa; }
+        .rust-col { color: #b672dd; font-family: 'Consolas', monospace; }
+        .go-col { color: #00add8; font-family: 'Consolas', monospace; }
+        .match { color: #28a745; }
+        .no-match { color: #dc3545; }
+        .category-title { font-weight: 600; color: #555; margin: 15px 0 8px 0; padding-bottom: 5px; border-bottom: 1px solid #eee; }
+        .file-name { font-size: 12px; opacity: 0.8; }
+    </style>
+</head>
+<body>
+<h1>Rust Frontend Lexer vs Go Frontend Lexer 对比</h1>
+
+<div id="container"></div>
+
+<script>
+const data = {
+"lexer.go": {
+  types: [
+    { rust: "pub struct Lexer<'src> { source, file_id, position, line, column, current_token, pushed_back, interner, diagnostics }", go: "type Lexer struct { scanner, interner, diagnostics, fileID, lookahead }", match: true }
+  ],
+  methods: [
+    { rust: "impl Lexer { pub fn new }", go: "func NewLexer", match: true },
+    { rust: "impl Lexer { pub fn next_token }", go: "func NextToken", match: true },
+    { rust: "impl Lexer { pub fn peek }", go: "func Peek", match: true },
+    { rust: "impl Lexer { pub fn peek_nth }", go: "func PeekNth", match: true },
+    { rust: "impl Lexer { pub fn unget }", go: "func Unget", match: true },
+    { rust: "impl Lexer { pub fn tokenize_all }", go: "func TokenizeAll", match: true },
+    { rust: "impl Lexer { fn lex_token }", go: "func lexToken (private)", match: true },
+    { rust: "impl Lexer { fn lex_after_plus/minus/star/slash/percent/ampersand/pipe/caret }", go: "func lexAfterPlus/Minus/Star/Slash/Percent/Ampersand/Pipe/Caret", match: true },
+    { rust: "impl Lexer { fn lex_after_bang/equal/less/greater/dot }", go: "func lexAfterBang/Equal/Less/Greater/Dot", match: true },
+    { rust: "impl Lexer { fn lex_error_char }", go: "func lexErrorChar", match: true },
+    { rust: "impl Lexer { fn skip_whitespace_and_comments }", go: "func skipWhitespaceAndComments", match: true },
+    { rust: "impl Lexer { fn lex_identifier_or_keyword }", go: "func lexIdentifierOrKeyword", match: true },
+    { rust: "impl Lexer { fn lex_dot_float }", go: "func lexDotFloat", match: true },
+    { rust: "impl Lexer { fn make_token }", go: "func makeToken", match: true },
+    { rust: "impl Lexer { pub fn current_position }", go: "func CurrentPosition", match: true },
+    { rust: "impl Lexer { pub fn source }", go: "func Source", match: true },
+    { rust: "impl Lexer { pub fn diagnostics / diagnostics_mut }", go: "func Diagnostics / DiagnosticsMut", match: true },
+    { rust: "impl Lexer { fn interner / interner_mut }", go: "func Interner / InternerMut", match: true },
+    { rust: "impl Lexer { fn try_consume_ident_char }", go: "(handled in lexIdentifierOrKeyword)", match: true }
+  ],
+  funcs: [
+    { rust: "fn is_c_whitespace", go: "func isCWhitespace", match: true }
+  ]
+},
+"token.go": {
+  types: [
+    { rust: "pub enum NumericBase { Decimal, Octal, Hex, Binary }", go: "type NumericBase int const { NumericBaseDecimal, NumericBaseHexadecimal, ... }", match: true },
+    { rust: "pub enum IntegerSuffix { None, U, L, UL, LL, ULL }", go: "type IntegerSuffix int const { IntegerSuffixNone, IntegerSuffixU, ... }", match: true },
+    { rust: "pub enum FloatSuffix { None, F, L, I, FI, LI }", go: "type FloatSuffix int const { FloatSuffixNone, FloatSuffixF, ... }", match: true },
+    { rust: "pub enum StringPrefix { None, L, U8, U16, U32 }", go: "type StringPrefix int const { StringPrefixNone, StringPrefixL, ... }", match: true },
+    { rust: "pub enum TokenKind { Keyword, Identifier, Integer, Float, String, Char, Punctuator, Eof, Invalid }", go: "type TokenKind interface{} + KeywordToken/IdentifierToken/etc", match: true },
+    { rust: "pub struct Token { kind, span }", go: "type Token struct { Kind, Span }", match: true }
+  ],
+  methods: [
+    { rust: "impl TokenKind { pub fn is_keyword }", go: "func IsKeyword", match: true },
+    { rust: "impl TokenKind { pub fn is_literal }", go: "func IsLiteral", match: true },
+    { rust: "impl TokenKind { pub fn is_operator }", go: "func IsOperator", match: true },
+    { rust: "impl TokenKind { pub fn is_assignment_operator }", go: "func IsAssignmentOperator", match: true },
+    { rust: "impl TokenKind { pub fn is_comparison_operator }", go: "func IsComparisonOperator", match: true },
+    { rust: "impl TokenKind { pub fn is_unary_operator }", go: "func IsUnaryOperator", match: true },
+    { rust: "impl TokenKind { pub fn keyword_str }", go: "func KeywordStr", match: true },
+    { rust: "impl TokenKind { pub fn punctuator_str }", go: "func PunctuatorStr", match: true },
+    { rust: "impl fmt::Display for TokenKind", go: "(use KeywordStr)", match: true },
+    { rust: "impl Token { pub fn new }", go: "func NewToken", match: true },
+    { rust: "impl Token { pub fn is }", go: "func (Token) Is", match: true },
+    { rust: "impl Token { pub fn is_eof }", go: "func (Token) IsEof", match: true }
+  ],
+  funcs: [
+    { rust: "pub fn lookup_keyword", go: "func LookupKeyword", match: true }
+  ]
+},
+"scanner.go": {
+  types: [
+    { rust: "pub struct Position { offset, line, column }", go: "type Position struct { Offset, Line, Column }", match: true },
+    { rust: "pub struct Scanner<'src> { source, len, pos, line, column, lookahead }", go: "type Scanner struct { source, offset, line, column, lookahead }", match: true }
+  ],
+  methods: [
+    { rust: "impl Position { pub fn new }", go: "func NewPosition", match: true },
+    { rust: "impl Scanner { pub fn new }", go: "func NewScanner", match: true },
+    { rust: "impl Scanner { pub fn advance }", go: "func advance (private)", match: true },
+    { rust: "impl Scanner { pub fn peek }", go: "func peek", match: true },
+    { rust: "impl Scanner { pub fn peek_nth }", go: "func peekNth", match: true },
+    { rust: "impl Scanner { pub fn unget }", go: "func unget", match: true },
+    { rust: "impl Scanner { pub fn position }", go: "func Position", match: true },
+    { rust: "impl Scanner { pub fn offset }", go: "func Offset", match: true },
+    { rust: "impl Scanner { pub fn line }", go: "func Line", match: true },
+    { rust: "impl Scanner { pub fn column }", go: "func Column", match: true },
+    { rust: "impl Scanner { pub fn is_eof }", go: "func IsEof", match: true },
+    { rust: "impl Scanner { pub fn source }", go: "func Source", match: true },
+    { rust: "impl Scanner { pub fn slice }", go: "func Slice", match: true },
+    { rust: "impl Scanner { pub fn skip_while }", go: "func skipWhile", match: true },
+    { rust: "impl Scanner { pub fn consume_if }", go: "func consumeIf", match: true },
+    { rust: "impl Scanner { pub fn consume_if_pred }", go: "func consumeIfPred", match: true },
+    { rust: "impl Scanner { pub fn is_pua_char }", go: "func IsPuaChar", match: true },
+    { rust: "impl Scanner { fn fill_lookahead }", go: "func fillLookahead (private)", match: true },
+    { rust: "impl Scanner { fn next_lookahead_position }", go: "func nextLookaheadPosition (private)", match: true },
+    { rust: "impl Scanner { fn source_byte_len }", go: "(implicit)", match: true }
+  ]
+},
+"string_literal.go": {
+  types: [],
+  methods: [],
+  funcs: [
+    { rust: "fn escape_byte_to_char", go: "func escapeByteToChar", match: true },
+    { rust: "fn process_escape_sequence", go: "func processEscapeSequence", match: true },
+    { rust: "fn process_unicode_escape", go: "func processUnicodeEscape", match: true },
+    { rust: "fn skip_whitespace", go: "func skipWhitespace", match: true },
+    { rust: "fn merge_prefix", go: "func mergePrefix", match: true },
+    { rust: "fn consume_adjacent_prefix", go: "func consumeAdjacentPrefix", match: true },
+    { rust: "pub fn lex_string_literal", go: "func lexStringLiteral", match: true },
+    { rust: "pub fn lex_char_literal", go: "func lexCharLiteral", match: true },
+    { rust: "pub fn detect_prefix", go: "func detectPrefix", match: true },
+    { rust: "pub fn has_adjacent_string", go: "func hasAdjacentString", match: true },
+    { rust: "pub fn lex_string_with_concatenation", go: "func lexStringWithConcatenation", match: true }
+  ]
+},
+"number_literal.go": {
+  types: [],
+  methods: [],
+  funcs: [
+    { rust: "fn digit_value", go: "func digitValue", match: true },
+    { rust: "fn parse_integer_value", go: "func parseIntegerValue", match: true },
+    { rust: "fn parse_integer_suffix", go: "func parseIntegerSuffix", match: true },
+    { rust: "fn parse_float_suffix", go: "func parseFloatSuffix", match: true },
+    { rust: "fn check_trailing_invalid_chars", go: "func checkTrailingInvalidChars", match: true },
+    { rust: "fn maybe_convert_to_imaginary", go: "func maybeConvertToImaginary", match: true },
+    { rust: "fn lex_hex_literal", go: "func lexHexLiteral", match: true },
+    { rust: "fn lex_hex_float_exponent", go: "func lexHexFloatExponent", match: true },
+    { rust: "fn lex_binary_literal", go: "func lexBinaryLiteral", match: true },
+    { rust: "fn lex_after_leading_zero", go: "func lexAfterLeadingZero", match: true },
+    { rust: "fn lex_decimal_literal", go: "func lexDecimalLiteral", match: true },
+    { rust: "fn lex_decimal_float_after_dot", go: "func lexDecimalFloatAfterDot", match: true },
+    { rust: "fn lex_decimal_exponent", go: "func lexDecimalExponent", match: true },
+    { rust: "pub fn lex_number", go: "func lexNumber", match: true }
+  ]
+}
+};
+
+function createTable(rows, cols) {
+  let html = '<table><thead><tr>';
+  cols.forEach(c => html += '<th>' + c + '</th>');
+  html += '</tr></thead><tbody>';
+  rows.forEach(r => {
+    html += '<tr>';
+    html += '<td class="rust-col">' + r.rust + '</td>';
+    html += '<td class="go-col">' + r.go + '</td>';
+    html += '<td class="' + (r.match ? 'match' : 'no-match') + '">' + (r.match ? '✓' : '✗') + '</td>';
+    html += '</tr>';
+  });
+  html += '</tbody></table>';
+  return html;
+}
+
+function createFileSection(filename, data) {
+  let html = '<div class="file-section">';
+  html += '<div class="file-header" onclick="this.parentElement.classList.toggle(\'collapsed\')">';
+  html += '<span>' + filename + '</span><span class="file-name">' + (data.types ? data.types.length : 0) + ' types, ' + (data.funcs ? data.funcs.length : 0) + ' funcs</span></div>';
+  html += '<div class="file-content">';
+  
+  if (data.types && data.types.length > 0) {
+    html += '<div class="category-title">类型定义</div>';
+    html += createTable(data.types, ['Rust', 'Go', '匹配']);
+  }
+  if (data.methods && data.methods.length > 0) {
+    html += '<div class="category-title">方法</div>';
+    html += createTable(data.methods, ['Rust', 'Go', '匹配']);
+  }
+  if (data.funcs && data.funcs.length > 0) {
+    html += '<div class="category-title">函数</div>';
+    html += createTable(data.funcs, ['Rust', 'Go', '匹配']);
+  }
+  
+  html += '</div></div>';
+  return html;
+}
+
+const container = document.getElementById('container');
+Object.keys(data).forEach(file => {
+  container.innerHTML += createFileSection(file, data[file]);
+});
+</script>
+</body>
+</html>

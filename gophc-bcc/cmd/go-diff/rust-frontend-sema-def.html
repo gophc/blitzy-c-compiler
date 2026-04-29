@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Rust Frontend Sema vs Go Frontend Sema 对比</title>
+    <style>
+        * { box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }
+        h1 { text-align: center; color: #333; }
+        .file-section { margin-bottom: 20px; border: 1px solid #ddd; border-radius: 8px; overflow: hidden; background: #fff; }
+        .file-header { background: #4a90d9; color: white; padding: 12px 20px; cursor: pointer; display: flex; justify-content: space-between; align-items: center; user-select: none; }
+        .file-header:hover { background: #3a7bc8; }
+        .file-header::after { content: '▼'; transition: transform 0.3s; }
+        .file-section.collapsed .file-header::after { transform: rotate(-90deg); }
+        .file-section.collapsed .file-content { display: none; }
+        .file-content { padding: 15px; }
+        .type-section { margin: 15px 0; border: 1px solid #e0e0e0; border-radius: 6px; overflow: hidden; }
+        .type-header { background: #e8f4fc; color: #2c5aa0; padding: 10px 15px; cursor: pointer; display: flex; justify-content: space-between; align-items: center; user-select: none; font-weight: 600; }
+        .type-header:hover { background: #d8e8f0; }
+        .type-header::after { content: '▼'; font-size: 12px; transition: transform 0.3s; }
+        .type-section.collapsed .type-header::after { transform: rotate(-90deg); }
+        .type-section.collapsed .type-content { display: none; }
+        .type-content { padding: 10px 15px; }
+        table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid #eee; }
+        th { background: #f8f8f8; font-weight: 600; color: #444; }
+        tr:hover { background: #fafafa; }
+        .rust-col { color: #b672dd; font-family: 'Consolas', monospace; }
+        .go-col { color: #00add8; font-family: 'Consolas', monospace; }
+        .match { color: #28a745; }
+        .no-match { color: #dc3545; }
+        .category-title { font-weight: 600; color: #555; margin: 15px 0 8px 0; padding-bottom: 5px; border-bottom: 1px solid #eee; }
+        .file-name { font-size: 12px; opacity: 0.8; }
+    </style>
+</head>
+<body>
+<h1>Rust Frontend Sema vs Go Frontend Sema 对比</h1>
+
+<div id="container"></div>
+
+<script>
+const data = {
+"mod.go": {
+  types: [
+    { rust: "pub struct SemanticAnalyzer<'a> { diagnostics, type_builder, target, interner, scopes, symbols, ... }", go: "type SemanticAnalyzer struct { diagnostics, typeBuilder, target, interner, scopes, symbols }", match: true },
+    { rust: "pub struct TranslationUnit (implicit)", go: "type TranslationUnit struct { Declarations }", match: true },
+    { rust: "pub struct FunctionDefinition", go: "type FunctionDefinition struct { Specifiers, Declarator, Body, Span }", match: true },
+    { rust: "pub struct Declaration", go: "type Declaration struct { Specifiers, Declarators, Span }", match: true },
+    { rust: "pub struct DeclarationSpecifiers", go: "type DeclarationSpecifiers struct { TypeSpecifiers, Attributes }", match: true },
+    { rust: "pub struct Declarator", go: "type Declarator struct { Pointer, DirectDecl, Attributes }", match: true },
+    { rust: "pub struct Pointer", go: "type Pointer struct { Inner, Quals }", match: true }
+  ],
+  methods: [
+    { rust: "impl SemanticAnalyzer { pub fn new }", go: "func NewSemanticAnalyzer", match: true },
+    { rust: "impl SemanticAnalyzer { pub fn analyze }", go: "func Analyze", match: true },
+    { rust: "impl SemanticAnalyzer { pub fn analyze_external_declaration }", go: "func analyzeExternalDeclaration", match: true },
+    { rust: "impl SemanticAnalyzer { pub fn analyze_function_definition }", go: "(not implemented)", match: false },
+    { rust: "impl SemanticAnalyzer { pub fn analyze_declaration }", go: "(not implemented)", match: false },
+    { rust: "impl SemanticAnalyzer { pub fn analyze_expression }", go: "(not implemented)", match: false }
+  ]
+},
+"type_checker.go": {
+  types: [
+    { rust: "pub struct TypeChecker<'a> { diagnostics, type_builder, target }", go: "type TypeChecker struct { diagnostics, typeBuilder, target }", match: true }
+  ],
+  methods: [
+    { rust: "impl TypeChecker { pub fn new }", go: "func NewTypeChecker", match: true },
+    { rust: "impl TypeChecker { fn size_t_type }", go: "func SizeTType", match: true },
+    { rust: "impl TypeChecker { fn ptrdiff_t_type }", go: "func PtrdiffTType", match: true },
+    { rust: "impl TypeChecker { fn strip_type }", go: "func StripType", match: true },
+    { rust: "impl TypeChecker { fn decay_type }", go: "func DecayType", match: true },
+    { rust: "impl TypeChecker { fn get_qualifiers }", go: "func GetQualifiers", match: true },
+    { rust: "impl TypeChecker { fn integer_literal_type }", go: "func IntegerLiteralType", match: true },
+    { rust: "impl TypeChecker { fn float_literal_type }", go: "func FloatLiteralType", match: true },
+    { rust: "impl TypeChecker { fn string_literal_type }", go: "func StringLiteralType", match: true },
+    { rust: "impl TypeChecker { pub fn integer_promotion }", go: "func IntegerPromotion", match: true },
+    { rust: "impl TypeChecker { pub fn usual_arithmetic_conversion }", go: "func UsualArithmeticConversion", match: true },
+    { rust: "impl TypeChecker { pub fn are_types_compatible }", go: "func AreTypesCompatible", match: true },
+    { rust: "impl TypeChecker { pub fn is_implicitly_convertible }", go: "func IsImplicitlyConvertible", match: true },
+    { rust: "impl TypeChecker { pub fn check_binary_op }", go: "func CheckBinaryOp", match: true },
+    { rust: "impl TypeChecker { pub fn check_unary_op }", go: "func CheckUnaryOp", match: true },
+    { rust: "impl TypeChecker { pub fn check_function_call }", go: "func CheckFunctionCall", match: true },
+    { rust: "impl TypeChecker { pub fn check_member_access }", go: "func CheckMemberAccess", match: true },
+    { rust: "impl TypeChecker { pub fn check_assignment }", go: "func CheckAssignment", match: true },
+    { rust: "impl TypeChecker { pub fn check_pointer_arithmetic }", go: "func CheckPointerArithmetic", match: true },
+    { rust: "impl TypeChecker { pub fn check_array_subscript }", go: "func CheckArraySubscript", match: true },
+    { rust: "impl TypeChecker { pub fn check_conditional }", go: "func CheckConditional", match: true },
+    { rust: "impl TypeChecker { pub fn default_argument_promotion }", go: "func DefaultArgumentPromotion", match: true }
+  ]
+},
+"symbol_table.go": {
+  types: [
+    { rust: "pub struct SymbolId(pub u32)", go: "type SymbolId uint32", match: true },
+    { rust: "pub enum SymbolKind { Variable, Function, TypedefName, EnumConstant }", go: "type SymbolKind int const { SymbolKindVariable, SymbolKindFunction, ... }", match: true },
+    { rust: "pub enum Linkage { External, Internal, None }", go: "type Linkage int const { LinkageExternal, LinkageInternal, LinkageNone }", match: true },
+    { rust: "pub enum StorageClass { Auto, Register, Static, Extern, Typedef, ThreadLocal }", go: "type StorageClass int const { StorageClassAuto, ... }", match: true },
+    { rust: "pub struct SymbolEntry { name, ty, kind, linkage, storage_class, ... }", go: "type SymbolEntry struct { Name, Ty, Kind, Linkage, StorageClass, ... }", match: true },
+    { rust: "pub struct SymbolTable { symbols, name_to_ids, current_scope_depth }", go: "type SymbolTable struct { symbols, nameToIds, currentScopeDepth }", match: true }
+  ],
+  methods: [
+    { rust: "impl SymbolId { #[inline] pub fn as_u32 }", go: "func (SymbolId) AsUint32", match: true },
+    { rust: "impl SymbolTable { pub fn new }", go: "func NewSymbolTable", match: true },
+    { rust: "impl SymbolTable { pub fn declare }", go: "func Declare", match: true },
+    { rust: "impl SymbolTable { pub fn define }", go: "func Define", match: true },
+    { rust: "impl SymbolTable { pub fn lookup }", go: "func Lookup", match: true },
+    { rust: "impl SymbolTable { pub fn lookup_in_current_scope }", go: "func LookupInCurrentScope", match: true },
+    { rust: "impl SymbolTable { pub fn lookup_mut }", go: "func LookupMut", match: true },
+    { rust: "impl SymbolTable { pub fn get }", go: "func Get", match: true },
+    { rust: "impl SymbolTable { pub fn get_mut }", go: "(not implemented)", match: false },
+    { rust: "impl SymbolTable { pub fn enter_scope }", go: "func EnterScope", match: true },
+    { rust: "impl SymbolTable { pub fn leave_scope }", go: "func LeaveScope", match: true },
+    { rust: "impl SymbolTable { pub fn resolve_linkage }", go: "func ResolveLinkage", match: true },
+    { rust: "impl SymbolTable { pub fn check_linkage_compatibility }", go: "func CheckLinkageCompatibility", match: true },
+    { rust: "impl SymbolTable { pub fn mark_weak }", go: "func MarkWeak", match: true },
+    { rust: "impl SymbolTable { pub fn mark_used }", go: "func MarkUsed", match: true },
+    { rust: "impl SymbolTable { pub fn check_unused_symbols }", go: "func CheckUnusedSymbols", match: true },
+    { rust: "impl SymbolTable { pub fn declare_enum_constant }", go: "func DeclareEnumConstant", match: true },
+    { rust: "impl SymbolTable { pub fn declare_function }", go: "func DeclareFunction", match: true }
+  ]
+},
+"scope.go": {
+  types: [
+    { rust: "pub enum ScopeKind { Global, File, Function, Block, FunctionPrototype }", go: "type ScopeKind int const { ScopeKindGlobal, ScopeKindFile, ... }", match: true },
+    { rust: "pub enum TagKind { Struct, Union, Enum }", go: "type TagKind int const { TagKindStruct, TagKindUnion, TagKindEnum }", match: true },
+    { rust: "pub struct TagEntry { kind, ty, is_complete, span }", go: "type TagEntry struct { Kind, Ty, IsComplete, Span }", match: true },
+    { rust: "pub struct LabelEntry { defined_at, referenced_at, is_local }", go: "type LabelEntry struct { DefinedAt, ReferencedAt, IsLocal }", match: true },
+    { rust: "pub struct Scope { kind, depth, ordinary, tags, labels, typedefs, is_loop_or_switch }", go: "type Scope struct { Kind, Depth, Ordinary, Tags, Labels, Typedefs, IsLoopOrSwitch }", match: true },
+    { rust: "pub struct ScopeStack { scopes, depth }", go: "type ScopeStack struct { scopes, depth }", match: true }
+  ],
+  methods: [
+    { rust: "impl Scope { fn new }", go: "func newScope (private)", match: true },
+    { rust: "impl Scope { pub fn mark_loop_or_switch }", go: "func (Scope) MarkLoopOrSwitch", match: true },
+    { rust: "impl ScopeStack { pub fn new }", go: "func NewScopeStack", match: true },
+    { rust: "impl ScopeStack { pub fn push_scope }", go: "func PushScope", match: true },
+    { rust: "impl ScopeStack { pub fn pop_scope }", go: "func PopScope", match: true },
+    { rust: "impl ScopeStack { pub fn current_scope }", go: "func CurrentScope", match: true },
+    { rust: "impl ScopeStack { pub fn current_scope_mut }", go: "func CurrentScopeMut", match: true },
+    { rust: "impl ScopeStack { pub fn current_depth }", go: "func CurrentDepth", match: true },
+    { rust: "impl ScopeStack { pub fn current_kind }", go: "func CurrentKind", match: true },
+    { rust: "impl ScopeStack { pub fn is_file_scope }", go: "func IsFileScope", match: true },
+    { rust: "impl ScopeStack { pub fn is_function_scope }", go: "func IsFunctionScope", match: true },
+    { rust: "impl ScopeStack { pub fn find_enclosing_function }", go: "func FindEnclosingFunction", match: true },
+    { rust: "impl ScopeStack { pub fn lookup_ordinary }", go: "func LookupOrdinary", match: true },
+    { rust: "impl ScopeStack { pub fn lookup_ordinary_in_current_scope }", go: "func LookupOrdinaryInCurrentScope", match: true },
+    { rust: "impl ScopeStack { pub fn declare_ordinary }", go: "func DeclareOrdinary", match: true },
+    { rust: "impl ScopeStack { pub fn lookup_tag }", go: "func LookupTag", match: true },
+    { rust: "impl ScopeStack { pub fn lookup_tag_in_current_scope }", go: "func LookupTagInCurrentScope", match: true },
+    { rust: "impl ScopeStack { pub fn declare_tag }", go: "func DeclareTag", match: true },
+    { rust: "impl ScopeStack { pub fn complete_tag }", go: "func CompleteTag", match: true },
+    { rust: "impl ScopeStack { pub fn declare_label }", go: "func DeclareLabel", match: true },
+    { rust: "impl ScopeStack { pub fn define_label }", go: "func DefineLabel", match: true },
+    { rust: "impl ScopeStack { pub fn reference_label }", go: "func ReferenceLabel", match: true },
+    { rust: "impl ScopeStack { pub fn validate_labels }", go: "func ValidateLabels", match: true },
+    { rust: "impl ScopeStack { pub fn is_typedef_name }", go: "func IsTypedefName", match: true },
+    { rust: "impl ScopeStack { pub fn register_typedef }", go: "func RegisterTypedef", match: true }
+  ]
+},
+"constant_eval.go": {
+  types: [
+    { rust: "pub enum ConstValue { SignedInt, UnsignedInt, Float, Address, StringLiteral }", go: "type ConstValue interface + ConstValueSigned/Unsigned/Float/Address", match: true }
+  ],
+  methods: [
+    { rust: "impl ConstValue { pub fn to_i128 }", go: "func toI128 (interface method)", match: true },
+    { rust: "impl ConstValue { pub fn to_u128 }", go: "func toU128 (interface method)", match: true },
+    { rust: "impl ConstValue { pub fn to_bool }", go: "func toBool (interface method)", match: true },
+    { rust: "impl ConstValue { pub fn is_zero }", go: "(use toBool)", match: true },
+    { rust: "impl ConstValue { pub fn negate }", go: "(not implemented)", match: false }
+  ],
+  funcs: [
+    { rust: "pub struct ConstantEvaluator<'a>", go: "type ConstEvaluator struct", match: true },
+    { rust: "impl ConstantEvaluator { pub fn new }", go: "func NewConstEvaluator", match: true },
+    { rust: "impl ConstantEvaluator { pub fn register_enum_value }", go: "func RegisterEnumValue", match: true },
+    { rust: "impl ConstantEvaluator { pub fn register_tag_type }", go: "func RegisterTagType", match: true },
+    { rust: "impl ConstantEvaluator { pub fn register_variable_type }", go: "func RegisterVariableType", match: true },
+    { rust: "impl ConstantEvaluator { pub fn register_typedef_type }", go: "func RegisterTypedefType", match: true },
+    { rust: "impl ConstantEvaluator { pub fn evaluate_integer_constant }", go: "func EvaluateIntegerConstant", match: true },
+    { rust: "impl ConstantEvaluator { pub fn evaluate_constant_expr }", go: "func EvaluateConstantExpr", match: true },
+    { rust: "impl ConstantEvaluator { pub fn is_constant_expression }", go: "func IsConstantExpression", match: true },
+    { rust: "impl ConstantEvaluator { pub fn validate_array_size }", go: "func ValidateArraySize", match: true },
+    { rust: "impl ConstantEvaluator { pub fn validate_bitfield_width }", go: "func ValidateBitfieldWidth", match: true },
+    { rust: "impl ConstantEvaluator { pub fn evaluate_static_assert }", go: "func EvaluateStaticAssert", match: true }
+  ]
+},
+"builtin_eval.go": {
+  types: [
+    { rust: "pub enum BuiltinResult { ConstantInt, ConstantBool, ConstantFloat, ResolvedType, RuntimeCall, NoValue }", go: "type BuiltinResult interface + BuiltinResultConstantInt/Bool/Float/ResolvedType/RuntimeCall/NoValue", match: true }
+  ],
+  methods: [
+    { rust: "pub struct BuiltinEvaluator<'a>", go: "type BuiltinEvaluator struct", match: true },
+    { rust: "impl BuiltinEvaluator { pub fn new }", go: "func NewBuiltinEvaluator", match: true },
+    { rust: "impl BuiltinEvaluator { pub fn evaluate_builtin }", go: "func EvaluateBuiltin", match: true },
+    { rust: "impl BuiltinEvaluator { pub fn is_builtin_name }", go: "func IsBuiltinName", match: true },
+    { rust: "impl BuiltinEvaluator { pub fn get_builtin_return_type }", go: "func GetBuiltinReturnType", match: true },
+    { rust: "impl BuiltinEvaluator { pub fn builtin_return_type_by_name }", go: "(not implemented)", match: false },
+    { rust: "impl BuiltinEvaluator { pub fn name_to_builtin_kind }", go: "(not implemented)", match: false }
+  ]
+},
+"attribute_handler.go": {
+  types: [
+    { rust: "pub enum ValidatedAttribute { Aligned, Packed, Section, Used, Unused, Weak, ... }", go: "type ValidatedAttribute interface + ValidatedAttributeAligned/Packed/Section/Used/Unused/Weak/...", match: true },
+    { rust: "pub enum SymbolVisibility { Default, Hidden, Protected, Internal }", go: "type SymbolVisibility int const { SymbolVisibilityDefault, ... }", match: true },
+    { rust: "pub enum FormatArchetype { Printf, Scanf, Strftime, Strfmon }", go: "type FormatArchetype int const { FormatArchetypePrintf, ... }", match: true },
+    { rust: "pub struct AttributeHandler<'a>", go: "type AttributeHandler struct", match: true }
+  ],
+  methods: [
+    { rust: "impl SymbolVisibility { fn default }", go: "(use const default)", match: true },
+    { rust: "impl AttributeHandler { pub fn new }", go: "func NewAttributeHandler", match: true },
+    { rust: "impl AttributeHandler { pub fn validate_attributes }", go: "(not implemented)", match: false }
+  ],
+  funcs: [
+    { rust: "pub fn has_attribute_by_symbol", go: "(not implemented)", match: false },
+    { rust: "pub fn extract_visibility", go: "func ExtractVisibility", match: true },
+    { rust: "pub fn extract_section", go: "func ExtractSection", match: true },
+    { rust: "pub fn has_used_attribute", go: "func ExtractUsed", match: true },
+    { rust: "pub fn has_weak_attribute", go: "func ExtractWeak", match: true },
+    { rust: "pub fn has_noreturn_attribute", go: "func ExtractNoReturn", match: true }
+  ]
+}
+};
+
+function createTable(rows, cols) {
+  let html = '<table><thead><tr>';
+  cols.forEach(c => html += '<th>' + c + '</th>');
+  html += '</tr></thead><tbody>';
+  rows.forEach(r => {
+    html += '<tr>';
+    html += '<td class="rust-col">' + r.rust + '</td>';
+    html += '<td class="go-col">' + r.go + '</td>';
+    html += '<td class="' + (r.match ? 'match' : 'no-match') + '">' + (r.match ? '✓' : '✗') + '</td>';
+    html += '</tr>';
+  });
+  html += '</tbody></table>';
+  return html;
+}
+
+function createFileSection(filename, data) {
+  let html = '<div class="file-section">';
+  html += '<div class="file-header" onclick="this.parentElement.classList.toggle(\'collapsed\')">';
+  html += '<span>' + filename + '</span><span class="file-name">' + (data.types ? data.types.length : 0) + ' types, ' + (data.methods ? data.methods.length : 0) + ' funcs</span></div>';
+  html += '<div class="file-content">';
+  
+  if (data.types && data.types.length > 0) {
+    html += '<div class="category-title">类型定义</div>';
+    html += createTable(data.types, ['Rust', 'Go', '匹配']);
+  }
+  if (data.methods && data.methods.length > 0) {
+    html += '<div class="category-title">方法/函数</div>';
+    html += createTable(data.methods, ['Rust', 'Go', '匹配']);
+  }
+  if (data.funcs && data.funcs.length > 0) {
+    html += '<div class="category-title">函数</div>';
+    html += createTable(data.funcs, ['Rust', 'Go', '匹配']);
+  }
+  
+  html += '</div></div>';
+  return html;
+}
+
+const container = document.getElementById('container');
+Object.keys(data).forEach(file => {
+  container.innerHTML += createFileSection(file, data[file]);
+});
+</script>
+</body>
+</html>

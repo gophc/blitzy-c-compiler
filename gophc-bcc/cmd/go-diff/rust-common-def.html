@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Rust Common vs Go Common 对比</title>
+    <style>
+        * { box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }
+        h1 { text-align: center; color: #333; }
+        .file-section { margin-bottom: 20px; border: 1px solid #ddd; border-radius: 8px; overflow: hidden; background: #fff; }
+        .file-header { background: #4a90d9; color: white; padding: 12px 20px; cursor: pointer; display: flex; justify-content: space-between; align-items: center; user-select: none; }
+        .file-header:hover { background: #3a7bc8; }
+        .file-header::after { content: '▼'; transition: transform 0.3s; }
+        .file-section.collapsed .file-header::after { transform: rotate(-90deg); }
+        .file-section.collapsed .file-content { display: none; }
+        .file-content { padding: 15px; }
+        .type-section { margin: 15px 0; border: 1px solid #e0e0e0; border-radius: 6px; overflow: hidden; }
+        .type-header { background: #e8f4fc; color: #2c5aa0; padding: 10px 15px; cursor: pointer; display: flex; justify-content: space-between; align-items: center; user-select: none; font-weight: 600; }
+        .type-header:hover { background: #d8e8f0; }
+        .type-header::after { content: '▼'; font-size: 12px; transition: transform 0.3s; }
+        .type-section.collapsed .type-header::after { transform: rotate(-90deg); }
+        .type-section.collapsed .type-content { display: none; }
+        .type-content { padding: 10px 15px; }
+        table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid #eee; }
+        th { background: #f8f8f8; font-weight: 600; color: #444; }
+        tr:hover { background: #fafafa; }
+        .rust-col { color: #b672dd; font-family: 'Consolas', monospace; }
+        .go-col { color: #00add8; font-family: 'Consolas', monospace; }
+        .match { color: #28a745; }
+        .no-match { color: #dc3545; }
+        .partial-match { color: #fd7e14; }
+        .category-title { font-weight: 600; color: #555; margin: 15px 0 8px 0; padding-bottom: 5px; border-bottom: 1px solid #eee; }
+        .file-name { font-size: 12px; opacity: 0.8; }
+    </style>
+</head>
+<body>
+<h1>Rust Common 模块 vs Go Common 模块 对比</h1>
+
+<div id="container"></div>
+
+<script>
+const data = {
+"types.rs": {
+  types: [
+    { rust: "pub struct TypeQualifiers { is_const, is_volatile, is_restrict, is_atomic }", go: "type TypeQualifiers struct { IsConst, IsVolatile, IsRestrict, IsAtomic }", match: true },
+    { rust: "pub struct StructField { name, ty, bit_width }", go: "type StructField struct { Name, Ty, BitWidth }", match: true },
+    { rust: "pub enum CType { Void, Bool, Char, ... }", go: "type CType interface + CTypeBase/CTypePointer/etc", match: true },
+    { rust: "pub enum MachineType { I8, I16, ... }", go: "type MachineType int const { MachineI8, MachineI16, ... }", match: true }
+  ],
+  methods: [
+    { rust: "impl TypeQualifiers { pub fn is_empty, pub fn merge }", go: "func (TypeQualifiers) IsEmpty, func (TypeQualifiers) Merge", match: true }
+  ],
+  funcs: [
+    { rust: "pub fn sizeof_ctype", go: "func SizeofCType", match: true },
+    { rust: "pub fn alignof_ctype", go: "func AlignofCType", match: true },
+    { rust: "pub fn sizeof_ctype_resolved", go: "func SizeofCTypeResolved", match: true },
+    { rust: "pub fn alignof_ctype_resolved", go: "func AlignofCTypeResolved", match: true },
+    { rust: "pub fn is_void", go: "func IsVoid", match: true },
+    { rust: "pub fn is_integer", go: "func IsInteger", match: true },
+    { rust: "pub fn is_unsigned", go: "func IsUnsigned", match: true },
+    { rust: "pub fn is_signed", go: "func IsSigned", match: true },
+    { rust: "pub fn is_floating", go: "func IsFloating", match: true },
+    { rust: "pub fn is_arithmetic", go: "func IsArithmetic", match: true },
+    { rust: "pub fn is_scalar", go: "func IsScalar", match: true },
+    { rust: "pub fn is_pointer", go: "func IsPointer", match: true },
+    { rust: "pub fn is_array", go: "func IsArray", match: true },
+    { rust: "pub fn is_function", go: "func IsFunction", match: true },
+    { rust: "pub fn is_struct_or_union", go: "func IsStructOrUnion", match: true },
+    { rust: "pub fn is_complete", go: "func IsCompleteType (in type_builder)", match: true },
+    { rust: "pub fn is_compatible", go: "func IsCompatible", match: true },
+    { rust: "pub fn resolve_and_strip", go: "func ResolveAndStrip", match: true },
+    { rust: "pub fn unqualified", go: "func Unqualified", match: true },
+    { rust: "pub fn resolve_typedef", go: "func ResolveTypedef", match: true },
+    { rust: "pub fn integer_promotion", go: "func IntegerPromotion", match: true },
+    { rust: "pub fn integer_rank", go: "func IntegerRank", match: true }
+  ],
+  privateFuncs: [
+    { rust: "fn resolve_tag_ref", go: "(internal, in SizeofCTypeResolved)", match: true },
+    { rust: "fn compute_struct_size", go: "func computeStructSize", match: true },
+    { rust: "fn compute_union_size", go: "func computeUnionSize", match: true },
+    { rust: "fn align_up", go: "func alignUp", match: true },
+    { rust: "fn compute_struct_or_union_align", go: "func computeStructOrUnionAlign", match: true },
+    { rust: "fn is_compatible_inner", go: "func isCompatibleInner", match: true },
+    { rust: "fn compute_struct_size_resolved", go: "func computeStructSizeResolved", match: true },
+    { rust: "fn compute_union_size_resolved", go: "func computeUnionSizeResolved", match: true },
+    { rust: "fn compute_struct_or_union_align_resolved", go: "func computeStructOrUnionAlignResolved", match: true }
+  ]
+},
+"type_builder.rs": {
+  types: [
+    { rust: "pub struct FieldLayout { offset, size, alignment, bitfield_info }", go: "type FieldLayout struct { Offset, Size, Alignment, BitfieldInfo }", match: true },
+    { rust: "pub struct StructLayout { fields, size, alignment, has_flexible_array }", go: "type StructLayout struct { Fields, Size, Alignment, HasFlexibleArray }", match: true },
+    { rust: "pub struct TypeBuilder { target }", go: "type TypeBuilder struct { target }", match: true }
+  ],
+  methods: [
+    { rust: "impl TypeBuilder { pub fn new, pub fn target }", go: "func NewTypeBuilder, func (TypeBuilder) Target", match: true },
+    { rust: "impl TypeBuilder { pub fn pointer_to }", go: "func (TypeBuilder) PointerTo", match: true },
+    { rust: "impl TypeBuilder { pub fn array_of }", go: "func (TypeBuilder) ArrayOf", match: true },
+    { rust: "impl TypeBuilder { pub fn function_type }", go: "func (TypeBuilder) FunctionType", match: true },
+    { rust: "impl TypeBuilder { pub fn const_qualified }", go: "func (TypeBuilder) ConstQualified", match: true },
+    { rust: "impl TypeBuilder { pub fn volatile_qualified }", go: "func (TypeBuilder) VolatileQualified", match: true },
+    { rust: "impl TypeBuilder { pub fn atomic_type }", go: "func (TypeBuilder) AtomicType", match: true },
+    { rust: "impl TypeBuilder { pub fn compute_struct_layout }", go: "func (TypeBuilder) ComputeStructLayout", match: true },
+    { rust: "impl TypeBuilder { pub fn compute_struct_layout_with_fields }", go: "func (TypeBuilder) ComputeStructLayoutWithFields", match: true },
+    { rust: "impl TypeBuilder { pub fn compute_union_layout }", go: "func (TypeBuilder) ComputeUnionLayout", match: true },
+    { rust: "impl TypeBuilder { pub fn sizeof_type }", go: "func (TypeBuilder) SizeofType", match: true },
+    { rust: "impl TypeBuilder { pub fn alignof_type }", go: "func (TypeBuilder) AlignofType", match: true }
+  ],
+  funcs: [
+    { rust: "pub fn is_integer_type", go: "func IsIntegerType", match: true },
+    { rust: "pub fn is_arithmetic_type", go: "func IsArithmeticType", match: true },
+    { rust: "pub fn is_scalar_type", go: "func IsScalarType", match: true },
+    { rust: "pub fn is_complete_type", go: "func IsCompleteType", match: true },
+    { rust: "pub fn integer_rank", go: "func IntegerRank", match: true },
+    { rust: "pub fn usual_arithmetic_conversion", go: "func UsualArithmeticConversion", match: true },
+    { rust: "pub fn integer_promote", go: "func IntegerPromotion", match: true }
+  ]
+},
+"temp_files.rs": {
+  types: [
+    { rust: "pub struct TempFile { path, delete_on_drop }", go: "type TempFile struct { FilePath, DeleteOnDrop }", match: true },
+    { rust: "pub struct TempDir { path, delete_on_drop }", go: "type TempDir struct { DirPath, DeleteOnDrop }", match: true }
+  ],
+  methods: [
+    { rust: "impl TempFile { pub fn new, new_in, path, keep, into_path }", go: "func NewTempFile, NewTempFileIn, Path, Keep, IntoPath", match: true },
+    { rust: "impl TempFile { impl Drop }", go: "func (TempFile) Remove (manual)", match: true },
+    { rust: "impl TempDir { pub fn new, new_in, path, create_file, keep }", go: "func NewTempDir, NewTempDirIn, Path, CreateFile, Keep", match: true },
+    { rust: "impl TempDir { impl Drop }", go: "(not implemented)", match: false }
+  ],
+  funcs: [
+    { rust: "pub fn create_temp_object_file", go: "func CreateTempObjectFile", match: true },
+    { rust: "pub fn create_temp_assembly_file", go: "func CreateTempAssemblyFile", match: true },
+    { rust: "pub fn create_temp_preprocessed_file", go: "func CreateTempPreprocessedFile", match: true }
+  ]
+},
+"target.rs": {
+  types: [
+    { rust: "pub enum Endianness { Little, Big }", go: "type Endianness int const { EndianLittle, EndianBig }", match: true },
+    { rust: "pub enum Target { X86_64, I686, AArch64, RiscV64 }", go: "type Target int const { TargetX86_64, TargetI686, ... }", match: true }
+  ],
+  methods: [
+    { rust: "impl fmt::Display for Endianness", go: "func (Endianness) String", match: true },
+    { rust: "impl Target { pub fn from_str }", go: "func TargetFromString", match: true },
+    { rust: "impl Target { pub fn pointer_width }", go: "func (Target) PointerWidth", match: true },
+    { rust: "impl Target { pub fn pointer_align }", go: "func (Target) PointerAlign", match: true },
+    { rust: "impl Target { pub fn is_64bit }", go: "func (Target) Is64Bit", match: true },
+    { rust: "impl Target { pub fn endianness }", go: "func (Target) Endianness", match: true },
+    { rust: "impl Target { pub fn long_size }", go: "func (Target) LongSize", match: true },
+    { rust: "impl Target { pub fn long_double_size }", go: "func (Target) LongDoubleSize", match: true },
+    { rust: "impl Target { pub fn long_double_align }", go: "func (Target) LongDoubleAlign", match: true },
+    { rust: "impl Target { pub fn elf_machine }", go: "func (Target) ElfMachine", match: true },
+    { rust: "impl Target { pub fn elf_class }", go: "func (Target) ElfClass", match: true },
+    { rust: "impl Target { pub fn elf_data }", go: "func (Target) ElfData", match: true },
+    { rust: "impl Target { pub fn elf_flags }", go: "func (Target) ElfFlags", match: true },
+    { rust: "impl Target { pub fn predefined_macros }", go: "func (Target) PredefinedMacros", match: true },
+    { rust: "impl Target { pub fn max_align }", go: "func (Target) MaxAlign", match: true },
+    { rust: "impl Target { pub fn page_size }", go: "func (Target) PageSize", match: true },
+    { rust: "impl Target { pub fn dynamic_linker }", go: "func (Target) DynamicLinker", match: true },
+    { rust: "impl Target { pub fn default_entry_point }", go: "func (Target) DefaultEntryPoint", match: true },
+    { rust: "impl Target { pub fn system_include_paths }", go: "func (Target) SystemIncludePaths", match: true },
+    { rust: "impl Target { pub fn system_library_paths }", go: "func (Target) SystemLibraryPaths", match: true },
+    { rust: "impl fmt::Display for Target", go: "func (Target) String", match: true }
+  ]
+},
+"string_interner.rs": {
+  types: [
+    { rust: "pub struct Symbol(u32)", go: "type Symbol uint32", match: true },
+    { rust: "pub struct Interner { map, strings }", go: "type Interner struct { strToSym, symToStr }", match: true }
+  ],
+  methods: [
+    { rust: "impl Symbol { pub fn as_u32, pub fn from_u32 }", go: "func (Symbol) AsUInt32, func SymbolFromUInt32", match: true },
+    { rust: "impl fmt::Display for Symbol", go: "func (Symbol) String", match: true },
+    { rust: "impl Interner { pub fn new, pub fn intern, resolve, get, len, is_empty }", go: "func NewInterner, Intern, Resolve, Get, Len, IsEmpty", match: true },
+    { rust: "impl Default for Interner", go: "(use NewInterner)", match: true },
+    { rust: "impl Index<Symbol> for Interner", go: "(not implemented)", match: false },
+    { rust: "impl fmt::Debug for Interner", go: "(not implemented)", match: false }
+  ]
+},
+"source_map.rs": {
+  types: [
+    { rust: "pub struct SourceLocation { file_id, filename, line, column }", go: "type SourceLocation struct { FileID, Filename, Line, Column }", match: true },
+    { rust: "pub struct LineDirective { file_id, directive_offset, new_line, new_filename }", go: "type LineDirective struct { FileID, DirectiveOffset, NewLine, NewFilename }", match: true },
+    { rust: "pub struct SourceFile { id, filename, content, line_offsets }", go: "type SourceFile struct { ID, Filename, Content, LineOffsets }", match: true },
+    { rust: "pub struct SourceMap { files, line_directives }", go: "type SourceMap struct { files, lineDirectives }", match: true }
+  ],
+  methods: [
+    { rust: "impl fmt::Display for SourceLocation", go: "func (SourceLocation) String", match: true },
+    { rust: "impl SourceFile { fn new, fn compute_line_offsets }", go: "func NewSourceFile, func computeLineOffsets", match: true },
+    { rust: "impl SourceFile { pub fn lookup_line_col }", go: "func (SourceFile) LookupLineCol", match: true },
+    { rust: "impl SourceFile { pub fn get_line_content }", go: "func (SourceFile) GetLineContent", match: true },
+    { rust: "impl SourceFile { pub fn line_count }", go: "func (SourceFile) LineCount", match: true },
+    { rust: "impl SourceMap { pub fn new, pub fn add_file }", go: "func NewSourceMap, func (SourceMap) AddFile", match: true },
+    { rust: "impl SourceMap { pub fn get_file }", go: "func (SourceMap) GetFile", match: true },
+    { rust: "impl SourceMap { pub fn lookup_location }", go: "func (SourceMap) LookupLocation", match: true },
+    { rust: "impl SourceMap { pub fn get_filename }", go: "func (SourceMap) GetFilename", match: true },
+    { rust: "impl SourceMap { pub fn get_line_directive_filenames }", go: "func (SourceMap) GetLineDirectiveFilenames", match: true },
+    { rust: "impl SourceMap { pub fn add_line_directive }", go: "func (SourceMap) AddLineDirective", match: true },
+    { rust: "impl SourceMap { pub fn resolve_location }", go: "func (SourceMap) ResolveLocation", match: true },
+    { rust: "impl SourceMap { pub fn format_span }", go: "func (SourceMap) FormatSpan", match: true },
+    { rust: "impl Default for SourceMap", go: "(use NewSourceMap)", match: true }
+  ]
+},
+"long_double.rs": {
+  types: [
+    { rust: "pub struct LongDouble { sign, exponent, significand }", go: "type LongDouble struct { sign, exponent, mantissa }", match: true }
+  ],
+  consts: [
+    { rust: "impl LongDouble { const ZERO, ONE, INFINITY, NAN... }", go: "var Zero, One, Inf, NegInf, NaN", match: true }
+  ],
+  methods: [
+    { rust: "impl LongDouble { pub fn is_zero, is_infinity, is_nan, is_negative }", go: "func (LongDouble) IsZero, IsInf, IsNaN, IsNegative", match: true },
+    { rust: "impl LongDouble { pub fn is_denormal, fn is_normal }", go: "func (LongDouble) IsDenormal", match: true },
+    { rust: "impl LongDouble { fn true_exponent }", go: "func (LongDouble) TrueExponent", match: true },
+    { rust: "impl LongDouble { pub fn add, sub, mul, div }", go: "(use operators)", match: false },
+    { rust: "impl LongDouble { pub fn neg }", go: "func (LongDouble) Neg", match: true },
+    { rust: "impl LongDouble { pub fn total_cmp }", go: "func (LongDouble) TotalCmp", match: true },
+    { rust: "impl LongDouble { pub fn from_f64, pub fn to_f64 }", go: "func Float64ToLongDouble, func (LongDouble) Float64", match: true },
+    { rust: "impl LongDouble { pub fn from_i64, to_i64, from_u64, to_u64 }", go: "func Int64ToLongDouble, (LongDouble) Int64/UInt64", match: true },
+    { rust: "impl LongDouble { pub fn to_bytes, from_bytes }", go: "func (LongDouble) Bytes, func FromBytes", match: true },
+    { rust: "impl std::ops::Add/Sub/Mul/Div/Neg", go: "(not implemented)", match: false },
+    { rust: "impl PartialEq/PartialOrd", go: "(use TotalCmp)", match: false },
+    { rust: "impl fmt::Display/fmt::Debug", go: "func (LongDouble) String", match: true }
+  ]
+},
+"fx_hash.rs": {
+  types: [
+    { rust: "pub struct FxHasher { hash }", go: "type FxHasher struct { h }", match: true },
+    { rust: "pub type FxHashMap, FxHashSet", go: "type FxHashMap, FxHashSet", match: true }
+  ],
+  methods: [
+    { rust: "impl FxHasher { pub fn new, fn add_to_hash }", go: "func NewFxHasher, Write methods", match: true },
+    { rust: "impl Default/Clone for FxHasher", go: "(not implemented)", match: false },
+    { rust: "impl Hasher for FxHasher", go: "func Write/WriteByte/WriteUint64/Sum/Reset", match: true }
+  ],
+  funcs: [
+    { rust: "pub fn fx_hash_map", go: "func NewFxHashMap", match: true },
+    { rust: "pub fn fx_hash_map_with_capacity", go: "func NewFxHashMapWithCapacity", match: true },
+    { rust: "pub fn fx_hash_set", go: "func NewFxHashSet", match: true },
+    { rust: "pub fn fx_hash_set_with_capacity", go: "func NewFxHashSetWithCapacity", match: true }
+  ]
+},
+"encoding.rs": {
+  funcs: [
+    { rust: "pub fn encode_byte_to_pua", go: "func EncodeByteToPUA", match: true },
+    { rust: "pub fn decode_pua_to_byte", go: "func DecodePUAToByte", match: true },
+    { rust: "pub fn is_pua_encoded", go: "func IsPUAEncoded", match: true },
+    { rust: "pub fn read_source_file", go: "(not implemented)", match: false },
+    { rust: "pub fn encode_bytes_to_string", go: "func EncodeBytesToString", match: true },
+    { rust: "pub fn decode_string_to_bytes", go: "func DecodeStringToBytes", match: true },
+    { rust: "pub fn extract_string_bytes", go: "func ExtractStringBytes", match: true }
+  ]
+},
+"diagnostics.rs": {
+  types: [
+    { rust: "pub enum Severity { Error, Warning, Note }", go: "type Severity int const { SeverityError, SeverityWarning, SeverityNote }", match: true },
+    { rust: "pub struct Span { file_id, start, end }", go: "type Span struct { FileID, Start, End }", match: true },
+    { rust: "pub struct SubDiagnostic { span, message }", go: "type SubDiagnostic struct { Span, Message }", match: true },
+    { rust: "pub struct FixSuggestion { span, replacement, message }", go: "type FixSuggestion struct { Span, Replacement, Message }", match: true },
+    { rust: "pub struct Diagnostic { severity, span, message, notes, fix_suggestion }", go: "type Diagnostic struct { Severity, Span, Message, Notes, FixSuggestion }", match: true },
+    { rust: "pub struct DiagnosticEngine { ... }", go: "type DiagnosticEngine struct { ... }", match: true }
+  ],
+  methods: [
+    { rust: "impl fmt::Display for Severity", go: "func (Severity) String", match: true },
+    { rust: "impl Span { pub fn new, pub fn dummy, pub fn merge, pub fn is_dummy }", go: "func NewSpan, DummySpan, Merge, IsDummy", match: true },
+    { rust: "impl Diagnostic { pub fn error, warning, note, with_note, with_fix }", go: "func Error, Warning, Note, WithNote, WithFix", match: true },
+    { rust: "impl DiagnosticEngine { pub fn new, begin/end_suppress }", go: "func NewDiagnosticEngine, Begin/EndSuppress", match: true },
+    { rust: "impl DiagnosticEngine { pub fn emit, emit_error, emit_warning, emit_note }", go: "func Emit, EmitError, EmitWarning, EmitNote", match: true },
+    { rust: "impl DiagnosticEngine { pub fn error_count, warning_count, has_errors }", go: "func ErrorCount, WarningCount, HasErrors", match: true },
+    { rust: "impl DiagnosticEngine { pub fn diagnostics, clear }", go: "func Diagnostics, Clear", match: true },
+    { rust: "impl DiagnosticEngine { pub fn print_all, fn print_diagnostic }", go: "func PrintAll, printDiagnostic", match: true },
+    { rust: "impl fmt::Debug for DiagnosticEngine", go: "(not implemented)", match: false }
+  ]
+}
+};
+
+function createTable(rows, cols) {
+  let html = '<table><thead><tr>';
+  cols.forEach(c => html += '<th>' + c + '</th>');
+  html += '</tr></thead><tbody>';
+  rows.forEach(r => {
+    html += '<tr>';
+    html += '<td class="rust-col">' + r.rust + '</td>';
+    html += '<td class="go-col">' + r.go + '</td>';
+    html += '<td class="' + (r.match ? 'match' : 'no-match') + '">' + (r.match ? '✓' : '✗') + '</td>';
+    html += '</tr>';
+  });
+  html += '</tbody></table>';
+  return html;
+}
+
+function createTypeSection(name, typeData, methodData) {
+  let html = '<div class="type-section">';
+  html += '<div class="type-header" onclick="this.parentElement.classList.toggle(\'collapsed\')">';
+  html += '<span>' + name + '</span></div>';
+  html += '<div class="type-content">';
+  if (typeData && typeData.length > 0) {
+    html += '<div class="category-title">类型定义</div>';
+    html += createTable(typeData, ['Rust', 'Go', '匹配']);
+  }
+  if (methodData && methodData.length > 0) {
+    html += '<div class="category-title">方法</div>';
+    html += createTable(methodData, ['Rust', 'Go', '匹配']);
+  }
+  html += '</div></div>';
+  return html;
+}
+
+function createFileSection(filename, data) {
+  let html = '<div class="file-section">';
+  html += '<div class="file-header" onclick="this.parentElement.classList.toggle(\'collapsed\')">';
+  html += '<span>' + filename + '</span><span class="file-name">' + Object.keys(data).filter(k => data[k] && Object.keys(data[k]).length) + ' categories</span></div>';
+  html += '<div class="file-content">';
+  
+  if (data.types) {
+    html += '<div class="category-title">类型定义</div>';
+    html += createTable(data.types, ['Rust', 'Go', '匹配']);
+  }
+  if (data.methods) {
+    html += '<div class="category-title">方法</div>';
+    html += createTable(data.methods, ['Rust', 'Go', '匹配']);
+  }
+  if (data.consts) {
+    html += '<div class="category-title">常量</div>';
+    html += createTable(data.consts, ['Rust', 'Go', '匹配']);
+  }
+  if (data.funcs) {
+    html += '<div class="category-title">公共函数</div>';
+    html += createTable(data.funcs, ['Rust', 'Go', '匹配']);
+  }
+  if (data.privateFuncs) {
+    html += '<div class="category-title">私有函数</div>';
+    html += createTable(data.privateFuncs, ['Rust', 'Go', '匹配']);
+  }
+  
+  html += '</div></div>';
+  return html;
+}
+
+const container = document.getElementById('container');
+Object.keys(data).forEach(file => {
+  container.innerHTML += createFileSection(file, data[file]);
+});
+</script>
+</body>
+</html>
