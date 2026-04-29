@@ -1,36 +1,14 @@
-# BCC Rust Common 模块类型和函数定义
+# BCC Rust Common 模块定义
 
-> **注意**: 以下函数在 Rust 中有重载(相同函数名,不同参数),Go 实现时需要使用不同的函数名
-
----
-
-## 重载函数列表 (Rust → Go 映射)
-
-| Rust 函数 | Go 函数 | 说明 |
-|----------|--------|------|
-| `sizeof_ctype(ty, target)` | `SizeofCType(ty, target)` | 基本版本 |
-| `sizeof_ctype_resolved(ty, target, tag_types)` | `SizeofCTypeResolved(ty, target, tagTypes)` | 解析标签类型版本 |
-| `alignof_ctype(ty, target)` | `AlignofCType(ty, target)` | 基本版本 |
-| `alignof_ctype_resolved(ty, target, tag_types)` | `AlignofCTypeResolved(ty, target, tagTypes)` | 解析标签类型版本 |
-| `is_integer_type(ty)` (type_builder.rs) | `IsIntegerType(ty)` | 类型谓词 |
-| `is_arithmetic_type(ty)` (type_builder.rs) | `IsArithmeticType(ty)` | 类型谓词 |
-| `is_scalar_type(ty)` (type_builder.rs) | `IsScalarType(ty)` | 类型谓词 |
-| `is_complete_type(ty)` (type_builder.rs) | `IsCompleteType(ty)` | 类型谓词 |
-| `integer_rank(ty)` (types.rs) | `IntegerRank(ty)` | 整数等级 |
-| `integer_rank(ty)` (type_builder.rs) | `IntegerRank(ty)` | 同一函数 |
-| `integer_promotion(ty)` (types.rs) | `IntegerPromotion(ty)` | 整数提升 |
-| `integer_promote(ty)` (type_builder.rs) | `IntegerPromotion(ty)` | 同一函数 |
-| `compute_struct_layout(fields, ...)` (type_builder.rs) | `ComputeStructLayout(fieldTypes, ...)` | []CType 版本 |
-| `compute_struct_layout_with_fields(fields, ...)` (type_builder.rs) | `ComputeStructLayoutWithFields(fields, ...)` | []StructField 版本(含位域) |
+本文档按文件整理 `src/common/` 下所有类型、函数和方法签名（私有），按定义出现顺序，不包括测试。
 
 ---
 
-## types.rs
+## 1. src/common/types.rs
 
-### 类型
+### 类型定义
 
 ```rust
-// 类型限定符
 pub struct TypeQualifiers {
     pub is_const: bool,
     pub is_volatile: bool,
@@ -38,14 +16,12 @@ pub struct TypeQualifiers {
     pub is_atomic: bool,
 }
 
-// 结构体/联合体字段
 pub struct StructField {
     pub name: Option<String>,
     pub ty: CType,
     pub bit_width: Option<u32>,
 }
 
-// C 语言类型
 pub enum CType {
     Void,
     Bool,
@@ -77,29 +53,42 @@ pub enum CType {
     Qualified(Box<CType>, TypeQualifiers),
 }
 
-// 机器类型
 pub enum MachineType {
-    I8, I16, I32, I64, I128,
-    F32, F64, F80,
-    Ptr, Void,
-    Integer, SSE, X87, Memory,
+    I8,
+    I16,
+    I32,
+    I64,
+    I128,
+    F32,
+    F64,
+    F80,
+    Ptr,
+    Void,
+    Integer,
+    SSE,
+    X87,
+    Memory,
 }
 ```
 
-### 函数
+### TypeQualifiers 方法
 
 ```rust
-// 标签类型定义
+impl TypeQualifiers {
+    pub fn is_empty(&self) -> bool
+    pub fn merge(self, other: TypeQualifiers) -> TypeQualifiers
+}
+```
+
+### 公共函数
+
+```rust
 pub fn set_tag_type_defs(defs: HashMap<String, CType>)
 pub fn clear_tag_type_defs()
-
-// 大小和对齐
 pub fn sizeof_ctype(ty: &CType, target: &Target) -> usize
 pub fn alignof_ctype(ty: &CType, target: &Target) -> usize
 pub fn sizeof_ctype_resolved(ty: &CType, target: &Target, tag_types: &HashMap<String, CType>) -> usize
 pub fn alignof_ctype_resolved(ty: &CType, target: &Target, tag_types: &HashMap<String, CType>) -> usize
-
-// 类型谓词
 pub fn is_void(ty: &CType) -> bool
 pub fn is_integer(ty: &CType) -> bool
 pub fn is_unsigned(ty: &CType) -> bool
@@ -112,21 +101,33 @@ pub fn is_array(ty: &CType) -> bool
 pub fn is_function(ty: &CType) -> bool
 pub fn is_struct_or_union(ty: &CType) -> bool
 pub fn is_complete(ty: &CType) -> bool
-
-// 类型兼容性
 pub fn is_compatible(a: &CType, b: &CType) -> bool
 pub fn resolve_and_strip(ty: &CType) -> &CType
 pub fn unqualified(ty: &CType) -> &CType
-pub fn resolve_typedef(ty: &CType) -> CType
+pub fn resolve_typedef(ty: &CType) -> &CType
 pub fn integer_promotion(ty: &CType) -> CType
 pub fn integer_rank(ty: &CType) -> u8
 ```
 
+### 私有函数
+
+```rust
+fn resolve_tag_ref(tag: &str) -> Option<CType>
+fn compute_struct_size(fields: &[StructField], packed: bool, aligned: Option<usize>, target: &Target) -> usize
+fn compute_union_size(fields: &[StructField], packed: bool, aligned: Option<usize>, target: &Target) -> usize
+fn align_up(value: usize, align: usize) -> usize
+fn compute_struct_or_union_align(fields: &[StructField], packed: bool, aligned: Option<usize>, target: &Target) -> usize
+fn is_compatible_inner(a: &CType, b: &CType) -> bool
+fn compute_struct_size_resolved(fields: &[StructField], packed: bool, aligned: Option<usize>, target: &Target, tag_types: &HashMap<String, CType>) -> usize
+fn compute_union_size_resolved(fields: &[StructField], packed: bool, aligned: Option<usize>, target: &Target, tag_types: &HashMap<String, CType>) -> usize
+fn compute_struct_or_union_align_resolved(fields: &[StructField], packed: bool, aligned: Option<usize>, target: &Target, tag_types: &HashMap<String, CType>) -> usize
+```
+
 ---
 
-## type_builder.rs
+## 2. src/common/type_builder.rs
 
-### 类型
+### 类型定义
 
 ```rust
 pub struct FieldLayout {
@@ -148,10 +149,9 @@ pub struct TypeBuilder {
 }
 ```
 
-### 函数
+### TypeBuilder 方法
 
 ```rust
-// TypeBuilder 方法
 impl TypeBuilder {
     pub fn new(target: Target) -> Self
     pub fn target(&self) -> &Target
@@ -167,8 +167,24 @@ impl TypeBuilder {
     pub fn sizeof_type(&self, ty: &CType) -> usize
     pub fn alignof_type(&self, ty: &CType) -> usize
 }
+```
 
-// 自由函数
+### 私有函数
+
+```rust
+fn align_up(value: usize, align: usize) -> usize
+fn compute_aggregate_alignment(max_natural_field_align: usize, packed: bool, explicit_align: Option<usize>) -> usize
+fn resolve_and_strip(ty: &CType) -> &CType
+fn integer_bit_width(ty: &CType) -> u32
+fn types_equal_for_conversion(a: &CType, b: &CType) -> bool
+fn is_unsigned_type(ty: &CType) -> bool
+fn to_unsigned(ty: &CType) -> CType
+fn is_integer_type_inner(ty: &CType) -> bool
+```
+
+### 公共函数
+
+```rust
 pub fn is_integer_type(ty: &CType) -> bool
 pub fn is_arithmetic_type(ty: &CType) -> bool
 pub fn is_scalar_type(ty: &CType) -> bool
@@ -180,9 +196,9 @@ pub fn integer_promote(ty: &CType) -> CType
 
 ---
 
-## temp_files.rs
+## 3. src/common/temp_files.rs
 
-### 类型
+### 类型定义
 
 ```rust
 pub struct TempFile {
@@ -196,7 +212,7 @@ pub struct TempDir {
 }
 ```
 
-### 函数
+### TempFile 方法
 
 ```rust
 impl TempFile {
@@ -207,6 +223,14 @@ impl TempFile {
     pub fn into_path(self) -> PathBuf
 }
 
+impl Drop for TempFile {
+    fn drop(&mut self)
+}
+```
+
+### TempDir 方法
+
+```rust
 impl TempDir {
     pub fn new() -> io::Result<Self>
     pub fn new_in(parent: &Path) -> io::Result<Self>
@@ -215,6 +239,15 @@ impl TempDir {
     pub fn keep(mut self) -> PathBuf
 }
 
+impl Drop for TempDir {
+    fn drop(&mut self)
+}
+```
+
+### 公共函数
+
+```rust
+fn unique_name(prefix: &str, suffix: &str) -> String
 pub fn create_temp_object_file() -> io::Result<TempFile>
 pub fn create_temp_assembly_file() -> io::Result<TempFile>
 pub fn create_temp_preprocessed_file() -> io::Result<TempFile>
@@ -222,9 +255,9 @@ pub fn create_temp_preprocessed_file() -> io::Result<TempFile>
 
 ---
 
-## target.rs
+## 4. src/common/target.rs
 
-### 类型
+### 类型定义
 
 ```rust
 pub enum Endianness {
@@ -240,7 +273,15 @@ pub enum Target {
 }
 ```
 
-### 函数
+### Endianness 方法
+
+```rust
+impl fmt::Display for Endianness {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
+}
+```
+
+### Target 方法
 
 ```rust
 impl Target {
@@ -264,24 +305,23 @@ impl Target {
     pub fn system_include_paths(&self) -> Vec<&'static str>
     pub fn system_library_paths(&self) -> Vec<&'static str>
 }
+
+impl fmt::Display for Target {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
+}
 ```
 
 ---
 
-## string_interner.rs
+## 5. src/common/string_interner.rs
 
-### 类型
+### 类型定义
 
 ```rust
 pub struct Symbol(u32)
-
-pub struct Interner {
-    map: FxHashMap<String, Symbol>,
-    strings: Vec<String>,
-}
 ```
 
-### 函数
+### Symbol 方法
 
 ```rust
 impl Symbol {
@@ -289,6 +329,23 @@ impl Symbol {
     pub fn from_u32(raw: u32) -> Self
 }
 
+impl fmt::Display for Symbol {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
+}
+```
+
+### 类型定义
+
+```rust
+pub struct Interner {
+    map: FxHashMap<String, Symbol>,
+    strings: Vec<String>,
+}
+```
+
+### Interner 方法
+
+```rust
 impl Interner {
     pub fn new() -> Self
     pub fn intern(&mut self, s: &str) -> Symbol
@@ -298,17 +355,25 @@ impl Interner {
     pub fn is_empty(&self) -> bool
 }
 
+impl Default for Interner {
+    fn default() -> Self
+}
+
 impl Index<Symbol> for Interner {
     type Output = str
     fn index(&self, sym: Symbol) -> &str
+}
+
+impl fmt::Debug for Interner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
 }
 ```
 
 ---
 
-## source_map.rs
+## 6. src/common/source_map.rs
 
-### 类型
+### 类型定义
 
 ```rust
 pub struct SourceLocation {
@@ -338,17 +403,29 @@ pub struct SourceMap {
 }
 ```
 
-### 函数
+### SourceLocation 方法
+
+```rust
+impl fmt::Display for SourceLocation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
+}
+```
+
+### SourceFile 方法
 
 ```rust
 impl SourceFile {
     fn new(id: u32, filename: String, content: String) -> Self
     fn compute_line_offsets(content: &str) -> Vec<u32>
-    fn lookup_line_col(&self, byte_offset: u32) -> (u32, u32)
-    fn get_line_content(&self, line: u32) -> &str
-    fn line_count(&self) -> usize
+    pub fn lookup_line_col(&self, byte_offset: u32) -> (u32, u32)
+    pub fn get_line_content(&self, line: u32) -> &str
+    pub fn line_count(&self) -> usize
 }
+```
 
+### SourceMap 方法
+
+```rust
 impl SourceMap {
     pub fn new() -> Self
     pub fn add_file(&mut self, filename: String, content: String) -> u32
@@ -358,43 +435,19 @@ impl SourceMap {
     pub fn get_line_directive_filenames(&self, file_id: u32) -> Vec<String>
     pub fn add_line_directive(&mut self, directive: LineDirective)
     pub fn resolve_location(&self, file_id: u32, byte_offset: u32) -> SourceLocation
-    pub fn format_span(&self, file_id: u32, start: u32, end: u32) -> String
+    pub fn format_span(&self, file_id: u32, start: u32, _end: u32) -> String
+}
+
+impl Default for SourceMap {
+    fn default() -> Self
 }
 ```
 
 ---
 
-## fx_hash.rs
+## 7. src/common/long_double.rs
 
-### 类型
-
-```rust
-pub struct FxHasher {
-    hash: usize,
-}
-
-pub type FxHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>
-pub type FxHashSet<K> = HashSet<K, BuildHasherDefault<FxHasher>>
-```
-
-### 函数
-
-```rust
-impl FxHasher {
-    pub fn new() -> Self
-}
-
-pub fn fx_hash_map<K, V>() -> FxHashMap<K, V>
-pub fn fx_hash_map_with_capacity<K, V>(capacity: usize) -> FxHashMap<K, V>
-pub fn fx_hash_set<K>() -> FxHashSet<K>
-pub fn fx_hash_set_with_capacity<K>(capacity: usize) -> FxHashSet<K>
-```
-
----
-
-## long_double.rs
-
-### 类型
+### 类型定义
 
 ```rust
 pub struct LongDouble {
@@ -404,7 +457,7 @@ pub struct LongDouble {
 }
 ```
 
-### 常量
+### LongDouble 常量
 
 ```rust
 impl LongDouble {
@@ -417,7 +470,7 @@ impl LongDouble {
 }
 ```
 
-### 函数
+### LongDouble 方法
 
 ```rust
 impl LongDouble {
@@ -426,39 +479,135 @@ impl LongDouble {
     pub fn is_nan(&self) -> bool
     pub fn is_negative(&self) -> bool
     pub fn is_denormal(&self) -> bool
-    
+    fn is_normal(&self) -> bool
+    fn true_exponent(&self) -> i32
+    fn abs_greater_than(&self, other: &LongDouble) -> bool
+    fn normalize_round(sign: bool, exp: i32, sig: u128) -> LongDouble
+    fn round_and_pack(sign: bool, exp: i32, sig_hi: u64, sig_lo: u64) -> LongDouble
     pub fn add(self, other: LongDouble) -> LongDouble
     pub fn sub(self, other: LongDouble) -> LongDouble
     pub fn mul(self, other: LongDouble) -> LongDouble
     pub fn div(self, other: LongDouble) -> LongDouble
     pub fn neg(self) -> LongDouble
-    
+    pub fn total_cmp(&self, other: &LongDouble) -> Ordering
     pub fn from_f64(val: f64) -> LongDouble
     pub fn to_f64(&self) -> f64
     pub fn from_i64(val: i64) -> LongDouble
-    pub fn to_i64(&self) -> i64
     pub fn from_u64(val: u64) -> LongDouble
+    pub fn to_i64(&self) -> i64
     pub fn to_u64(&self) -> u64
-    
     pub fn to_bytes(&self) -> [u8; 10]
     pub fn from_bytes(bytes: &[u8; 10]) -> LongDouble
-    
-    pub fn total_cmp(&self, other: &LongDouble) -> Ordering
+}
+
+impl PartialEq for LongDouble {
+    fn eq(&self, other: &Self) -> bool
+}
+
+impl PartialOrd for LongDouble {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering>
+}
+
+impl fmt::Display for LongDouble {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
+}
+
+impl fmt::Debug for LongDouble {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
+}
+
+impl Default for LongDouble {
+    fn default() -> Self
+}
+
+impl std::ops::Add for LongDouble {
+    type Output = LongDouble
+    fn add(self, rhs: LongDouble) -> LongDouble
+}
+
+impl std::ops::Sub for LongDouble {
+    type Output = LongDouble
+    fn sub(self, rhs: LongDouble) -> LongDouble
+}
+
+impl std::ops::Mul for LongDouble {
+    type Output = LongDouble
+    fn mul(self, rhs: LongDouble) -> LongDouble
+}
+
+impl std::ops::Div for LongDouble {
+    type Output = LongDouble
+    fn div(self, rhs: LongDouble) -> LongDouble
+}
+
+impl std::ops::Neg for LongDouble {
+    type Output = LongDouble
+    fn neg(self) -> LongDouble
 }
 ```
 
 ---
 
-## encoding.rs
+## 8. src/common/fx_hash.rs
 
-### 函数
+### 类型定义
 
 ```rust
-const MAX_SOURCE_FILE_SIZE: u64 = 256 * 1024 * 1024
-const PUA_BASE: u32 = 0xE000
-const PUA_LOW: u32 = 0xE080
-const PUA_HIGH: u32 = 0xE0FF
+pub struct FxHasher {
+    hash: usize,
+}
+```
 
+### 类型别名
+
+```rust
+pub type FxHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>
+pub type FxHashSet<K> = HashSet<K, BuildHasherDefault<FxHasher>>
+```
+
+### FxHasher 方法
+
+```rust
+impl FxHasher {
+    pub fn new() -> Self
+    fn add_to_hash(&mut self, word: usize)
+}
+
+impl Default for FxHasher {
+    fn default() -> Self
+}
+
+impl Clone for FxHasher {
+    fn clone(&self) -> Self
+}
+
+impl Hasher for FxHasher {
+    fn finish(&self) -> u64
+    fn write(&mut self, bytes: &[u8])
+    fn write_u8(&mut self, i: u8)
+    fn write_u16(&mut self, i: u16)
+    fn write_u32(&mut self, i: u32)
+    fn write_u64(&mut self, i: u64)
+    fn write_usize(&mut self, i: usize)
+}
+```
+
+### 公共函数
+
+```rust
+pub fn fx_hash_map<K, V>() -> FxHashMap<K, V>
+pub fn fx_hash_map_with_capacity<K, V>(capacity: usize) -> FxHashMap<K, V>
+pub fn fx_hash_set<K>() -> FxHashSet<K>
+pub fn fx_hash_set_with_capacity<K>(capacity: usize) -> FxHashSet<K>
+```
+
+---
+
+## 9. src/common/encoding.rs
+
+### 公共函数
+
+```rust
 pub fn encode_byte_to_pua(byte: u8) -> char
 pub fn decode_pua_to_byte(ch: char) -> Option<u8>
 pub fn is_pua_encoded(ch: char) -> bool
@@ -470,9 +619,9 @@ pub fn extract_string_bytes(s: &str) -> Vec<u8>
 
 ---
 
-## diagnostics.rs
+## 10. src/common/diagnostics.rs
 
-### 类型
+### 类型定义
 
 ```rust
 pub enum Severity {
@@ -514,7 +663,15 @@ pub struct DiagnosticEngine {
 }
 ```
 
-### 函数
+### Severity 方法
+
+```rust
+impl fmt::Display for Severity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
+}
+```
+
+### Span 方法
 
 ```rust
 impl Span {
@@ -523,7 +680,11 @@ impl Span {
     pub fn merge(self, other: Span) -> Span
     pub fn is_dummy(&self) -> bool
 }
+```
 
+### Diagnostic 方法
+
+```rust
 impl Diagnostic {
     pub fn error(span: Span, message: impl Into<String>) -> Self
     pub fn warning(span: Span, message: impl Into<String>) -> Self
@@ -531,7 +692,11 @@ impl Diagnostic {
     pub fn with_note(mut self, span: Span, message: impl Into<String>) -> Self
     pub fn with_fix(mut self, span: Span, replacement: impl Into<String>, message: impl Into<String>) -> Self
 }
+```
 
+### DiagnosticEngine 方法
+
+```rust
 impl DiagnosticEngine {
     pub fn new() -> Self
     pub fn begin_suppress(&mut self)
@@ -546,6 +711,60 @@ impl DiagnosticEngine {
     pub fn diagnostics(&self) -> &[Diagnostic]
     pub fn clear(&mut self)
     pub fn print_all(&self, source_map: &SourceMap)
+    fn print_diagnostic(&self, diag: &Diagnostic, source_map: &SourceMap)
     pub fn span_filename<'a>(&self, span: &Span, source_map: &'a SourceMap) -> Option<&'a str>
 }
+
+impl Default for DiagnosticEngine {
+    fn default() -> Self
+}
+
+impl fmt::Debug for DiagnosticEngine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
+}
+```
+
+---
+
+## 11. src/common/mod.rs
+
+模块入口文件，仅包含模块声明，无类型或函数定义。
+
+---
+
+## 十二、src/common/long_double.rs (续)
+
+### LongDouble 内部方法
+
+```rust
+impl LongDouble {
+    // 内部辅助方法
+    fn true_exponent(&self) -> i32
+    fn abs_greater_than(&self, other: &LongDouble) -> bool
+    fn normalize_round(sign: bool, exp: i32, sig: u128) -> LongDouble
+    fn round_and_pack(sign: bool, exp: i32, sig_hi: u64, sig_lo: u64) -> LongDouble
+}
+```
+
+---
+
+## 十三、src/common/type_builder.rs (续)
+
+### 类型谓词函数
+
+```rust
+pub fn is_integer_type(ty: &CType) -> bool
+pub fn is_arithmetic_type(ty: &CType) -> bool
+pub fn is_scalar_type(ty: &CType) -> bool
+pub fn is_complete_type(ty: &CType) -> bool
+pub fn integer_rank(ty: &CType) -> u8
+pub fn usual_arithmetic_conversion(lhs: &CType, rhs: &CType) -> CType
+pub fn integer_promote(ty: &CType) -> CType
+
+// 内部辅助函数
+fn integer_bit_width(ty: &CType) -> u32
+fn types_equal_for_conversion(a: &CType, b: &CType) -> bool
+fn is_unsigned_type(ty: &CType) -> bool
+fn to_unsigned(ty: &CType) -> CType
+fn is_integer_type_inner(ty: &CType) -> bool
 ```
